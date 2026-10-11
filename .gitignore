@@ -1,0 +1,52 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local state & caches
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.review-bot-state/
+
+# IDE & OS
+.idea/
+.vscode/
+.DS_Store
+
+# User workspace rules
+graphify-out/
+
+# Local agent session configuration
+.junie/
+
+# Environment files and private credentials
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+.secrets/
+secrets/
+
+# Downloaded analysis tool binaries (checksums live in tooling/tools.lock.json)
+tooling/lib/

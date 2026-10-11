@@ -1,0 +1,175 @@
+{
+  "pmd_version": "7.3.0",
+  "java_version": "21",
+  "artifacts": {
+    "pmd-cli-7.3.0.jar": {
+      "sha256": "32874dbe65f3abacd0462d999cef720a9d0a92cc0edc6666593639252e25937f",
+      "size_bytes": 50030,
+      "category": "pmd_cli",
+      "relative_path": "tooling/lib/pmd-cli-7.3.0.jar"
+    },
+    "pmd-java-7.3.0.jar": {
+      "sha256": "14695a9a480302b942bf7647f2c47bf07c7e1953d62c7741d532ea0d9e207487",
+      "size_bytes": 1638586,
+      "category": "pmd_java",
+      "relative_path": "tooling/lib/pmd-java-7.3.0.jar"
+    },
+    "pmd-core-7.3.0.jar": {
+      "sha256": "ef0e5b8818ade2a6def61e5159b2b76bfebdbf0ca0c511a1ea8bab71357245dc",
+      "size_bytes": 928632,
+      "category": "pmd_core",
+      "relative_path": "tooling/lib/pmd-core-7.3.0.jar"
+    },
+    "pmd-designer-7.2.0.jar": {
+      "sha256": "d7bdecaf6ea499ed0bf2767d638657b36f286f20ac2cc3bc498c25a8a71f1c85",
+      "size_bytes": 4694447,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/pmd-designer-7.2.0.jar"
+    },
+    "slf4j-simple-2.0.17.jar": {
+      "sha256": "ddfea59ac074c6d3e24ac2c38622d2d963895e17f70b38ed4bdae4d780be6964",
+      "size_bytes": 15716,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/slf4j-simple-2.0.17.jar"
+    },
+    "jul-to-slf4j-2.0.17.jar": {
+      "sha256": "a7afcd23b9cfd1475e55c94f943b808c5922035e7e2c2a5c65a487a4106bc538",
+      "size_bytes": 6349,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/jul-to-slf4j-2.0.17.jar"
+    },
+    "Saxon-HE-12.4.jar": {
+      "sha256": "575f8b696e3b6f9aa7a3bf01611b8bf1b84576b55ce29bc16656a53a147ef441",
+      "size_bytes": 5595135,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/Saxon-HE-12.4.jar"
+    },
+    "xmlresolver-5.2.2.jar": {
+      "sha256": "efc92bd7ed32b3e57095e0b3e872051ccfbbdcc980831ef33e89e38161a85222",
+      "size_bytes": 165689,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/xmlresolver-5.2.2.jar"
+    },
+    "xmlresolver-5.2.2-data.jar": {
+      "sha256": "173904bdbd783ba0fac92c5bcc05da5d09f0ce7eed24346666ea0a239461f9b4",
+      "size_bytes": 1027801,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/xmlresolver-5.2.2-data.jar"
+    },
+    "httpclient5-5.4.4.jar": {
+      "sha256": "3f8657eab91b7533e5cf232d4e268253c4ff9f99f1e4bcd67841618bed67f2de",
+      "size_bytes": 911620,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/httpclient5-5.4.4.jar"
+    },
+    "slf4j-api-2.0.17.jar": {
+      "sha256": "7b751d952061954d5abfed7181c1f645d336091b679891591d63329c622eb832",
+      "size_bytes": 69908,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/slf4j-api-2.0.17.jar"
+    },
+    "picocli-4.7.5.jar": {
+      "sha256": "e83a906fb99b57091d1d68ac11f7c3d2518bd7a81a9c71b259e2c00d1564c8e8",
+      "size_bytes": 415128,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/picocli-4.7.5.jar"
+    },
+    "progressbar-0.9.5.jar": {
+      "sha256": "a1a086fa66f85c49bb3ca701a78cebb33647f367d4a5be8588c784d56272cc6e",
+      "size_bytes": 35670,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/progressbar-0.9.5.jar"
+    },
+    "checker-qual-2.11.1.jar": {
+      "sha256": "015224a4b1dc6de6da053273d4da7d39cfea20e63038169fc45ac0d1dc9c5938",
+      "size_bytes": 201116,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/checker-qual-2.11.1.jar"
+    },
+    "asm-9.6.jar": {
+      "sha256": "3c6fac2424db3d4a853b669f4e3d1d9c3c552235e19a319673f887083c2303a1",
+      "size_bytes": 123598,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/asm-9.6.jar"
+    },
+    "commons-lang3-3.17.0.jar": {
+      "sha256": "6ee731df5c8e5a2976a1ca023b6bb320ea8d3539fbe64c8a1d5cb765127c33b4",
+      "size_bytes": 673587,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/commons-lang3-3.17.0.jar"
+    },
+    "pcollections-3.2.0.jar": {
+      "sha256": "6c1447309cd47560924dbf4939b37756c53b15febc0191ec52d6e0b53b6cc62a",
+      "size_bytes": 66757,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/pcollections-3.2.0.jar"
+    },
+    "antlr4-runtime-4.9.3.jar": {
+      "sha256": "131a6594969bc4f321d652ea2a33bc0e378ca312685ef87791b2c60b29d01ea5",
+      "size_bytes": 336742,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/antlr4-runtime-4.9.3.jar"
+    },
+    "gson-2.11.0.jar": {
+      "sha256": "57928d6e5a6edeb2abd3770a8f95ba44dce45f3b23b7a9dc2b309c581552a78b",
+      "size_bytes": 298435,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/gson-2.11.0.jar"
+    },
+    "nice-xml-messages-3.1.jar": {
+      "sha256": "0b4ceb5b8362d43c9c6c49b1bd57f1c5da54d3c5c7c305fa39c0a04462bb4799",
+      "size_bytes": 48648,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/nice-xml-messages-3.1.jar"
+    },
+    "jline-3.21.0.jar": {
+      "sha256": "1e7d63a2bd1c26354ca1987e55469ea4327c4a3845c10d7a7790ca9729c49c02",
+      "size_bytes": 994664,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/jline-3.21.0.jar"
+    },
+    "error_prone_annotations-2.27.0.jar": {
+      "sha256": "24c923372c58e35d0b9f16a028929bb9aedc77521867c274f2bd0735df5ba1f5",
+      "size_bytes": 19370,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/error_prone_annotations-2.27.0.jar"
+    },
+    "httpcore5-h2-5.3.6.jar": {
+      "sha256": "479a8aa5e6f99030a2a446a68d1f62320698932746f811fc656a1ea06b94184d",
+      "size_bytes": 242521,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/httpcore5-h2-5.3.6.jar"
+    },
+    "httpcore5-5.3.6.jar": {
+      "sha256": "8fb4528d3e970aca440523a1bd698a389fa710ecfea4c5c6096698b86d1669ce",
+      "size_bytes": 909490,
+      "category": "pmd_runtime",
+      "relative_path": "tooling/lib/httpcore5-5.3.6.jar"
+    },
+    "ruleset.xml": {
+      "sha256": "c3e9649c6e69a94a22644db666c098d05a7b7f4ea364e496d320cdd24dece2f2",
+      "size_bytes": 1987,
+      "category": "ruleset",
+      "relative_path": "src/review_bot/resources/pmd/ruleset.xml"
+    }
+  },
+  "jdk": {
+    "required_major_version": 21,
+    "vendor_families": [
+      "Amazon.com Inc.",
+      "Eclipse Adoptium"
+    ],
+    "minimum_specification_version": "21"
+  },
+  "jdk_identity": {
+    "recommended_distribution": "Amazon Corretto 21",
+    "verified_versions": [
+      "21.0.6",
+      "21.0.11"
+    ],
+    "verified_vendors": [
+      "Amazon.com Inc.",
+      "Eclipse Adoptium"
+    ]
+  }
+}
