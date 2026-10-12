@@ -109,8 +109,11 @@ def publish_review_comment(
         try:
             if publication_guard():
                 return None
-        except Exception:
-            logger.exception("publication_guard_failed")
+        except Exception as exc:
+            if strict_target:
+                logger.warning("publication_guard_failed:%s", type(exc).__name__)
+            else:
+                logger.exception("publication_guard_failed")
         return PublicationReceipt(
             comment_id=comment_id, status="failed", fingerprint=fingerprint, marker=marker,
             published_at=datetime.now(UTC).isoformat() if comment_id is not None else None,

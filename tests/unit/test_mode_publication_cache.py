@@ -40,7 +40,8 @@ def test_custom_b_marker_is_operator_owned_and_distinct():
         PublishConfig(b_comments_enabled="true")
 
 
-def test_receipt_migration_preserves_legacy_body_hash_and_never_infers_b_success(tmp_path):
+@pytest.mark.parametrize("prior_status_columns", [False, True])
+def test_receipt_migration_preserves_legacy_body_hash_and_never_infers_b_success(tmp_path, prior_status_columns):
     path = tmp_path / "legacy.sqlite"
     with sqlite3.connect(path) as connection:
         connection.executescript("""
@@ -52,11 +53,16 @@ def test_receipt_migration_preserves_legacy_body_hash_and_never_infers_b_success
             );
         """)
         connection.execute("INSERT INTO publication_receipts VALUES (99, 7, ?, 701, 'old-body-hash', 'old-time')", (B_MARKER,))
+        if prior_status_columns:
+            connection.execute("ALTER TABLE publication_receipts ADD COLUMN status TEXT NOT NULL DEFAULT 'unknown'")
+            connection.execute("ALTER TABLE publication_receipts ADD COLUMN run_id TEXT")
+            connection.execute("UPDATE publication_receipts SET status = 'succeeded', run_id = 'old-run'")
     for _ in range(2):
         store = SQLiteJobStore(path)
         try:
             row = store._get_connection().execute("SELECT comment_id, published_fingerprint, published_at, status, run_id, input_fingerprint FROM publication_receipts").fetchone()
-            assert row == (701, "old-body-hash", "old-time", "unknown", None, None)
+            expected_status, expected_run = ("succeeded", "old-run") if prior_status_columns else ("unknown", None)
+            assert row == (701, "old-body-hash", "old-time", expected_status, expected_run, None)
             store.enqueue_request(PrRequestRecord(44, 99, 7, 1))
             run = store.claim_next_run("worker", 60)
             assert store.get_current_publication(run, B_MARKER, input_fingerprint="b" * 64) is None

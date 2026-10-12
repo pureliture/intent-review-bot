@@ -3,12 +3,17 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from review_bot.adapters.github.auth import GitHubAppAuthError
+from review_bot.application.publication import publish_review_comment
 from review_bot.application.review_a import MockModelClient
+from review_bot.application.review_b import SYSTEM_PROMPTS
 from review_bot.domain.models_v1 import ModelResponse
+from review_bot.runtime.artifacts import RunArtifacts
 from tests.integration.test_intent_flow import (
     enable_a_fixture,
     intent_flow,
@@ -210,7 +215,7 @@ def test_b_publication_checks_fixed_sources_before_and_after_write(intent_flow, 
     assert modes["intent"]["publication"]["input_fingerprint"] is None
 
 
-@pytest.mark.parametrize("mutation", ["issue", "head", "draft", "body"])
+@pytest.mark.parametrize("mutation", ["issue", "issue_version", "issue_unavailable", "head", "draft", "body"])
 def test_b_post_write_race_marks_existing_comment_stale_not_success(intent_flow, mutation):
     flow = intent_flow
     opt_in(flow)
@@ -219,6 +224,10 @@ def test_b_post_write_race_marks_existing_comment_stale_not_success(intent_flow,
         flow.issue_status.pop("on_comment_write", None)
         if mutation == "issue":
             flow.issue["body"] = "Post-write changed requirement"
+        elif mutation == "issue_version":
+            flow.issue["updated_at"] = "2026-10-04T00:00:00Z"
+        elif mutation == "issue_unavailable":
+            flow.issue_status["code"] = 404
         elif mutation == "head":
             flow.pr["head"]["sha"] = "d" * 40
         elif mutation == "draft":
@@ -305,6 +314,159 @@ def test_b_publication_authorization_loss_preserves_usage_and_stops_remaining_mo
     assert retried["intent"]["reused"] is False
     assert retried["architecture"]["reused"] is a_ran
     assert flow.analyzer.run_analysis.call_count == 2
+
+
+@pytest.mark.parametrize("method", ["find_marker_comment", "create_comment", "update_comment"])
+def test_a_publication_authorization_loss_preserves_core_and_stops_b(intent_flow, monkeypatch, method):
+    flow = intent_flow
+    opt_in(flow, ("architecture", "intent"))
+    if method == "update_comment":
+        flow.comments.append({"id": 700, "body": A_MARKER + "\nPrior review",
+            "user": {"login": "review-app[bot]", "type": "Bot"}})
+    original = getattr(flow.github, method)
+
+    def reject_architecture(*args, **kwargs):
+        text = kwargs.get("body", kwargs.get("marker", args[-1] if args else ""))
+        if isinstance(text, str) and A_MARKER in text:
+            raise GitHubAppAuthError("synthetic-authorization-secret")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(flow.github, method, reject_architecture)
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
+    root, status, recorded = receipts(flow)
+    assert status == "failed" and len(flow.model.requests) == 0
+    assert (root / "A/receipt.json").exists() and not (root / "B/result.json").exists()
+    receipt = json.loads((root / "A/receipt.json").read_text())
+    core = json.loads((root / "A/result.json").read_text())
+    assert receipt["a_result"] == core and receipt["usage"] == core["usage"]
+    assert recorded["architecture"]["error_code"] == "publication_authorization_lost"
+    assert receipt["publication"]["status"] == "unknown" and receipt["publication"]["input_fingerprint"] is None
+    assert "intent" not in recorded and writes(flow) == []
+    assert "synthetic-authorization-secret" not in (root / "A/receipt.json").read_text()
+
+
+@pytest.mark.parametrize("mode", ["architecture", "intent"])
+def test_authorization_loss_remains_common_when_receipt_storage_fails(intent_flow, monkeypatch, caplog, mode):
+    flow = intent_flow
+    other = "intent" if mode == "architecture" else "architecture"
+    opt_in(flow, (mode, other))
+
+    def lose_authorization(*args, **kwargs):
+        raise GitHubAppAuthError("synthetic-authorization-secret")
+
+    def storage_failure(*args, **kwargs):
+        raise OSError("synthetic-storage-secret")
+
+    monkeypatch.setattr(flow.github, "find_marker_comment", lose_authorization)
+    monkeypatch.setattr(RunArtifacts, "save_receipt", storage_failure)
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
+    root, status = output(flow)
+    assert status == "failed" and writes(flow) == []
+    current_dir, other_dir = ("A", "B") if mode == "architecture" else ("B", "A")
+    assert (root / current_dir / "result.json").exists() and not (root / other_dir / "result.json").exists()
+    assert len(flow.model.requests) == (0 if mode == "architecture" else 3)
+    assert flow.analyzer.run_analysis.call_count == (2 if mode == "architecture" else 0)
+    assert flow.store._get_connection().execute("SELECT error FROM runs WHERE run_id = ?", (root.name,)).fetchone()[0] == "publication_authorization_lost"
+    assert "synthetic-authorization-secret" not in caplog.text and "synthetic-storage-secret" not in caplog.text
+
+
+def test_b_publication_guard_failure_hides_raw_exception_without_reads_or_writes(intent_flow, caplog):
+    flow = intent_flow
+
+    def failed_guard():
+        raise ValueError("synthetic-guard-secret")
+
+    receipt = publish_review_comment(flow.github, 99, 7, flow.pr["head"]["sha"], flow.pr["base"]["sha"],
+        B_MARKER + "\nGuarded fixture", marker=B_MARKER, publication_guard=failed_guard, strict_target=True)
+    assert receipt.status == "failed" and receipt.reason == "publication_fenced"
+    assert flow.calls == [] and flow.comments == []
+    assert "synthetic-guard-secret" not in caplog.text
+
+
+@pytest.mark.parametrize("abort", ["stop", "closed", "generation", "lease", "deadline"])
+@pytest.mark.parametrize("boundary", ["on_comment_read", "on_comment_write"])
+def test_b_posting_fences_stop_writes_and_remaining_modes(intent_flow, monkeypatch, abort, boundary):
+    flow = intent_flow
+    opt_in(flow, ("intent", "architecture"))
+    flow.config.execution.task_timeout_seconds = 2
+    clock = [100.0]
+    observed = {}
+    monkeypatch.setattr("review_bot.runtime.worker.time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def interrupt():
+        flow.issue_status.pop(boundary, None)
+        observed["run_id"] = flow.worker._current_run_id
+        if abort == "stop":
+            flow.worker.stop()
+        elif abort == "closed":
+            flow.pr["state"] = "closed"
+            assert send_event(flow, "closed-at-publication", "closed").status_code == 202
+        elif abort == "generation":
+            assert send_event(flow, "superseded-at-publication", "edited").status_code == 202
+        elif abort == "lease":
+            flow.store._get_connection().execute("UPDATE runs SET lease_expires_at = 0")
+            observed["replacement"] = flow.store.claim_next_run("replacement", 30)
+            assert observed["replacement"] is not None
+        else:
+            clock[0] += 3
+
+    flow.issue_status[boundary] = interrupt
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
+    root, status = output(flow, observed["run_id"])
+    assert len(flow.model.requests) == 3 and flow.analyzer.run_analysis.call_count == 0
+    assert json.loads((root / "B/usage.json").read_text())["total"]["calls"] == 3
+    assert not (root / "A/result.json").exists()
+    assert flow.store._get_connection().execute("SELECT COUNT(*) FROM publication_receipts").fetchone()[0] == 0
+    expected_writes = [("POST", "/repos/org/repo/issues/7/comments")] if boundary == "on_comment_write" else []
+    assert writes(flow) == expected_writes
+    if expected_writes:
+        assert flow.comments[0]["body"].count(B_MARKER) == 1 and "Stale review" not in flow.comments[0]["body"]
+    if abort in ("stop", "closed"):
+        assert status == "cancelled"
+    elif abort == "generation":
+        assert status == "superseded"
+    elif abort == "deadline":
+        assert status == "failed"
+        assert flow.store._get_connection().execute("SELECT reason FROM runs WHERE run_id = ?", (root.name,)).fetchone()[0] == "task_deadline_exceeded"
+    else:
+        assert status == "running" and observed["replacement"].run_id == root.name
+        assert flow.store._get_connection().execute("SELECT worker_id FROM runs WHERE run_id = ?", (root.name,)).fetchone()[0] == "replacement"
+
+
+def test_b_profile_change_does_not_invalidate_or_hide_a_cache(intent_flow, monkeypatch):
+    """B's prompt profile is separate; the actual shared model profile is not."""
+    flow = intent_flow
+    opt_in(flow, ("architecture", "intent"))
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is True
+    _, status, first = receipts(flow)
+    assert status == "succeeded" and len(flow.model.requests) == 3
+    prompt = SYSTEM_PROMPTS["assess"] + "\nFixture B prompt profile revision; retain all citation rules."
+    monkeypatch.setitem(SYSTEM_PROMPTS, "assess", prompt)
+    assert send_event(flow, "only-b-profile-changed", "edited").status_code == 202 and flow.worker.run_once() is True
+    _, status, second = receipts(flow)
+    assert status == "succeeded" and len(flow.model.requests) == 6
+    assert second["architecture"]["reused"] is True and second["intent"]["reused"] is False
+    assert first["architecture"]["input_fingerprint"] == second["architecture"]["input_fingerprint"]
+    assert first["intent"]["input_fingerprint"] != second["intent"]["input_fingerprint"]
+    assert flow.analyzer.run_analysis.call_count == 2 and len(flow.comments) == 2
+    assert writes(flow)[-1] == ("PATCH", "/repos/org/repo/issues/comments/702")
+    assert flow.model.requests[-1].system_prompt == prompt
+
+
+def test_shared_model_profile_change_invalidates_both_mode_caches(intent_flow):
+    flow = intent_flow
+    opt_in(flow, ("architecture", "intent"))
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is True
+    _, _, first = receipts(flow)
+    flow.model.profile = replace(flow.model.profile, model="fixture-model-v2")
+    assert send_event(flow, "shared-profile-changed", "edited").status_code == 202 and flow.worker.run_once() is True
+    _, status, second = receipts(flow)
+    assert status == "succeeded" and len(flow.model.requests) == 6
+    for mode in ("architecture", "intent"):
+        assert second[mode]["reused"] is False
+        assert first[mode]["input_fingerprint"] != second[mode]["input_fingerprint"]
+    assert flow.analyzer.run_analysis.call_count == 4 and len(flow.comments) == 2
+    assert writes(flow)[-2:] == [("PATCH", "/repos/org/repo/issues/comments/701"), ("PATCH", "/repos/org/repo/issues/comments/702")]
 
 
 def test_b_cache_freshness_is_checked_again_after_marker_lookup(intent_flow):

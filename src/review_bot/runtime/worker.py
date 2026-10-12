@@ -545,6 +545,23 @@ class WorkerLoop:
             usage={"calls": 0, "model_calls": 0, "input_tokens": 0, "output_tokens": 0},
             input_fingerprint=input_fingerprint, reused=True)
 
+    def _abort_authorization_loss(
+        self, run: RunRecord, artifacts: RunArtifacts | None, receipt: ExecutionReceipt, deadline: float,
+    ) -> None:
+        self._require_active(run, deadline)
+        try:
+            if artifacts is not None:
+                artifacts.save_receipt(receipt)
+            publication = receipt.publication
+            if publication is not None and (publication.status == "unknown"
+                or type(publication.comment_id) is int and publication.comment_id > 0):
+                self._record_publication(run, publication, deadline)
+        except _RunAborted:
+            raise
+        except Exception as exc:
+            logger.warning("authorization_receipt_storage_failed:%s", type(exc).__name__)
+        raise _CommonFailure("publication_authorization_lost")
+
     def _execute_architecture(
         self, run: RunRecord, review_snap: Any, pr_snap: Any, classification: Any, mode_sel: Any,
         artifacts: RunArtifacts | None, title: str, body: str, draft: bool, deadline: float,
@@ -632,14 +649,27 @@ class WorkerLoop:
                 reason="artifact_only" if self.config.publish.mode == "artifact_only" else "draft_comments_disabled")
         else:
             auth_before = getattr(self.github_client, "authorization_failures", None)
-            publication = publish_review_comment(github_client=self.github_client, repository_id=run.repository_id,
-                pr_number=run.pr_number, expected_head_sha=head_sha, expected_base_sha=review_snap.target_base_sha,
-                body=markdown, marker=marker, publication_guard=lambda: self._active(run, deadline),
-                **({"context_guard": context_guard} if self.github_client_factory is not None else {}))
+            authorization_lost = False
+            try:
+                publication = publish_review_comment(github_client=self.github_client, repository_id=run.repository_id,
+                    pr_number=run.pr_number, expected_head_sha=head_sha, expected_base_sha=review_snap.target_base_sha,
+                    body=markdown, marker=marker, publication_guard=lambda: self._active(run, deadline),
+                    **({"context_guard": context_guard} if self.github_client_factory is not None else {}))
+            except GitHubAuthorizationError:
+                authorization_lost = True
+                publication = PublicationReceipt(None, "unknown",
+                    publication_fingerprint(run.repository_id, run.pr_number, head_sha, markdown), marker=marker,
+                    reason="publication_authorization_lost")
             self._require_active(run, deadline)
             auth_after = getattr(self.github_client, "authorization_failures", None)
-            if "intent" in mode_sel.selected_modes and type(auth_before) is int and type(auth_after) is int and auth_after > auth_before:
-                raise GitHubAppAuthError("Publication authorization lost")
+            if authorization_lost or ("intent" in mode_sel.selected_modes and type(auth_before) is int and type(auth_after) is int and auth_after > auth_before):
+                has_comment_id = type(publication.comment_id) is int and publication.comment_id > 0
+                publication = replace(publication, status="unknown" if authorization_lost or has_comment_id else "failed",
+                    reason="publication_authorization_lost", input_fingerprint=None)
+                receipt = ExecutionReceipt(2, "architecture", mode_sel.selection_id, review_snap.snapshot_id,
+                    run.generation, result.run_key, "failed", a_result=result, usage=result.usage,
+                    error_code="publication_authorization_lost", publication=publication, input_fingerprint=input_fingerprint)
+                self._abort_authorization_loss(run, artifacts, receipt, deadline)
             has_comment_id = type(publication.comment_id) is int and publication.comment_id > 0
             if publication.status != "succeeded" or not has_comment_id:
                 stale = publication.status == "stale" or publication.reason in ("stale_head_sha", "stale_base_sha", "pr_not_open")
@@ -730,10 +760,7 @@ class WorkerLoop:
             publication = replace(publication, status="unknown" if has_comment_id else "failed",
                 reason="publication_authorization_lost", input_fingerprint=None)
             receipt = replace(core_receipt, execution_status="failed", publication=publication, error_code="publication_authorization_lost")
-            artifacts.save_receipt(receipt)
-            if has_comment_id:
-                self._record_publication(run, publication, deadline)
-            raise _CommonFailure("publication_authorization_lost")
+            self._abort_authorization_loss(run, artifacts, receipt, deadline)
         if publication.status != "succeeded" or not has_comment_id:
             stale = publication.status == "stale" or publication.reason in ("stale_head_sha", "stale_base_sha", "pr_not_open")
             reason = "invalid_comment_id" if publication.status == "succeeded" else publication.reason
