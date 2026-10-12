@@ -6,6 +6,7 @@ from copy import deepcopy
 
 import pytest
 
+from review_bot.adapters.github.auth import GitHubAppAuthError
 from review_bot.application.review_a import MockModelClient
 from review_bot.domain.models_v1 import ModelResponse
 from tests.integration.test_intent_flow import (
@@ -235,7 +236,7 @@ def test_b_post_write_race_marks_existing_comment_stale_not_success(intent_flow,
     assert writes(flow) == [("POST", "/repos/org/repo/issues/7/comments"), ("PATCH", "/repos/org/repo/issues/comments/701")]
 
 
-@pytest.mark.parametrize("case", ["human", "other_bot", "duplicate", "modified", "missing"])
+@pytest.mark.parametrize("case", ["human", "other_bot", "duplicate", "repeated_marker", "modified", "missing"])
 def test_b_reuse_requeries_comment_ownership_and_body(intent_flow, case):
     flow = intent_flow
     opt_in(flow)
@@ -247,6 +248,8 @@ def test_b_reuse_requeries_comment_ownership_and_body(intent_flow, case):
         flow.comments[0]["user"]["login"] = "other-app[bot]"
     elif case == "duplicate":
         flow.comments.append({**deepcopy(flow.comments[0]), "id": 999})
+    elif case == "repeated_marker":
+        flow.comments[0]["body"] += "\n" + B_MARKER
     elif case == "modified":
         flow.comments[0]["body"] += "\nChanged outside the service"
     else:
@@ -259,6 +262,49 @@ def test_b_reuse_requeries_comment_ownership_and_body(intent_flow, case):
         assert len(flow.model.requests) == 6 and len(writes(flow)) == initial + 1
     else:
         assert status == "failed" and len(writes(flow)) == initial and len(flow.model.requests) == 3
+
+
+@pytest.mark.parametrize("method", ["find_marker_comment", "create_comment", "update_comment"])
+@pytest.mark.parametrize("modes", [("intent", "architecture"), ("architecture", "intent")])
+def test_b_publication_authorization_loss_preserves_usage_and_stops_remaining_modes(intent_flow, monkeypatch, method, modes):
+    flow = intent_flow
+    opt_in(flow, modes)
+    if method == "update_comment":
+        flow.comments.append({"id": 700, "body": B_MARKER + "\nPrior review",
+            "user": {"login": "review-app[bot]", "type": "Bot"}})
+    original = getattr(flow.github, method)
+
+    def reject_intent(*args, **kwargs):
+        text = kwargs.get("body", kwargs.get("marker", args[-1] if args else ""))
+        if isinstance(text, str) and B_MARKER in text:
+            raise GitHubAppAuthError("synthetic-authorization-secret")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(flow.github, method, reject_intent)
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
+    root, status, recorded = receipts(flow)
+    assert status == "failed" and len(flow.model.requests) == 3
+    intent = recorded["intent"]
+    assert (root / "B/receipt.json").exists()
+    receipt = json.loads((root / "B/receipt.json").read_text())
+    assert receipt["b_result"]["status"] == "completed" and intent["usage"]["calls"] == 3
+    assert receipt["usage"] == intent["usage"]
+    assert intent["execution_status"] == "failed" and intent["error_code"] == "publication_authorization_lost"
+    assert intent["publication"]["status"] == ("unknown" if method == "update_comment" else "failed")
+    assert intent["publication"]["input_fingerprint"] is None
+    assert "synthetic-authorization-secret" not in (root / "manifest.json").read_text()
+    a_ran = modes[0] == "architecture"
+    assert ("architecture" in recorded) is a_ran
+    assert flow.analyzer.run_analysis.call_count == (2 if a_ran else 0)
+    assert all(path != "/repos/org/repo/issues/comments/700" for _, path in writes(flow))
+
+    monkeypatch.setattr(flow.github, method, original)
+    assert send_event(flow, "authorization-restored", "edited").status_code == 202 and flow.worker.run_once() is True
+    _, status, retried = receipts(flow)
+    assert status == "succeeded" and len(flow.model.requests) == 6
+    assert retried["intent"]["reused"] is False
+    assert retried["architecture"]["reused"] is a_ran
+    assert flow.analyzer.run_analysis.call_count == 2
 
 
 def test_b_cache_freshness_is_checked_again_after_marker_lookup(intent_flow):

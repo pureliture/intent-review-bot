@@ -202,6 +202,9 @@ def publish_review_comment(
             reason=f"ambiguous_marker_comment:{type(exc).__name__}" if strict_target else f"ambiguous_marker_comment: {exc}",
         )
     except GitHubAuthorizationError:
+        if strict_target:
+            raise PublicationAuthorizationError(PublicationReceipt(None, "failed", fingerprint, marker=marker,
+                reason="publication_authorization_lost")) from None
         raise
     except Exception as exc:
         return PublicationReceipt(
@@ -238,6 +241,9 @@ def publish_review_comment(
             )
             published_id = comment_id
         except GitHubAuthorizationError:
+            if strict_target:
+                raise PublicationAuthorizationError(PublicationReceipt(comment_id, "failed", fingerprint, marker=marker,
+                    reason="publication_authorization_lost")) from None
             raise
         except Exception as exc:
             logger.warning("update_comment_failed:%s", type(exc).__name__)
@@ -269,6 +275,9 @@ def publish_review_comment(
                 else getattr(created, "id", None) or getattr(created, "comment_id", None)
             )
         except GitHubAuthorizationError:
+            if strict_target:
+                raise PublicationAuthorizationError(PublicationReceipt(None, "failed", fingerprint, marker=marker,
+                    reason="publication_authorization_lost")) from None
             raise
         except Exception as exc:
             logger.warning("create_comment_failed:%s", type(exc).__name__)

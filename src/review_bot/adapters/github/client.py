@@ -336,6 +336,8 @@ class GitHubApiClient:
         for comment in comments:
             body = comment.get("body", "")
             if marker in body:
+                if body.count(marker) != 1:
+                    raise ValueError("ambiguous_marker_comment")
                 if self._bot_login is not None:
                     user = comment.get("user")
                     if (
