@@ -180,6 +180,11 @@ This is the single active delivery slice. The prior Step 1/2 records remain hist
 - Actual accounting: **1 review generation + 1 native token-measurement call**, 1170 total input / 229 total output tokens (review 585/228; metering 585/1); no unknown usage. The full result, stage validation/delivery and collection record are under the ignored private evaluation directory above. No external comment or automatic service evaluation was performed; `b_comments_enabled` remains false in operational defaults.
 - Remaining prerequisite for a full real review: an explicitly approved existing-profile input budget large enough for the unchanged complete observation and assessment requests, with their normal token/output/deadline validation. This pass does not authorize that budget change or B automatic posting. Full current regression and final documentation verification remain the next bounded actions.
 
+### Output exception accounting correction (2026-10-12)
+
+- Verified fix (commit `2c95536`): replaced narrow output exceptions with fenced aborts and typed error codes (e.g., `architecture_pipeline_error:RuntimeError`), ensuring core results and usage are preserved in receipts while adhering to existing abort semantics.
+- Full regression passed: **2,037 tests passed**.
+
 ### Resumed checkpoint audit (2026-10-12)
 
 - Fresh Git truth supersedes the older task handoff: existing `master` checkout at `db1ea94f4ece122723c61fd8829c6399f74d8ca5`, no linked worktree, staged or untracked files. The preservation and functional commits above already exist; this pass will not recreate completed Step 1/2 or invent missing commit history.
