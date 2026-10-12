@@ -25,7 +25,7 @@ uv run pytest
 
 ## GitHub App service (operator-prepared)
 
-The intended path is **App installation → repository selection → signed PR event → SQLite lease → A architecture review → create or update one A comment**. The CLI now composes the existing signed FastAPI receiver, SQLite job store, installation-scoped GitHub/repository adapters and `WorkerLoop`; it does not install an App or deploy a service.
+The default path is **App installation → repository selection → signed PR event → SQLite lease → A architecture review → create or update one A comment**. Explicitly available/selected B intent review uses the same Worker, with separate files, receipts and an independently approved publication gate. The CLI composes the existing signed FastAPI receiver, SQLite job store, installation-scoped GitHub/repository adapters and `WorkerLoop`; it does not install an App or deploy a service.
 
 - **D1 — installation-based eligibility:** repositories selected during installation are eligible without operator registration. Empty `service.installation_allowlist` and `service.repository_allowlist` allow installed repositories; nonempty lists add restrictions. Installation/repository binding and installation-token scope still apply.
 - **D2 — publication default:** `execution.mode: github_app` defaults to `publish.mode: comment` when the publication mode is omitted. Offline/local CLI review retains the `artifact_only` default. An operator can explicitly select `artifact_only` to keep results private without GitHub writes.
@@ -87,7 +87,7 @@ Automated service CLI tests use in-process signed FastAPI requests, real SQLite 
 
 ## B intent evaluation (fixed input, never posts)
 
-The offline `intent` command evaluates **text code of any language** through `extract_goals → observe_changes → assess`. It does not read a target checkout, execute target code/builds/tests/hooks, initialize PMD/CPD, require Java or an analysis image, enqueue work, or compose a GitHub publisher. The same core is now registered as `intent` in the shared Worker; **B automatic posting remains disabled**, including when `publish.mode: comment`.
+The offline `intent` command evaluates **text code of any language** through `extract_goals → observe_changes → assess`. It does not read a target checkout, execute target code/builds/tests/hooks, initialize PMD/CPD, require Java or an analysis image, enqueue work, or compose a GitHub publisher. The same core is registered as `intent` in the shared Worker; **B automatic posting remains disabled by default**, including when `publish.mode: comment`.
 
 Prepare a fixed `IntentTaskInput` v1 with `build_intent_task_input(snapshot, base, head, related_paths=())` in `review_bot.application.intent_context`. It contains exactly `schema_version`, the existing service-v2 `snapshot`, full-file `base`/`head` code snapshots, sorted `reviewed_paths`, and `input_hash`. Supply PR/issue original text in `snapshot.evidence`; a text digest alone is not original text. The builder includes changed/rename paths and explicitly related paths, checks file/evidence/inventory hashes and fixed versions, and computes the input hash over the complete record excluding `input_hash`. Serialize it with `dataclasses.asdict` and JSON; do not hand-edit the resulting record or reuse a hash after material changes.
 
@@ -110,7 +110,7 @@ Goal/constraint quotes must be literal contiguous spans present in every referen
 
 Synthetic Python/JavaScript/Java fixtures and CLI tests exercise the real B pipeline using mock models/HTTP. They establish integration and validation, not model quality or completion of the live PR #36 evaluation. A v1 records, commands, `A/` artifacts and marker remain unchanged.
 
-### B in the shared Worker (private files only)
+### B in the shared Worker (posting opt-in)
 
 In the operator configuration, select `execution.available_modes: [intent]` (or `[architecture, intent]`) and `publish.mode: artifact_only`. Optional `intent.context_paths` is a default-empty list of explicit repository-relative **file** paths for related code/tests; host, traversal, duplicate and trusted-excluded paths are rejected. B reads full regular UTF-8 Git blobs for changed/renamed paths and these related files at fixed comparison-base/head SHAs, not a checkout. Unrequested files are not part of B completeness; absent, excluded or unsupported files remain in the scope, and overflow never reduces it.
 
@@ -118,7 +118,27 @@ When B is available, PR title/body and explicit same-repository references (`#12
 
 Selected A/B executors run sequentially in the existing SQLite task/lease. A eligibility or empty PMD signals do not exclude B. Existing local/model/Tev selectors accept available subsets independently; the native System 1 bridge still uses one existing `/v1/systemone` decision request. Mode preparation/review/storage/publication failures preserve the other mode; common collection/authorization failures, PR close, worker stop, deadline or generation/lease loss abort all remaining work. Normal completed/`not_run` outcomes aggregate to `succeeded`; execution/publication failures aggregate to `failed`.
 
-Common `snapshot.json`/`selection.json`/`manifest.json` stay at the run root; A's filenames remain under `A/`, and B stores its stage files under `B/`. Each mode has `receipt.json` (service v2, optional `a_result`/`b_result`, separate usage/delivery/publication); the shared manifest records mode input fingerprints and statuses. Directories/files remain 0700/0600. SQLite run status is authoritative after external cancellation or lease loss: an interrupted manifest may remain `running`, because the lost owner must not write it. B's publication reason is `artifact_only` or `b_comments_disabled`; no B POST/PATCH is performed. Per-mode SQLite input-fingerprint migration/reuse, B posting opt-in/marker/freshness guards and live PR evaluation belong to the next slice, not this delivery.
+Common `snapshot.json`/`selection.json`/`manifest.json` stay at the run root; A's filenames remain under `A/`, and B stores its stage files under `B/`. Each mode has `receipt.json` (service v2, optional `a_result`/`b_result`, separate usage/delivery/publication); the shared manifest records mode input fingerprints and statuses. A completed core result/usage survives mode-local output failures as well as publication failures. Directories/files remain 0700/0600. SQLite run status is authoritative after external cancellation or lease loss: an interrupted manifest may remain `running`, because the lost owner must not write it.
+
+Publication configuration is independent of mode selection:
+
+| Field | Default / boundary |
+| --- | --- |
+| `publish.b_marker` | `<!-- review-bot:intent:v1 -->`; must be distinct from the A marker |
+| `publish.b_comments_enabled` | `false`; enabling it requires a separate user decision after evaluation |
+| `publish.mode` | `artifact_only` always makes no A/B comment writes; service `comment` alone does not enable B |
+
+With B posting disabled, its receipt says `not_attempted/b_comments_disabled` (or `artifact_only`) and private stage files/draft remain available. Even an explicitly enabled B requires a completed validated result and known bot identity; unset profiles, incomplete/oversized inputs and invalid responses are not posted. Each mode creates or updates only its own single bot-owned marker comment. Foreign/other-bot ownership, repeated or ambiguous markers and marker collisions fail closed; no approval/request-changes is submitted. B drafts escape untrusted HTML/markers and generate links only from validated evidence.
+
+Before and after writes, the publisher checks current PR head/target base, open/Draft policy, PR text/context and lease/generation; B also rechecks the used same-repository issues' original contents/versions and missing states. A failed freshness check is not a current successful publication or reusable result. Common authorization loss stops remaining modes while retaining completed results and attempted publication identity. GitHub reads and writes are not atomic; post-write stale/unknown receipts do not imply the comment was never written. Issue-only changes do not enqueue work; sources are recollected at the next PR request.
+
+SQLite adds nullable `publication_receipts.input_fingerprint` non-destructively. Each mode's actual material, prompt/schema, execution/profile configuration and model identity determine its own reuse key; `published_fingerprint` retains its comment-body hash meaning. Only a successful matching individual receipt plus installation/fence and a fresh bot-owned comment/body recheck permits reuse. A whole-run failure or A cache hit cannot hide B's retry/result. Legacy rows remain readable through the legacy A path or safely miss the new cache; they are never assumed to prove B success. No cleanup/retention policy is changed.
+
+### Implementation evidence and actual PR evaluation
+
+Signed real-Git/SQLite fixtures with mock HTTP/models verify per-mode creation and same-ID updates, reuse from partial failure, unsafe/stale comment blocking, issue changes and A-only/security regressions. Current full regression: **2,034 passed**; commands and commit evidence are in `milestones.md`. This proves implementation/integration, not model quality, live automated publication or deployment. Automatic B posting has not been enabled in operational configuration.
+
+The existing read-only PR #36 evaluation pinned base `20f911fb4c73a9f0b016ba9876a5daa9e0772572` and head `f149d9a4dc04f37198e0c53025f479b211ea2b43`, collecting current PR text separately from the historical code date. The existing approved Granite profile actually completed and citation-validated `extract_goals` (one review generation plus one token preflight). The intact `observe_changes` request needs **215,531 bytes**, over the profile's **92,160-byte** cap, so it was not called and `assess` was not attempted: **`not_run/input_limit_exceeded`, not a completed B review**. No target tests/build/hooks or external comment were executed. Full replay requires separately approved whole-input budgets and reverified trusted existing runtime/token/output/deadline gates; no truncation, alternate provider or limit increase is implied by test success.
 
 ## Local Ollama (explicit opt-in)
 
