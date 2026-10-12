@@ -90,6 +90,7 @@ def test_cli_unsafe_paths_fail_before_any_calls_and_preserve_files(tmp_path: Pat
     output = tmp_path / "output"
     if unsafe == "public_output":
         output.mkdir(mode=0o755)
+        output.chmod(0o755)
     elif unsafe == "linked_parent":
         actual = tmp_path / "actual"
         actual.mkdir(mode=0o700)

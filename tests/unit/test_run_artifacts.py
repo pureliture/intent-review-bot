@@ -43,6 +43,7 @@ def test_unsafe_run_id_rejected(tmp_path: Path, run_id: str) -> None:
 def test_nonprivate_root_is_rejected(tmp_path: Path) -> None:
     root = tmp_path / "shared"
     root.mkdir(mode=0o755)
+    root.chmod(0o755)
     run = RunRecord("run-example", 44, 99, 7, 1, "", "running", "prepare")
     with pytest.raises(ValueError, match="artifact_directory_must_be_private"):
         RunArtifacts(root, run)
