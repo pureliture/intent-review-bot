@@ -8,12 +8,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from review_bot.adapters.git import GitRepositoryReader
 from review_bot.adapters.github.auth import GitHubAppAuthError
 from review_bot.application.publication import publish_review_comment
 from review_bot.application.review_a import MockModelClient
 from review_bot.application.review_b import SYSTEM_PROMPTS
-from review_bot.domain.models_v1 import ModelResponse
+from review_bot.domain.models_v1 import ModelResponse, PmdViolation
 from review_bot.runtime.artifacts import RunArtifacts
+from tests.conftest import SyntheticGitRepo
 from tests.integration.test_intent_flow import (
     enable_a_fixture,
     intent_flow,
@@ -22,6 +24,7 @@ from tests.integration.test_intent_flow import (
     synthetic_repo,
     use_modes,
 )
+from tests.unit.test_delta_adversarial import make_test_run
 
 A_MARKER = "<!-- review-bot:architecture:v1 -->"
 B_MARKER = "<!-- review-bot:intent:v1 -->"
@@ -132,6 +135,66 @@ def test_b_success_is_reused_from_a_failed_execution_run(intent_flow):
     assert status == "succeeded" and modes["intent"]["reused"] is True
     assert len(flow.model.requests) == 3 and len(flow.comments) == 2
     assert modes["architecture"]["execution_status"] == "not_run"
+
+
+@pytest.mark.parametrize("failure", ["format", "artifact"])
+def test_a_output_failure_preserves_called_core_and_usage_without_suppressing_b(intent_flow, monkeypatch, failure):
+    flow = intent_flow
+    use_modes(flow, ("architecture", "intent"))
+    repo_dir = flow.state / "a-source"
+    repo_dir.mkdir()
+    repo = SyntheticGitRepo(repo_dir)
+    source_path = "src/main/java/demo/App.java"
+    repo.write_file(source_path, "class App { void handle() {} }\n")
+    repo.write_file("tests/test_app.py", "def test_handle():\n    assert handle() == 1\n")
+    flow.pr["base"]["sha"] = repo.commit("Synthetic A base")
+    head_code = "class App { void handle() { int x = 1; } }\n"
+    repo.write_file(source_path, head_code)
+    flow.pr["head"]["sha"] = repo.commit("Synthetic A head")
+    reader = GitRepositoryReader(repo.repo_dir)
+    flow.worker.repo_reader_factory = lambda *args: reader
+    violation = PmdViolation(source_path, source_path, 1, 1, 1, 1, "CognitiveComplexity",
+        "Design", 3, "App", "handle", "", "Synthetic analysis signal", code_fragment=head_code)
+    flow.analyzer.run_analysis.side_effect = lambda sha, *args: make_test_run(sha, source_files=(source_path,),
+        pmd_violations=(violation,) if sha == flow.pr["head"]["sha"] else ())
+    complete_b = flow.model.complete
+    a_requests = []
+
+    def complete(request):
+        if "review-a/v1" not in request.system_prompt:
+            return complete_b(request)
+        flow.model.requests.append(request)
+        a_requests.append(request)
+        properties = request.response_schema["properties"]
+        return ModelResponse(json.dumps({"base_sha": properties["base_sha"]["const"],
+            "head_sha": properties["head_sha"]["const"], "review_mode": properties["review_mode"]["const"],
+            "summary": "Only the supplied synthetic analysis was assessed.", "findings": [], "questions": []}),
+            {"calls": 1, "input_tokens": 100, "output_tokens": 50})
+
+    def fail_output(*args, **kwargs):
+        raise OSError("synthetic-output-secret")
+
+    monkeypatch.setattr(flow.model, "complete", complete)
+    if failure == "format":
+        monkeypatch.setattr("review_bot.runtime.worker.format_review_markdown", fail_output)
+    else:
+        monkeypatch.setattr(RunArtifacts, "save_review", fail_output)
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
+    root, status, recorded = receipts(flow)
+    assert status == "failed" and len(a_requests) == 1 and len(flow.model.requests) == 4
+    a = json.loads((root / "A/receipt.json").read_text())
+    assert a["a_result"] is not None, a["error_code"]
+    assert a["execution_status"] == "failed" and a["a_result"]["status"] == "completed"
+    assert a["a_result"]["schema_version"] == 1 and a["a_result"]["review_type"] == "A"
+    assert a["usage"] == a["a_result"]["usage"] == {"calls": 1, "input_tokens": 100, "output_tokens": 50}
+    assert recorded["architecture"]["usage"] == a["usage"]
+    assert a["model_delivery"] == {"status": "sent"}
+    assert a["publication"] is None and a["error_code"] == "architecture_pipeline_error:OSError"
+    assert recorded["intent"]["execution_status"] == "completed" and recorded["intent"]["usage"]["calls"] == 3
+    assert writes(flow) == []
+    assert flow.store._get_connection().execute("SELECT COUNT(*) FROM publication_receipts").fetchone()[0] == 1
+    assert "synthetic-output-secret" not in (root / "A/receipt.json").read_text()
+    assert "synthetic-output-secret" not in (root / "manifest.json").read_text()
 
 
 def test_a_cache_does_not_hide_b_retry_after_invalid_model_response(intent_flow):

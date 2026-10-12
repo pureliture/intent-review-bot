@@ -635,13 +635,26 @@ class WorkerLoop:
             raise _ModeFailure("review_result_unavailable")
         if not writes_comment and artifacts is None:
             raise _ModeFailure("artifact_root_required")
-        markdown = format_review_markdown(result, task_input, marker=marker,
-            max_length=self.config.output.max_comment_characters,
-            artifact_notice="전체 A 자료는 비공개 서비스 결과 파일에 보존됩니다." if artifacts is not None else None)
-        self._require_active(run, deadline)
-        if artifacts is not None:
-            artifacts.save_review(snapshot=review_snap, selection=mode_sel, task_input=task_input,
-                base_run=base_run, head_run=head_run, result=result, markdown=markdown, config_hash=self.config.config_hash)
+        analysis_failed = any(getattr(value, "status", None) in ("failed", "missing_report") for value in (base_run, head_run))
+        status = "failed" if analysis_failed or result.status == "failed" else result.status
+        core_receipt = ExecutionReceipt(2, "architecture", mode_sel.selection_id, review_snap.snapshot_id,
+            run.generation, result.run_key, status, a_result=result, usage=result.usage,
+            coverage=result.scope, limitations=tuple(task_input.limitations),
+            model_delivery={"status": "sent" if result.usage and result.usage.get("calls", 0) else "not_attempted" if self.model_client is None else "unknown"},
+            error_code="analysis_failed" if analysis_failed else result.reason if status == "failed" else None,
+            input_fingerprint=input_fingerprint)
+        try:
+            markdown = format_review_markdown(result, task_input, marker=marker,
+                max_length=self.config.output.max_comment_characters,
+                artifact_notice="전체 A 자료는 비공개 서비스 결과 파일에 보존됩니다." if artifacts is not None else None)
+            self._require_active(run, deadline)
+            if artifacts is not None:
+                artifacts.save_review(snapshot=review_snap, selection=mode_sel, task_input=task_input,
+                    base_run=base_run, head_run=head_run, result=result, markdown=markdown, config_hash=self.config.config_hash)
+        except (OSError, ValueError, TypeError) as exc:
+            self._require_active(run, deadline)
+            prefix = "worker" if mode_sel.selected_modes == ("architecture",) else "architecture"
+            return replace(core_receipt, execution_status="failed", error_code=f"{prefix}_pipeline_error:{type(exc).__name__}")
         self._require_active(run, deadline)
         if not writes_comment:
             publication = PublicationReceipt(None, "not_attempted",
@@ -666,29 +679,18 @@ class WorkerLoop:
                 has_comment_id = type(publication.comment_id) is int and publication.comment_id > 0
                 publication = replace(publication, status="unknown" if authorization_lost or has_comment_id else "failed",
                     reason="publication_authorization_lost", input_fingerprint=None)
-                receipt = ExecutionReceipt(2, "architecture", mode_sel.selection_id, review_snap.snapshot_id,
-                    run.generation, result.run_key, "failed", a_result=result, usage=result.usage,
-                    error_code="publication_authorization_lost", publication=publication, input_fingerprint=input_fingerprint)
+                receipt = replace(core_receipt, execution_status="failed", error_code="publication_authorization_lost", publication=publication)
                 self._abort_authorization_loss(run, artifacts, receipt, deadline)
             has_comment_id = type(publication.comment_id) is int and publication.comment_id > 0
             if publication.status != "succeeded" or not has_comment_id:
                 stale = publication.status == "stale" or publication.reason in ("stale_head_sha", "stale_base_sha", "pr_not_open")
                 reason = "invalid_comment_id" if publication.status == "succeeded" else publication.reason
                 error = f"Freshness check failed: {reason}" if stale else f"Publication failed: {reason}"
-                receipt = ExecutionReceipt(2, "architecture", mode_sel.selection_id, review_snap.snapshot_id,
-                    run.generation, result.run_key, "failed", a_result=result, usage=result.usage,
-                    error_code=error, publication=publication, input_fingerprint=input_fingerprint)
+                receipt = replace(core_receipt, execution_status="failed", error_code=error, publication=publication)
                 if stale:
                     self._publication_superseded(run, receipt, artifacts, deadline)
                 return receipt
-        analysis_failed = any(getattr(value, "status", None) in ("failed", "missing_report") for value in (base_run, head_run))
-        status = "failed" if analysis_failed or result.status == "failed" else result.status
-        return ExecutionReceipt(2, "architecture", mode_sel.selection_id, review_snap.snapshot_id,
-            run.generation, result.run_key, status, a_result=result, usage=result.usage,
-            coverage=result.scope, limitations=tuple(task_input.limitations),
-            model_delivery={"status": "sent" if result.usage and result.usage.get("calls", 0) else "not_attempted" if self.model_client is None else "unknown"},
-            error_code="analysis_failed" if analysis_failed else result.reason if status == "failed" else None,
-            publication=publication, input_fingerprint=input_fingerprint)
+        return replace(core_receipt, publication=publication)
 
     def _execute_intent(
         self, run: RunRecord, review_snap: Any, mode_sel: Any, material: Any,
