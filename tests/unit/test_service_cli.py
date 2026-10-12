@@ -182,7 +182,8 @@ def test_worker_once_empty_composes_ports_without_reading_key(
     assert config.publish.mode == "comment"
     assert config.service.installation_allowlist == []
     assert config.service.repository_allowlist == []
-    assert ports["analyzer"] is dependencies.analyzer
+    dependencies.analyzer_factory.assert_not_called()
+    assert ports["analyzer_factory"]() is dependencies.analyzer
     assert callable(ports["github_client_factory"])
     assert callable(ports["repo_reader_factory"])
     assert ports["artifact_root"] == service_config.state / "artifacts"
@@ -375,7 +376,7 @@ def test_service_rejects_unsafe_database(
 
 @pytest.mark.parametrize("failure", ["analyzer", "worker", "loop", "uvicorn", "app"])
 def test_service_failures_close_store_restore_umask_and_redact_values(
-    service_config, dependencies, monkeypatch: pytest.MonkeyPatch,
+    service_config, dependencies, worker_pipeline_ports, monkeypatch: pytest.MonkeyPatch,
     failure: str, capsys: pytest.CaptureFixture[str],
 ) -> None:
     from review_bot.runtime import service
@@ -384,6 +385,16 @@ def test_service_failures_close_store_restore_umask_and_redact_values(
     error = RuntimeError(message)
     command = "worker"
     if failure == "analyzer":
+        from review_bot.adapters.github.client import MockGitHubClient
+        from review_bot.runtime.worker import WorkerLoop
+
+        seed_run(service_config)
+        github = MockGitHubClient()
+        github.set_pull_request(7, repository="org/repo")
+        github.pull_requests[7]["base"]["repo"] = {"id": 99, "full_name": "org/repo"}
+        dependencies.adapters.github_client.return_value = github
+        dependencies.adapters.repository_cache.prepare.return_value = worker_pipeline_ports["repo_reader"]
+        monkeypatch.setattr(service, "WorkerLoop", WorkerLoop)
         dependencies.analyzer_factory.side_effect = error
     elif failure == "worker":
         dependencies.worker_factory.side_effect = error
@@ -396,10 +407,22 @@ def test_service_failures_close_store_restore_umask_and_redact_values(
         command = "webhook"
         monkeypatch.setattr(service, "create_webhook_app", Mock(side_effect=error))
     before = current_umask()
-    assert main([command, "--config", str(service_config.path)]) == 1
+    args = [command, "--config", str(service_config.path)]
+    if failure == "analyzer":
+        args.append("--once")
+    assert main(args) == 1
     assert current_umask() == before
     dependencies.opened[0].close.assert_called_once_with()
-    dependencies.provider_factory.assert_not_called()
+    if failure == "analyzer":
+        dependencies.analyzer_factory.assert_called_once()
+        connection = sqlite3.connect(service_config.state / "jobs.sqlite")
+        try:
+            assert connection.execute("SELECT status, stage, error FROM runs").fetchone() == (
+                "failed", "analyze", "worker_pipeline_error:RuntimeError")
+        finally:
+            connection.close()
+    else:
+        dependencies.provider_factory.assert_not_called()
     captured = capsys.readouterr()
     for value in (SECRET, str(service_config.key), str(service_config.state)):
         assert value not in captured.out + captured.err
@@ -513,21 +536,53 @@ def test_claimed_worker_rejects_unsafe_key_and_records_failure(
 
 
 def test_rootless_preflight_failure_never_falls_back(
-    service_config, dependencies, monkeypatch: pytest.MonkeyPatch,
+    service_config, dependencies, worker_pipeline_ports, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     from review_bot.adapters.pmd.container import RootlessPmdAnalyzer
+    from review_bot.adapters.github.client import MockGitHubClient
     from review_bot.runtime import service
+    from review_bot.runtime.worker import WorkerLoop
+
+    seed_run(service_config)
+    github = MockGitHubClient()
+    github.set_pull_request(7, repository="org/repo")
+    github.pull_requests[7]["base"]["repo"] = {"id": 99, "full_name": "org/repo"}
+    dependencies.adapters.github_client.return_value = github
+    dependencies.adapters.repository_cache.prepare.return_value = worker_pipeline_ports["repo_reader"]
+    monkeypatch.setattr(service, "WorkerLoop", WorkerLoop)
 
     docker = Mock(side_effect=OSError(SECRET + str(service_config.state)))
     monkeypatch.setattr(RootlessPmdAnalyzer, "_docker", docker)
     monkeypatch.setattr(service, "RootlessPmdAnalyzer", RootlessPmdAnalyzer)
     assert main(["worker", "--config", str(service_config.path), "--once"]) == 1
     docker.assert_called_once_with(["info", "--format", "{{json .}}"], timeout=10)
-    dependencies.worker_factory.assert_not_called()
-    dependencies.provider_factory.assert_not_called()
+    dependencies.analyzer_factory.assert_not_called()
+    connection = sqlite3.connect(service_config.state / "jobs.sqlite")
+    try:
+        status, stage, error = connection.execute("SELECT status, stage, error FROM runs").fetchone()
+        assert (status, stage) == ("failed", "analyze")
+        assert error == "worker_pipeline_error:AnalysisSetupError"
+    finally:
+        connection.close()
     dependencies.opened[0].close.assert_called_once_with()
     assert SECRET not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["worker", "webhook"])
+def test_intent_only_service_has_no_architecture_or_java_prerequisite(service_config, dependencies, command) -> None:
+    service_config.raw["execution"]["available_modes"] = ["intent"]
+    service_config.raw["publish"]["mode"] = "artifact_only"
+    service_config.raw.pop("architecture")
+    write_config(service_config)
+    args = [command, "--config", str(service_config.path)]
+    if command == "worker":
+        args.append("--once")
+    assert main(args) == 0
+    dependencies.analyzer_factory.assert_not_called()
+    assert not (service_config.state / "analysis").exists()
+    if command == "worker":
+        assert dependencies.worker_factory.call_args.kwargs["analyzer_factory"] is None
 
 
 @pytest.mark.parametrize("operation", ["create", "update", "artifact_only"])

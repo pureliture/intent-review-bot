@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS publication_receipts (
     published_at TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'unknown',
     run_id TEXT,
+    input_fingerprint TEXT,
     PRIMARY KEY (repository_id, pr_number, marker)
 );
 """

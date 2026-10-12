@@ -282,6 +282,44 @@ def test_tev_port_uses_systemone_not_chat(mock_http: Any, decision_request: Mode
     assert response.usage == {"input_tokens": 179, "output_tokens": 0}
 
 
+@pytest.mark.parametrize("modes, choice, expected", [
+    (["intent"], "intent", ["intent"]),
+    (["intent"], "not_applicable", []),
+    (["architecture", "intent"], "architecture", ["architecture"]),
+    (["architecture", "intent"], "intent", ["intent"]),
+    (["architecture", "intent"], "architecture_and_intent", ["architecture", "intent"]),
+    (["architecture", "intent"], "not_applicable", []),
+    (["intent", "architecture"], "architecture_and_intent", ["intent", "architecture"]),
+])
+def test_tev_selects_available_intent_subsets_in_one_existing_request(mock_http, decision_request, modes, choice, expected):
+    from review_bot.adapters.ollama import OllamaDecisionClient
+
+    choices = ["intent", "not_applicable"] if len(modes) == 1 else ["architecture", "intent", "architecture_and_intent", "not_applicable"]
+    data = decision_response()
+    data["answers"]["review_mode"].update(choice=choice, probabilities={key: 1.0 if key == choice else 0.0 for key in choices})
+    requests = mock_http(lambda request: httpx.Response(200, json=data))
+    metadata = json.loads(decision_request.user_content)
+    metadata["available_modes"] = modes
+    result = OllamaDecisionClient().complete(replace(decision_request, user_content=json.dumps(metadata)))
+    assert json.loads(result.text) == {"selected_modes": expected}
+    assert [request.url.path for request in requests] == ["/api/show", "/v1/systemone"]
+    criteria = json.loads(requests[-1].content)["questions"]["review_mode"]["criteria"]
+    assert set(criteria) == set(choices)
+    assert "missing" in criteria["intent"].lower()
+
+
+@pytest.mark.parametrize("modes", [[], ["intent", "intent"], ["intent", "unknown"], ["general"], ["architecture_and_intent"]])
+def test_tev_invalid_mode_availability_is_rejected_without_http(mock_http, decision_request, modes):
+    from review_bot.adapters.ollama import OllamaDecisionClient
+
+    requests = mock_http(lambda request: pytest.fail("Invalid availability must not be sent"))
+    metadata = json.loads(decision_request.user_content)
+    metadata["available_modes"] = modes
+    with pytest.raises(PermanentModelError):
+        OllamaDecisionClient().complete(replace(decision_request, user_content=json.dumps(metadata)))
+    assert requests == []
+
+
 def test_tev_architecture_choice_and_local_prefilter_remain_separate(mock_http: Any) -> None:
     from review_bot.adapters.ollama import OllamaDecisionClient
 

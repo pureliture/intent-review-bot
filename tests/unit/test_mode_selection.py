@@ -4,7 +4,7 @@ Requirements:
 - requirements-a.md §A-01:
   - Every PR snapshot must evaluate mode selection.
   - Registers 'architecture' (A) with 'all_available' policy.
-  - B/unregistered modes are NOT registered or executed.
+  - A-only availability does not select B; unknown modes are rejected.
 - contracts.md §2:
   - ModeSelection schema: selection_id, snapshot_id, policy_version,
     available_modes, selected_modes, selection_status ('completed', 'failed', 'superseded').
@@ -72,6 +72,10 @@ class TestModeSelectionTier1:
         assert "intent" not in selected
         assert "b" not in selected
 
+    def test_intent_is_registered_independently(self, selector: Callable) -> None:
+        assert selector("snap-b", ["intent"]).selected_modes == ("intent",)
+        assert selector("snap-ab", ["architecture", "intent"]).selected_modes == ("architecture", "intent")
+
 
 # ==============================================================================
 # Tier 2: Boundary & Edge Cases
@@ -110,6 +114,27 @@ def selection_inputs(
     ),))
     pr = assemble_pr_snapshot("org/repo", 42, "ancestor", "head", "main", changed_files=changed_files, rename_map=renames)
     return snapshot, pr
+
+
+def test_local_selector_does_not_apply_a_docs_eligibility_to_b() -> None:
+    from review_bot.application.selection import LightweightModeSelector
+
+    snapshot, pr = selection_inputs(("README.md",), "Fix typos")
+    assert LightweightModeSelector().select_modes(snapshot, pr, ("architecture", "intent")).selected_modes == ("intent",)
+
+
+@pytest.mark.parametrize("selected", [[], ["intent"], ["architecture"], ["architecture", "intent"]])
+def test_model_selector_accepts_only_available_independent_modes(selected) -> None:
+    from review_bot.application.selection import ModelModeSelector
+
+    snapshot, pr = selection_inputs(("custom.settings",))
+    client = Mock(spec=ModelClient)
+    client.complete.return_value = ModelResponse(json.dumps({"selected_modes": selected}))
+    result = ModelModeSelector(client, model="selector").select_modes(snapshot, pr, ("architecture", "intent"))
+    assert result.selected_modes == tuple(selected)
+    request = client.complete.call_args.args[0]
+    assert "intent" in request.system_prompt
+    assert request.response_schema["properties"]["selected_modes"]["maxItems"] == 2
 
 
 @pytest.mark.parametrize("paths", [(), ("README.md", "docs/guide.md"), ("assets/logo.png", "images/banner.svg")])

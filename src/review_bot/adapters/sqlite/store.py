@@ -81,6 +81,8 @@ class SQLiteJobStore:
                 conn.execute("ALTER TABLE publication_receipts ADD COLUMN status TEXT NOT NULL DEFAULT 'unknown';")
             if "run_id" not in receipt_columns:
                 conn.execute("ALTER TABLE publication_receipts ADD COLUMN run_id TEXT;")
+            if "input_fingerprint" not in receipt_columns:
+                conn.execute("ALTER TABLE publication_receipts ADD COLUMN input_fingerprint TEXT;")
 
     @contextmanager
     def transaction(self, immediate: bool = True) -> Generator[sqlite3.Connection, None, None]:
@@ -416,7 +418,7 @@ class SQLiteJobStore:
             source = "WHERE 1"
             params: tuple[object, ...] = (
                 repository_id, pr_number, receipt.marker, receipt.comment_id,
-                receipt.fingerprint, published_at, receipt.status, run_id,
+                receipt.fingerprint, published_at, receipt.status, run_id, receipt.input_fingerprint,
             )
             if worker_id is not None:
                 source = (
@@ -427,32 +429,45 @@ class SQLiteJobStore:
             cur = conn.execute(
                 f"""
                 INSERT INTO publication_receipts (
-                    repository_id, pr_number, marker, comment_id, published_fingerprint, published_at, status, run_id
-                ) SELECT ?, ?, ?, ?, ?, ?, ?, ? {source}
+                    repository_id, pr_number, marker, comment_id, published_fingerprint, published_at, status, run_id, input_fingerprint
+                ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? {source}
                 ON CONFLICT(repository_id, pr_number, marker) DO UPDATE SET
                     comment_id = excluded.comment_id,
                     published_fingerprint = excluded.published_fingerprint,
                     published_at = excluded.published_at,
                     status = excluded.status,
-                    run_id = excluded.run_id;
+                    run_id = excluded.run_id,
+                    input_fingerprint = excluded.input_fingerprint;
                 """,
                 params,
             )
             return cur.rowcount > 0
 
-    def get_current_publication(self, run: RunRecord, marker: str) -> PublicationReceipt | None:
-        """Only successful, installation-bound input matches can be reused."""
+    def get_current_publication(
+        self, run: RunRecord, marker: str, *, input_fingerprint: str | None = None,
+    ) -> PublicationReceipt | None:
+        """Reuse individual success, or the legacy A whole-run success lookup."""
+        if input_fingerprint is not None and (
+            type(input_fingerprint) is not str or len(input_fingerprint) != 64
+            or any(char not in "0123456789abcdef" for char in input_fingerprint)
+        ):
+            return None
+        match = (
+            "p.input_fingerprint = ? AND r.status IN ('succeeded', 'failed', 'skipped')"
+            if input_fingerprint is not None else "r.fingerprint = ? AND r.status = 'succeeded'"
+        )
         row = self._get_connection().execute(
-            "SELECT p.comment_id, p.published_fingerprint, p.published_at, p.status "
+            "SELECT p.comment_id, p.published_fingerprint, p.published_at, p.status, p.input_fingerprint "
             "FROM publication_receipts p JOIN runs r ON r.run_id = p.run_id "
             "WHERE p.repository_id = ? AND p.pr_number = ? AND p.marker = ? "
-            "AND r.installation_id = ? AND r.fingerprint = ? AND r.status = 'succeeded' "
+            f"AND r.installation_id = ? AND {match} "
             "AND p.status IN ('fresh', 'succeeded');",
-            (run.repository_id, run.pr_number, marker, run.installation_id, run.fingerprint),
+            (run.repository_id, run.pr_number, marker, run.installation_id,
+                input_fingerprint if input_fingerprint is not None else run.fingerprint),
         ).fetchone()
         if row is None:
             return None
-        return PublicationReceipt(row[0], row[3], row[1], marker, row[2] or None)
+        return PublicationReceipt(row[0], row[3], row[1], marker, row[2] or None, input_fingerprint=row[4])
 
     def get_pr_request(
         self, repository_id: int, pr_number: int

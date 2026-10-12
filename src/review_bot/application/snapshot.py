@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
 from review_bot.application.classification import classify_pr
+from review_bot.application.context import hash_json
+from review_bot.application.intent_context import collect_intent_code_snapshot, validate_intent_context_paths
 from review_bot.application.selection import DeadlineModeSelector, LightweightModeSelector, select_modes
 from review_bot.domain.envelope_v2 import (
     ChangedFile,
@@ -16,9 +19,70 @@ from review_bot.domain.envelope_v2 import (
 )
 from review_bot.domain.models_v1 import (
     Classification,
+    CodeSnapshot,
     PrSnapshot,
 )
 from review_bot.ports import MergeBaseResult, ModeSelectorPort, RepositoryReader
+
+
+class SnapshotCollectionAborted(RuntimeError):
+    """The common execution gate closed while preparing fixed material."""
+
+
+@dataclass(frozen=True)
+class SnapshotMaterial:
+    merge_base: MergeBaseResult
+    changed_files: tuple[ChangedFile, ...]
+    rename_map: dict[str, str]
+    evidence: tuple[EnvelopeEvidence, ...]
+    unavailable_sources: tuple[UnavailableSource, ...]
+    context_digest: str
+    base: CodeSnapshot | None = None
+    head: CodeSnapshot | None = None
+    captured_at: str | None = None
+    as_of: str | None = None
+
+
+def collect_snapshot_material(
+    repo_reader: RepositoryReader, target_base_sha: str, head_sha: str, *,
+    evidence: Sequence[EnvelopeEvidence] = (), unavailable_sources: Sequence[UnavailableSource] = (),
+    related_paths: tuple[str, ...] = (), captured_at: str | None = None, as_of: str | None = None,
+    before_read: Callable[[], bool] | None = None,
+) -> SnapshotMaterial:
+    """Freeze B originals and complete scoped Git files before making any selection."""
+    def gate() -> None:
+        if before_read is not None and not before_read():
+            raise SnapshotCollectionAborted("snapshot_collection_gate_closed")
+
+    related_paths = validate_intent_context_paths(related_paths)
+    gate()
+    merge_base = repo_reader.resolve_merge_base(target_base_sha, head_sha)
+    changed = ()
+    renames = {}
+    base = head = None
+    gate()
+    if merge_base.is_comparable:
+        changed = repo_reader.get_changed_files(merge_base.comparison_base_sha, head_sha)
+        gate()
+        renames = repo_reader.get_rename_map(merge_base.comparison_base_sha, head_sha)
+        paths = tuple(sorted(set(related_paths) | {path for item in changed
+            for path in (item.path, item.previous_path) if path}))
+        gate()
+        base = collect_intent_code_snapshot(repo_reader, merge_base.comparison_base_sha, paths)
+        gate()
+        head = collect_intent_code_snapshot(repo_reader, head_sha, paths)
+        gate()
+    stable_evidence = []
+    for item in evidence:
+        value = asdict(item)
+        value["locator"].pop("retrieved_at", None)
+        stable_evidence.append(value)
+    digest = hash_json({"comparison": asdict(merge_base), "changed_files": [asdict(item) for item in changed],
+        "related_paths": sorted(related_paths), "evidence": stable_evidence,
+        "unavailable_sources": [asdict(item) for item in unavailable_sources],
+        "base": asdict(base) if base is not None else None, "head": asdict(head) if head is not None else None})
+    return SnapshotMaterial(merge_base, tuple(changed), renames, tuple(evidence), tuple(unavailable_sources),
+        digest, base, head, captured_at, as_of)
 
 
 def assemble_pr_snapshot(
@@ -60,10 +124,13 @@ def assemble_review_snapshot(
     as_of: str | None = None,
     evidence: Sequence[EnvelopeEvidence] = (),
     unavailable_sources: Sequence[UnavailableSource] = (),
+    *,
+    context_digest: str | None = None,
+    captured_at: str | None = None,
 ) -> ReviewSnapshot:
     """Build immutable Service Envelope v2 ReviewSnapshot."""
     now_utc = datetime.now(UTC).isoformat()
-    capture_time = now_utc
+    capture_time = captured_at or now_utc
     as_of_time = as_of or now_utc
     comparison_base_sha = (
         merge_base_result.comparison_base_sha
@@ -76,7 +143,7 @@ def assemble_review_snapshot(
     pr_text_digest = hashlib.sha256(pr_text_raw).hexdigest()
 
     context_raw = f"{repository}:{pr_number}:{target_base_sha}:{head_sha}".encode()
-    context_digest = hashlib.sha256(context_raw).hexdigest()
+    context_digest = context_digest or hashlib.sha256(context_raw).hexdigest()
 
     # Deterministic snapshot ID calculation
     snap_key = (
@@ -124,19 +191,26 @@ def assemble_snapshot_bundle(
     selector_policy: str = "all_available",
     selector_uses_model: bool = False,
     mode_selector: ModeSelectorPort | None = None,
+    material: SnapshotMaterial | None = None,
 ) -> tuple[ReviewSnapshot, PrSnapshot, Classification, ModeSelection]:
     """Execute end-to-end M2 snapshot assembly pipeline."""
     title = title or ""
     body = body or ""
     # 1. Merge-base resolution
-    merge_base_res = repo_reader.resolve_merge_base(target_base_sha, head_sha)
+    if material is None and "intent" in available_modes:
+        material = collect_snapshot_material(repo_reader, target_base_sha, head_sha, evidence=(EnvelopeEvidence(
+            id="E-PR-01", kind="pr_text", version="head",
+            locator={"repository": repository, "pr_number": pr_number},
+            content={"title": title, "body": body}, digest=hashlib.sha256(f"{title}\n{body}".encode()).hexdigest(),
+        ),))
+    merge_base_res = material.merge_base if material is not None else repo_reader.resolve_merge_base(target_base_sha, head_sha)
 
     # 2. Changed files and rename map determination
-    unavailable: list[UnavailableSource] = []
+    unavailable: list[UnavailableSource] = list(material.unavailable_sources) if material is not None else []
     if merge_base_res.is_comparable and merge_base_res.comparison_base_sha:
         comp_sha = merge_base_res.comparison_base_sha
-        changed_files = repo_reader.get_changed_files(comp_sha, head_sha)
-        rename_map = repo_reader.get_rename_map(comp_sha, head_sha)
+        changed_files = material.changed_files if material is not None else repo_reader.get_changed_files(comp_sha, head_sha)
+        rename_map = material.rename_map if material is not None else repo_reader.get_rename_map(comp_sha, head_sha)
         effective_base_sha = comp_sha
     else:
         changed_files = ()
@@ -157,8 +231,8 @@ def assemble_snapshot_bundle(
     )
 
     # 4. Assemble snapshots
-    evidence = ()
-    if selector_uses_model:
+    evidence = material.evidence if material is not None else ()
+    if selector_uses_model and material is None:
         evidence = (EnvelopeEvidence(
             id="pr-text", kind="pr_text", version="head",
             locator={"repository": repository, "pr_number": pr_number},
@@ -176,9 +250,13 @@ def assemble_snapshot_bundle(
         changed_files=changed_files,
         title=title,
         body=body,
-        as_of=as_of,
+        as_of=material.as_of if material is not None and material.as_of is not None else as_of,
         evidence=evidence,
         unavailable_sources=tuple(unavailable),
+        **({"context_digest": hash_json({"repository": repository, "pr_number": pr_number,
+            "repository_id": repository_id, "installation_id": installation_id,
+            "intent_material": material.context_digest}), "captured_at": material.captured_at}
+            if material is not None else {}),
     )
 
     pr_snapshot = assemble_pr_snapshot(

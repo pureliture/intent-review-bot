@@ -18,6 +18,8 @@ from pydantic import (
     model_validator,
 )
 
+from review_bot.domain.markers import DEFAULT_B_MARKER, valid_intent_marker
+
 ENV_VAR_PATTERN = r"^[A-Z_][A-Z0-9_]*$"
 
 
@@ -168,11 +170,21 @@ class PublishConfig(BaseModel):
     mode: Literal["artifact_only", "comment"] = "artifact_only"
     separate_comments_per_task: bool = True
     a_marker: str = "<!-- review-bot:architecture:v1 -->"
+    b_marker: str = DEFAULT_B_MARKER
+    b_comments_enabled: bool = False
     draft_comments: bool = False
     automatic_approval: bool = False
     automatic_request_changes: bool = False
     recheck_before_and_after_write: bool = True
     legacy_migration: LegacyMigrationConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_b_marker(self) -> PublishConfig:
+        if not valid_intent_marker(self.b_marker):
+            raise ValueError("invalid B publication marker")
+        if self.a_marker in self.b_marker or self.b_marker in self.a_marker:
+            raise ValueError("A and B publication markers must be distinct")
+        return self
 
 
 class ModelConfig(BaseModel):
@@ -243,6 +255,19 @@ class RepositorySettingsConfig(BaseModel):
     architecture_rule_paths: list[str] = Field(default_factory=list)
 
 
+class IntentConfig(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    context_paths: list[str] = Field(default_factory=list, max_length=5000)
+
+    @field_validator("context_paths")
+    @classmethod
+    def validate_context_paths(cls, paths: list[str]) -> list[str]:
+        from review_bot.application.intent_context import validate_intent_context_paths
+
+        validate_intent_context_paths(tuple(paths))
+        return paths
+
+
 class ComparisonConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
     base_strategy: Literal["unique_merge_base"] = "unique_merge_base"
@@ -294,7 +319,8 @@ class ReviewBotConfig(BaseModel):
     service: ServiceConfig
     publish: PublishConfig = Field(default_factory=PublishConfig)
     model: ModelConfig
-    architecture: ArchitectureConfig
+    architecture: ArchitectureConfig = Field(default_factory=ArchitectureConfig)
+    intent: IntentConfig = Field(default_factory=IntentConfig)
     repository_settings: RepositorySettingsConfig
     comparison: ComparisonConfig
     code_input: CodeInputConfig
@@ -303,6 +329,11 @@ class ReviewBotConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_github_app_mode(self) -> ReviewBotConfig:
+        if (
+            "architecture" in self.execution.available_modes and "intent" not in self.execution.available_modes
+            and "architecture" not in self.model_fields_set
+        ):
+            raise ValueError("architecture configuration is required for A-only execution")
         if self.execution.mode == "github_app" and "mode" not in self.publish.model_fields_set:
             self.publish.mode = "comment"
         return self
@@ -329,6 +360,24 @@ class TargetRepositoryConfig(BaseModel):
 def compute_config_hash(data: dict[str, Any] | BaseModel) -> str:
     """Computes a deterministic SHA-256 digest over normalized canonical JSON."""
     raw_dict = data.model_dump(mode="json") if isinstance(data, BaseModel) else data
+    execution = raw_dict.get("execution")
+    if (
+        raw_dict.get("schema_version") == 2 and isinstance(execution, dict)
+        and "intent" not in execution.get("available_modes", ["architecture"])
+        and isinstance(raw_dict.get("publish"), dict)
+    ):
+        publish = dict(raw_dict["publish"])
+        for key, default in (("b_marker", DEFAULT_B_MARKER), ("b_comments_enabled", False)):
+            if publish.get(key) == default:
+                publish.pop(key, None)
+        raw_dict = {**raw_dict, "publish": publish}
+    if (
+        raw_dict.get("schema_version") == 2 and isinstance(execution, dict)
+        and isinstance(execution.get("available_modes", ["architecture"]), list)
+        and "intent" not in execution.get("available_modes", ["architecture"])
+        and raw_dict.get("intent") == {"context_paths": []}
+    ):
+        raw_dict = {key: value for key, value in raw_dict.items() if key != "intent"}
     canonical_json = json.dumps(
         raw_dict,
         sort_keys=True,

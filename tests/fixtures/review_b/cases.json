@@ -1,0 +1,23 @@
+{
+  "python": {
+    "source_path": "src/request.py",
+    "test_path": "tests/test_request.py",
+    "base": "def process(request):\n    return create(request)\n",
+    "head": "def process(request):\n    with lock(request.key):\n        return create(request)\n",
+    "test": "def test_process():\n    assert process(request) == expected\n"
+  },
+  "javascript": {
+    "source_path": "src/request.js",
+    "test_path": "tests/request.test.js",
+    "base": "export function process(request) {\n  return create(request);\n}\n",
+    "head": "export function process(request) {\n  return withLock(request.key, () => create(request));\n}\n",
+    "test": "test('process', () => {\n  expect(process(request)).toEqual(expected);\n});\n"
+  },
+  "java": {
+    "source_path": "src/Request.java",
+    "test_path": "tests/RequestTest.java",
+    "base": "class Request {\n  Object process() { return create(); }\n}\n",
+    "head": "class Request {\n  synchronized Object process() { return create(); }\n}\n",
+    "test": "class RequestTest {\n  void testProcess() { assertEquals(expected, process()); }\n}\n"
+  }
+}

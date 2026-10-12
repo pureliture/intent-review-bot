@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from .models_v1 import ReviewResult
 from .status import (
@@ -11,6 +11,9 @@ from .status import (
     PublicationStatusKind,
     SelectionStatusKind,
 )
+
+if TYPE_CHECKING:
+    from .models_b import ReviewBResult
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,7 @@ class PublicationReceipt:
     marker: str = "<!-- review-bot:architecture:v1 -->"
     published_at: str | None = None
     reason: str = ""
+    input_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,10 @@ class ExecutionReceipt:
     limitations: tuple[str, ...] = ()
     error_code: str | None = None
     publication: PublicationReceipt | None = None
+    b_result: ReviewBResult | None = None
+    usage: dict[str, object] | None = None
+    input_fingerprint: str | None = None
+    reused: bool = False
 
 
 # Aliased for contract alignment

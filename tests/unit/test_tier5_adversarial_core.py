@@ -376,8 +376,11 @@ class TestApplicationCoreAdversarial:
         with pytest.raises(ValueError, match="Unregistered review mode requested: 'unknown_mode'"):
             select_modes("snap-1", ["unknown_mode"])
 
-        with pytest.raises(ValueError, match="Unregistered review mode requested: 'intent'"):
-            select_modes("snap-1", ["architecture", "intent"])
+        with pytest.raises(ValueError, match="Unregistered review mode requested: 'b'"):
+            select_modes("snap-1", ["architecture", "b"])
+
+        assert select_modes("snap-1", ["intent"]).selected_modes == ("intent",)
+        assert select_modes("snap-1", ["architecture", "intent"]).selected_modes == ("architecture", "intent")
 
         with pytest.raises(ValueError, match="Unsupported selector policy: 'first_available'"):
             select_modes("snap-1", ["architecture"], policy="first_available")

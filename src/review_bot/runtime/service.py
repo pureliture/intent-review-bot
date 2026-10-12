@@ -44,6 +44,18 @@ def load_service_config(path: str | None) -> ReviewBotConfig:
         raise ServiceConfigurationError("service.sqlite_wal must be true")
     if not config.service.lease_and_generation_fencing:
         raise ServiceConfigurationError("service.lease_and_generation_fencing must be true")
+    if "architecture" in config.execution.available_modes and "intent" not in config.execution.available_modes:
+        _validate_architecture_runtime(config)
+    try:
+        validate_active_environment(config)
+    except Exception:
+        raise ServiceConfigurationError("Required GitHub App environment references must be set") from None
+    if not os.environ.get(config.service.state_root_env, "").strip():
+        raise ServiceConfigurationError("service.state_root_env must reference a private absolute directory")
+    return config
+
+
+def _validate_architecture_runtime(config: ReviewBotConfig) -> None:
     isolation = config.architecture.isolation
     if isolation.runtime != "rootless_docker":
         raise ServiceConfigurationError("architecture.isolation.runtime must be rootless_docker")
@@ -54,13 +66,15 @@ def load_service_config(path: str | None) -> ReviewBotConfig:
     image = config.architecture.tool_image_digest
     if image is None or _IMAGE_PIN.fullmatch(image) is None:
         raise ServiceConfigurationError("architecture.tool_image_digest requires a precise sha256 image pin")
-    try:
-        validate_active_environment(config)
-    except Exception:
-        raise ServiceConfigurationError("Required GitHub App environment references must be set") from None
-    if not os.environ.get(config.service.state_root_env, "").strip():
-        raise ServiceConfigurationError("service.state_root_env must reference a private absolute directory")
-    return config
+
+
+def _architecture_analyzer(config: ReviewBotConfig, root: Path) -> RootlessPmdAnalyzer:
+    _validate_architecture_runtime(config)
+    isolation = config.architecture.isolation
+    analysis_root = _private_directory(root / "analysis")
+    return RootlessPmdAnalyzer(config.architecture.tool_image_digest, analysis_root,
+        memory_mib=isolation.memory_mib, pids=isolation.pids, cpus=isolation.cpus,
+        timeout_seconds=config.architecture.tool_timeout_seconds)
 
 
 def _checked_path(path: Path) -> Path:
@@ -126,7 +140,10 @@ def open_service_state(config: ReviewBotConfig) -> Iterator[tuple[Path, SQLiteJo
     job_store = None
     try:
         root = _private_directory(Path(os.environ[config.service.state_root_env]))
-        for name in ("repositories", "analysis", "artifacts"):
+        directories = ("repositories", "artifacts")
+        if "architecture" in config.execution.available_modes and "intent" not in config.execution.available_modes:
+            directories += ("analysis",)
+        for name in directories:
             _private_directory(root / name)
         database = root / "jobs.sqlite"
         _check_database_files(database)
@@ -191,15 +208,10 @@ def run_webhook(config_path: str | None, *, host: str = "127.0.0.1", port: int =
 def run_worker(config_path: str | None, *, once: bool = False) -> int:
     config = load_service_config(config_path)
     with open_service_state(config) as (root, job_store):
-        isolation = config.architecture.isolation
-        analyzer = RootlessPmdAnalyzer(
-            config.architecture.tool_image_digest, root / "analysis",
-            memory_mib=isolation.memory_mib, pids=isolation.pids, cpus=isolation.cpus,
-            timeout_seconds=config.architecture.tool_timeout_seconds,
-        )
+        analyzer_factory = (lambda: _architecture_analyzer(config, root)) if "architecture" in config.execution.available_modes else None
         adapters = _ClaimedAppAdapters(config, root / "repositories")
         loop = WorkerLoop(
-            config, job_store, analyzer=analyzer, github_client_factory=adapters.github_client,
+            config, job_store, analyzer_factory=analyzer_factory, github_client_factory=adapters.github_client,
             repo_reader_factory=adapters.repository_reader, artifact_root=root / "artifacts",
         )
         if once:

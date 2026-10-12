@@ -227,7 +227,10 @@ class TestModeSelectionAdversarial:
             "ARCHITECTURE",     # case sensitive: only lowercase registered
             "architecture ",    # trailing space
             " architecture",    # leading space
-            "intent",           # Mode B is not registered in M2
+            "intent'; DROP TABLE runs;--",
+            "INTENT",
+            "intent ",
+            " intent",
             "b",
             "unknown_mode",
             "all",

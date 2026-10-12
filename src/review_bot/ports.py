@@ -1,7 +1,7 @@
 """Abstract Protocols and port types for github-review-bot Hexagonal Architecture."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -208,8 +208,10 @@ class JobStore(Protocol):
         """Persist a receipt atomically fenced to the worker's live run; False on rejection."""
         ...
 
-    def get_current_publication(self, run: RunRecord, marker: str) -> PublicationReceipt | None:
-        """Get successful output for unchanged inputs within the same installation."""
+    def get_current_publication(
+        self, run: RunRecord, marker: str, *, input_fingerprint: str | None = None,
+    ) -> PublicationReceipt | None:
+        """Get successful mode output, or legacy whole-run output, in the same installation."""
         ...
 
     def get_pr_request(
@@ -225,16 +227,32 @@ class JobStore(Protocol):
         ...
 
 
+class GitHubAuthorizationError(RuntimeError):
+    """Authorization loss is common failure, not a mode-local API response error."""
+
+
 @runtime_checkable
 class GitHubClient(Protocol):
     """Port for interacting with the GitHub API (PR retrieval and comment management)."""
 
-    def get_pull_request(self, pr_number: int) -> dict[str, Any]:
+    def get_pull_request(
+        self, pr_number: int, *, max_response_bytes: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         """Fetch PR state, head SHA, base SHA, branch name, and label names."""
         ...
 
+    def get_issue(
+        self, issue_number: int, *, max_response_bytes: int = 524288,
+        timeout_seconds: float = 10.0,
+    ) -> dict[str, Any]:
+        """Read one issue within this client's bound repository, with bounded bytes/time."""
+        ...
+
     def find_marker_comment(
-        self, pr_number: int, marker: str = "<!-- review-bot:architecture:v1 -->"
+        self, pr_number: int, marker: str = "<!-- review-bot:architecture:v1 -->", *,
+        before_request: Callable[[], bool] | None = None, timeout_seconds: float | None = None,
+        max_response_bytes: int | None = None,
     ) -> Any | None:
         """Find existing bot review comment containing the designated marker."""
         ...

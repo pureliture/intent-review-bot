@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -11,6 +12,10 @@ import httpx
 from review_bot.adapters.github.auth import GitHubAppAuthError, _github_api_url, _safe_token
 
 _MAX_COMMENT_PAGES = 100
+
+
+class GitHubResponseLimitError(ValueError):
+    """A source response exceeded the trusted byte bound; contains no response data."""
 
 
 class GitHubApiClient:
@@ -48,10 +53,19 @@ class GitHubApiClient:
         self._repository_id = repository_id
         self._bound_repository = repository if repository_id is not None and repository else None
         self._bot_login = bot_login
+        self._authorization_failures = 0
 
     @property
     def repository_id(self) -> int | None:
         return self._repository_id
+
+    @property
+    def bot_login(self) -> str | None:
+        return self._bot_login
+
+    @property
+    def authorization_failures(self) -> int:
+        return self._authorization_failures
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -67,6 +81,7 @@ class GitHubApiClient:
             except Exception:
                 pass
             if not _safe_token(token):
+                self._authorization_failures += 1
                 raise GitHubAppAuthError("GitHub token provider failed")
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -76,22 +91,44 @@ class GitHubApiClient:
     def _safe_request(method: str = "GET") -> httpx.Request:
         return httpx.Request(method, "https://api.github.com")
 
-    def _request(self, method: str, url: str | httpx.URL, **kwargs: Any) -> httpx.Response:
+    def _request(
+        self, method: str, url: str | httpx.URL, *, max_response_bytes: int | None = None,
+        timeout_seconds: float | None = None, **kwargs: Any,
+    ) -> httpx.Response:
         if self._token_provider is not None:
             _github_api_url(self.api_url)
         headers = self._headers()
-        options: dict[str, Any] = {"timeout": self.timeout, "follow_redirects": False}
+        options: dict[str, Any] = {"timeout": self.timeout if timeout_seconds is None else timeout_seconds, "follow_redirects": False}
         if self._transport is not None:
             options["transport"] = self._transport
         resp = None
         try:
             with httpx.Client(**options) as client:
-                resp = client.request(method, url, headers=headers, **kwargs)
+                if max_response_bytes is None:
+                    resp = client.request(method, url, headers=headers, **kwargs)
+                else:
+                    deadline = time.monotonic() + (self.timeout if timeout_seconds is None else timeout_seconds)
+                    with client.stream(method, url, headers=headers, **kwargs) as streamed:
+                        content = bytearray()
+                        for chunk in streamed.iter_bytes():
+                            if time.monotonic() >= deadline:
+                                raise httpx.TimeoutException("GitHub source deadline exceeded", request=self._safe_request(method))
+                            if len(content) + len(chunk) > max_response_bytes:
+                                raise GitHubResponseLimitError("source_response_limit_exceeded")
+                            content.extend(chunk)
+                        resp = httpx.Response(streamed.status_code, headers=streamed.headers,
+                            content=bytes(content), request=self._safe_request(method))
+        except GitHubResponseLimitError:
+            raise
+        except httpx.TimeoutException:
+            raise httpx.TimeoutException("GitHub API timeout", request=self._safe_request(method)) from None
         except Exception:
             resp = None
         if resp is None:
             raise httpx.RequestError("GitHub API request failed", request=self._safe_request(method))
         if not 200 <= resp.status_code < 300:
+            if resp.status_code == 401:
+                self._authorization_failures += 1
             request = self._safe_request(method)
             raise httpx.HTTPStatusError(
                 f"GitHub API request failed (HTTP {resp.status_code})", request=request,
@@ -176,12 +213,49 @@ class GitHubApiClient:
         return repo, pr_num
 
     def get_pull_request(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        maximum = kwargs.pop("max_response_bytes", None)
+        timeout = kwargs.pop("timeout_seconds", None)
+        if maximum is not None and (type(maximum) is not int or not 1 <= maximum <= 524288):
+            raise ValueError("Invalid GitHub source byte bound")
+        if timeout is not None and (type(timeout) not in (int, float) or not 0 < timeout <= 20):
+            raise ValueError("Invalid GitHub source time bound")
         repo, pr_number = self._resolve_repo_and_pr(*args, **kwargs)
         url = f"{self.api_url}/repos/{repo}/pulls/{pr_number}"
-        resp = self._request("GET", url)
+        if maximum is None and timeout is None:
+            resp = self._request("GET", url)
+        else:
+            resp = self._request("GET", url, max_response_bytes=maximum, timeout_seconds=timeout)
         return self._json(resp, "pull request")
 
+    def get_issue(
+        self, issue_number: int, *, max_response_bytes: int = 524288,
+        timeout_seconds: float = 10.0,
+    ) -> dict[str, Any]:
+        if type(issue_number) is not int or not 1 <= issue_number <= 2147483647:
+            raise ValueError("Invalid GitHub issue number")
+        if type(max_response_bytes) is not int or not 1 <= max_response_bytes <= 524288:
+            raise ValueError("Invalid GitHub source byte bound")
+        if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 20:
+            raise ValueError("Invalid GitHub source time bound")
+        repo = self._repository_for()
+        resp = self._request("GET", f"{self.api_url}/repos/{repo}/issues/{issue_number}",
+            max_response_bytes=max_response_bytes, timeout_seconds=timeout_seconds)
+        payload = self._json(resp, "issue")
+        if type(payload.get("number")) is not int or payload["number"] != issue_number:
+            raise httpx.RequestError("Invalid GitHub issue identity", request=self._safe_request())
+        return payload
+
     def list_comments(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        gate = kwargs.pop("before_request", None)
+        timeout = kwargs.pop("timeout_seconds", None)
+        maximum = kwargs.pop("max_response_bytes", None)
+        if gate is not None and not callable(gate):
+            raise ValueError("Invalid GitHub read gate")
+        if timeout is not None and (type(timeout) not in (int, float) or not 0 < timeout <= 20):
+            raise ValueError("Invalid GitHub source time bound")
+        if maximum is not None and (type(maximum) is not int or not 1 <= maximum <= 8388608):
+            raise ValueError("Invalid GitHub comment byte bound")
+        deadline = time.monotonic() + timeout if timeout is not None else None
         repo, pr_number = self._resolve_repo_and_pr(*args, **kwargs)
         comments_url = httpx.URL(
             f"{self.api_url}/repos/{repo}/issues/{pr_number}/comments"
@@ -190,8 +264,18 @@ class GitHubApiClient:
         comments: list[dict[str, Any]] = []
         visited: set[httpx.URL] = set()
         while True:
+            if gate is not None and gate() is not True:
+                raise ValueError("github_read_gate_closed")
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                raise httpx.TimeoutException("GitHub comment read deadline exceeded", request=self._safe_request())
             visited.add(url)
-            resp = self._request("GET", url)
+            if maximum is None and remaining is None:
+                resp = self._request("GET", url)
+            else:
+                resp = self._request("GET", url, max_response_bytes=maximum, timeout_seconds=remaining)
+            if gate is not None and gate() is not True:
+                raise ValueError("github_read_gate_closed")
             page_comments = self._json(resp, "comments", list)
             if any(not isinstance(comment, dict) for comment in page_comments):
                 raise httpx.RequestError("Invalid GitHub comments response", request=self._safe_request())
@@ -227,6 +311,7 @@ class GitHubApiClient:
             url = next_url
 
     def find_marker_comment(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        read_options = {key: kwargs.pop(key) for key in ("before_request", "timeout_seconds", "max_response_bytes") if key in kwargs}
         marker = kwargs.get("marker", "<!-- review-bot:architecture:v1 -->")
         reference = None
         if len(args) == 1:
@@ -246,7 +331,7 @@ class GitHubApiClient:
             pr_number = int(kwargs.get("pr_number", 0))
 
         repo = self._repository_for(reference, **kwargs)
-        comments = self.list_comments(repo, pr_number)
+        comments = self.list_comments(repo, pr_number, **read_options)
         matched = []
         for comment in comments:
             body = comment.get("body", "")
@@ -309,6 +394,7 @@ class MockGitHubClient:
 
     def __init__(self) -> None:
         self.pull_requests: dict[int, dict[str, Any]] = {}
+        self.issues: dict[int, dict[str, Any]] = {}
         self.comments: dict[int, dict[str, Any]] = {}
         self._next_comment_id = 1
         self.posted_comments: list[dict[str, Any]] = []
@@ -358,6 +444,13 @@ class MockGitHubClient:
         else:
             pr_number = int(kwargs.get("pr_number", 0))
         return [c for c in self.comments.values() if c.get("pr_number") == pr_number]
+
+    def get_issue(self, issue_number: int, **kwargs: Any) -> dict[str, Any]:
+        if issue_number not in self.issues:
+            request = httpx.Request("GET", "https://api.github.com")
+            raise httpx.HTTPStatusError("Issue unavailable", request=request,
+                response=httpx.Response(404, request=request))
+        return self.issues[issue_number]
 
     def find_marker_comment(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
         marker = kwargs.get("marker", "<!-- review-bot:architecture:v1 -->")

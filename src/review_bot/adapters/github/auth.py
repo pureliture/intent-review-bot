@@ -17,11 +17,13 @@ import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from review_bot.ports import GitHubAuthorizationError
+
 _REFRESH_MARGIN = 60
 _PERMISSIONS = {"contents": "read", "pull_requests": "write"}
 
 
-class GitHubAppAuthError(RuntimeError):
+class GitHubAppAuthError(GitHubAuthorizationError):
     """Sanitized authentication failure without credentials or HTTP payloads."""
 
 

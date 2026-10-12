@@ -13,12 +13,15 @@ from typing import Any
 from review_bot import __version__
 from review_bot.adapters.git import CommitNotFoundError, GitError, GitRepositoryReader
 from review_bot.adapters.markdown.formatter import format_review_markdown
+from review_bot.adapters.markdown.intent_formatter import format_intent_markdown
 from review_bot.adapters.ollama import OLLAMA_PROFILE
 from review_bot.adapters.pmd.runner import PmdRunner
 from review_bot.application.classification import classify_pr
 from review_bot.application.context import build_task_input
 from review_bot.application.delta import build_delta
+from review_bot.application.intent_context import MAX_INPUT_BYTES, decode_intent_task_input
 from review_bot.application.review_a import run_review_a_pipeline
+from review_bot.application.review_b import run_review_b_pipeline
 from review_bot.config import load_review_config
 from review_bot.domain.models_v1 import (
     AnalysisRun,
@@ -30,6 +33,7 @@ from review_bot.domain.models_v1 import (
     Snapshot,
     ToolAnalysis,
 )
+from review_bot.runtime.artifacts import IntentArtifacts, read_private_intent_input
 from review_bot.runtime.model_clients import build_review_client
 
 logger = logging.getLogger(__name__)
@@ -342,6 +346,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="Process a single claimed run and exit",
     )
 
+    intent_parser = subparsers.add_parser(
+        "intent", help="Evaluate fixed B intent input privately, without posting or target execution",
+    )
+    intent_parser.add_argument("--input", required=True, help="Private fixed B v1 input JSON (owned 0600/0400 file)")
+    intent_parser.add_argument("--output", required=True, help="Fresh private output directory (0700)")
+    intent_parser.add_argument("--model-profile", choices=[OLLAMA_PROFILE], default=None,
+        help="Explicitly enable the existing local review profile (default: no model calls)")
+
     return parser
 
 
@@ -599,6 +611,31 @@ def run_offline_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_intent(args: argparse.Namespace) -> int:
+    """Read-only fixed evaluation; no config, queue, repository, or publisher is composed."""
+    try:
+        text = read_private_intent_input(Path(args.input), max_bytes=MAX_INPUT_BYTES)
+        task_input = decode_intent_task_input(text)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        sys.stderr.write("Error: invalid_intent_input\n")
+        return 1
+    try:
+        artifacts = IntentArtifacts(Path(args.output))
+    except (OSError, ValueError):
+        sys.stderr.write("Error: unsafe_intent_output\n")
+        return 1
+    try:
+        model_client = build_review_client(args.model_profile)
+        result = run_review_b_pipeline(task_input, model_client)
+        markdown = format_intent_markdown(result, task_input)
+        artifacts.save(task_input, result, markdown)
+    except Exception:
+        sys.stderr.write("Error: intent_evaluation_failed\n")
+        return 1
+    print(f"intent: {result.status}/{result.reason}")
+    return 1 if result.status == "failed" else 0
+
+
 def _cmd_webhook(args: argparse.Namespace) -> int:
     from review_bot.runtime.service import ServiceConfigurationError, run_webhook
 
@@ -641,6 +678,9 @@ def main(args: list[str] | None = None) -> int:
 
     if parsed.subcommand == "review":
         return run_offline_review(parsed)
+
+    if parsed.subcommand == "intent":
+        return run_intent(parsed)
 
     if parsed.subcommand == "offline":
         # Print initialized message to satisfy smoke tests
