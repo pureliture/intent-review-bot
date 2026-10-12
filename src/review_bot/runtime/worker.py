@@ -651,7 +651,9 @@ class WorkerLoop:
             if artifacts is not None:
                 artifacts.save_review(snapshot=review_snap, selection=mode_sel, task_input=task_input,
                     base_run=base_run, head_run=head_run, result=result, markdown=markdown, config_hash=self.config.config_hash)
-        except (OSError, ValueError, TypeError) as exc:
+        except (_RunAborted, _CommonFailure, GitHubAuthorizationError):
+            raise
+        except Exception as exc:
             self._require_active(run, deadline)
             prefix = "worker" if mode_sel.selected_modes == ("architecture",) else "architecture"
             return replace(core_receipt, execution_status="failed", error_code=f"{prefix}_pipeline_error:{type(exc).__name__}")
@@ -734,7 +736,9 @@ class WorkerLoop:
                 publication_mode="comment" if reason is None else "artifact_only")
             self._require_active(run, deadline)
             artifacts.save_intent(task_input, result, markdown)
-        except (OSError, ValueError, TypeError) as exc:
+        except (_RunAborted, _CommonFailure, GitHubAuthorizationError):
+            raise
+        except Exception as exc:
             self._require_active(run, deadline)
             return replace(core_receipt, execution_status="failed", error_code=f"intent_artifact_error:{type(exc).__name__}")
         self._stage(run, RunStage.PUBLISH, deadline)

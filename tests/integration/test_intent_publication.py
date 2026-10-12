@@ -172,7 +172,7 @@ def test_a_output_failure_preserves_called_core_and_usage_without_suppressing_b(
             {"calls": 1, "input_tokens": 100, "output_tokens": 50})
 
     def fail_output(*args, **kwargs):
-        raise OSError("synthetic-output-secret")
+        raise RuntimeError("synthetic-output-secret")
 
     monkeypatch.setattr(flow.model, "complete", complete)
     if failure == "format":
@@ -189,12 +189,56 @@ def test_a_output_failure_preserves_called_core_and_usage_without_suppressing_b(
     assert a["usage"] == a["a_result"]["usage"] == {"calls": 1, "input_tokens": 100, "output_tokens": 50}
     assert recorded["architecture"]["usage"] == a["usage"]
     assert a["model_delivery"] == {"status": "sent"}
-    assert a["publication"] is None and a["error_code"] == "architecture_pipeline_error:OSError"
+    assert a["publication"] is None and a["error_code"] == "architecture_pipeline_error:RuntimeError"
     assert recorded["intent"]["execution_status"] == "completed" and recorded["intent"]["usage"]["calls"] == 3
     assert writes(flow) == []
     assert flow.store._get_connection().execute("SELECT COUNT(*) FROM publication_receipts").fetchone()[0] == 1
     assert "synthetic-output-secret" not in (root / "A/receipt.json").read_text()
     assert "synthetic-output-secret" not in (root / "manifest.json").read_text()
+
+
+@pytest.mark.parametrize("failure", ["format", "artifact"])
+def test_b_unexpected_output_failure_preserves_core_and_usage(intent_flow, monkeypatch, failure):
+    flow = intent_flow
+
+    def fail_output(*args, **kwargs):
+        raise RuntimeError("synthetic-output-secret")
+
+    if failure == "format":
+        monkeypatch.setattr("review_bot.runtime.worker.format_intent_markdown", fail_output)
+    else:
+        monkeypatch.setattr(RunArtifacts, "save_intent", fail_output)
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
+    root, status, recorded = receipts(flow)
+    assert status == "failed" and len(flow.model.requests) == 3
+    b = json.loads((root / "B/receipt.json").read_text())
+    assert b["b_result"] is not None and b["b_result"]["status"] == "completed"
+    assert b["b_result"]["schema_version"] == 1 and b["b_result"]["review_type"] == "B"
+    assert b["usage"] == b["b_result"]["usage"]
+    assert b["usage"]["calls"] == b["usage"]["model_calls"] == 3
+    assert b["usage"]["input_tokens"] == 300 and b["usage"]["output_tokens"] == 150
+    assert recorded["intent"]["usage"] == b["usage"]
+    assert b["execution_status"] == "failed" and b["error_code"] == "intent_artifact_error:RuntimeError"
+    assert b["publication"] is None and writes(flow) == []
+    assert "synthetic-output-secret" not in (root / "B/receipt.json").read_text()
+    assert "synthetic-output-secret" not in (root / "manifest.json").read_text()
+
+
+def test_b_output_failure_does_not_override_lease_loss(intent_flow, monkeypatch):
+    flow = intent_flow
+
+    def lose_lease_and_fail(*args, **kwargs):
+        flow.worker._lease_lost = True
+        raise RuntimeError("synthetic-output-secret")
+
+    monkeypatch.setattr(RunArtifacts, "save_intent", lose_lease_and_fail)
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
+    root, status = output(flow)
+    assert status == "running" and flow.worker._lease_lost is True
+    assert len(flow.model.requests) == 3
+    assert not (root / "B/receipt.json").exists()
+    assert flow.store._get_connection().execute("SELECT COUNT(*) FROM publication_receipts").fetchone()[0] == 0
+    assert writes(flow) == []
 
 
 def test_a_cache_does_not_hide_b_retry_after_invalid_model_response(intent_flow):
