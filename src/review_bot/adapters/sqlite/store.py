@@ -250,24 +250,39 @@ class SQLiteJobStore:
         with self.transaction(immediate=True) as conn:
             now = time.time()
             lease_expires_at = now + lease_seconds
+            active = conn.execute(
+                "SELECT COUNT(*) FROM runs WHERE LOWER(status) IN ('running', 'claimed') AND lease_expires_at > ?;",
+                (now,),
+            ).fetchone()[0]
+            if active >= 2:
+                return None
             # Find next runnable job: pending OR expired lease
             cur = conn.execute(
                 """
-                SELECT run_id, installation_id, repository_id, pr_number, generation,
-                       fingerprint, status, stage, attempts, started_at, completed_at, error, reason
-                FROM runs
+                SELECT candidate.run_id, candidate.installation_id, candidate.repository_id, candidate.pr_number,
+                       candidate.generation, candidate.fingerprint, candidate.status, candidate.stage,
+                       candidate.attempts, candidate.started_at, candidate.completed_at, candidate.error, candidate.reason
+                FROM runs AS candidate
                 WHERE (
-                    LOWER(status) IN ('pending', 'queued')
+                    LOWER(candidate.status) IN ('pending', 'queued')
                     OR (
-                        LOWER(status) IN ('running', 'claimed')
-                        AND lease_expires_at IS NOT NULL
-                        AND lease_expires_at <= ?
+                        LOWER(candidate.status) IN ('running', 'claimed')
+                        AND candidate.lease_expires_at IS NOT NULL
+                        AND candidate.lease_expires_at <= ?
                     )
                 )
-                ORDER BY created_at ASC
+                AND NOT EXISTS (
+                    SELECT 1 FROM runs AS active
+                    WHERE active.run_id != candidate.run_id
+                      AND active.repository_id = candidate.repository_id
+                      AND active.pr_number = candidate.pr_number
+                      AND LOWER(active.status) IN ('running', 'claimed')
+                      AND active.lease_expires_at > ?
+                )
+                ORDER BY candidate.created_at ASC, candidate.rowid ASC
                 LIMIT 1;
                 """,
-                (now,),
+                (now, now),
             )
             row = cur.fetchone()
             if not row:

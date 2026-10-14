@@ -124,7 +124,7 @@ class ExecutionConfig(BaseModel):
     run_only_selected_modes: bool = True
     selector_policy: Literal["all_available"] = "all_available"
     selector_uses_model: bool = False
-    worker_concurrency: int = Field(ge=1, default=1)
+    worker_concurrency: int = Field(ge=1, le=2, default=1)
     task_timeout_seconds: int = Field(ge=1, default=900)
     pr_actions: list[str] = Field(
         default_factory=lambda: [
@@ -198,7 +198,7 @@ class ModelConfig(BaseModel):
     allow_summarization: bool = False
     allow_truncation: bool = False
     allow_automatic_splitting: bool = False
-    max_concurrency: int = Field(ge=1, default=1)
+    max_concurrency: int = Field(ge=1, le=2, default=1)
     call_timeout_seconds: int = Field(ge=1, default=60)
     max_attempts: int = Field(ge=1, default=1)
     max_output_bytes: int = Field(ge=1, default=32768)

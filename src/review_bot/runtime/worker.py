@@ -21,6 +21,7 @@ from review_bot.adapters.github.intent_sources import collect_intent_sources, in
 from review_bot.adapters.llamacpp import LlamaCppModelClient
 from review_bot.adapters.markdown.formatter import format_review_markdown
 from review_bot.adapters.markdown.intent_formatter import format_intent_markdown
+from review_bot.adapters.model_http import reset_model_request_context, set_model_request_context
 from review_bot.adapters.ollama import OllamaModelClient
 from review_bot.application.classification import classify_pr
 from review_bot.application.context import build_task_input
@@ -91,6 +92,7 @@ class WorkerLoop:
         repo_reader_factory: Callable[[RunRecord, dict[str, Any], GitHubClient], RepositoryReader] | None = None,
         artifact_root: Path | None = None,
         analyzer_factory: Callable[[], StaticAnalyzer] | None = None,
+        stop_event: threading.Event | None = None,
     ) -> None:
         self.config = config
         self.job_store = job_store
@@ -121,7 +123,11 @@ class WorkerLoop:
         self.poll_interval = poll_interval
         self.lease_duration = lease_duration
 
-        self._stop_event = threading.Event()
+        self._stop_event = stop_event if stop_event is not None else threading.Event()
+        if isinstance(self.model_client, (OllamaModelClient, LlamaCppModelClient)):
+            self.model_client.request_cancelled = self._stop_event.is_set
+        if self._ollama_selector_client is not None:
+            self._ollama_selector_client.request_cancelled = self._stop_event.is_set
         self._lease_lost = False
         self._current_run_id: str | None = None
         self._setup_signals()
@@ -245,6 +251,14 @@ class WorkerLoop:
         deadline = time.monotonic() + getattr(getattr(self.config, "execution", None), "task_timeout_seconds", 900)
         receipts: dict[str, ExecutionReceipt] = {}
         heartbeat_stop, heartbeat_thread = self._start_heartbeat(run_id)
+        request_scope_lock = threading.Lock()
+        request_scope_closed = threading.Event()
+
+        def request_cancelled() -> bool:
+            with request_scope_lock:
+                return request_scope_closed.is_set() or not self._active(run, deadline)
+
+        request_context = set_model_request_context(request_cancelled, deadline)
 
         try:
             self.config.publish.validate_b_marker()
@@ -436,6 +450,9 @@ class WorkerLoop:
             return False
 
         finally:
+            with request_scope_lock:
+                request_scope_closed.set()
+            reset_model_request_context(request_context)
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=2.0)
             self._current_run_id = None

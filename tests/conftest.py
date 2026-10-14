@@ -718,3 +718,9 @@ def temp_sqlite_db(tmp_path: Path) -> Generator[Path, None, None]:
     yield db_file
     if db_file.exists():
         db_file.unlink(missing_ok=True)
+
+
+@pytest.fixture(autouse=True)
+def private_model_admission_state(tmp_path_factory, monkeypatch):
+    root = tmp_path_factory.mktemp("model-admission")
+    monkeypatch.setenv("REVIEW_BOT_MODEL_STATE_DIR", str(root))

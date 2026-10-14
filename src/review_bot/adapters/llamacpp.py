@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from review_bot.adapters.model_http import mark_model_request_sent, model_request_slot
 from review_bot.application.review_a import ModelProfile, PermanentModelError, TransientModelError
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 
@@ -195,33 +196,40 @@ class _LlamaCppClient:
         if content is not None:
             headers["Content-Type"] = "application/json"
         try:
-            with httpx.Client(trust_env=False, follow_redirects=False, timeout=self._remaining(deadline)) as client:
-                timeout = self._remaining(deadline)
-                if measurement:
-                    self._record_delivery("unknown")
-                with client.stream(method, self._origin + path, content=content, headers=headers, timeout=timeout) as response:
-                    if measurement:
-                        self._record_delivery("sent")
-                    self._remaining(deadline)
-                    status = response.status_code
-                    if status != 200:
-                        error = TransientModelError if status in (408, 429) or status >= 500 else PermanentModelError
-                        raise error(f"llama.cpp HTTP {status}")
-                    length = response.headers.get("Content-Length")
-                    if length is not None:
-                        try:
-                            length_bytes = int(length)
-                        except ValueError:
-                            raise PermanentModelError("Invalid llama.cpp response byte length") from None
-                        if not 0 <= length_bytes <= _MAX_RESPONSE_BYTES:
-                            raise PermanentModelError("llama.cpp response exceeds byte limit")
-                    body = bytearray()
-                    for chunk in response.iter_bytes():
-                        self._remaining(deadline)
-                        if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
-                            raise PermanentModelError("llama.cpp response exceeds byte limit")
-                        body.extend(chunk)
-                    self._remaining(deadline)
+            with model_request_slot(self, deadline, generates=path == "/v1/chat/completions") as (ticket, deadline):
+                try:
+                    with httpx.Client(trust_env=False, follow_redirects=False, timeout=self._remaining(deadline)) as client:
+                        timeout = self._remaining(deadline)
+                        if measurement:
+                            self._record_delivery("unknown")
+                        mark_model_request_sent(ticket)
+                        with client.stream(method, self._origin + path, content=content, headers=headers, timeout=timeout) as response:
+                            if measurement:
+                                self._record_delivery("sent")
+                            status = response.status_code
+                            self._remaining(deadline)
+                            length = response.headers.get("Content-Length")
+                            if length is not None:
+                                try:
+                                    length_bytes = int(length)
+                                except ValueError:
+                                    raise PermanentModelError("Invalid llama.cpp response byte length") from None
+                                if not 0 <= length_bytes <= _MAX_RESPONSE_BYTES:
+                                    raise PermanentModelError("llama.cpp response exceeds byte limit")
+                            body = bytearray()
+                            for chunk in response.iter_bytes():
+                                self._remaining(deadline)
+                                if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
+                                    raise PermanentModelError("llama.cpp response exceeds byte limit")
+                                body.extend(chunk)
+                            ticket.finish()
+                            self._remaining(deadline)
+                            if status != 200:
+                                error = TransientModelError if status in (408, 429) or status >= 500 else PermanentModelError
+                                raise error(f"llama.cpp HTTP {status}")
+                except (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout):
+                    ticket.finish()
+                    raise
         except httpx.TimeoutException:
             raise TimeoutError("llama.cpp request timed out") from None
         except httpx.DecodingError:

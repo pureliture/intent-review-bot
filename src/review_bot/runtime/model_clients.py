@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 
 from review_bot.adapters.llamacpp import LLAMACPP_PROFILE, LlamaCppDecisionClient, LlamaCppModelClient
+from review_bot.adapters.model_http import default_model_admission
 from review_bot.adapters.ollama import OLLAMA_PROFILE, OllamaDecisionClient, OllamaModelClient
 from review_bot.config import ModelConfig
 from review_bot.ports import ModelClient
@@ -29,8 +30,11 @@ def build_review_client(profile: str | None, settings: ModelConfig | None = None
         max_attempts=settings.max_attempts,
     )
     if profile == LLAMACPP_PROFILE:
-        return LlamaCppModelClient(api_url=_endpoint("ME707_BONSAI_BASE_URL"), **options)
-    return OllamaModelClient(**options)
+        client = LlamaCppModelClient(api_url=_endpoint("ME707_BONSAI_BASE_URL"), **options)
+    else:
+        client = OllamaModelClient(**options)
+    client.request_admission = default_model_admission(settings.max_concurrency)
+    return client
 
 
 def build_selector_client(profile: str | None, settings: ModelConfig | None = None) -> ModelClient | None:
@@ -40,7 +44,10 @@ def build_selector_client(profile: str | None, settings: ModelConfig | None = No
         raise ValueError("Unsupported model profile")
     settings = settings or ModelConfig()
     if profile == LLAMACPP_PROFILE:
-        return LlamaCppDecisionClient(
+        client = LlamaCppDecisionClient(
             api_url=_endpoint("ME707_TEV1_BASE_URL"), timeout_seconds=settings.call_timeout_seconds,
         )
-    return OllamaDecisionClient(timeout_seconds=settings.call_timeout_seconds)
+    else:
+        client = OllamaDecisionClient(timeout_seconds=settings.call_timeout_seconds)
+    client.request_admission = default_model_admission(settings.max_concurrency)
+    return client

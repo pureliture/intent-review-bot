@@ -701,7 +701,7 @@ def test_model_mode_selector_preserves_all_available_fallback(adapter: Any, mock
 def test_selector_uses_one_remaining_deadline_even_after_explicit_warmup(
     adapter: Any, mock_http: Any, decision_request: ModelRequest, monkeypatch: pytest.MonkeyPatch, expired: bool,
 ) -> None:
-    clock = [0.0]
+    clock = [adapter.time.monotonic()]
     monkeypatch.setattr(adapter, "time", SimpleNamespace(monotonic=lambda: clock[0]))
 
     def handler(request: httpx.Request) -> Any:

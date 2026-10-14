@@ -36,6 +36,7 @@ from review_bot.adapters.github.webhook import (
 from review_bot.adapters.sqlite.store import SQLiteJobStore
 from review_bot.config import load_review_config_from_str
 from review_bot.domain.envelope_v2 import DeliveryRecord, PrRequestRecord
+from review_bot.domain.status import RunStatus
 from review_bot.runtime.webhook import create_webhook_app
 from review_bot.runtime.worker import WorkerLoop
 from tests.conftest import MockGitHubClient
@@ -880,7 +881,7 @@ class TestWorkerGenerationFencingRaceStress:
     def test_concurrent_worker_race_resolution(
         self, tmp_path: Path, valid_config_yaml: str, worker_pipeline_ports: dict[str, Any],
     ) -> None:
-        """Simulate Worker A running stale gen 1 and Worker B running fresh gen 2 concurrently."""
+        """Fence stale gen 1 before admitting gen 2, and reject every later old-owner write."""
         db_file = tmp_path / "concurrent_fencing.db"
         store = SQLiteJobStore(db_file)
         config, _ = load_review_config_from_str(valid_config_yaml)
@@ -903,18 +904,23 @@ class TestWorkerGenerationFencingRaceStress:
         store.enqueue_request(req)
         assert store.get_pr_request(40, 5).desired_generation == 2
 
-        # Worker B claims gen 2
+        # Gen 2 waits while the stale owner still holds this PR's lease.
         worker_b = WorkerLoop(
             config, store, github_client=mock_gh, worker_id="worker-B", lease_duration=10.0,
             **worker_pipeline_ports,
         )
-        run_b = store.claim_next_run("worker-B", lease_seconds=10.0)
-        assert run_b is not None
-        assert run_b.generation == 2
+        assert store.claim_next_run("worker-B", lease_seconds=10.0) is None
 
         # Worker A tries to execute -> Fenced!
         result_a = worker_a.process_run(run_a)
         assert result_a is False
+
+        run_b = store.claim_next_run("worker-B", lease_seconds=10.0)
+        assert run_b is not None
+        assert run_b.generation == 2
+        assert store.update_run(
+            run_a.run_id, RunStatus.SUCCEEDED, worker_id="worker-A", generation=run_a.generation,
+        ) is False
 
         # Worker B tries to execute -> Succeeds!
         result_b = worker_b.process_run(run_b)
@@ -1122,6 +1128,9 @@ class TestSqliteJobStoreConcurrencyAndResilience:
                     break
                 with lock:
                     claimed_run_ids.append(run.run_id)
+                assert store.update_run(
+                    run.run_id, RunStatus.SUCCEEDED, worker_id=f"worker-{worker_idx}", generation=run.generation,
+                )
 
         # 6 threads competing for 10 jobs
         with ThreadPoolExecutor(max_workers=6) as executor:

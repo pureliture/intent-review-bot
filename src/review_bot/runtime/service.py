@@ -3,17 +3,20 @@ from __future__ import annotations
 
 import os
 import stat
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import uvicorn
+from pydantic import ValidationError
 
 from review_bot.adapters.github.auth import GitHubAppTokenProvider
 from review_bot.adapters.pmd.container import RootlessPmdAnalyzer, _IMAGE_PIN
 from review_bot.adapters.sqlite.store import SQLiteJobStore
-from review_bot.config import ReviewBotConfig, load_review_config, validate_active_environment
+from review_bot.config import ConfigValidationError, ReviewBotConfig, load_review_config, validate_active_environment
 from review_bot.domain.envelope_v2 import RunRecord
 from review_bot.ports import GitHubClient, RepositoryReader
 from review_bot.runtime.github_app import GitHubAppAdapters
@@ -30,14 +33,19 @@ def load_service_config(path: str | None) -> ReviewBotConfig:
         raise ServiceConfigurationError("Service commands require --config")
     try:
         config, _ = load_review_config(path)
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, ConfigValidationError) and isinstance(exc.__cause__, ValidationError):
+            locations = {error["loc"] for error in exc.__cause__.errors(include_input=False, include_context=False)}
+            for section, field in (("execution", "worker_concurrency"), ("model", "max_concurrency")):
+                if (section, field) in locations:
+                    raise ServiceConfigurationError(f"{section}.{field} must be 1 or 2") from None
         raise ServiceConfigurationError("Cannot load operator --config") from None
     if config.execution.mode != "github_app":
         raise ServiceConfigurationError("execution.mode must be github_app")
     if config.execution.backend != "github_app":
         raise ServiceConfigurationError("execution.backend must be github_app")
-    if config.execution.worker_concurrency != 1:
-        raise ServiceConfigurationError("execution.worker_concurrency must be 1")
+    if config.execution.worker_concurrency not in (1, 2):
+        raise ServiceConfigurationError("execution.worker_concurrency must be 1 or 2")
     if config.service.worker != "synchronous":
         raise ServiceConfigurationError("service.worker must be synchronous")
     if not config.service.sqlite_wal:
@@ -209,16 +217,44 @@ def run_worker(config_path: str | None, *, once: bool = False) -> int:
     config = load_service_config(config_path)
     with open_service_state(config) as (root, job_store):
         analyzer_factory = (lambda: _architecture_analyzer(config, root)) if "architecture" in config.execution.available_modes else None
-        adapters = _ClaimedAppAdapters(config, root / "repositories")
-        loop = WorkerLoop(
-            config, job_store, analyzer_factory=analyzer_factory, github_client_factory=adapters.github_client,
-            repo_reader_factory=adapters.repository_reader, artifact_root=root / "artifacts",
-        )
+        stop_event = threading.Event() if not once and config.execution.worker_concurrency == 2 else None
+
+        def compose(store: SQLiteJobStore, slot: int) -> WorkerLoop:
+            adapters = _ClaimedAppAdapters(config, root / "repositories")
+            options = {} if stop_event is None else {"stop_event": stop_event, "worker_id": f"service-{os.getpid()}-{slot}"}
+            return WorkerLoop(
+                config, store, analyzer_factory=analyzer_factory, github_client_factory=adapters.github_client,
+                repo_reader_factory=adapters.repository_reader, artifact_root=root / "artifacts", **options,
+            )
+
+        loop = compose(job_store, 0)
         if once:
             loop.prepare_models()
             run = job_store.claim_next_run(loop.worker_id, loop.lease_duration)
             if run is None:
                 return 0
             return 0 if loop.process_run(run) else 1
-        loop.run_forever()
+        if stop_event is None:
+            loop.run_forever()
+        else:
+            second_store = SQLiteJobStore(root / "jobs.sqlite")
+            try:
+                second = compose(second_store, 1)
+
+                def execute(worker: WorkerLoop, store: SQLiteJobStore) -> None:
+                    try:
+                        worker.run_forever()
+                    finally:
+                        stop_event.set()
+                        store.close()
+
+                with ThreadPoolExecutor(max_workers=2, thread_name_prefix="review-worker") as pool:
+                    futures = [pool.submit(execute, loop, job_store), pool.submit(execute, second, second_store)]
+                    try:
+                        for future in as_completed(futures):
+                            future.result()
+                    finally:
+                        stop_event.set()
+            finally:
+                second_store.close()
     return 0
