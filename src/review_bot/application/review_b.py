@@ -336,6 +336,8 @@ def _measurement_receipt(record: IntentStageRecord, client: ModelClient, profile
             token_measurement_usage={"input_tokens": 0, "output_tokens": 0})
     if isinstance(receipt, dict) and set(receipt) == {"delivery", "model_calls", "usage"}:
         usage = _usage(ModelResponse("", receipt["usage"]))
+        if receipt["delivery"] == "sent" and type(receipt["model_calls"]) is int and receipt["model_calls"] == 0 and usage == {"input_tokens": 0, "output_tokens": 0}:
+            return replace(record, token_measurement_delivery="sent", token_measurement_model_calls=0, token_measurement_usage=usage)
         if receipt["delivery"] == "sent" and type(receipt["model_calls"]) is int and receipt["model_calls"] == 1 and usage is not None and usage["output_tokens"] <= 1:
             return replace(record, token_measurement_delivery="sent", token_measurement_model_calls=1, token_measurement_usage=usage)
     return replace(record, token_measurement_delivery="unknown", token_measurement_model_calls=None, token_measurement_usage=None)

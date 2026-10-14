@@ -446,6 +446,10 @@ publish:
   automatic_approval: false
   automatic_request_changes: false
   recheck_before_and_after_write: true
+  legacy_migration:
+    enabled: false
+    marker: "<!-- seulgi-review:A -->"
+    exact_title: "## 리팩토링 신호 — 이번 PR 변경 파일 기준"
 model:
   profile: null
   profile_env: REVIEW_MODEL_PROFILE

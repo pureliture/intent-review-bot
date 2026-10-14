@@ -18,9 +18,10 @@ from typing import Any
 
 from review_bot.adapters.github.auth import GitHubAppAuthError
 from review_bot.adapters.github.intent_sources import collect_intent_sources, intent_sources_current
+from review_bot.adapters.llamacpp import LlamaCppModelClient
 from review_bot.adapters.markdown.formatter import format_review_markdown
 from review_bot.adapters.markdown.intent_formatter import format_intent_markdown
-from review_bot.adapters.ollama import OLLAMA_PROFILE, SELECTOR_MODEL, OllamaDecisionClient, OllamaModelClient
+from review_bot.adapters.ollama import OllamaModelClient
 from review_bot.application.classification import classify_pr
 from review_bot.application.context import build_task_input
 from review_bot.application.delta import build_delta
@@ -46,7 +47,7 @@ from review_bot.ports import (
 )
 from review_bot.runtime.artifacts import RunArtifacts
 from review_bot.runtime.mode_fingerprints import architecture_input_fingerprint, intent_input_fingerprint
-from review_bot.runtime.model_clients import build_review_client
+from review_bot.runtime.model_clients import build_review_client, build_selector_client
 
 logger = logging.getLogger("review_bot.worker")
 
@@ -67,8 +68,8 @@ class WorkerLoop:
     """Worker daemon executing claimed jobs with lease heartbeats and generation fencing.
 
     Fast selection defaults to a local selector and never reuses model_client.
-    The explicit ollama-local-128k profile composes Granite and, when enabled,
-    a separate Tev selector. run_once prepares models before claiming a lease;
+    Explicit model profiles compose review and, when enabled, a separate
+    selector client. run_once prepares models before claiming a lease;
     callers claiming manually must call prepare_models before claiming work.
     For other lightweight models, explicitly inject
     mode_selector=ModelModeSelector(selector_client, model="<provider-model>").
@@ -103,14 +104,14 @@ class WorkerLoop:
         profile = getattr(model_settings, "profile", None)
         self.model_client = model_client if model_client is not None else build_review_client(profile, model_settings)
         self.github_client = github_client
-        self._ollama_selector_client: OllamaDecisionClient | None = None
+        self._ollama_selector_client: ModelClient | None = None
         self._models_prepared = False
         if (
-            mode_selector is None and profile == OLLAMA_PROFILE
+            mode_selector is None and profile is not None
             and getattr(getattr(config, "execution", None), "selector_uses_model", False)
         ):
-            self._ollama_selector_client = OllamaDecisionClient()
-            mode_selector = ModelModeSelector(self._ollama_selector_client, model=SELECTOR_MODEL)
+            self._ollama_selector_client = build_selector_client(profile, model_settings)
+            mode_selector = ModelModeSelector(self._ollama_selector_client, model=self._ollama_selector_client.model)
         selector = mode_selector if mode_selector is not None else LightweightModeSelector()
         self.mode_selector = selector if isinstance(selector, DeadlineModeSelector) else DeadlineModeSelector(selector)
         self.worker_id = (
@@ -146,7 +147,7 @@ class WorkerLoop:
         """Verify and warm explicitly configured local models before taking a job lease."""
         if self._models_prepared:
             return
-        if isinstance(self.model_client, OllamaModelClient):
+        if isinstance(self.model_client, (OllamaModelClient, LlamaCppModelClient)):
             self.model_client.warmup()
         if self._ollama_selector_client is not None:
             self._ollama_selector_client.warmup()
