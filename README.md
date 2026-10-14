@@ -40,7 +40,8 @@ Supply an operator-owned, full **schema-version-2** configuration using `--confi
 | Field | Required setting |
 | --- | --- |
 | `execution.mode`, `execution.backend` | `github_app` |
-| `execution.worker_concurrency` | `1`; multiple workers are rejected, not silently ignored |
+| `execution.worker_concurrency` | `1` (default) or `2`; larger values are rejected |
+| `model.max_concurrency` | `1` (default) or `2`; the shared model-admission group never exceeds two |
 | `service.worker` | `synchronous` |
 | `service.sqlite_wal`, `service.lease_and_generation_fencing` | `true` |
 | `architecture.isolation.runtime` | `rootless_docker`; no host subprocess fallback |
@@ -58,7 +59,7 @@ The configuration stores **environment variable references**, not raw secrets. R
 | `service.app_id_env` | `REVIEW_BOT_APP_ID` | GitHub App's positive decimal ID |
 | `service.app_private_key_file_env` | `REVIEW_BOT_APP_PRIVATE_KEY_FILE` | Absolute path to an owned, regular private-key file, mode `0600` or read-only `0400` |
 | `service.webhook_secret_env` | `REVIEW_BOT_WEBHOOK_SECRET` | Webhook signing secret from the operator's secret facility |
-| `service.state_root_env` | `REVIEW_BOT_STATE_DIR` | Absolute, private service-state directory shared by the receiver and its single worker |
+| `service.state_root_env` | `REVIEW_BOT_STATE_DIR` | Absolute, private service-state directory shared by the receiver and its one or two workers |
 
 Do not commit the key, secrets or private state. Paths must not contain symlink components; root/HOME state paths, shared state directories, foreign ownership and linked database/key files are rejected. Existing unsafe permissions are not repaired. State/cache/analysis/artifact directories are created with mode `0700`, SQLite database and sidecars must be `0600`, and service execution uses `umask 077`, restoring the caller's mask on exit. Key reading, JWT signing and GitHub access occur only after a run is claimed; `/health` is liveness, not proof that credentials or publication work.
 
@@ -85,6 +86,16 @@ Without a model profile, A model review is explicitly `not_run`; static analysis
 
 Automated service CLI tests use in-process signed FastAPI requests, real SQLite and `WorkerLoop`, with mock GitHub/repository/analyzer boundaries and a fake server runner. Existing integration tests separately exercise local Git/PMD/CPD and the A pipeline against mock GitHub. This is **not** live App installation, live comment publication, a deployment/public release or an Actions cutover. Actual Ubuntu rootless execution, UID bind access and live GitHub/model behavior on this service path remain unverified.
 
+### Two workers and shared model admission
+
+The receiver stores accepted work before returning `202`; it does not wait for analysis or model execution. Continuous workers poll the existing SQLite queue when idle (default one second), not cron. With `execution.worker_concurrency: 2`, the service runs two independent Workers with separate DB connections, leases and App adapters, and shared shutdown. The atomic claim admits at most **two live leases** across processes sharing that jobs DB and at most **one live lease per repository/PR**. Third and later requests remain queued. New events still coalesce to the latest PR generation; expired leases can recover, but execution is not exactly-once. `--once` still claims only one task.
+
+Every actual model HTTP request uses a separate **shared SQLite admission group**, including selection, native/legacy token measurement, review, retries and warmup. Set `REVIEW_BOT_MODEL_STATE_DIR` to the same absolute, owned private directory in **every participating Worker and evaluation CLI** for the same GPU/model group. If omitted, all processes under the same OS account use `~/.local/state/github-review-bot/model-admission`. Different group directories, other OS accounts and non-bot clients are not controlled by this limit. A caller configured for one request can conservatively lower active group concurrency; neither setting enables parallel stages inside one PR.
+
+The admission DB stores reservation tokens/state/deadlines/limits, never prompts, source or credentials. Directories are `0700`, DB/sidecars `0600`; unsafe paths/ownership fail closed. Waiting consumes the original request/task deadline, and queued calls recheck worker cancellation and generation/lease fences before HTTP. Unused reservations can expire. **A sent generation with a lost response or crashed caller is not automatically freed by TTL:** the server may still be running it. Capacity remains conservatively reserved until actual server idleness is confirmed and an operator uses `SQLiteModelAdmission.resolve_uncertain(token, confirmed_idle=True)`. There is no automatic reconciliation or recovery CLI; never clear that state merely to bypass the limit.
+
+The existing `seulgi-server` CI PMD/CPD analysis is **not migrated or replaced** by this general-purpose bot. Optional A retains its rootless/pinned-image requirements. Company use is deferred to a separate repository after personal development; no PAT support or personal/company authentication-switch framework is added here.
+
 ## B intent evaluation (fixed input, never posts)
 
 The offline `intent` command evaluates **text code of any language** through `extract_goals → observe_changes → assess`. It does not read a target checkout, execute target code/builds/tests/hooks, initialize PMD/CPD, require Java or an analysis image, enqueue work, or compose a GitHub publisher. The same core is registered as `intent` in the shared Worker; **B automatic posting remains disabled by default**, including when `publish.mode: comment`.
@@ -98,7 +109,7 @@ rtk proxy uv run --locked review-bot intent --input /path/to/private/fixed-B-inp
   --output /path/to/private/evaluation-001
 ```
 
-Without `--model-profile`, the result is `not_run/model_profile_unset`, with zero review or metering calls. Ambient model opt-in does not enable this command. To explicitly use the **existing local** profile, add `--model-profile ollama-local-128k`; model preparation is the operator's responsibility and no provider is added or downloaded.
+Without `--model-profile`, the result is `not_run/model_profile_unset`, with zero review or metering calls. Ambient model opt-in does not enable this command. Explicit profiles are `ollama-local-128k` and `me707-llamacpp`; model preparation is the operator's responsibility, with no model download or provider fallback.
 
 Each valid evaluation stores `B/{input,goals,observations,result,scope,usage,validation}.json`, `B/comment.md` and a mode-specific `manifest.json` with `publication=not_attempted/artifact_only`. Unattempted or invalid stage data is JSON `null`; earlier validated stages and actual call usage survive later failures. Exit `0` means artifacts were saved for a completed or explicitly `not_run` outcome, **not** that a real review completed. Invalid input, unsafe paths, pipeline failure or storage failure exits `1`; no source or raw exception value is printed.
 
@@ -106,7 +117,7 @@ Goals receive PR/issue text only; observations receive full code/test files, cha
 
 Goal/constraint quotes must be literal contiguous spans present in every referenced original text and contain at least **12 non-whitespace Unicode characters**. A shorter quote is accepted only when it equals a complete original `title` or `body` field (after stripping leading/trailing whitespace) in each referenced text record, while still occurring literally in every record. The trusted prompt instructs the model to include surrounding original text in the same contiguous span for brief intent embedded in a longer field, without padding, joining separate spans or rewriting text; short sentences/lines are not additional exceptions. These citation checks do not prove that the statement faithfully represents the quoted meaning.
 
-`usage.calls` counts review-completion attempts. The local native token counter itself makes a one-output-token preflight: B records its delivery/usage separately and includes it in total tokens and `model_calls` (normally **three review calls + three preflights**, plus a non-generating metadata request). Unknown transport/usage remains `null` with known subtotals, not zero. Supplied `test_run` records are integrity-checked and version/path-bound, **not independently attested**; reading test source never creates a run record. Drafts show scope, unexecuted tests, missing goals/context, and uncertainty, and construct links only from verified evidence.
+`usage.calls` counts review-completion attempts. The **Ollama** token counter makes a one-output-token preflight; B includes its separate delivery/usage in total tokens and `model_calls` (normally three review calls plus three generating preflights). The **llama.cpp** native template/tokenizer generates no answer and records zero generation calls/tokens for measurement, so normally only the three review generations count. Metadata/template/tokenizer HTTP requests still share admission. Unknown transport/usage remains `null` with known subtotals, not zero. Supplied `test_run` records are integrity-checked and version/path-bound, **not independently attested**; reading test source never creates a run record. Drafts show scope, unexecuted tests, missing goals/context, and uncertainty, and construct links only from verified evidence.
 
 Synthetic Python/JavaScript/Java fixtures and CLI tests exercise the real B pipeline using mock models/HTTP. They establish integration and validation, not model quality or completion of the live PR #36 evaluation. A v1 records, commands, `A/` artifacts and marker remain unchanged.
 
@@ -116,7 +127,7 @@ In the operator configuration, select `execution.available_modes: [intent]` (or 
 
 When B is available, PR title/body and explicit same-repository references (`#12`, `owner/repo#12`, `https://github.com/owner/repo/issues/12`) are frozen **before selection**. Only the bound repository's issue endpoint is used; issue bodies are not recursively followed. The collector admits at most eight distinct references, 256 KiB per original text, 1 MiB total original text and ten seconds of issue-request time; individual PR/issue responses are capped at 512 KiB. No permissions are widened. Missing references, 403/404, limits and unavailable historical versions are explicit; 401/installation authorization loss aborts the shared run. Source bodies/versions, complete scoped files and missing states affect `context_digest`/`snapshot_id`. Retrieval-time-only changes do not change that material digest; the fixed input still records collection/as-of times and hashes its entire record.
 
-Selected A/B executors run sequentially in the existing SQLite task/lease. A eligibility or empty PMD signals do not exclude B. Existing local/model/Tev selectors accept available subsets independently; the native System 1 bridge still uses one existing `/v1/systemone` decision request. Mode preparation/review/storage/publication failures preserve the other mode; common collection/authorization failures, PR close, worker stop, deadline or generation/lease loss abort all remaining work. Normal completed/`not_run` outcomes aggregate to `succeeded`; execution/publication failures aggregate to `failed`.
+Selected A/B executors run sequentially in the existing SQLite task/lease. A eligibility or empty PMD signals do not exclude B. Existing local/model/Tev selectors accept available subsets independently: Ollama keeps `/v1/systemone`, while the explicit llama.cpp profile uses schema-constrained chat completion for its separate Tev1 model. Mode preparation/review/storage/publication failures preserve the other mode; common collection/authorization failures, PR close, worker stop, deadline or generation/lease loss abort all remaining work. Normal completed/`not_run` outcomes aggregate to `succeeded`; execution/publication failures aggregate to `failed`.
 
 Common `snapshot.json`/`selection.json`/`manifest.json` stay at the run root; A's filenames remain under `A/`, and B stores its stage files under `B/`. Each mode has `receipt.json` (service v2, optional `a_result`/`b_result`, separate usage/delivery/publication); the shared manifest records mode input fingerprints and statuses. A completed core result/usage survives mode-local output failures as well as publication failures. Directories/files remain 0700/0600. SQLite run status is authoritative after external cancellation or lease loss: an interrupted manifest may remain `running`, because the lost owner must not write it.
 
@@ -136,9 +147,56 @@ SQLite adds nullable `publication_receipts.input_fingerprint` non-destructively.
 
 ### Implementation evidence and actual PR evaluation
 
-Signed real-Git/SQLite fixtures with mock HTTP/models verify per-mode creation and same-ID updates, reuse from partial failure, unsafe/stale comment blocking, issue changes and A-only/security regressions. Current full regression: **2,037 passed**; commands and commit evidence are in `milestones.md`. The functional fix for A/B output accounting was commit `2c95536`. This proves implementation/integration, not model quality, live automated publication or deployment. Automatic B posting has not been enabled in operational configuration.
+Signed real-Git/SQLite fixtures with mock HTTP/models verify per-mode creation and same-ID updates, reuse from partial failure, unsafe/stale comment blocking, issue changes and A-only/security regressions. New fixtures cover four signed PRs through two actual Workers, native llama.cpp HTTP/measurement, waiting/resume and stale-generation suppression. Current full regression: **2,357 passed in 60.81s**; exact commands/checkpoints are in `milestones.md`. Profile integration is `d2fb56e`, shared admission `216f502`, and stress-fixture alignment `d2554c0`. The older 2,037-test result at `2c95536` is historical. This proves implementation/integration, not model quality, live automated publication or deployment. Automatic B posting has not been enabled in operational configuration.
 
-The existing read-only PR #36 evaluation pinned base `20f911fb4c73a9f0b016ba9876a5daa9e0772572` and head `f149d9a4dc04f37198e0c53025f479b211ea2b43`, collecting current PR text separately from the historical code date. The existing approved Granite profile actually completed and citation-validated `extract_goals` (one review generation plus one token preflight). The intact `observe_changes` request needs **215,531 bytes**, over the profile's **92,160-byte** cap, so it was not called and `assess` was not attempted: **`not_run/input_limit_exceeded`, not a completed B review**. No target tests/build/hooks or external comment were executed. Full replay requires separately approved whole-input budgets and reverified trusted existing runtime/token/output/deadline gates; no truncation, alternate provider or limit increase is implied by test success.
+The existing read-only PR #36 evaluation pinned base `20f911fb4c73a9f0b016ba9876a5daa9e0772572` and head `f149d9a4dc04f37198e0c53025f479b211ea2b43`, collecting current PR text separately from the historical code date. The existing approved Granite profile actually completed and citation-validated `extract_goals` (one review generation plus one token preflight). The intact `observe_changes` request needs **215,531 bytes**, over that profile's **92,160-byte** cap, so it was not called and `assess` was not attempted: **`not_run/input_limit_exceeded`, not a completed B review**. No target tests/build/hooks or external comment were executed. This is historical Granite evidence, not the new llama.cpp profile's capacity. PR #36 has not been replayed with the new adapter; runtime/token/output/deadline validation remains required, with no truncation or automatic task-budget increase.
+
+The proposed **code-first B workflow, additional context/relation review and new Tev1 planning role remain unimplemented**. This delivery preserves the existing B three-stage contract; it does not finalize the pending review-scope, relation, budget or termination design.
+
+## Local llama.cpp (explicit opt-in)
+
+`me707-llamacpp` uses separate OpenAI-compatible servers and exact model IDs:
+
+| Role | Model ID | Required per-slot context | Explicit endpoint variable |
+| --- | --- | --- | --- |
+| Review | `bonsai2-27b` | 262,144 tokens | `ME707_BONSAI_BASE_URL` |
+| Existing System 1 mode selection | `tev1-4b-q8_0` | 131,072 tokens | `ME707_TEV1_BASE_URL` |
+
+Endpoints must be uncredentialed HTTP `/v1` URLs on loopback or the approved `ubuntu-ms-7e07` host. Proxy environment variables and redirects are not used. Neither the service nor CLI infers a node IP, downloads a model or falls back to Ollama. Keep model APIs on the approved private network; the webhook forwarding path is not model authentication.
+
+For example, prepare these environment references in the process environment (not a committed secret/config file):
+
+```bash
+export ME707_BONSAI_BASE_URL=http://ubuntu-ms-7e07:11435/v1
+export ME707_TEV1_BASE_URL=http://ubuntu-ms-7e07:11437/v1
+export REVIEW_BOT_MODEL_STATE_DIR=/home/review-bot/private-model-admission
+```
+
+The following is only a fragment of the existing operator configuration; it does not generate or activate a deployment:
+
+```yaml
+execution:
+  available_modes: [intent]
+  worker_concurrency: 2
+  selector_uses_model: true
+model:
+  profile: me707-llamacpp
+  max_concurrency: 2
+publish:
+  mode: artifact_only
+  b_comments_enabled: false
+```
+
+For a non-publishing fixed-input evaluation, explicitly select the profile:
+
+```bash
+rtk proxy uv run --locked review-bot intent --input /path/to/private/fixed-B-input.json \
+  --output /path/to/private/evaluation-llamacpp-001 --model-profile me707-llamacpp
+```
+
+Construction remains offline. Preparation verifies model identity, slot context and a chat template through `/v1/models` and `/props`, without a warmup generation. Before generation, `/apply-template` and `/tokenize` measure the intact request with the server's native tokenizer; `/v1/chat/completions` uses strict JSON schema output and checks measured input against completion usage. Unsupported measurement, truncation, bad identity/usage/JSON or exhausted budgets fail closed. A 16 MiB transport cap is not a token estimate. The existing **B task's 131,072-token per-request input/total limits remain unchanged** even with a 256k review model.
+
+The parallel read-only node check confirmed SSH authentication, both health/model endpoints, and 256k/128k context with two slots each. It did **not** exercise generation or the adapter's live template/tokenizer compatibility. The node handoff records Bonsai2 weights as `PQ2_0`, not the earlier proposed 8-bit weights, and Tev1 as `Q8_0`; those weight choices are not validated by model IDs alone. Queried user-systemd unit names were inactive despite responding APIs, so process ownership/autostart/restart recovery and Ubuntu bot deployment are still unverified. No new live PR review or external comment was performed.
 
 ## Local Ollama (explicit opt-in)
 
