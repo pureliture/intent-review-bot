@@ -272,7 +272,10 @@ def test_generation_preserves_messages_schema_and_template_kwargs(mock_http: Any
     assert template == {"messages": messages, "chat_template_kwargs": {"enable_thinking": False}}
     assert payload["messages"] == messages and payload["model"] == model
     assert payload["chat_template_kwargs"] == template["chat_template_kwargs"]
-    assert payload["response_format"] == {"type": "json_schema", "schema": request.response_schema}
+    assert payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "review_bot", "strict": True, "schema": request.response_schema},
+    }
     assert payload["max_tokens"] == request.max_output_tokens
     assert (payload["stream"], payload["temperature"], payload["seed"], payload["n"]) == (False, 0, 0, 1)
     assert payload["stop"] == [] and payload["cache_prompt"] is False and payload["n_keep"] == -1

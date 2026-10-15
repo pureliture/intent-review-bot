@@ -55,8 +55,19 @@ class _MacBookLlamaCppClient:
 
     def _chat_payload(self, request: ModelRequest) -> dict[str, Any]:
         payload = super()._chat_payload(request)
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "review_bot", "strict": True, "schema": payload["response_format"]["schema"]},
+        }
         payload["chat_template_kwargs"] = {"enable_thinking": False}
         return payload
+
+    def _check_output(self, value: dict[str, Any], payload: dict[str, Any]) -> None:
+        validation_payload = {
+            **payload,
+            "response_format": {"type": "json_schema", "schema": payload["response_format"]["json_schema"]["schema"]},
+        }
+        super()._check_output(value, validation_payload)
 
 
 class MacBookLlamaCppModelClient(_MacBookLlamaCppClient, LlamaCppModelClient):
