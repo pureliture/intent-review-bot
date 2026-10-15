@@ -48,7 +48,7 @@ from review_bot.ports import (
 )
 from review_bot.runtime.artifacts import RunArtifacts
 from review_bot.runtime.mode_fingerprints import architecture_input_fingerprint, intent_input_fingerprint
-from review_bot.runtime.model_clients import build_review_client, build_selector_client
+from review_bot.runtime.model_clients import build_planning_client, build_review_client, build_selector_client
 
 logger = logging.getLogger("review_bot.worker")
 
@@ -93,6 +93,7 @@ class WorkerLoop:
         artifact_root: Path | None = None,
         analyzer_factory: Callable[[], StaticAnalyzer] | None = None,
         stop_event: threading.Event | None = None,
+        planning_client: ModelClient | None = None,
     ) -> None:
         self.config = config
         self.job_store = job_store
@@ -105,6 +106,7 @@ class WorkerLoop:
         model_settings = getattr(config, "model", None)
         profile = getattr(model_settings, "profile", None)
         self.model_client = model_client if model_client is not None else build_review_client(profile, model_settings)
+        self.planning_client = planning_client
         self.github_client = github_client
         self._ollama_selector_client: ModelClient | None = None
         self._models_prepared = False
@@ -128,6 +130,8 @@ class WorkerLoop:
             self.model_client.request_cancelled = self._stop_event.is_set
         if self._ollama_selector_client is not None:
             self._ollama_selector_client.request_cancelled = self._stop_event.is_set
+        if isinstance(self.planning_client, LlamaCppModelClient):
+            self.planning_client.request_cancelled = self._stop_event.is_set
         self._lease_lost = False
         self._current_run_id: str | None = None
         self._setup_signals()
@@ -724,7 +728,16 @@ class WorkerLoop:
         task_input = build_intent_task_input(review_snap, material.base, material.head,
             related_paths=tuple(self.config.intent.context_paths))
         marker = self.config.publish.b_marker
-        input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client)
+        code_first = self.config.intent.pipeline == "code-first-v2"
+        if code_first:
+            if self.planning_client is None and self.model_client is not None:
+                self.planning_client = build_planning_client(self.config.model.profile, self.config.model)
+                if isinstance(self.planning_client, LlamaCppModelClient):
+                    self.planning_client.request_cancelled = self._stop_event.is_set
+            input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client,
+                planning_client=self.planning_client)
+        else:
+            input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client)
 
         def source_guard(current: dict[str, Any]) -> bool:
             self._require_active(run, deadline)
@@ -738,8 +751,19 @@ class WorkerLoop:
             if reused is not None:
                 return reused
         self._stage(run, RunStage.REVIEW, deadline)
-        limits = IntentReviewLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
-        result = run_review_b_pipeline(task_input, self.model_client, before_stage=lambda: self._active(run, deadline), limits=limits)
+        if code_first:
+            from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
+            from review_bot.application.review_b_code import run_code_first_review
+            from review_bot.domain.models_b_code import CodeFirstReviewLimits
+
+            limits = CodeFirstReviewLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
+            result = run_code_first_review(task_input, self.model_client, planning_client=self.planning_client,
+                before_stage=lambda: self._active(run, deadline), limits=limits)
+            formatter = format_code_intent_markdown
+        else:
+            limits = IntentReviewLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
+            result = run_review_b_pipeline(task_input, self.model_client, before_stage=lambda: self._active(run, deadline), limits=limits)
+            formatter = format_intent_markdown
         self._stage(run, RunStage.VALIDATE, deadline)
         core_receipt = ExecutionReceipt(2, "intent", mode_sel.selection_id, review_snap.snapshot_id, run.generation,
             result.run_key, result.status, usage=result.usage,
@@ -749,7 +773,7 @@ class WorkerLoop:
             if not self.config.publish.b_comments_enabled else "draft_comments_disabled"
             if draft and not self.config.publish.draft_comments else result.reason if result.status != "completed" else None)
         try:
-            markdown = format_intent_markdown(result, task_input, marker=marker,
+            markdown = formatter(result, task_input, marker=marker,
                 max_length=min(60000, self.config.output.max_comment_characters),
                 publication_mode="comment" if reason is None else "artifact_only")
             self._require_active(run, deadline)

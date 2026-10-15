@@ -69,3 +69,25 @@ def build_selector_client(profile: str | None, settings: ModelConfig | None = No
         else default_model_admission(settings.max_concurrency)
     )
     return client
+
+
+def build_planning_client(profile: str | None, settings: ModelConfig | None = None) -> ModelClient | None:
+    """Opted-in B planning is a separate role; absent endpoints never select another provider."""
+    if profile is None or profile == OLLAMA_PROFILE:
+        return None
+    if profile not in MODEL_PROFILES:
+        raise ValueError("Unsupported model profile")
+    from review_bot.adapters.intent_planner import LlamaCppPlanClient, MacBookLlamaCppPlanClient
+
+    variable = "MACBOOK_TEV1_BASE_URL" if profile == MACBOOK_LLAMACPP_PROFILE else "ME707_TEV1_BASE_URL"
+    if not os.environ.get(variable, "").strip():
+        return None
+    settings = settings or ModelConfig()
+    options = dict(api_url=_endpoint(variable, profile), timeout_seconds=settings.call_timeout_seconds,
+        max_output_bytes=settings.max_output_bytes, max_attempts=settings.max_attempts)
+    client = MacBookLlamaCppPlanClient(**options) if profile == MACBOOK_LLAMACPP_PROFILE else LlamaCppPlanClient(**options)
+    client.request_admission = (
+        macbook_model_admission(settings.max_concurrency) if profile == MACBOOK_LLAMACPP_PROFILE
+        else default_model_admission(settings.max_concurrency)
+    )
+    return client

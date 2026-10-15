@@ -14,6 +14,19 @@ from uuid import uuid4
 from review_bot.domain.envelope_v2 import RunRecord
 
 
+def _intent_artifact_values(task_input: Any, result: Any) -> dict[str, Any]:
+    values = {"input.json": task_input, "result.json": result, "scope.json": result.scope,
+        "usage.json": {"total": result.usage, "stages": [asdict(stage) for stage in result.stages]},
+        "validation.json": {"status": result.status, "reason": result.reason, "errors": result.validation_errors,
+            "stages": [{"stage": stage.stage, "status": stage.status, "reason": stage.reason} for stage in result.stages]}}
+    if result.schema_version == 2:
+        values.update({"plan.json": result.plan, "observations.json": result.group_observations,
+            "intents.json": result.reconstructed_intents, "relations.json": result.relations})
+    else:
+        values.update({"goals.json": result.goals, "observations.json": result.observations})
+    return values
+
+
 class RunArtifacts:
     """Shared private originals with independent A/ and B/ mode outputs."""
 
@@ -100,11 +113,7 @@ class RunArtifacts:
 
     def save_intent(self, task_input: Any, result: Any, markdown: str) -> None:
         _intent_directory(self.root / "B")
-        values = {"input.json": task_input, "goals.json": result.goals, "observations.json": result.observations,
-            "result.json": result, "scope.json": result.scope,
-            "usage.json": {"total": result.usage, "stages": [asdict(stage) for stage in result.stages]},
-            "validation.json": {"status": result.status, "reason": result.reason, "errors": result.validation_errors,
-                "stages": [{"stage": stage.stage, "status": stage.status, "reason": stage.reason} for stage in result.stages]}}
+        values = _intent_artifact_values(task_input, result)
         for name, value in values.items():
             self.write_json("B/" + name, value)
         self._write("B/comment.md", markdown)
@@ -112,6 +121,8 @@ class RunArtifacts:
             "input_fingerprint": result.run_key, "prompt_version": result.prompt_version,
             "prompt_hash": result.prompt_hash, "status": result.status, "reason": result.reason,
             "publication": None}
+        if result.schema_version == 2:
+            self.manifest["modes"]["intent"]["result_schema_version"] = 2
         self.write_json("manifest.json", self.manifest)
 
     def save_receipt(self, receipt: Any) -> None:
@@ -225,11 +236,7 @@ class IntentArtifacts:
 
     def save(self, task_input: Any, result: Any, markdown: str) -> None:
         publication = {"status": "not_attempted", "reason": "artifact_only"}
-        values = {"input.json": task_input, "goals.json": result.goals, "observations.json": result.observations,
-            "result.json": result, "scope.json": result.scope,
-            "usage.json": {"total": result.usage, "stages": [asdict(stage) for stage in result.stages]},
-            "validation.json": {"status": result.status, "reason": result.reason, "errors": result.validation_errors,
-                "stages": [{"stage": stage.stage, "status": stage.status, "reason": stage.reason} for stage in result.stages]}}
+        values = _intent_artifact_values(task_input, result)
         for name, value in values.items():
             data = asdict(value) if is_dataclass(value) else value
             self._write(self.directory, name, json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
@@ -239,4 +246,6 @@ class IntentArtifacts:
             "modes": {"intent": {"input_hash": task_input.input_hash, "input_fingerprint": result.run_key,
                 "prompt_version": result.prompt_version, "prompt_hash": result.prompt_hash,
                 "status": result.status, "reason": result.reason, "publication": publication}}}
+        if result.schema_version == 2:
+            manifest["modes"]["intent"]["result_schema_version"] = 2
         self._write(self.root, "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n")

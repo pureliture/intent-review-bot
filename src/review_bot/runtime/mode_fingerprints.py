@@ -55,7 +55,7 @@ def architecture_input_fingerprint(snapshot, classification, config, client, *, 
         return None
 
 
-def intent_input_fingerprint(task, config, client) -> str | None:
+def intent_input_fingerprint(task, config, client, *, planning_client=None) -> str | None:
     """Hash full effective material/profile/prompts, not retrieval clocks or remaining deadline."""
     try:
         material = asdict(task)
@@ -68,6 +68,18 @@ def intent_input_fingerprint(task, config, client) -> str | None:
             item["locator"].pop("retrieved_at", None)
             if item["kind"] == "pr_text":
                 item["locator"].pop("updated_at", None)
+        if config.intent.pipeline == "code-first-v2":
+            from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
+            from review_bot.application.review_b_code import code_first_prompt_hashes, run_code_first_review
+            from review_bot.domain.models_b_code import CodeFirstReviewLimits
+
+            return hash_json({"schema": "mode-publication/code-first-v2", "mode": "intent", "material": material,
+                "model": _profile(client), "planner": _profile(planning_client), "prompts": code_first_prompt_hashes(),
+                "implementation": _implementation_hash(build_intent_task_input, run_code_first_review,
+                    run_review_b_pipeline, format_code_intent_markdown),
+                "limits": asdict(CodeFirstReviewLimits(task_timeout_seconds=config.execution.task_timeout_seconds)),
+                "intent": config.intent.model_dump(mode="json"),
+                "output": config.output.model_dump(mode="json"), "marker": config.publish.b_marker})
         return hash_json({"schema": "mode-publication/v1", "mode": "intent", "material": material,
             "model": _profile(client), "prompt_version": PROMPT_VERSION,
             "prompts": SYSTEM_PROMPTS, "schemas": {stage: response_schema(stage) for stage in SYSTEM_PROMPTS},

@@ -257,6 +257,7 @@ class RepositorySettingsConfig(BaseModel):
 
 class IntentConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
+    pipeline: Literal["declared-v1", "code-first-v2"] = "declared-v1"
     context_paths: list[str] = Field(default_factory=list, max_length=5000)
 
     @field_validator("context_paths")
@@ -360,6 +361,8 @@ class TargetRepositoryConfig(BaseModel):
 def compute_config_hash(data: dict[str, Any] | BaseModel) -> str:
     """Computes a deterministic SHA-256 digest over normalized canonical JSON."""
     raw_dict = data.model_dump(mode="json") if isinstance(data, BaseModel) else data
+    if isinstance(raw_dict.get("intent"), dict) and raw_dict["intent"].get("pipeline") == "declared-v1":
+        raw_dict = {**raw_dict, "intent": {key: value for key, value in raw_dict["intent"].items() if key != "pipeline"}}
     execution = raw_dict.get("execution")
     if (
         raw_dict.get("schema_version") == 2 and isinstance(execution, dict)

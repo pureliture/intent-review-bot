@@ -33,7 +33,7 @@ from review_bot.domain.models_v1 import (
     ToolAnalysis,
 )
 from review_bot.runtime.artifacts import IntentArtifacts, read_private_intent_input
-from review_bot.runtime.model_clients import MODEL_PROFILES, build_review_client
+from review_bot.runtime.model_clients import MODEL_PROFILES, build_planning_client, build_review_client
 
 logger = logging.getLogger(__name__)
 
@@ -352,6 +352,8 @@ def create_parser() -> argparse.ArgumentParser:
     intent_parser.add_argument("--output", required=True, help="Fresh private output directory (0700)")
     intent_parser.add_argument("--model-profile", choices=MODEL_PROFILES, default=None,
         help="Explicitly enable a review profile (default: no model calls)")
+    intent_parser.add_argument("--pipeline", choices=("declared-v1", "code-first-v2"), default="declared-v1",
+        help="B review contract (default: declared-v1; code-first-v2 reads code before optional PR text)")
 
     return parser
 
@@ -625,13 +627,23 @@ def run_intent(args: argparse.Namespace) -> int:
         return 1
     try:
         model_client = build_review_client(args.model_profile)
-        result = run_review_b_pipeline(task_input, model_client)
-        markdown = format_intent_markdown(result, task_input)
+        if getattr(args, "pipeline", "declared-v1") == "code-first-v2":
+            from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
+            from review_bot.application.review_b_code import run_code_first_review
+
+            planning_client = build_planning_client(args.model_profile)
+            result = run_code_first_review(task_input, model_client, planning_client=planning_client)
+            markdown = format_code_intent_markdown(result, task_input)
+        else:
+            result = run_review_b_pipeline(task_input, model_client)
+            markdown = format_intent_markdown(result, task_input)
         artifacts.save(task_input, result, markdown)
     except Exception:
         sys.stderr.write("Error: intent_evaluation_failed\n")
         return 1
     print(f"intent: {result.status}/{result.reason}")
+    if getattr(args, "pipeline", "declared-v1") == "code-first-v2":
+        return 0 if result.status == "completed" else 1
     return 1 if result.status == "failed" else 0
 
 

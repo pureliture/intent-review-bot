@@ -14,6 +14,7 @@ from .status import (
 
 if TYPE_CHECKING:
     from .models_b import ReviewBResult
+    from .models_b_code import CodeFirstReviewResult
 
 
 @dataclass(frozen=True)
@@ -109,7 +110,7 @@ class ExecutionReceipt:
     limitations: tuple[str, ...] = ()
     error_code: str | None = None
     publication: PublicationReceipt | None = None
-    b_result: ReviewBResult | None = None
+    b_result: ReviewBResult | CodeFirstReviewResult | None = None
     usage: dict[str, object] | None = None
     input_fingerprint: str | None = None
     reused: bool = False
