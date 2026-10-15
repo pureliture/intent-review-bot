@@ -78,6 +78,8 @@ def test_cli_preserves_v1_default_and_requires_explicit_code_first_choice():
     assert create_parser().parse_args(args).pipeline == "declared-v1"
     selected = create_parser().parse_args([*args, "--pipeline", "code-first-v2"])
     assert selected.pipeline == "code-first-v2" and selected.model_profile is None
+    assert selected.call_timeout_seconds is None
+    assert create_parser().parse_args([*args, "--call-timeout-seconds", "120"]).call_timeout_seconds == 120
 
 
 def test_code_first_cache_cannot_reuse_v1_or_a_different_planning_role(valid_config_yaml, offline_profiles):
@@ -137,3 +139,22 @@ def test_planner_receives_measured_full_fit_and_schema_requires_every_prepared_p
     finding_fields = {item["properties"]["assessment"]["enum"][0]: item["properties"] for item in variants}
     assert finding_fields["insufficient_context"]["missing_context"]["minItems"] == 1
     assert finding_fields["code_defect"]["failure_condition"]["minLength"] == 1
+
+
+def test_request_for_the_whole_original_already_in_the_group_does_not_trigger_a_no_progress_recheck():
+    from review_bot.application.review_b_code import run_code_first_review
+    from tests.fixtures.review_b_code import CodeFirstModelClient, make_task
+
+    def already_delivered(payload, body):
+        if payload["stage"] == "observe_group":
+            return {**body, "requested_paths": list(payload["paths"])}
+        return body
+
+    task = make_task()
+    client = CodeFirstModelClient(transform=already_delivered)
+    result = run_code_first_review(task, client, planning_client=CodeFirstModelClient())
+    assert result.status == "completed" and result.relations[0]["status"] == "conflict"
+    assert result.group_observations[0]["requested_paths"] == list(task.reviewed_paths)
+    assert len(client.requests) == 3
+    assert all(record.stage != "recheck_relations" for record in result.stages)
+    assert {cite["path"] for cite in result.findings[0]["citations"]} == {"src/value.py", "src/caller.py"}

@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from review_bot.application.review_a import MockModelClient
+from review_bot.config import ModelConfig
 from review_bot.domain.models_v1 import ModelResponse
 from review_bot.runtime import cli
 from tests.conftest import SyntheticGitRepo
@@ -253,3 +254,40 @@ def test_code_first_cli_uses_both_real_adapters_native_metering_and_shared_sqlit
     with sqlite3.connect(state / "requests.sqlite") as connection:
         assert connection.execute("SELECT COUNT(*) FROM model_admission").fetchone()[0] == 0
     assert (state / "requests.sqlite").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("timeout", [120, 0])
+def test_cli_applies_existing_timeout_setting_to_both_roles_without_changing_task_budget(tmp_path, monkeypatch, timeout):
+    from review_bot.application import review_b_code
+    from review_bot.domain.models_b_code import CodeFirstReviewLimits
+
+    configured = []
+    task_budgets = []
+    actual_review = review_b_code.run_code_first_review
+
+    def bounded_review(*args, **kwargs):
+        task_budgets.append((kwargs.get("limits") or CodeFirstReviewLimits()).task_timeout_seconds)
+        return actual_review(*args, **kwargs)
+
+    def factory(profile, settings):
+        assert profile == "macbook-llamacpp" and isinstance(settings, ModelConfig)
+        configured.append(settings.call_timeout_seconds)
+        return CodeFirstModelClient()
+
+    monkeypatch.setattr(cli, "build_review_client", factory)
+    monkeypatch.setattr(cli, "build_planning_client", factory)
+    monkeypatch.setattr(review_b_code, "run_code_first_review", bounded_review)
+    source = tmp_path / "fixed-code-input.json"
+    source.write_text(json.dumps(asdict(make_code_task())), encoding="utf-8")
+    source.chmod(0o600)
+    destination = tmp_path / "configured-output"
+    code = cli.main(["intent", "--input", str(source), "--output", str(destination),
+        "--pipeline", "code-first-v2", "--model-profile", "macbook-llamacpp",
+        "--call-timeout-seconds", str(timeout)])
+    if timeout == 0:
+        assert code == 1 and configured == [] and task_budgets == []
+        assert not (destination / "B/result.json").exists()
+    else:
+        assert code == 0 and configured == [120, 120] and task_budgets == [900]
+        result = json.loads((destination / "B/result.json").read_text())
+        assert result["status"] == "completed"

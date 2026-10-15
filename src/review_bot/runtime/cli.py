@@ -21,7 +21,7 @@ from review_bot.application.delta import build_delta
 from review_bot.application.intent_context import MAX_INPUT_BYTES, decode_intent_task_input
 from review_bot.application.review_a import run_review_a_pipeline
 from review_bot.application.review_b import run_review_b_pipeline
-from review_bot.config import load_review_config
+from review_bot.config import ModelConfig, load_review_config
 from review_bot.domain.models_v1 import (
     AnalysisRun,
     CpdDuplication,
@@ -354,6 +354,8 @@ def create_parser() -> argparse.ArgumentParser:
         help="Explicitly enable a review profile (default: no model calls)")
     intent_parser.add_argument("--pipeline", choices=("declared-v1", "code-first-v2"), default="declared-v1",
         help="B review contract (default: declared-v1; code-first-v2 reads code before optional PR text)")
+    intent_parser.add_argument("--call-timeout-seconds", type=int, default=None,
+        help="Explicit per-call model timeout; task, context and token budgets remain unchanged")
 
     return parser
 
@@ -626,12 +628,15 @@ def run_intent(args: argparse.Namespace) -> int:
         sys.stderr.write("Error: unsafe_intent_output\n")
         return 1
     try:
-        model_client = build_review_client(args.model_profile)
+        timeout = getattr(args, "call_timeout_seconds", None)
+        settings = ModelConfig(call_timeout_seconds=timeout) if timeout is not None else None
+        model_client = build_review_client(args.model_profile, settings) if settings is not None else build_review_client(args.model_profile)
         if getattr(args, "pipeline", "declared-v1") == "code-first-v2":
             from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
             from review_bot.application.review_b_code import run_code_first_review
 
-            planning_client = build_planning_client(args.model_profile)
+            planning_client = (build_planning_client(args.model_profile, settings) if settings is not None
+                else build_planning_client(args.model_profile))
             result = run_code_first_review(task_input, model_client, planning_client=planning_client)
             markdown = format_code_intent_markdown(result, task_input)
         else:

@@ -43,6 +43,11 @@ Citations contain only evidence_id, start_line and end_line. Cite actual provide
 Code line numbers are one-based LF-delimited content lines; text records use title + newline + body;
 test_run citations refer to output lines. Previous observations are not substitutes for original evidence.
 State missing context concretely. Code delivery alone does not establish a consistent relation.
+missing_context lists ONLY specific unavailable information needed for a judgement. It is NOT a place
+for a summary, a known defect/conflict, a supplied file, or a restatement of a completed review.
+Use missing_context=[] when the relevant original information is already provided. Unknown developer
+intention is hypothesis uncertainty, not by itself missing context that blocks a code-based judgement.
+requested_paths requests only additional originals not present in this request; use [] when none are needed.
 """
 SYSTEM_PROMPTS = {
     "plan_code_review": _COMMON + """Plan relationship groups, not review verdicts or intent.
@@ -846,9 +851,13 @@ def run_code_first_review(
         relations = updated
         budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
     pending = [row for row in relations if row["status"] in ("unreviewed", "insufficient_context") and not row["reviewed_together"]]
-    requested = {path for group in groups for path in group["requested_paths"]}
+    requested = {path for group in groups for path in group["requested_paths"] if path not in group["paths"]}
     context_missing = [path for path in requested if path not in task.reviewed_paths]
-    recheck_paths = sorted({path for row in pending for path in (row["from_path"], row["to_path"])} | (requested & set(task.reviewed_paths)))
+    recheck_set = {path for row in pending for path in (row["from_path"], row["to_path"])} | (requested & set(task.reviewed_paths))
+    for group in groups:
+        if (set(group["requested_paths"]) - set(group["paths"])) & set(task.reviewed_paths):
+            recheck_set.update(group["paths"])
+    recheck_paths = sorted(recheck_set)
     if recheck_paths and limits.max_rechecks:
         recheck_relations = pending if pending else relations
         request, supplied = _request(task, "recheck_relations", profile, limits, relations=recheck_relations,
