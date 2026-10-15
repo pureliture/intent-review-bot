@@ -90,7 +90,7 @@ Automated service CLI tests use in-process signed FastAPI requests, real SQLite 
 
 The receiver stores accepted work before returning `202`; it does not wait for analysis or model execution. Continuous workers poll the existing SQLite queue when idle (default one second), not cron. With `execution.worker_concurrency: 2`, the service runs two independent Workers with separate DB connections, leases and App adapters, and shared shutdown. The atomic claim admits at most **two live leases** across processes sharing that jobs DB and at most **one live lease per repository/PR**. Third and later requests remain queued. New events still coalesce to the latest PR generation; expired leases can recover, but execution is not exactly-once. `--once` still claims only one task.
 
-Every actual model HTTP request uses a separate **shared SQLite admission group**, including selection, native/legacy token measurement, review, retries and warmup. Set `REVIEW_BOT_MODEL_STATE_DIR` to the same absolute, owned private directory in **every participating Worker and evaluation CLI** for the same GPU/model group. If omitted, all processes under the same OS account use `~/.local/state/github-review-bot/model-admission`. Different group directories, other OS accounts and non-bot clients are not controlled by this limit. A caller configured for one request can conservatively lower active group concurrency; neither setting enables parallel stages inside one PR.
+Every actual model HTTP request uses a separate **shared SQLite admission group**, including selection, native/legacy token measurement, review, retries and warmup. For me707/Ollama, set `REVIEW_BOT_MODEL_STATE_DIR` to the same absolute, owned private directory in **every participating Worker and evaluation CLI** for the same GPU/model group. If omitted, all processes under the same OS account use `~/.local/state/github-review-bot/model-admission`. The isolated [MacBook profile](#macbook-local-llamacpp-explicit-opt-in) uses its own group/variable instead. Different group directories, other OS accounts and non-bot clients are not controlled by this limit. A caller configured for one request can conservatively lower active group concurrency; neither setting enables parallel stages inside one PR.
 
 The admission DB stores reservation tokens/state/deadlines/limits, never prompts, source or credentials. Directories are `0700`, DB/sidecars `0600`; unsafe paths/ownership fail closed. Waiting consumes the original request/task deadline, and queued calls recheck worker cancellation and generation/lease fences before HTTP. Unused reservations can expire. **A sent generation with a lost response or crashed caller is not automatically freed by TTL:** the server may still be running it. Capacity remains conservatively reserved until actual server idleness is confirmed and an operator uses `SQLiteModelAdmission.resolve_uncertain(token, confirmed_idle=True)`. There is no automatic reconciliation or recovery CLI; never clear that state merely to bypass the limit.
 
@@ -111,7 +111,7 @@ rtk proxy uv run --locked review-bot intent --input /path/to/private/fixed-B-inp
   --output /path/to/private/evaluation-001
 ```
 
-Without `--model-profile`, the result is `not_run/model_profile_unset`, with zero review or metering calls. Ambient model opt-in does not enable this command. Explicit profiles are `ollama-local-128k` and `me707-llamacpp`; model preparation is the operator's responsibility, with no model download or provider fallback.
+Without `--model-profile`, the result is `not_run/model_profile_unset`, with zero review or metering calls. Ambient model opt-in does not enable this command. Explicit profiles are `ollama-local-128k`, `me707-llamacpp` and `macbook-llamacpp`; model preparation is the operator's responsibility, with no model download or provider fallback.
 
 Each valid evaluation stores `B/{input,goals,observations,result,scope,usage,validation}.json`, `B/comment.md` and a mode-specific `manifest.json` with `publication=not_attempted/artifact_only`. Unattempted or invalid stage data is JSON `null`; earlier validated stages and actual call usage survive later failures. Exit `0` means artifacts were saved for a completed or explicitly `not_run` outcome, **not** that a real review completed. Invalid input, unsafe paths, pipeline failure or storage failure exits `1`; no source or raw exception value is printed.
 
@@ -149,7 +149,7 @@ SQLite adds nullable `publication_receipts.input_fingerprint` non-destructively.
 
 ### Implementation evidence and actual PR evaluation
 
-Signed real-Git/SQLite fixtures with mock HTTP/models verify per-mode creation and same-ID updates, reuse from partial failure, unsafe/stale comment blocking, issue changes and A-only/security regressions. New fixtures cover four signed PRs through two actual Workers, native llama.cpp HTTP/measurement, waiting/resume and stale-generation suppression. Current full regression: **2,426 passed in 96.43s**, including the one-slot safety gate and pre-generation accounting; exact commands/checkpoints are in `milestones.md`. Profile integration is `d2fb56e`, shared admission `216f502`, and stress-fixture alignment `d2554c0`. The earlier 2,357-test and 2,037-test results remain historical. This proves implementation/integration, not model quality, live automated publication, server reconfiguration or deployment. Automatic B posting has not been enabled in operational configuration.
+Signed real-Git/SQLite fixtures with mock HTTP/models verify per-mode creation and same-ID updates, reuse from partial failure, unsafe/stale comment blocking, issue changes and A-only/security regressions. New fixtures cover four signed PRs through two actual Workers, native llama.cpp HTTP/measurement, waiting/resume and stale-generation suppression. Current full regression: **2,703 passed in 77.64s**, including the isolated MacBook profile, one-slot safety gate and pre-generation accounting; exact commands/checkpoints are in `milestones.md`. MacBook integration is `b7eec08`, live wire correction `904e85a`; earlier profile/admission checkpoints and 2,426/2,357/2,037-test counts remain historical. Automated checks prove implementation/integration, not model quality, live automated publication, Ubuntu server reconfiguration or deployment. Separate [actual MacBook runtime checks](#macbook-local-llamacpp-explicit-opt-in) demonstrate local generation/admission behavior but explicitly retain a failed final B assessment. Automatic B posting has not been enabled in operational configuration.
 
 The existing read-only PR #36 evaluation pinned base `20f911fb4c73a9f0b016ba9876a5daa9e0772572` and head `f149d9a4dc04f37198e0c53025f479b211ea2b43`, collecting current PR text separately from the historical code date. The existing approved Granite profile actually completed and citation-validated `extract_goals` (one review generation plus one token preflight). The intact `observe_changes` request needs **215,531 bytes**, over that profile's **92,160-byte** cap, so it was not called and `assess` was not attempted: **`not_run/input_limit_exceeded`, not a completed B review**. No target tests/build/hooks or external comment were executed. This is historical Granite evidence, not the new llama.cpp profile's capacity. PR #36 has not been replayed with the new adapter; runtime/token/output/deadline validation remains required, with no truncation or automatic task-budget increase.
 
@@ -234,6 +234,60 @@ Apply and verify only when the node is reachable:
 5. Use short synthetic requests to exercise two requests to one model and one to the other. Observe actual server slots/deferred-work telemetry: no more than one generation per server, the same-model request waits/resumes, and disconnecting a client never raises the bound. Use finite output/deadline limits and drain the test requests before resuming senders. Mock HTTP tests and `/health` alone do not establish this behavior on the installed version.
 
 This does **not** implement automatic uncertain-ticket reconciliation, durable inference results or server-hang recovery. Existing `sent/uncertain` admission records remain intact and may still block new model calls. Neither the one-slot metadata check nor a service restart by itself authorizes clearing them.
+
+## MacBook local llama.cpp (explicit opt-in)
+
+`macbook-llamacpp` reuses the common review engine and llama.cpp transport with thin local adapters. It does not modify `me707-llamacpp` or Ollama, select an environment automatically, or fall back to Ubuntu when a local endpoint fails. Both endpoints must be loopback HTTP `/v1`; the model aliases and configured **32k test context** are exact, not claims about maximum training context.
+
+| Role | Required server alias | Endpoint variable | Configured context | Maximum output |
+| --- | --- | --- | --- | --- |
+| Review | `lfm2.5-2.6b-q8_0` | `MACBOOK_LFM_BASE_URL` | 32768 | 4096 tokens |
+| Existing mode selector | `tev1-0.8b-q8_0` | `MACBOOK_TEV1_BASE_URL` | 32768 | 64 tokens |
+
+Keep model files in a private ignored directory. This session prepared the author's [LFM2.5 Q8_0 GGUF](https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF) and the unchanged Q8_0 model layer from official [Ollama `tev1:0.8b`](https://ollama.com/library/tev1); no Ollama server, converted replacement or external inference provider is used. Exact revisions, file sizes and verified SHA-256 hashes are in `milestones.md`.
+
+Use a build that supports this Tev1 GGUF's decision metadata: official ARM64 **b11447** (`da263e727`) was actually verified. Homebrew 0.6.0/build 11429 rejected it as `unsupported decision model type: pplx-decider`. Installing that older package alone is not sufficient. The pinned [official release](https://github.com/ggml-org/llama.cpp/releases/tag/b11447) was prepared locally under the ignored runtime directory; these binaries/models are not included in Git.
+
+From this feature worktree, run one server per terminal using that verified binary and prepared files (do not start a second copy on an occupied port):
+
+```bash
+rtk proxy .review-bot-state/macbook-runtime/runtime-b11447/llama-b11447/llama-server \
+  --model .review-bot-state/macbook-runtime/models/LFM2.5-2.6B-Q8_0.gguf \
+  --alias lfm2.5-2.6b-q8_0 --host 127.0.0.1 --port 18135 \
+  --parallel 1 --ctx-size 32768 -ngl 99 --slots --metrics --no-webui \
+  --no-context-shift --reasoning-format auto --reasoning-budget 0
+```
+
+```bash
+rtk proxy .review-bot-state/macbook-runtime/runtime-b11447/llama-b11447/llama-server \
+  --model .review-bot-state/macbook-runtime/models/Tev1-0.8B-Q8_0.gguf \
+  --alias tev1-0.8b-q8_0 --host 127.0.0.1 --port 18137 \
+  --parallel 1 --ctx-size 32768 -ngl 99 --slots --metrics --no-webui \
+  --no-context-shift --reasoning-format auto --reasoning-budget 0
+```
+
+The LFM template prefixes `<think>` even with `enable_thinking=false`. The supported server reasoning flags above are necessary: `--reasoning-format none` produced HTTP 400 with structured-output grammar in the live test. The MacBook adapter sends identical template kwargs during native preflight and generation, uses the server's `response_format.json_schema` envelope, and retains strict usage/output validation. Input is limited to **28672 tokens**, reserving 4096 output tokens; the 16 MiB transport guard is not a token estimate, and oversized input is rejected rather than trimmed.
+
+In the bot/test shell:
+
+```bash
+export MACBOOK_LFM_BASE_URL=http://127.0.0.1:18135/v1
+export MACBOOK_TEV1_BASE_URL=http://127.0.0.1:18137/v1
+export REVIEW_BOT_MACBOOK_MODEL_STATE_DIR="$PWD/.review-bot-state/macbook-runtime/admission"
+rtk proxy uv run --locked review-bot intent --input /path/to/fixed-input.json \
+  --output "$PWD/.review-bot-state/macbook-runtime/evaluation-new" --model-profile macbook-llamacpp
+```
+
+Use a fresh output directory for each evaluation. Service/review commands use the same explicit profile through `model.profile` or `--model-profile`. For B-only local operation keep `execution.available_modes: [intent]`; optional A still requires its existing Linux/rootless analysis environment. `intent` directly chooses B and does not call the selector. Tev1 here uses the **existing metadata-only chat selector**, not `/v1/systemone` or the still-unimplemented review-planning role.
+
+Both local roles share their own private SQLite admission group; absent an override, its directory is the current user's `.local/state/github-review-bot/macbook-model-admission`. The production default/explicit `REVIEW_BOT_MODEL_STATE_DIR` cannot be reused. Existing `model.max_concurrency: 1|2` applies (default 1), with direct-client defaults bounded at 2; server parallel 1 additionally serializes same-model generation. Separate local endpoints/state/results prevent profile/cache mixing, not permission to bypass unresolved tickets. The conservative `sent/uncertain` rules remain unchanged.
+
+### Actual local verification, not review quality
+
+- Real production-factory calls verified both aliases/context/one-slot contracts, native template/tokenizer and matching generation usage. A three-request workload measured participating HTTP/SQLite peak **2**, generation **1 per server / 2 combined**; the third request waited until an earlier response completed, then all three succeeded.
+- Closing an actual streaming connection while another LFM request was deferred left the server bound at **1**, and the waiting request completed. This direct server component test did **not** create/reconcile uncertain app tickets. Both servers and the existing admission DB returned to idle/empty; no server restart or manual ticket clearing was used to make the workload pass.
+- The existing B CLI actually called all three stages on a tiny, empty-description synthetic fixture: **2508 input / 1490 output tokens**, exact usage and private output. Goals/observations validated, but the final assessment was rejected for **`duplicate_result_id`** (`failed/invalid_model_response`, exit 1). That is **not a completed B review**; validation was not weakened, and nothing was published.
+- Small-model classification/review quality, the real PR #36, Ubuntu capacity changes/deployment and automatic recovery remain unverified or incomplete. The runtime checks do not implement code-first B/new Tev1 planning. Test servers are session-scoped, not an installed background service; the prepared private binaries/models remain available for a later local run.
 
 ## Local Ollama (explicit opt-in)
 
