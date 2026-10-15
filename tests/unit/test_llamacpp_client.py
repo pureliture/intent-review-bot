@@ -85,7 +85,7 @@ def mock_http(monkeypatch: pytest.MonkeyPatch) -> Any:
                 assert request.method == "GET"
                 return httpx.Response(200, json={
                     "default_generation_settings": {"id": 0, "n_ctx": 262144 if model == MAIN else 131072},
-                    "total_slots": 2, "chat_template": "{{ messages }}<assistant>",
+                    "total_slots": 1, "chat_template": "{{ messages }}<assistant>",
                 })
             if path == "/apply-template":
                 payload = json.loads(request.content)
@@ -193,6 +193,57 @@ def test_warmup_only_verifies_model_and_actual_slot_context(adapter: Any, mock_h
     assert all(request.method == "GET" for request in requests)
 
 
+@pytest.mark.parametrize("role,operation", [
+    (MAIN, "verify"), (MAIN, "warmup"), (MAIN, "count_input_tokens"), (MAIN, "complete"),
+    (SELECTOR, "verify"), (SELECTOR, "warmup"), (SELECTOR, "complete"),
+])
+@pytest.mark.parametrize("slots", [None, 0, 2, 3, True, False, 1.0, "1", -1])
+def test_server_generation_slots_are_exactly_one(
+    adapter: Any, mock_http: Any, main_request: ModelRequest, decision_request: ModelRequest,
+    role: str, operation: str, slots: Any,
+) -> None:
+    def handler(request: httpx.Request) -> Any:
+        if request.url.path == "/props":
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": 262144 if role == MAIN else 131072},
+                "total_slots": slots, "chat_template": "template",
+            })
+        return None
+
+    requests = mock_http(handler, model=role)
+    client_type = adapter.LlamaCppModelClient if role == MAIN else adapter.LlamaCppDecisionClient
+    client = client_type(api_url=API_URL)
+    arguments = () if operation in ("verify", "warmup") else (main_request if role == MAIN else decision_request,)
+    with pytest.raises(PermanentModelError):
+        getattr(client, operation)(*arguments)
+    assert [request.url.path for request in requests] == ["/v1/models", "/props"]
+    assert all(request.method == "GET" for request in requests)
+
+
+@pytest.mark.parametrize("role", [MAIN, SELECTOR])
+def test_generation_rechecks_server_capacity_after_warmup(
+    adapter: Any, mock_http: Any, main_request: ModelRequest, decision_request: ModelRequest, role: str,
+) -> None:
+    slots = [1]
+
+    def handler(request: httpx.Request) -> Any:
+        if request.url.path == "/props":
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": 262144 if role == MAIN else 131072},
+                "total_slots": slots[0], "chat_template": "template",
+            })
+        return None
+
+    requests = mock_http(handler, model=role)
+    client_type = adapter.LlamaCppModelClient if role == MAIN else adapter.LlamaCppDecisionClient
+    client = client_type(api_url=API_URL)
+    client.warmup()
+    slots[0] = 2
+    with pytest.raises(PermanentModelError):
+        client.complete(main_request if role == MAIN else decision_request)
+    assert [request.url.path for request in requests] == ["/v1/models", "/props"] * 2
+
+
 @pytest.mark.parametrize("fault", [
     "wrong_model", "missing_model", "multiple_models", "model_not_list", "missing_context", "training_only",
     "small_context", "total_context", "boolean_context", "string_context", "missing_slots", "boolean_slots",
@@ -200,7 +251,7 @@ def test_warmup_only_verifies_model_and_actual_slot_context(adapter: Any, mock_h
 ])
 def test_verification_fails_closed(adapter: Any, mock_http: Any, fault: str) -> None:
     models: Any = {"object": "list", "data": [{"id": MAIN, "meta": {"n_ctx_train": 262144}}]}
-    props: Any = {"default_generation_settings": {"n_ctx": 262144}, "total_slots": 2, "chat_template": "template"}
+    props: Any = {"default_generation_settings": {"n_ctx": 262144}, "total_slots": 1, "chat_template": "template"}
     if fault == "wrong_model":
         models["data"][0]["id"] = SELECTOR
     elif fault == "missing_model":

@@ -17,18 +17,22 @@ from tests.fixtures.review_b import make_task, responses, stage_bodies
     ({"input_tokens": 0, "output_tokens": 0}, True),
     ({"input_tokens": 1, "output_tokens": 0}, False),
 ])
-def test_native_tokenizer_without_generation_has_exact_usage(measurement_usage, known):
+@pytest.mark.parametrize("delivery", ["sent", "not_sent"])
+def test_native_tokenizer_without_generation_has_exact_usage(measurement_usage, known, delivery):
     client = MockModelClient(responses(), input_tokens=100)
     client.profile = replace(client.profile, is_mock=False, provider="llamacpp")
-    client.token_count_receipt = {"delivery": "sent", "model_calls": 0, "usage": measurement_usage}
+    client.token_count_receipt = {"delivery": delivery, "model_calls": 0, "usage": measurement_usage}
     result = run_review_b_pipeline(make_task(), client)
     assert result.status == "completed"
     assert result.usage["calls"] == 3
     assert result.usage["model_calls"] == (3 if known else None)
     assert all(stage.token_measurement_model_calls == (0 if known else None) for stage in result.stages)
+    assert all(stage.token_measurement_delivery == (delivery if known else "unknown") for stage in result.stages)
 
 
-@pytest.mark.parametrize("failure_stage", [None, "observe_changes"])
+@pytest.mark.parametrize("failure_stage", [
+    None, "observe_changes", "server_capacity_at_start", "server_capacity_after_goals",
+])
 def test_me707_cli_saves_validated_results_without_posting(tmp_path, monkeypatch, failure_stage):
     requests = []
     client_type = httpx.Client
@@ -41,8 +45,12 @@ def test_me707_cli_saves_validated_results_without_posting(tmp_path, monkeypatch
         if request.url.path == "/v1/models":
             return httpx.Response(200, json={"object": "list", "data": [{"id": "bonsai2-27b", "object": "model"}]})
         if request.url.path == "/props":
+            generated = any(item.url.path == "/v1/chat/completions" for item in requests)
+            unsafe_capacity = failure_stage == "server_capacity_at_start" or (
+                failure_stage == "server_capacity_after_goals" and generated
+            )
             return httpx.Response(200, json={
-                "default_generation_settings": {"n_ctx": 262144}, "total_slots": 2,
+                "default_generation_settings": {"n_ctx": 262144}, "total_slots": 2 if unsafe_capacity else 1,
                 "chat_template": "fixture-chat-template",
             })
         payload = json.loads(request.content)
@@ -80,7 +88,18 @@ def test_me707_cli_saves_validated_results_without_posting(tmp_path, monkeypatch
         "--model-profile", "me707-llamacpp"]) == 0
     result = json.loads((output / "B/result.json").read_text())
     calls = [request for request in requests if request.url.path == "/v1/chat/completions"]
-    if failure_stage:
+    if failure_stage in ("server_capacity_at_start", "server_capacity_after_goals"):
+        expected_calls = int(failure_stage == "server_capacity_after_goals")
+        assert len(calls) == result["usage"]["calls"] == expected_calls
+        assert result["status"] == "not_run"
+        assert result["reason"] == "token_count_unavailable"
+        assert bool(result["goals"]) == bool(expected_calls)
+        assert result["observations"] is None
+        assert result["stages"][2]["status"] == "not_attempted"
+        assert requests[-1].url.path == "/props"
+        assert result["usage"]["input_tokens"] == 100 * expected_calls
+        assert result["usage"]["output_tokens"] == 50 * expected_calls
+    elif failure_stage:
         assert len(calls) == 1
         assert result["status"] == "not_run"
         assert result["reason"] == "token_count_unavailable"

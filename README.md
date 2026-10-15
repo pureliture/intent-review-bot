@@ -94,6 +94,8 @@ Every actual model HTTP request uses a separate **shared SQLite admission group*
 
 The admission DB stores reservation tokens/state/deadlines/limits, never prompts, source or credentials. Directories are `0700`, DB/sidecars `0600`; unsafe paths/ownership fail closed. Waiting consumes the original request/task deadline, and queued calls recheck worker cancellation and generation/lease fences before HTTP. Unused reservations can expire. **A sent generation with a lost response or crashed caller is not automatically freed by TTL:** the server may still be running it. Capacity remains conservatively reserved until actual server idleness is confirmed and an operator uses `SQLiteModelAdmission.resolve_uncertain(token, confirmed_idle=True)`. There is no automatic reconciliation or recovery CLI; never clear that state merely to bypass the limit.
 
+The llama.cpp deployment contract additionally requires **one actual generation slot per model server**, independent of that HTTP admission group. See [server-side generation capacity](#server-side-generation-capacity). This execution bound does not release uncertain SQLite tickets or recover a lost response.
+
 The existing `seulgi-server` CI PMD/CPD analysis is **not migrated or replaced** by this general-purpose bot. Optional A retains its rootless/pinned-image requirements. Company use is deferred to a separate repository after personal development; no PAT support or personal/company authentication-switch framework is added here.
 
 ## B intent evaluation (fixed input, never posts)
@@ -147,7 +149,7 @@ SQLite adds nullable `publication_receipts.input_fingerprint` non-destructively.
 
 ### Implementation evidence and actual PR evaluation
 
-Signed real-Git/SQLite fixtures with mock HTTP/models verify per-mode creation and same-ID updates, reuse from partial failure, unsafe/stale comment blocking, issue changes and A-only/security regressions. New fixtures cover four signed PRs through two actual Workers, native llama.cpp HTTP/measurement, waiting/resume and stale-generation suppression. Current full regression: **2,357 passed in 60.81s**; exact commands/checkpoints are in `milestones.md`. Profile integration is `d2fb56e`, shared admission `216f502`, and stress-fixture alignment `d2554c0`. The older 2,037-test result at `2c95536` is historical. This proves implementation/integration, not model quality, live automated publication or deployment. Automatic B posting has not been enabled in operational configuration.
+Signed real-Git/SQLite fixtures with mock HTTP/models verify per-mode creation and same-ID updates, reuse from partial failure, unsafe/stale comment blocking, issue changes and A-only/security regressions. New fixtures cover four signed PRs through two actual Workers, native llama.cpp HTTP/measurement, waiting/resume and stale-generation suppression. Current full regression: **2,426 passed in 96.43s**, including the one-slot safety gate and pre-generation accounting; exact commands/checkpoints are in `milestones.md`. Profile integration is `d2fb56e`, shared admission `216f502`, and stress-fixture alignment `d2554c0`. The earlier 2,357-test and 2,037-test results remain historical. This proves implementation/integration, not model quality, live automated publication, server reconfiguration or deployment. Automatic B posting has not been enabled in operational configuration.
 
 The existing read-only PR #36 evaluation pinned base `20f911fb4c73a9f0b016ba9876a5daa9e0772572` and head `f149d9a4dc04f37198e0c53025f479b211ea2b43`, collecting current PR text separately from the historical code date. The existing approved Granite profile actually completed and citation-validated `extract_goals` (one review generation plus one token preflight). The intact `observe_changes` request needs **215,531 bytes**, over that profile's **92,160-byte** cap, so it was not called and `assess` was not attempted: **`not_run/input_limit_exceeded`, not a completed B review**. No target tests/build/hooks or external comment were executed. This is historical Granite evidence, not the new llama.cpp profile's capacity. PR #36 has not been replayed with the new adapter; runtime/token/output/deadline validation remains required, with no truncation or automatic task-budget increase.
 
@@ -194,9 +196,44 @@ rtk proxy uv run --locked review-bot intent --input /path/to/private/fixed-B-inp
   --output /path/to/private/evaluation-llamacpp-001 --model-profile me707-llamacpp
 ```
 
-Construction remains offline. Preparation verifies model identity, slot context and a chat template through `/v1/models` and `/props`, without a warmup generation. Before generation, `/apply-template` and `/tokenize` measure the intact request with the server's native tokenizer; `/v1/chat/completions` uses strict JSON schema output and checks measured input against completion usage. Unsupported measurement, truncation, bad identity/usage/JSON or exhausted budgets fail closed. A 16 MiB transport cap is not a token estimate. The existing **B task's 131,072-token per-request input/total limits remain unchanged** even with a 256k review model.
+Construction remains offline. Preparation verifies model identity, exactly one server generation slot, slot context and a chat template through `/v1/models` and `/props`, without a warmup generation. The slot count must be integer `1`; two or more, missing, boolean, float and string values are rejected before template/tokenizer or generation calls. Both roles recheck this on each completion; review token measurement also rechecks it. Before generation, `/apply-template` and `/tokenize` measure the intact request with the server's native tokenizer; `/v1/chat/completions` uses strict JSON schema output and checks measured input against completion usage. Unsupported measurement, truncation, bad identity/usage/JSON or exhausted budgets fail closed. A 16 MiB transport cap is not a token estimate. The existing **B task's 131,072-token per-request input/total limits remain unchanged** even with a 256k review model.
 
-The parallel read-only node check confirmed SSH authentication, both health/model endpoints, and 256k/128k context with two slots each. It did **not** exercise generation or the adapter's live template/tokenizer compatibility. The node handoff records Bonsai2 weights as `PQ2_0`, not the earlier proposed 8-bit weights, and Tev1 as `Q8_0`; those weight choices are not validated by model IDs alone. Queried user-systemd unit names were inactive despite responding APIs, so process ownership/autostart/restart recovery and Ubuntu bot deployment are still unverified. No new live PR review or external comment was performed.
+The earlier parallel read-only node check confirmed SSH authentication, both health/model endpoints, and 256k/128k context with **two slots each**, which does not satisfy the new one-slot contract. It did **not** exercise generation or the adapter's live template/tokenizer compatibility. The node handoff records Bonsai2 weights as `PQ2_0`, not the earlier proposed 8-bit weights, and Tev1 as `Q8_0`; those weight choices are not validated by model IDs alone. Queried user-systemd unit names were inactive despite responding APIs, so process ownership/autostart/restart recovery and Ubuntu bot deployment are still unverified. On the latest 2026-10-15 retry the Ubuntu peer was offline, after earlier SSH/API connection timeouts. **The new server flags have not been applied remotely**, and live queue/disconnect tests remain pending. No new live PR review or external comment was performed.
+
+### Server-side generation capacity
+
+Keep the existing SQLite review queue and shared HTTP admission. Do not add Redis, a gateway or another scheduler just to enforce this bound. Configure the **existing** llama.cpp launch commands as follows, preserving every other flag:
+
+| Server | Generation flag | Total context flag | Expected `/props` |
+| --- | --- | --- | --- |
+| Bonsai2 | `--parallel 1` | `--ctx-size 262144` | `total_slots=1`, per-slot `n_ctx=262144` |
+| Tev1 | `--parallel 1` | `--ctx-size 131072` | `total_slots=1`, per-slot `n_ctx=131072` |
+
+These are replacement flags, **not complete launch commands or an applied deployment**. Replace conflicting command/environment values rather than appending duplicates. llama.cpp's context flag is the total across slots: changing parallelism without adjusting the former `524288`/`262144` totals would change the per-slot context. Model weights, quantization, KV placement, aliases, ports, private-network binding and authentication stay unchanged.
+
+With this configuration the two server processes can generate at most **one request each, two combined**. Same-model requests serialize; they cannot use the other server's free slot. The server can defer an excess request even while its HTTP connection is open. Client timeout does not prove that the server stopped computing or removed a queued request. This bounds generation in these two processes, not all GPU applications or all metadata HTTP requests.
+
+Apply and verify only when the node is reachable:
+
+1. Identify the actual owner/supervisor for both listening ports and the installed server version. Preserve existing launch settings privately. Historical systemd unit names are not proof of the current manager; do not start a second copy of a server.
+2. Pause new generation senders, including evaluation commands and non-bot clients, and confirm active **and deferred** work has drained. A health response or one idle-slot sample alone is insufficient. Do not interrupt someone else's active request to apply the flags.
+3. Replace only the parallel/context settings in that existing manager. Restart one idle server at a time through its confirmed supervisor. Do not kill arbitrary processes, recreate services or change network/authentication settings.
+4. Check both exact model IDs and `/props` values above. With the two explicit endpoint environment variables set, the existing verification API makes only metadata calls:
+
+   ```bash
+   rtk proxy uv run --locked python -c '
+   from review_bot.runtime.model_clients import build_review_client, build_selector_client
+   for factory in (build_review_client, build_selector_client):
+       factory("me707-llamacpp").verify()
+   print("model, one-slot, context and template checks passed")
+   '
+   ```
+
+   These client checks still share HTTP admission and can wait on unresolved tickets. An operator's direct read-only metadata inspection does not release those tickets; do not switch to a fresh admission DB to bypass them.
+
+5. Use short synthetic requests to exercise two requests to one model and one to the other. Observe actual server slots/deferred-work telemetry: no more than one generation per server, the same-model request waits/resumes, and disconnecting a client never raises the bound. Use finite output/deadline limits and drain the test requests before resuming senders. Mock HTTP tests and `/health` alone do not establish this behavior on the installed version.
+
+This does **not** implement automatic uncertain-ticket reconciliation, durable inference results or server-hang recovery. Existing `sent/uncertain` admission records remain intact and may still block new model calls. Neither the one-slot metadata check nor a service restart by itself authorizes clearing them.
 
 ## Local Ollama (explicit opt-in)
 

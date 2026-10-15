@@ -79,7 +79,7 @@ class ControlledLlamaHTTP:
             assert request.method == "GET" and request.content == b""
             body = ({"object": "list", "data": [{"id": REVIEW_MODEL}]} if path == "/v1/models" else {
                 "chat_template": "synthetic-system-user-template",
-                "default_generation_settings": {"n_ctx": 262144}, "total_slots": 2,
+                "default_generation_settings": {"n_ctx": 262144}, "total_slots": 1,
             })
             return httpx.Response(200, json=body)
         assert request.method == "POST"

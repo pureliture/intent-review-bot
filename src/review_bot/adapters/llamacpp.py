@@ -251,11 +251,13 @@ class _LlamaCppClient:
         ):
             raise PermanentModelError("llama.cpp server does not expose the exact role model")
         props = self._request("GET", "/props", deadline)
+        if type(props.get("total_slots")) is not int or props["total_slots"] != 1:
+            raise PermanentModelError("llama.cpp requires exactly one server generation slot")
         settings = props.get("default_generation_settings")
         template = props.get("chat_template")
         if (
             not isinstance(settings, dict) or type(settings.get("n_ctx")) is not int
-            or settings["n_ctx"] != self._context_tokens or not _positive_integer(props.get("total_slots"))
+            or settings["n_ctx"] != self._context_tokens
             or not isinstance(template, str) or not template.strip()
         ):
             raise PermanentModelError("llama.cpp requires the configured per-slot context and chat template")
