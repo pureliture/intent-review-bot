@@ -151,13 +151,16 @@ class _LlamaCppClient:
         if not _valid_timeout(timeout_seconds):
             raise ValueError("llama.cpp timeout must be positive and finite")
         self._model = model
-        self._api_url = _endpoint(api_url)
+        self._api_url = self._validate_endpoint(api_url)
         self._origin = self._api_url[:-len("/v1")]
         self.timeout_seconds = timeout_seconds
         self._context_tokens = context_tokens
         self._max_input_tokens = context_tokens - _OUTPUT_RESERVE
         self._max_output_tokens = max_output_tokens
         self._max_output_bytes = max_output_bytes
+
+    def _validate_endpoint(self, api_url: str) -> str:
+        return _endpoint(api_url)
 
     @property
     def model(self) -> str:
@@ -305,8 +308,10 @@ class _LlamaCppClient:
         uses model special-token insertion and parses the template's special tokens.
         Unsupported formatting/tokenization fails closed; counts are never cached.
         """
-        formatted = self._request("POST", "/apply-template", deadline, {"messages": payload["messages"]},
-                                  measurement=measurement)
+        template_input = {"messages": payload["messages"]}
+        if "chat_template_kwargs" in payload:
+            template_input["chat_template_kwargs"] = payload["chat_template_kwargs"]
+        formatted = self._request("POST", "/apply-template", deadline, template_input, measurement=measurement)
         prompt = formatted.get("prompt")
         if not isinstance(prompt, str) or not prompt:
             raise PermanentModelError("Unsupported llama.cpp chat template response")
@@ -395,6 +400,9 @@ class _LlamaCppClient:
 class LlamaCppModelClient(_LlamaCppClient):
     """Bonsai review client; transport bytes and actual prompt tokens are separate limits."""
 
+    _role_model = REVIEW_MODEL
+    _role_context_tokens = _REVIEW_CONTEXT_TOKENS
+
     def __init__(
         self, model: str = REVIEW_MODEL, *, api_url: str, timeout_seconds: int = 60,
         max_output_bytes: int = 32768, max_attempts: int = 1,
@@ -403,8 +411,8 @@ class LlamaCppModelClient(_LlamaCppClient):
             raise ValueError("llama.cpp output byte limit must be positive and bounded")
         if not _positive_integer(max_attempts):
             raise ValueError("llama.cpp attempts must be positive")
-        super().__init__(model, api_url, timeout_seconds, role_model=REVIEW_MODEL,
-                         context_tokens=_REVIEW_CONTEXT_TOKENS, max_output_tokens=_OUTPUT_RESERVE,
+        super().__init__(model, api_url, timeout_seconds, role_model=self._role_model,
+                         context_tokens=self._role_context_tokens, max_output_tokens=_OUTPUT_RESERVE,
                          max_output_bytes=max_output_bytes)
         self.profile = ModelProfile(
             provider="llamacpp", model=model, max_input_bytes=_MAX_INPUT_BYTES, max_output_bytes=max_output_bytes,
@@ -429,9 +437,12 @@ class LlamaCppModelClient(_LlamaCppClient):
 class LlamaCppDecisionClient(_LlamaCppClient):
     """Tev metadata-only mode selection via chat, not a review-plan or general review role."""
 
+    _role_model = SELECTOR_MODEL
+    _role_context_tokens = _SELECTOR_CONTEXT_TOKENS
+
     def __init__(self, model: str = SELECTOR_MODEL, *, api_url: str, timeout_seconds: int = 60) -> None:
-        super().__init__(model, api_url, timeout_seconds, role_model=SELECTOR_MODEL,
-                         context_tokens=_SELECTOR_CONTEXT_TOKENS, max_output_tokens=_SELECTOR_OUTPUT_TOKENS,
+        super().__init__(model, api_url, timeout_seconds, role_model=self._role_model,
+                         context_tokens=self._role_context_tokens, max_output_tokens=_SELECTOR_OUTPUT_TOKENS,
                          max_output_bytes=_MAX_SELECTOR_OUTPUT_BYTES)
 
     def _chat_payload(self, request: ModelRequest) -> dict[str, Any]:
