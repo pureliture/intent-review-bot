@@ -111,3 +111,29 @@ def test_full_input_budget_does_not_reserve_profile_output_space_twice():
     assert result.plan["source"] == "program_joint"
     assert len(client.requests) == 3
     assert all(record.measured_input_tokens == 100 for record in result.stages)
+
+
+def test_planner_receives_measured_full_fit_and_schema_requires_every_prepared_path():
+    import json
+
+    from review_bot.application.review_b_code import run_code_first_review
+    from tests.fixtures.review_b_code import CodeFirstModelClient, make_task
+
+    task = make_task()
+    review, planner = CodeFirstModelClient(), CodeFirstModelClient()
+    assert run_code_first_review(task, review, planning_client=planner).status == "completed"
+    request = planner.requests[0]
+    assert json.loads(request.user_content)["full_input_fits"] is True
+    groups = request.response_schema["properties"]["groups"]
+    assert groups["minItems"] == groups["maxItems"] == 1
+    paths = groups["items"]["properties"]["paths"]
+    assert paths["minItems"] == paths["maxItems"] == len(task.reviewed_paths)
+    assert set(paths["items"]["enum"]) == set(task.reviewed_paths)
+    intent_fields = review.requests[1].response_schema["properties"]["intents"]["items"]["properties"]
+    assert intent_fields["alternatives"]["minItems"] == 1
+    assert intent_fields["observation_ids"]["minItems"] == 1
+    assert intent_fields["citations"]["minItems"] == 1
+    variants = review.requests[-1].response_schema["properties"]["findings"]["items"]["oneOf"]
+    finding_fields = {item["properties"]["assessment"]["enum"][0]: item["properties"] for item in variants}
+    assert finding_fields["insufficient_context"]["missing_context"]["minItems"] == 1
+    assert finding_fields["code_defect"]["failure_condition"]["minLength"] == 1

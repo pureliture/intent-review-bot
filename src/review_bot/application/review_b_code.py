@@ -48,12 +48,24 @@ SYSTEM_PROMPTS = {
     "plan_code_review": _COMMON + """Plan relationship groups, not review verdicts or intent.
 Read the entire changed-file list, file sizes, fixed base/head metadata and unabridged unified diff (n=3).
 No PR/issue purpose text is supplied. Cover every reviewed_path exactly once; keep both rename paths together.
+reviewed_paths includes already prepared unchanged context/tests, not just changed_files: include ALL of them.
+The program supplies full_input_fits. When true, return ONE group containing every reviewed_path.
+Do not list a prepared path as missing merely because it has no diff. Use relations to identify joint checks.
 Prefer joint observation if it fits. Important relations name both from_path and to_path and their contract.
+Relations connect TWO DIFFERENT paths, never a path to itself. A base/head change in one file is not a
+cross-file relation. If the diff does not establish a relationship, return relations=[] rather than inventing it.
 Never silently drop a large file. Missing context is not permission to read outside the fixed scope.
 """,
     "observe_group": _COMMON + """Jointly observe the entire base/head files in this group and test source,
 with test_run records separately supplied. No PR/issue purpose or other model's purpose inference is supplied.
 Record behavior changes, intent candidates, relations and uncertainty, not independent per-file final verdicts.
+Compare literal base and head content before claiming they are identical. Prefer focused behavior observations
+over restating every unchanged file. Intent candidates describe possible reasons, not file metadata.
+Every supplied source/test_source content is the COMPLETE original file for that version; compare base and head
+directly. The absence of a separate diff does not mean the change or implementation is unavailable.
+consistent/conflict require citations from BOTH endpoint paths, reasoning, and missing_context=[].
+conflict additionally requires a concrete failure_condition. If context prevents that judgement, use
+insufficient_context with specific missing_context instead of calling the relationship a conflict.
 A cross-group relation remains unreviewed until both full endpoints have been reviewed together.
 Use requested_paths only for concrete additional original context; outside-scope paths will NOT be fetched.
 """,
@@ -70,10 +82,21 @@ and missing_context. These are hypotheses, never actual developer intent or decl
     "assess": _COMMON + """Assess validated observations, reconstructed hypotheses, relations and actual
 original spans. Optional PR/issue text is reference material only, not an anchor or a source of requirements.
 Code defects can be found with no body or a false body. A mismatch with a description alone is NOT a defect.
+An unchanged file is NOT itself a defect. A failure_condition identifies a concrete input/operation and
+invalid behavior or incompatible contract, not just that a file changed or stayed unchanged.
 Distinguish code_defect, conditional_risk, insufficient_context and explanation_mismatch.
 code_defect requires actual code citations and a concrete failure_condition; relation conflicts require both
 sides' evidence. Do not contradict a validated relation judgement. Keep completion, scope sufficiency and
 absence of findings separate. review_sufficient is false when important relations remain unresolved.
+For EVERY finding referencing a relation_id, include its own citations for BOTH from_path and to_path;
+citations in earlier observations or the relation record do NOT replace the finding's citations.
+A code_defect referencing a relation requires that relation's status=conflict. Merge duplicate symptoms of
+one broken contract into one grounded finding. An unchanged test expectation is not a separate code defect.
+insufficient_context requires nonempty missing_context identifying the unavailable information.
+review_sufficient means enough original context for the reported STATIC judgements within this scope,
+NOT defect-free code, proven developer intent, or successful tests. A proven code defect can have
+review_sufficient=true. Missing PR prose or not executing tests alone does not make static review insufficient.
+no_findings must equal whether findings is empty.
 """,
 }
 
@@ -91,6 +114,21 @@ def _refs_schema(allowed: list[str], *, maximum: int = 128) -> dict:
     return _array_schema(item, maximum=min(maximum, len(allowed)))
 
 
+def _finding_schema(references: dict, citations: dict) -> dict:
+    properties = {"statement": _text_schema(), "reasoning": _text_schema(),
+        "failure_condition": _text_schema(empty=True), **references,
+        "citations": citations, "missing_context": _strings_schema()}
+    variants = []
+    for assessment in ASSESSMENTS:
+        fields = {**properties, "assessment": {"type": "string", "enum": [assessment]}}
+        if assessment in ("code_defect", "conditional_risk"):
+            fields["failure_condition"] = _text_schema()
+        if assessment == "insufficient_context":
+            fields["missing_context"] = {**_strings_schema(), "minItems": 1}
+        variants.append(_object_schema(fields))
+    return {"oneOf": variants}
+
+
 def code_first_response_schema(
     stage: str, *, paths: tuple[str, ...] = (), evidence_ids: tuple[str, ...] = (),
     observation_ids: tuple[str, ...] = (), intent_ids: tuple[str, ...] = (),
@@ -99,6 +137,7 @@ def code_first_response_schema(
     citation = _object_schema({"evidence_id": {"type": "string", **({"enum": sorted(evidence_ids)} if evidence_ids else {})},
         "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1}})
     citations = _array_schema(citation, maximum=128 if evidence_ids else 0)
+    required_citations = {**citations, "minItems": 1 if evidence_ids else 0}
     relation_fields = {"status": {"type": "string", "enum": list(RELATION_STATES)},
         "reasoning": _text_schema(empty=True), "failure_condition": _text_schema(empty=True),
         "citations": citations, "missing_context": _strings_schema()}
@@ -112,24 +151,25 @@ def code_first_response_schema(
             "relations": _array_schema(_object_schema(endpoints), maximum=128), "missing_context": _strings_schema()})
     if stage == "observe_group":
         return _object_schema({"observations": _array_schema(_object_schema({"statement": _text_schema(),
-            "citations": citations, "intent_candidates": _strings_schema(), "missing_context": _strings_schema()})),
+            "citations": required_citations, "intent_candidates": _strings_schema(), "missing_context": _strings_schema()})),
             "new_relations": _array_schema(_object_schema({**endpoints, **relation_fields}), maximum=128),
             "relation_updates": updates, "requested_paths": _strings_schema(128), "missing_context": _strings_schema()})
     if stage == "recheck_relations":
         return _object_schema({"relation_updates": updates, "missing_context": _strings_schema()})
-    references = {"observation_ids": _refs_schema(list(observation_ids)), "relation_ids": _refs_schema(list(relation_ids))}
+    references = {"observation_ids": {**_refs_schema(list(observation_ids)), "minItems": 1 if observation_ids else 0},
+        "relation_ids": _refs_schema(list(relation_ids))}
     if stage == "infer_intent":
         return _object_schema({"intents": _array_schema(_object_schema({"statement": _text_schema(), **references,
-            "citations": citations, "counterevidence": citations, "alternatives": _strings_schema(),
-            "uncertainty": _text_schema(), "missing_context": _strings_schema()}))})
+            "citations": required_citations, "counterevidence": citations,
+            "alternatives": {**_strings_schema(), "minItems": 1},
+            "uncertainty": _text_schema(), "missing_context": _strings_schema()}), maximum=20 if observation_ids else 0)})
     if stage == "assess":
         references = {**references, "intent_ids": _refs_schema(list(intent_ids))}
-        return _object_schema({"summary": _text_schema(), "findings": _array_schema(_object_schema({
-            "assessment": {"type": "string", "enum": list(ASSESSMENTS)}, "statement": _text_schema(),
-            "reasoning": _text_schema(), "failure_condition": _text_schema(empty=True), **references,
-            "citations": citations, "missing_context": _strings_schema()})),
+        return _object_schema({"summary": _text_schema(),
+            "findings": _array_schema(_finding_schema(references, required_citations), maximum=20 if observation_ids else 0),
             "questions": _array_schema(_object_schema({"question": _text_schema(), **references,
-                "citations": citations, "why_needed": _text_schema(), "how_answer_changes_assessment": _text_schema()})),
+                "citations": required_citations, "why_needed": _text_schema(), "how_answer_changes_assessment": _text_schema()}),
+                maximum=20 if observation_ids else 0),
             "relation_updates": updates, "review_sufficient": {"type": "boolean"}, "no_findings": {"type": "boolean"}})
     raise ValueError("invalid_code_first_stage")
 
@@ -364,6 +404,7 @@ def _plan_material(task: IntentTaskInput) -> dict:
 def _request(task: IntentTaskInput, stage: str, profile: ModelProfile, limits: CodeFirstReviewLimits, *,
     group: dict | None = None, groups: list[dict] | None = None, intents: list[dict] | None = None,
     relations: list[dict] | None = None, supplied: list[dict] | None = None, paths: list[str] | None = None,
+    full_input_fits: bool = False,
 ) -> tuple[ModelRequest, list[dict]]:
     groups, intents, relations = groups or [], intents or [], relations or []
     supplied = supplied if supplied is not None else []
@@ -372,6 +413,7 @@ def _request(task: IntentTaskInput, stage: str, profile: ModelProfile, limits: C
     if stage == "plan_code_review":
         payload.update(_plan_material(task))
         payload["max_groups"] = limits.max_groups
+        payload["full_input_fits"] = full_input_fits
     else:
         payload["evidence"] = [item for item in supplied if item["kind"] != "test_run"]
         payload["test_runs"] = [item for item in supplied if item["kind"] == "test_run"]
@@ -380,6 +422,8 @@ def _request(task: IntentTaskInput, stage: str, profile: ModelProfile, limits: C
             payload.update({"group_id": group["group_id"], "paths": group["paths"],
                 "changed_files": [asdict(change) for change in task.snapshot.changed_files
                     if {change.path, change.previous_path} & set(group["paths"])]})
+            payload["unified_diffs"] = [item for item in _plan_material(task)["unified_diffs"]
+                if {item["path"], item["previous_path"]} & set(group["paths"])]
         elif stage == "recheck_relations":
             payload["paths"] = paths
         else:
@@ -394,6 +438,9 @@ def _request(task: IntentTaskInput, stage: str, profile: ModelProfile, limits: C
         observation_ids=tuple(row["observation_id"] for row in _all_observations(groups)),
         intent_ids=tuple(row["intent_id"] for row in intents),
         relation_ids=tuple(row["relation_id"] for row in relations), max_groups=limits.max_groups)
+    if stage == "plan_code_review" and full_input_fits:
+        schema["properties"]["groups"].update(minItems=1, maxItems=1)
+        schema["properties"]["groups"]["items"]["properties"]["paths"]["minItems"] = len(task.reviewed_paths)
     return ModelRequest(1, profile.model, SYSTEM_PROMPTS[stage],
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
         profile.timeout_seconds, profile.max_output_tokens, schema), supplied
@@ -761,12 +808,15 @@ def run_code_first_review(
     if not full_fits and budget.records[index].reason != "input_limit_exceeded":
         return stopped(index)
     if planning_client is not None and planner_profile is not None:
-        request, _ = _request(task, "plan_code_review", planner_profile, limits)
+        request, _ = _request(task, "plan_code_review", planner_profile, limits, full_input_fits=full_fits)
         raw, index = budget.execute(request, planning_client, replace(planner_profile, max_attempts=1),
             label="plan_code_review", reserve_calls=3 * call_reservation, reserve_tokens=3 * output)
         if raw is not None:
             try:
                 plan, relations = _validate_plan(raw, task, limits)
+                if full_fits and len(plan["groups"]) != 1:
+                    plan, relations = None, []
+                    raise IntentInputError("joint_plan_required")
                 budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
             except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
                 budget.records[index] = replace(budget.records[index], status="failed", reason="invalid_model_response")
