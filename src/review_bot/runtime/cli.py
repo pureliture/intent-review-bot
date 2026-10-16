@@ -352,8 +352,10 @@ def create_parser() -> argparse.ArgumentParser:
     intent_parser.add_argument("--output", required=True, help="Fresh private output directory (0700)")
     intent_parser.add_argument("--model-profile", choices=MODEL_PROFILES, default=None,
         help="Explicitly enable a review profile (default: no model calls)")
-    intent_parser.add_argument("--pipeline", choices=("declared-v1", "code-first-v2"), default="declared-v1",
-        help="B review contract (default: declared-v1; code-first-v2 reads code before optional PR text)")
+    intent_parser.add_argument("--pipeline", choices=("declared-v1", "code-first-v2", "perspectives-v1"), default="declared-v1",
+        help="B review contract; perspectives-v1 performs one fixed-input intent review with closed perspective choices")
+    intent_parser.add_argument("--language", choices=("ko", "en"), default="ko",
+        help="Human output language for perspectives-v1 (default: ko)")
     intent_parser.add_argument("--call-timeout-seconds", type=int, default=None,
         help="Explicit per-call model timeout; task, context and token budgets remain unchanged")
 
@@ -631,7 +633,17 @@ def run_intent(args: argparse.Namespace) -> int:
         timeout = getattr(args, "call_timeout_seconds", None)
         settings = ModelConfig(call_timeout_seconds=timeout) if timeout is not None else None
         model_client = build_review_client(args.model_profile, settings) if settings is not None else build_review_client(args.model_profile)
-        if getattr(args, "pipeline", "declared-v1") == "code-first-v2":
+        if getattr(args, "pipeline", "declared-v1") == "perspectives-v1":
+            from review_bot.adapters.markdown.intent_perspective_formatter import format_intent_perspective_markdown
+            from review_bot.application.intent_perspective_review import run_intent_perspective_review
+            from review_bot.runtime.model_clients import build_intent_selection_client
+
+            selector = (build_intent_selection_client(args.model_profile, settings) if settings is not None
+                else build_intent_selection_client(args.model_profile))
+            result = run_intent_perspective_review(task_input, model_client, selection_client=selector,
+                language=getattr(args, "language", "ko"))
+            markdown = format_intent_perspective_markdown(result, task_input)
+        elif getattr(args, "pipeline", "declared-v1") == "code-first-v2":
             from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
             from review_bot.application.code_first_intent_review import run_code_first_review
 
@@ -647,7 +659,7 @@ def run_intent(args: argparse.Namespace) -> int:
         sys.stderr.write("Error: intent_evaluation_failed\n")
         return 1
     print(f"intent: {result.status}/{result.reason}")
-    if getattr(args, "pipeline", "declared-v1") == "code-first-v2":
+    if getattr(args, "pipeline", "declared-v1") in ("code-first-v2", "perspectives-v1"):
         return 0 if result.status == "completed" else 1
     return 1 if result.status == "failed" else 0
 

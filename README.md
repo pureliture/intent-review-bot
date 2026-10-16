@@ -100,6 +100,19 @@ The llama.cpp deployment contract additionally requires **one actual generation 
 
 The existing `seulgi-server` CI PMD/CPD analysis is **not migrated or replaced** by this general-purpose bot. Optional A retains its rootless/pinned-image requirements. Company use is deferred to a separate repository after personal development; no PAT support or personal/company authentication-switch framework is added here.
 
+## 1회 의도 리뷰 (perspectives-v1)
+
+승인된 8개 관점으로 PR 본문과 고정된 변경 전후 코드를 함께 검토하는 명시적 평가 모드다. Tev1이 관점별 적용·비적용·판단불가를 선택하고, 주 리뷰 LLM이 원문을 읽어 의도와 구현의 연결 및 달성 가능성을 검토한다. 관점 추가·제외, 기존 원문의 재해석에 따른 판단 정정, 필요한 맥락의 누적과 부분 검토를 지원한다.
+
+    rtk proxy uv run --locked --offline review-bot intent \
+      --input /path/to/private/input.json --output /path/to/private/review-001 \
+      --pipeline perspectives-v1 --model-profile me707-llamacpp \
+      --language ko --call-timeout-seconds 120
+
+이 모드는 고정 입력 한 번을 리뷰하고 비공개 결과를 저장한다. 기본은 선택 8회와 주 리뷰 2회이며, 한도 안에서 최대 1회 원문 재확인이 추가될 수 있다. 입력·ModelRequest schema 1을 유지하고 새 결과만 schema 3이다. CLI는 완료 0, 미완료 1을 반환한다. 생성 전 전체 원문 한도를 검사하며 실제 사용량·실패·이력을 보존한다.
+
+사용자 설명은 의도 → 구현과의 연결 → 달성 가능성 → 질문 순서이며, 기본 언어는 ko다. 기존 declared-v1/code-first-v2와 구별되는 명시적 옵션이고 Worker·게시기·반복 리뷰를 구성하지 않는다. 최신성 보강은 후순위다. [선택지와 실행 계약](docs/intent-review-single-run.md)을 참고한다.
+
 ## B intent evaluation (fixed input, never posts)
 
 The offline `intent` command evaluates **text code of any language**. The default `declared-v1` pipeline preserves `extract_goals → observe_changes → assess`; the explicitly selected [code-first v2](#code-first-b-and-tev1-planning-v2-explicit-opt-in) reads code before reconstructing purpose. Neither pipeline reads a target checkout, executes target code/builds/tests/hooks, initializes PMD/CPD, requires Java or an analysis image, enqueues work, or composes a GitHub publisher. Both use the shared Worker's `intent` mode; **B automatic posting remains disabled by default**, including when `publish.mode: comment`.

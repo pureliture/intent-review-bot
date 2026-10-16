@@ -1,7 +1,7 @@
 # 설계 준수 감사 기록
 
 기준: `feat/llamacpp-concurrency`, `e7b1988110027148dc3cbf6049980fc0bd06966f` (2026-10-16).
-판정: **부분 준수**. 실행·형식·인용 검증 성공은 요구사항 충족이나 의도 리뷰 품질의 보증이 아니다.
+판정: **부분 준수**. 실행·형식·인용 검증 성공은 요구사항 충족이나 의도 리뷰 품질의 보증이 아니다. 이후 승인한 1회 의도 리뷰의 계약은 아래 후속 기록과 별도 실행 문서에 구분한다.
 
 ## 범위와 증거 수준
 
@@ -118,3 +118,17 @@
 IDE 확인: 이전 전용 Rename 시도는 Python 모듈을 찾지 못했다. 열린 루트 프로젝트의 유효 content root는 저장소 루트였고, 별도로 연 기능 worktree의 자동 감지는 build/review-a/.../java 생성물을 Java 모듈로 잡아 src/와 tests/의 Python roots를 구성하지 않았다. Python 지원은 설치되어 있었지만, 이 상태와 이전 Rename 오류의 직접 인과관계는 검증되지 않았다.
 
 적용 상태: 후속 사용자 지시에 따라 10개 지정 경로를 Git-aware shell rename으로 옮기고, source/test import와 fixture 참조를 새 경로로 갱신했다. CLI·설정 식별자, 호출 계약, schema/prompt 버전, A/B 산출물·marker·게시 정책은 변경하지 않았다. 전체 회귀 rtk proxy uv run --locked --offline pytest -q --tb=short → **2946 passed, 232.70s**, 기존 Starlette deprecation warning 1건. 아래 감사 결함은 해결 상태로 바꾸지 않았다.
+
+## 후속 합의: 초기 관점 선택과 1회 리뷰
+
+2026-10-16 사용자는 B-01의 개선 목표를 다시 정의했다. Tev1의 검토 계획 자유 생성을 확장하는 대신, 승인된 8개 의도 리뷰 관점의 필요성을 고정 선택지에서 판정하게 한다. PR 본문과 변경을 함께 읽어 목적·구현·기대 결과의 연결을 검토하는 것이 중심이다.
+
+[1회 리뷰 계약](intent-review-single-run.md)에 초기 선택지, PR 전체의 복수 선택, 주 리뷰 LLM의 선택 보정, 기존 원문의 재해석에 따른 판단 정정, 후속 원문 재확인, 필요한 누락만 부분 검토로 처리하는 원칙, 의도 중심의 사용자 설명을 기록했다.
+
+새 perspectives-v1 경로를 [실행 코어](../src/review_bot/application/intent_perspective_review.py), [카탈로그](../src/review_bot/domain/intent_perspectives.py), [출력기](../src/review_bot/adapters/markdown/intent_perspective_formatter.py)에 구현했다. 검증 근거는 [단위 회귀](../tests/unit/test_intent_perspective_review.py), [일회 CLI·어댑터 연결](../tests/integration/test_intent_perspective_cli.py)과 [milestones의 이번 실행 결과](../milestones.md)를 따른다. 앞선 2946개 테스트나 브레인스토밍 문서 검사를 이번 동작 변경의 회귀 결과로 재사용하지 않는다.
+
+이번 최종 전체 회귀 `rtk proxy uv run --locked --offline pytest -q --tb=short`는 **3002 passed, 1 warning in 241.40s**, exit 0이다. 기존 Starlette TestClient deprecation 경고 1건이며 테스트 삭제나 검증 완화 없이 실행했다.
+
+사용자는 고정 입력 1회 리뷰를 우선하고 최신성 보강을 후순위로 지정했다. R-04는 미해결·후순위로 남긴다. 기존 code-first-v2의 감사 시점 동작, A-01~A-03, R-01~R-03 전체를 해결했다고 표시하지 않는다. 새 경로의 구조 검증이나 회귀 통과도 실제 모델의 의미적 리뷰 품질을 보증하지 않는다.
+
+me707 사전 점검은 온라인 peer 확인 이후에도 리뷰 서버의 생성 슬롯 1개 계약 검증 실패와 선택 역할 메타데이터 시간 초과로 통과하지 못했다. 실제 PR #5 입력의 일회 CLI도 `not_run/token_count_unavailable`, exit 1이며 생성 호출은 0회다. 비공개 실패 결과와 게시 미시도 상태를 보존했고 기존 서버 설정과 검증 조건을 바꾸지 않았다. 실모델 의도 리뷰와 앞선 PR #5 오탐의 개선 여부는 미검증이다.

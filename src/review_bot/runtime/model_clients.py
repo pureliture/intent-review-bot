@@ -91,3 +91,21 @@ def build_planning_client(profile: str | None, settings: ModelConfig | None = No
         else default_model_admission(settings.max_concurrency)
     )
     return client
+
+
+def build_intent_selection_client(profile: str | None, settings: ModelConfig | None = None) -> ModelClient | None:
+    """Construct the explicit closed-choice Tev role for single-run intent review."""
+    if profile is None:
+        return None
+    if profile not in (LLAMACPP_PROFILE, MACBOOK_LLAMACPP_PROFILE):
+        raise ValueError("Intent perspective selection requires an explicit llama.cpp profile")
+    from review_bot.adapters.intent_selection import LlamaCppIntentSelectionClient, MacBookIntentSelectionClient
+
+    settings = settings or ModelConfig()
+    local = profile == MACBOOK_LLAMACPP_PROFILE
+    variable = "MACBOOK_TEV1_BASE_URL" if local else "ME707_TEV1_BASE_URL"
+    cls = MacBookIntentSelectionClient if local else LlamaCppIntentSelectionClient
+    client = cls(api_url=_endpoint(variable, profile), timeout_seconds=settings.call_timeout_seconds)
+    client.request_admission = (macbook_model_admission(settings.max_concurrency) if local
+        else default_model_admission(settings.max_concurrency))
+    return client
