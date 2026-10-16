@@ -7,9 +7,9 @@ from dataclasses import asdict
 import httpx
 import pytest
 
-from review_bot.application.review_b import STAGES
+from review_bot.application.declared_intent_review import STAGES
 from review_bot.runtime import cli
-from tests.fixtures.review_b import make_task, stage_bodies
+from tests.fixtures.intent_review import make_task, stage_bodies
 
 
 @pytest.mark.parametrize("failure", [None, "wrong_model", "tokenizer_after_goals", "capacity_after_goals"])

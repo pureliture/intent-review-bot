@@ -8,11 +8,11 @@ from dataclasses import replace
 
 import pytest
 
-from review_bot.application.review_a import MockModelClient, ModelProfile, TransientModelError
-from review_bot.application.review_b import MIN_QUOTE_NONSPACE_CHARS, response_schema, run_review_b_pipeline
-from review_bot.domain.models_b import IntentReviewLimits
+from review_bot.application.architecture_review import MockModelClient, ModelProfile, TransientModelError
+from review_bot.application.declared_intent_review import MIN_QUOTE_NONSPACE_CHARS, response_schema, run_review_b_pipeline
+from review_bot.domain.intent_models import IntentReviewLimits
 from review_bot.domain.models_v1 import ModelResponse
-from tests.fixtures.review_b import GOAL, make_task, responses, stage_bodies
+from tests.fixtures.intent_review import GOAL, make_task, responses, stage_bodies
 
 
 def test_generation_schema_separates_new_result_ids_from_other_entity_types() -> None:
@@ -287,10 +287,10 @@ def test_output_and_usage_fail_closed_without_raw_exception_values(failure: str)
 
 
 def test_deadline_after_a_call_stops_and_keeps_that_calls_usage(monkeypatch) -> None:
-    from review_bot.application import review_b
+    from review_bot.application import declared_intent_review
 
     clock = [0.0]
-    monkeypatch.setattr(review_b.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(declared_intent_review.time, "monotonic", lambda: clock[0])
 
     class SlowClient(MockModelClient):
         def complete(self, request):
@@ -317,7 +317,7 @@ def test_declared_and_observed_evidence_can_support_noninsufficient_assessments(
 
 
 def test_assessment_request_builder_revalidates_prior_results() -> None:
-    from review_bot.application.review_b import build_intent_model_request, validate_intent_goals, validate_intent_observations
+    from review_bot.application.declared_intent_review import build_intent_model_request, validate_intent_goals, validate_intent_observations
 
     task = make_task()
     bodies = stage_bodies()

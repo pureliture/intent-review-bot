@@ -9,13 +9,13 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from review_bot.application.review_a import MockModelClient
+from review_bot.application.architecture_review import MockModelClient
 from review_bot.config import ModelConfig
 from review_bot.domain.models_v1 import ModelResponse
 from review_bot.runtime import cli
 from tests.conftest import SyntheticGitRepo
-from tests.fixtures.review_b import make_task
-from tests.fixtures.review_b_code import (
+from tests.fixtures.intent_review import make_task
+from tests.fixtures.code_first_intent_review import (
     BASE_SOURCE,
     CALLER,
     HEAD_SOURCE,
@@ -258,12 +258,12 @@ def test_code_first_cli_uses_both_real_adapters_native_metering_and_shared_sqlit
 
 @pytest.mark.parametrize("timeout", [120, 0])
 def test_cli_applies_existing_timeout_setting_to_both_roles_without_changing_task_budget(tmp_path, monkeypatch, timeout):
-    from review_bot.application import review_b_code
-    from review_bot.domain.models_b_code import CodeFirstReviewLimits
+    from review_bot.application import code_first_intent_review
+    from review_bot.domain.code_first_intent_models import CodeFirstReviewLimits
 
     configured = []
     task_budgets = []
-    actual_review = review_b_code.run_code_first_review
+    actual_review = code_first_intent_review.run_code_first_review
 
     def bounded_review(*args, **kwargs):
         task_budgets.append((kwargs.get("limits") or CodeFirstReviewLimits()).task_timeout_seconds)
@@ -276,7 +276,7 @@ def test_cli_applies_existing_timeout_setting_to_both_roles_without_changing_tas
 
     monkeypatch.setattr(cli, "build_review_client", factory)
     monkeypatch.setattr(cli, "build_planning_client", factory)
-    monkeypatch.setattr(review_b_code, "run_code_first_review", bounded_review)
+    monkeypatch.setattr(code_first_intent_review, "run_code_first_review", bounded_review)
     source = tmp_path / "fixed-code-input.json"
     source.write_text(json.dumps(asdict(make_code_task())), encoding="utf-8")
     source.chmod(0o600)

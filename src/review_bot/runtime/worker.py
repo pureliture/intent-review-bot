@@ -28,13 +28,13 @@ from review_bot.application.context import build_task_input
 from review_bot.application.delta import build_delta
 from review_bot.application.intent_context import IntentInputError, build_intent_task_input
 from review_bot.application.publication import PublicationAuthorizationError, publication_fingerprint, publish_review_comment
-from review_bot.application.review_a import run_review_a_pipeline
-from review_bot.application.review_b import run_review_b_pipeline
+from review_bot.application.architecture_review import run_review_a_pipeline
+from review_bot.application.declared_intent_review import run_review_b_pipeline
 from review_bot.application.selection import DeadlineModeSelector, LightweightModeSelector, ModelModeSelector
 from review_bot.application.snapshot import assemble_snapshot_bundle, collect_snapshot_material
 from review_bot.config import ReviewBotConfig
 from review_bot.domain.envelope_v2 import ExecutionReceipt, PublicationReceipt, RunRecord
-from review_bot.domain.models_b import IntentReviewLimits
+from review_bot.domain.intent_models import IntentReviewLimits
 from review_bot.domain.models_v1 import AnalysisRun, Snapshot
 from review_bot.domain.status import RunStage, RunStatus
 from review_bot.ports import (
@@ -753,8 +753,8 @@ class WorkerLoop:
         self._stage(run, RunStage.REVIEW, deadline)
         if code_first:
             from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
-            from review_bot.application.review_b_code import run_code_first_review
-            from review_bot.domain.models_b_code import CodeFirstReviewLimits
+            from review_bot.application.code_first_intent_review import run_code_first_review
+            from review_bot.domain.code_first_intent_models import CodeFirstReviewLimits
 
             limits = CodeFirstReviewLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
             result = run_code_first_review(task_input, self.model_client, planning_client=self.planning_client,

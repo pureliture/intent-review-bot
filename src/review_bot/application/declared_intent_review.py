@@ -24,8 +24,8 @@ from review_bot.application.intent_context import (
     strict_json_loads,
     unavailable_context,
 )
-from review_bot.application.review_a import ModelProfile, TransientModelError
-from review_bot.domain.models_b import (
+from review_bot.application.architecture_review import ModelProfile, TransientModelError
+from review_bot.domain.intent_models import (
     DeclaredConstraint,
     DeclaredGoal,
     ImplementationObservation,

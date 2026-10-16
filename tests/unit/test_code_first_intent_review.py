@@ -9,15 +9,15 @@ from unittest.mock import Mock
 import pytest
 
 from review_bot.application.intent_context import build_intent_evidence, build_intent_task_input, evidence_digest
-from review_bot.application.review_a import ModelProfile, TransientModelError
-from review_bot.application.review_b import run_review_b_pipeline
-from review_bot.application.review_b_code import (
+from review_bot.application.architecture_review import ModelProfile, TransientModelError
+from review_bot.application.declared_intent_review import run_review_b_pipeline
+from review_bot.application.code_first_intent_review import (
     PROMPT_VERSION, SYSTEM_PROMPTS, code_first_prompt_hashes, run_code_first_review, validate_code_first_result,
 )
 from review_bot.domain.envelope_v2 import EnvelopeEvidence
-from review_bot.domain.models_b_code import CodeFirstReviewLimits
+from review_bot.domain.code_first_intent_models import CodeFirstReviewLimits
 from review_bot.domain.models_v1 import ModelResponse
-from tests.fixtures.review_b_code import (
+from tests.fixtures.code_first_intent_review import (
     BASE_SOURCE, CALLER, HEAD_SOURCE, CodeFirstModelClient, make_task, stage_response,
 )
 
@@ -460,9 +460,9 @@ def test_known_transient_retry_is_bounded_and_unknown_retry_never_continues():
 
 @pytest.mark.parametrize("when", ["measure", "complete"])
 def test_deadline_after_each_external_call_keeps_usage_and_passes_remaining_time(when, monkeypatch):
-    from review_bot.application import review_b_code
+    from review_bot.application import code_first_intent_review
     clock = [0.0]
-    monkeypatch.setattr(review_b_code.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(code_first_intent_review.time, "monotonic", lambda: clock[0])
     class Slow(CodeFirstModelClient):
         def count_input_tokens(self, request):
             result = super().count_input_tokens(request)
@@ -617,7 +617,7 @@ def test_recorded_run_spanning_groups_is_supplied_separately_to_each_relevant_gr
 
 
 def test_unterminated_original_diff_lines_are_not_stitched_or_dropped():
-    from tests.fixtures.review_b import digest
+    from tests.fixtures.intent_review import digest
     task = make_task()
     def no_final_lf(code):
         return replace(code, files=tuple(replace(file, content=file.content.rstrip("\n"),
@@ -634,7 +634,7 @@ def test_unterminated_original_diff_lines_are_not_stitched_or_dropped():
 
 def test_more_than_128_prepared_paths_do_not_become_a_silent_group_path_limit():
     from review_bot.domain.models_v1 import CodeFile
-    from tests.fixtures.review_b import digest
+    from tests.fixtures.intent_review import digest
     task = make_task()
     extra = tuple(CodeFile(f"context/{index:03}.py", "# fixed context\n", digest("# fixed context\n"), "source") for index in range(130))
     task = build_intent_task_input(task.snapshot, replace(task.base, files=(*task.base.files, *extra), inventory_hash=""),

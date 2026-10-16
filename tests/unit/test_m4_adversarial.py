@@ -1,6 +1,6 @@
 """Empirical adversarial stress-test suite for Milestone 4:
 - review_bot.application.context (Input gate, TaskInput assembly, Evidence indexing)
-- review_bot.application.review_a (Request builder, validate_model_response, Model Clients, Pipeline)
+- review_bot.application.architecture_review (Request builder, validate_model_response, Model Clients, Pipeline)
 
 Adversarial Dimensions:
 1. Input Gate Stress Testing (corrupted snapshots, missing blobs, empty files, byte/token limits)
@@ -24,7 +24,7 @@ from review_bot.application.context import (
     check_input_gate,
 )
 from review_bot.application.delta import compute_delta
-from review_bot.application.review_a import (
+from review_bot.application.architecture_review import (
     PROMPT_VERSION,
     MockModelClient,
     ModelProfile,

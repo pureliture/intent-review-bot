@@ -624,7 +624,7 @@ def mock_github() -> MockGitHubClient:
 def worker_review_inputs() -> tuple[Any, Any]:
     from review_bot.application.context import build_task_input
     from review_bot.application.delta import compute_delta
-    from review_bot.application.review_a import MockModelClient, ModelProfile, run_review_a_pipeline
+    from review_bot.application.architecture_review import MockModelClient, ModelProfile, run_review_a_pipeline
     from review_bot.domain.models_v1 import (
         Classification, CodeFile, CodeSnapshot, ModelResponse, PrSnapshot, Snapshot,
     )
@@ -664,7 +664,7 @@ def worker_review_inputs() -> tuple[Any, Any]:
 def worker_pipeline_ports(worker_review_inputs: tuple[Any, Any]) -> dict[str, Any]:
     from unittest.mock import Mock
 
-    from review_bot.application.review_a import MockModelClient
+    from review_bot.application.architecture_review import MockModelClient
     from review_bot.domain.envelope_v2 import ChangedFile
     from review_bot.domain.models_v1 import ModelResponse
     from review_bot.ports import MergeBaseResult, RepositoryReader, StaticAnalyzer

@@ -14,13 +14,13 @@ from review_bot.application.intent_context import (
     IntentInputError, build_intent_evidence, build_intent_task_input, decode_intent_task_input,
     collect_intent_code_snapshot, evidence_digest, intent_scope, strict_json_loads,
 )
-from review_bot.application.review_a import MockModelClient
-from review_bot.application.review_b import run_review_b_pipeline
+from review_bot.application.architecture_review import MockModelClient
+from review_bot.application.declared_intent_review import run_review_b_pipeline
 from review_bot.domain.envelope_v2 import ChangedFile, EnvelopeEvidence
 from review_bot.domain.models_v1 import CodeFile, SourceExclusion
 from review_bot.config import ConfigValidationError, load_review_config_from_str
 from review_bot.ports import RepositoryReader
-from tests.fixtures.review_b import BASE_SHA, CAPTURED_AT, HEAD_SHA, digest, make_task, responses, stage_bodies
+from tests.fixtures.intent_review import BASE_SHA, CAPTURED_AT, HEAD_SHA, digest, make_task, responses, stage_bodies
 
 
 def wire(task):

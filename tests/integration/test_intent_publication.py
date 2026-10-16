@@ -11,8 +11,8 @@ import pytest
 from review_bot.adapters.git import GitRepositoryReader
 from review_bot.adapters.github.auth import GitHubAppAuthError
 from review_bot.application.publication import publish_review_comment
-from review_bot.application.review_a import MockModelClient
-from review_bot.application.review_b import SYSTEM_PROMPTS
+from review_bot.application.architecture_review import MockModelClient
+from review_bot.application.declared_intent_review import SYSTEM_PROMPTS
 from review_bot.domain.models_v1 import ModelResponse, PmdViolation
 from review_bot.runtime.artifacts import RunArtifacts
 from tests.conftest import SyntheticGitRepo

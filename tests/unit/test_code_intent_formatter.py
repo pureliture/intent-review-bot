@@ -7,10 +7,10 @@ from dataclasses import replace
 import pytest
 
 from review_bot.adapters.markdown.code_intent_formatter import DEFAULT_B_MARKER, format_code_intent_markdown
-from review_bot.application.review_b_code import run_code_first_review
-from review_bot.domain.models_b_code import CodeFirstReviewLimits
-from tests.fixtures.review_b_code import CodeFirstModelClient, make_task
-from tests.unit.test_review_b_code import split_client
+from review_bot.application.code_first_intent_review import run_code_first_review
+from review_bot.domain.code_first_intent_models import CodeFirstReviewLimits
+from tests.fixtures.code_first_intent_review import CodeFirstModelClient, make_task
+from tests.unit.test_code_first_intent_review import split_client
 
 
 def test_compact_code_first_scope_plan_relation_final_and_usage_are_visible():

@@ -13,8 +13,8 @@ from .status import (
 )
 
 if TYPE_CHECKING:
-    from .models_b import ReviewBResult
-    from .models_b_code import CodeFirstReviewResult
+    from .intent_models import ReviewBResult
+    from .code_first_intent_models import CodeFirstReviewResult
 
 
 @dataclass(frozen=True)

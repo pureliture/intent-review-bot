@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 import pytest
 
-from review_bot.application.review_a import PermanentModelError, TransientModelError, run_review_a_pipeline
+from review_bot.application.architecture_review import PermanentModelError, TransientModelError, run_review_a_pipeline
 from review_bot.application.selection import ModelModeSelector
 from review_bot.domain.models_v1 import ModelRequest
 from review_bot.ports import ModelClient

@@ -24,7 +24,7 @@ from review_bot.adapters.git import GitRepositoryReader
 from review_bot.adapters.github.client import MockGitHubClient as ApiMockGitHubClient
 from review_bot.adapters.pmd.runner import PmdRunner
 from review_bot.adapters.sqlite.store import SQLiteJobStore
-from review_bot.application.review_a import MockModelClient
+from review_bot.application.architecture_review import MockModelClient
 from review_bot.config import load_review_config_from_str
 from review_bot.domain.envelope_v2 import PrRequestRecord
 from review_bot.domain.models_v1 import AnalysisRun, ModelResponse

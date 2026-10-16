@@ -8,9 +8,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from review_bot.application.review_a import MockModelClient
+from review_bot.application.architecture_review import MockModelClient
 from review_bot.runtime import cli
-from tests.fixtures.review_b import make_task, responses
+from tests.fixtures.intent_review import make_task, responses
 
 
 def fixed_input(tmp_path: Path, language: str = "python") -> Path:
@@ -123,8 +123,8 @@ def test_cli_unsafe_paths_fail_before_any_calls_and_preserve_files(tmp_path: Pat
 
 @pytest.mark.parametrize("failure_stage", [None, "observe_changes"])
 def test_cli_existing_local_profile_records_native_preflight_usage(tmp_path: Path, monkeypatch, failure_stage) -> None:
-    from review_bot.application.review_b import STAGES
-    from tests.fixtures.review_b import stage_bodies
+    from review_bot.application.declared_intent_review import STAGES
+    from tests.fixtures.intent_review import stage_bodies
     from tests.unit.test_ollama_client import chat_response, model_info
 
     requests = []
@@ -182,7 +182,7 @@ def test_cli_existing_local_profile_records_native_preflight_usage(tmp_path: Pat
 
 
 def test_cli_invalid_final_response_retains_earlier_files_and_usage(tmp_path: Path, monkeypatch) -> None:
-    from tests.fixtures.review_b import stage_bodies
+    from tests.fixtures.intent_review import stage_bodies
 
     bodies = stage_bodies()
     bodies[2]["findings"][0]["goal_ids"] = ["invented"]

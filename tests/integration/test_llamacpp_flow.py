@@ -7,10 +7,10 @@ from dataclasses import asdict, replace
 import httpx
 import pytest
 
-from review_bot.application.review_a import MockModelClient
-from review_bot.application.review_b import STAGES, run_review_b_pipeline
+from review_bot.application.architecture_review import MockModelClient
+from review_bot.application.declared_intent_review import STAGES, run_review_b_pipeline
 from review_bot.runtime import cli
-from tests.fixtures.review_b import make_task, responses, stage_bodies
+from tests.fixtures.intent_review import make_task, responses, stage_bodies
 
 
 @pytest.mark.parametrize("measurement_usage,known", [

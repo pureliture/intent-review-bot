@@ -5,10 +5,10 @@ from dataclasses import asdict, replace
 
 from review_bot.adapters.markdown.intent_formatter import MAX_COMMENT_LENGTH, _escape, _link
 from review_bot.application.intent_context import build_intent_evidence, decode_intent_task_input
-from review_bot.application.review_b_code import validate_code_first_result
+from review_bot.application.code_first_intent_review import validate_code_first_result
 from review_bot.domain.markers import DEFAULT_B_MARKER, valid_intent_marker
-from review_bot.domain.models_b import IntentTaskInput
-from review_bot.domain.models_b_code import CodeFirstReviewResult
+from review_bot.domain.intent_models import IntentTaskInput
+from review_bot.domain.code_first_intent_models import CodeFirstReviewResult
 
 
 def format_code_intent_markdown(

@@ -85,7 +85,7 @@ def test_cli_preserves_v1_default_and_requires_explicit_code_first_choice():
 def test_code_first_cache_cannot_reuse_v1_or_a_different_planning_role(valid_config_yaml, offline_profiles):
     from review_bot.runtime.mode_fingerprints import intent_input_fingerprint
     from review_bot.runtime.model_clients import build_planning_client, build_review_client
-    from tests.fixtures.review_b import make_task
+    from tests.fixtures.intent_review import make_task
 
     config, _ = load_review_config_from_str(valid_config_yaml)
     task = make_task()
@@ -102,9 +102,9 @@ def test_code_first_cache_cannot_reuse_v1_or_a_different_planning_role(valid_con
 
 
 def test_full_input_budget_does_not_reserve_profile_output_space_twice():
-    from review_bot.application.review_a import ModelProfile
-    from review_bot.application.review_b_code import run_code_first_review
-    from tests.fixtures.review_b_code import CodeFirstModelClient, make_task
+    from review_bot.application.architecture_review import ModelProfile
+    from review_bot.application.code_first_intent_review import run_code_first_review
+    from tests.fixtures.code_first_intent_review import CodeFirstModelClient, make_task
 
     profile = ModelProfile("mock", "input-budget-fixture", max_input_tokens=128, max_output_tokens=64, is_mock=True)
     client = CodeFirstModelClient(profile=profile)
@@ -118,8 +118,8 @@ def test_full_input_budget_does_not_reserve_profile_output_space_twice():
 def test_planner_receives_measured_full_fit_and_schema_requires_every_prepared_path():
     import json
 
-    from review_bot.application.review_b_code import run_code_first_review
-    from tests.fixtures.review_b_code import CodeFirstModelClient, make_task
+    from review_bot.application.code_first_intent_review import run_code_first_review
+    from tests.fixtures.code_first_intent_review import CodeFirstModelClient, make_task
 
     task = make_task()
     review, planner = CodeFirstModelClient(), CodeFirstModelClient()
@@ -142,8 +142,8 @@ def test_planner_receives_measured_full_fit_and_schema_requires_every_prepared_p
 
 
 def test_request_for_the_whole_original_already_in_the_group_does_not_trigger_a_no_progress_recheck():
-    from review_bot.application.review_b_code import run_code_first_review
-    from tests.fixtures.review_b_code import CodeFirstModelClient, make_task
+    from review_bot.application.code_first_intent_review import run_code_first_review
+    from tests.fixtures.code_first_intent_review import CodeFirstModelClient, make_task
 
     def already_delivered(payload, body):
         if payload["stage"] == "observe_group":

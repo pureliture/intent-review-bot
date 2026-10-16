@@ -19,13 +19,13 @@ from review_bot.application.intent_context import (
     bounded_array, bounded_object, bounded_text, build_intent_evidence,
     decode_intent_task_input, intent_scope, safe_relative_path, strict_json_loads,
 )
-from review_bot.application.review_a import ModelProfile, TransientModelError
-from review_bot.application.review_b import (
+from review_bot.application.architecture_review import ModelProfile, TransientModelError
+from review_bot.application.declared_intent_review import (
     MAX_OUTPUT_BYTES, _array_schema, _gate, _make_result, _measurement_receipt,
     _object_schema, _usage, _valid_profile,
 )
-from review_bot.domain.models_b import IntentModelAttempt, IntentStageRecord, IntentTaskInput
-from review_bot.domain.models_b_code import CodeFirstReviewLimits, CodeFirstReviewResult
+from review_bot.domain.intent_models import IntentModelAttempt, IntentStageRecord, IntentTaskInput
+from review_bot.domain.code_first_intent_models import CodeFirstReviewLimits, CodeFirstReviewResult
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 from review_bot.ports import ModelClient
 

@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from review_bot.adapters.model_http import mark_model_request_sent, model_request_slot
-from review_bot.application.review_a import ModelProfile, PermanentModelError, TransientModelError
+from review_bot.application.architecture_review import ModelProfile, PermanentModelError, TransientModelError
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 
 OLLAMA_PROFILE = "ollama-local-128k"

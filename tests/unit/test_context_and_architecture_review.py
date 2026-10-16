@@ -1,4 +1,4 @@
-"""Unit tests for Milestone 4: context.py and review_a.py application components."""
+"""Unit tests for Milestone 4: context.py and architecture_review.py application components."""
 from __future__ import annotations
 
 import hashlib
@@ -12,7 +12,7 @@ from review_bot.application.context import (
     classify_pr as context_classify_pr,
 )
 from review_bot.application.delta import compute_delta
-from review_bot.application.review_a import (
+from review_bot.application.architecture_review import (
     PROMPT_VERSION,
     MockModelClient,
     ModelProfile,

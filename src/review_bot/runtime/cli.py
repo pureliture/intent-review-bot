@@ -19,8 +19,8 @@ from review_bot.application.classification import classify_pr
 from review_bot.application.context import build_task_input
 from review_bot.application.delta import build_delta
 from review_bot.application.intent_context import MAX_INPUT_BYTES, decode_intent_task_input
-from review_bot.application.review_a import run_review_a_pipeline
-from review_bot.application.review_b import run_review_b_pipeline
+from review_bot.application.architecture_review import run_review_a_pipeline
+from review_bot.application.declared_intent_review import run_review_b_pipeline
 from review_bot.config import ModelConfig, load_review_config
 from review_bot.domain.models_v1 import (
     AnalysisRun,
@@ -633,7 +633,7 @@ def run_intent(args: argparse.Namespace) -> int:
         model_client = build_review_client(args.model_profile, settings) if settings is not None else build_review_client(args.model_profile)
         if getattr(args, "pipeline", "declared-v1") == "code-first-v2":
             from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
-            from review_bot.application.review_b_code import run_code_first_review
+            from review_bot.application.code_first_intent_review import run_code_first_review
 
             planning_client = (build_planning_client(args.model_profile, settings) if settings is not None
                 else build_planning_client(args.model_profile))

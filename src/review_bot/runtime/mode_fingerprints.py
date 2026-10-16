@@ -12,9 +12,9 @@ from review_bot.adapters.markdown.intent_formatter import format_intent_markdown
 from review_bot.application.context import build_task_input, hash_json
 from review_bot.application.delta import build_delta
 from review_bot.application.intent_context import build_intent_task_input
-from review_bot.application.review_a import ModelProfile, build_system_prompt, run_review_a_pipeline
-from review_bot.application.review_b import PROMPT_VERSION, SYSTEM_PROMPTS, response_schema, run_review_b_pipeline
-from review_bot.domain.models_b import IntentReviewLimits
+from review_bot.application.architecture_review import ModelProfile, build_system_prompt, run_review_a_pipeline
+from review_bot.application.declared_intent_review import PROMPT_VERSION, SYSTEM_PROMPTS, response_schema, run_review_b_pipeline
+from review_bot.domain.intent_models import IntentReviewLimits
 
 
 def _implementation_hash(*functions) -> str:
@@ -70,8 +70,8 @@ def intent_input_fingerprint(task, config, client, *, planning_client=None) -> s
                 item["locator"].pop("updated_at", None)
         if config.intent.pipeline == "code-first-v2":
             from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
-            from review_bot.application.review_b_code import code_first_prompt_hashes, run_code_first_review
-            from review_bot.domain.models_b_code import CodeFirstReviewLimits
+            from review_bot.application.code_first_intent_review import code_first_prompt_hashes, run_code_first_review
+            from review_bot.domain.code_first_intent_models import CodeFirstReviewLimits
 
             return hash_json({"schema": "mode-publication/code-first-v2", "mode": "intent", "material": material,
                 "model": _profile(client), "planner": _profile(planning_client), "prompts": code_first_prompt_hashes(),

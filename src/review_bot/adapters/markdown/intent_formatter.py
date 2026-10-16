@@ -8,10 +8,10 @@ from dataclasses import asdict
 from urllib.parse import quote
 
 from review_bot.application.intent_context import build_intent_evidence, decode_intent_task_input
-from review_bot.application.review_b import validate_intent_assessment, validate_intent_goals, validate_intent_observations
+from review_bot.application.declared_intent_review import validate_intent_assessment, validate_intent_goals, validate_intent_observations
 from review_bot.domain.envelope_v2 import EnvelopeEvidence
 from review_bot.domain.markers import DEFAULT_B_MARKER, valid_intent_marker
-from review_bot.domain.models_b import IntentTaskInput, ReviewBResult
+from review_bot.domain.intent_models import IntentTaskInput, ReviewBResult
 
 MAX_COMMENT_LENGTH = 60000
 

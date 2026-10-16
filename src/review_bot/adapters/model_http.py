@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from review_bot.adapters.sqlite.model_admission import SQLiteModelAdmission
-from review_bot.application.review_a import PermanentModelError
+from review_bot.application.architecture_review import PermanentModelError
 
 _REQUEST_CONTEXT: ContextVar[tuple[Callable[[], bool], float] | None] = ContextVar("model_request_context", default=None)
 

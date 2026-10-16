@@ -14,7 +14,7 @@ White-box empirical challenge tests covering:
    - selection.py: mode registration validation, unsupported policies, deduplication, deterministic hashing
    - snapshot.py: ChangedFile vs string paths, non-ASCII title/body, unavailable/ambiguous merge-bases
    - context.py: fixed SHA validation, safe path sanitation, span validity, input gate limits, model contract validation
-   - review_a.py: prompt specialization, JSON schema rules, duplicate key & non-finite numeric rejection,
+   - architecture_review.py: prompt specialization, JSON schema rules, duplicate key & non-finite numeric rejection,
      echo verification, citation validation (inverted spans, non-verbatim quotes, evidence bounds),
      CPD structural rule defense, and pipeline execution error paths
    - delta.py: metric pattern extraction (Cognitive, NPath, Cyclomatic, NCSS, GodClass), time range parsing,
@@ -100,7 +100,7 @@ from review_bot.application.delta import (
 from review_bot.application.delta import (
     _safe_path as delta_safe_path,
 )
-from review_bot.application.review_a import (
+from review_bot.application.architecture_review import (
     ModelProfile,
     build_model_request,
     run_review_a_pipeline,

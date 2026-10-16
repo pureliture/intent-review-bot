@@ -6,10 +6,10 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from review_bot.application.intent_context import build_intent_task_input
-from review_bot.application.review_a import ModelProfile
+from review_bot.application.architecture_review import ModelProfile
 from review_bot.domain.envelope_v2 import ChangedFile
 from review_bot.domain.models_v1 import CodeFile, CodeSnapshot, ModelRequest, ModelResponse
-from tests.fixtures.review_b import BASE_SHA, HEAD_SHA, digest, make_task as make_v1_task
+from tests.fixtures.intent_review import BASE_SHA, HEAD_SHA, digest, make_task as make_v1_task
 
 BASE_SOURCE = 'def render(value):\n    return str(value)\n'
 HEAD_SOURCE = 'def render(value):\n    return {"value": value}\n'

@@ -12,7 +12,7 @@ from review_bot.ports import JobStore
 from review_bot.runtime import cli, model_clients
 from review_bot.runtime.mode_fingerprints import intent_input_fingerprint
 from review_bot.runtime.worker import WorkerLoop
-from tests.fixtures.review_b import make_task
+from tests.fixtures.intent_review import make_task
 
 
 @pytest.fixture(autouse=True)

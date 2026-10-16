@@ -18,7 +18,7 @@
 - 요구: Tev1이 추적할 동작 경로, 대조할 관계와 분석 방법을 계획하고 후속 리뷰에 전달한다.
 - 구현: 파일 묶음·묶은 이유 중심의 응답 계약이다. 전체 입력이 들어가면 한 묶음을 요구하며, 묶은 이유도 후속 분석 행동으로 전달하지 않는다.
 - 영향: PR #5에서는 계획 호출 성공이 방법론 계획의 유효성을 입증하지 못했다.
-- 근거: [코드 우선 리뷰](../src/review_bot/application/review_b_code.py#L309-L349), [계획 클라이언트](../src/review_bot/adapters/intent_planner.py), [구성 테스트](../tests/unit/test_code_intent_composition.py).
+- 근거: [코드 우선 리뷰](../src/review_bot/application/code_first_intent_review.py#L309-L349), [계획 클라이언트](../src/review_bot/adapters/intent_planner.py), [구성 테스트](../tests/unit/test_code_intent_composition.py).
 - 종료 조건: 계획이 구체적인 분석 행동을 정하고 실제 후속 요청에 반영되는 반례 테스트와 실행 증거가 필요하다.
 
 ### B-02 · 잠정 관계 해석을 후속 단계가 정정하지 못함
@@ -26,21 +26,21 @@
 - 요구: 초기 관찰은 잠정적이며, 후속 원문 검토가 잘못된 해석을 근거와 함께 정정할 수 있어야 한다.
 - 구현: 앞서 검증된 `consistent`·`conflict` 판정을 뒤집는 응답을 거부한다. 형식·인용 검증이 의미적 해석을 고정하는 결과가 된다.
 - 영향: PR #5의 초기 잘못된 `conflict`가 후속 평가에 남았다.
-- 근거: [코드 우선 리뷰](../src/review_bot/application/review_b_code.py), [현재 관계 판정 테스트](../tests/unit/test_review_b_code.py#L292-L317).
+- 근거: [코드 우선 리뷰](../src/review_bot/application/code_first_intent_review.py), [현재 관계 판정 테스트](../tests/unit/test_code_first_intent_review.py#L292-L317).
 - 종료 조건: 정당한 해석 정정과 근거 없는 변경을 구분하고, 이전 해석과 정정 근거를 함께 보존해야 한다.
 
 ### B-03 · 목적 재구성·최종 평가에서 원문 재확인 경로가 없음
 
 - 요구: 종합 중 발견한 맥락 부족을 고정 범위 안의 원문으로 확인하거나 명확히 유보한다.
 - 구현: 재확인 경로는 관찰 직후에만 있다. 목적 재구성·최종 평가에서 새 확인 필요성을 발견해도 원문 요청으로 연결할 수 없다.
-- 근거: [재확인 및 종합 경로](../src/review_bot/application/review_b_code.py#L853-L910).
+- 근거: [재확인 및 종합 경로](../src/review_bot/application/code_first_intent_review.py#L853-L910).
 - 종료 조건: 허용된 고정 범위·예산 안의 후속 확인 또는 명시적인 부분 검토 처리가 필요하다. Tev1 재계획 루프나 무제한 탐색을 요구하는 것은 아니다.
 
 ### B-04 · 누락 정보와 완료 판정이 불일치함
 
 - 요구: 미확인 자료·관계를 단계 사이에 보존하고, 실행 완료·범위 충분·지적 없음을 구분한다.
 - 구현: 앞 단계의 누락 정보를 모두 집계하지 않아, 필요한 맥락이 없다는 기록과 최종 완료 판정이 함께 남을 수 있다.
-- 근거: [완료 판정](../src/review_bot/application/review_b_code.py#L853-L910), [부분 검토 테스트](../tests/unit/test_review_b_code.py#L320-L365).
+- 근거: [완료 판정](../src/review_bot/application/code_first_intent_review.py#L853-L910), [부분 검토 테스트](../tests/unit/test_code_first_intent_review.py#L320-L365).
 - 종료 조건: 계획·관찰·재확인·목적·평가의 미해결 상태를 누적하고 최종 충분성 판정에 반영해야 한다.
 
 ### B-05 · 사용자용 의도 설명과 언어 설정이 출력에 반영되지 않음
@@ -54,14 +54,14 @@
 
 - 요구: 필수 필드, 허용 신호·변화 분류와 근거가 맞는 응답만 수용한다.
 - 구현: 누락 필드를 기본값으로 채우는 경로가 있어 `findings: [{}]` 같은 응답을 완료 처리할 수 있다.
-- 근거: [아키텍처 리뷰 검증](../src/review_bot/application/review_a.py#L441-L571), [기존 테스트](../tests/unit/test_context_and_review_a.py#L221-L278).
+- 근거: [아키텍처 리뷰 검증](../src/review_bot/application/architecture_review.py#L441-L571), [기존 테스트](../tests/unit/test_context_and_architecture_review.py#L221-L278).
 - 종료 조건: 필수·추가 필드와 실제 선택된 신호/변화/인용 관계의 로컬 검증 및 malformed 응답 반례가 필요하다.
 
 ### A-02 · 모델 예외 원문이 결과와 댓글로 전달됨
 
 - 요구: 원시 예외나 비밀 값을 결과·댓글에 기록하지 않는다.
 - 구현: 모델 예외의 `str(exc)`가 `validation_errors`에 저장되고 댓글의 한계 항목으로 출력될 수 있다.
-- 근거: [예외 처리](../src/review_bot/application/review_a.py#L725-L733), [댓글 출력](../src/review_bot/adapters/markdown/formatter.py#L257-L265).
+- 근거: [예외 처리](../src/review_bot/application/architecture_review.py#L725-L733), [댓글 출력](../src/review_bot/adapters/markdown/formatter.py#L257-L265).
 - 종료 조건: 안전한 오류 코드·이유로 변환한다. 토큰·URL·내부 경로를 포함한 합성 예외로 비노출을 검증해야 한다. 실제 비밀 유출이 확인된 것은 아니다.
 
 ### A-03 · Java 소스 없음이 비교 단계에서 분석 실패로 바뀜
@@ -100,7 +100,7 @@
 - A/B 표시는 기존 CLI·설정·직렬화·marker·산출물 호환 표기로 유지한다. 파일명 변경으로 위 문제를 해결했다고 표시하지 않는다.
 - 후속 동작 수정의 완료는 해당 항목의 반례 재현, 수정, 관련 회귀와 요구 → 실제 출력 대조 증거를 남긴 뒤에만 기록한다.
 
-### 파일명 변경안 — 적용 대기
+### 역할 기반 파일명 변경 — 적용 완료
 
 | 현재 Python 경로 | 책임 기반 목표 경로 |
 | --- | --- |
@@ -115,4 +115,6 @@
 | `tests/fixtures/review_b/` | `tests/fixtures/intent_review/` |
 | `tests/fixtures/review_b_code.py` | `tests/fixtures/code_first_intent_review.py` |
 
-실행 상태: 연결된 IDE의 이름 변경 기능이 Python 모듈을 찾지 못했다. import 위치·모듈 파일 위치·파일명·전체 모듈 경로를 지정한 시도 모두 실패했고, **소스·import·테스트 이름은 아직 변경하지 않았다**. 위 표는 적용 결과가 아니다. Python 모듈의 이름 변경이 가능한 환경에서 참조 변경과 회귀를 함께 수행해야 한다.
+IDE 확인: 이전 전용 Rename 시도는 Python 모듈을 찾지 못했다. 열린 루트 프로젝트의 유효 content root는 저장소 루트였고, 별도로 연 기능 worktree의 자동 감지는 build/review-a/.../java 생성물을 Java 모듈로 잡아 src/와 tests/의 Python roots를 구성하지 않았다. Python 지원은 설치되어 있었지만, 이 상태와 이전 Rename 오류의 직접 인과관계는 검증되지 않았다.
+
+적용 상태: 후속 사용자 지시에 따라 10개 지정 경로를 Git-aware shell rename으로 옮기고, source/test import와 fixture 참조를 새 경로로 갱신했다. CLI·설정 식별자, 호출 계약, schema/prompt 버전, A/B 산출물·marker·게시 정책은 변경하지 않았다. 전체 회귀 rtk proxy uv run --locked --offline pytest -q --tb=short → **2946 passed, 232.70s**, 기존 Starlette deprecation warning 1건. 아래 감사 결함은 해결 상태로 바꾸지 않았다.

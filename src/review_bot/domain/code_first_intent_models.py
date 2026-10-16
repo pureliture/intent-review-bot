@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from .models_b import IntentReviewLimits, IntentStageRecord
+from .intent_models import IntentReviewLimits, IntentStageRecord
 
 
 @dataclass(frozen=True)
