@@ -2,6 +2,8 @@
 
 Standalone GitHub Architecture (A) and Intent (B) Review Bot (`review_bot`) implementing Port-Adapter (Hexagonal) Architecture.
 
+**Design conformance:** the [2026-10-16 audit](docs/design-conformance-20261016.md) records unresolved review-contract gaps and risks requiring reproduction. Passing execution/schema/citation tests is not proof of complete design conformance or review quality.
+
 ## Requirements
 - Python >= 3.11
 - uv >= 0.10.0
