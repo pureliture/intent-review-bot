@@ -96,7 +96,7 @@ Every actual model HTTP request uses a separate **shared SQLite admission group*
 
 The admission DB stores reservation tokens/state/deadlines/limits, never prompts, source or credentials. Directories are `0700`, DB/sidecars `0600`; unsafe paths/ownership fail closed. Waiting consumes the original request/task deadline, and queued calls recheck worker cancellation and generation/lease fences before HTTP. Unused reservations can expire. **A sent generation with a lost response or crashed caller is not automatically freed by TTL:** the server may still be running it. Capacity remains conservatively reserved until actual server idleness is confirmed and an operator uses `SQLiteModelAdmission.resolve_uncertain(token, confirmed_idle=True)`. There is no automatic reconciliation or recovery CLI; never clear that state merely to bypass the limit.
 
-The llama.cpp deployment contract additionally requires **one actual generation slot per model server**, independent of that HTTP admission group. See [server-side generation capacity](#server-side-generation-capacity). This execution bound does not release uncertain SQLite tickets or recover a lost response.
+The me707 llama.cpp deployment contract requires **two actual generation slots per model server**, independent of that shared HTTP admission group. The separate MacBook profile retains one slot per server. See [server-side generation capacity](#server-side-generation-capacity). Slot verification does not release uncertain SQLite tickets or recover a lost response.
 
 The existing `seulgi-server` CI PMD/CPD analysis is **not migrated or replaced** by this general-purpose bot. Optional A retains its rootless/pinned-image requirements. Company use is deferred to a separate repository after personal development; no PAT support or personal/company authentication-switch framework is added here.
 
@@ -245,9 +245,11 @@ rtk proxy uv run --locked review-bot intent --input /path/to/private/fixed-B-inp
   --output /path/to/private/evaluation-llamacpp-001 --model-profile me707-llamacpp
 ```
 
-Construction remains offline. Preparation verifies model identity, exactly one server generation slot, slot context and a chat template through `/v1/models` and `/props`, without a warmup generation. The slot count must be integer `1`; two or more, missing, boolean, float and string values are rejected before template/tokenizer or generation calls. Clients recheck this on each completion and review/planning token measurement. Before generation, `/apply-template` and `/tokenize` measure the intact request with the server's native tokenizer; `/v1/chat/completions` uses strict JSON schema output and checks measured input against completion usage. Unsupported measurement, truncation, bad identity/usage/JSON or exhausted budgets fail closed. A 16 MiB transport cap is not a token estimate. V1's per-request 131,072-token input/total limits and v2's 131,072-token input/**accumulated task** limits are not automatically enlarged by a 256k model.
+Construction remains offline. Preparation verifies model identity, exactly two server generation slots, per-slot context and a chat template through `/v1/models` and `/props`, without a warmup generation. For me707 the slot count must be integer `2`; one, three or more, missing, boolean, float and string values are rejected before template/tokenizer or generation calls. The MacBook profile separately requires integer `1`. Clients recheck this on each completion and review/planning token measurement. Before generation, `/apply-template` and `/tokenize` measure the intact request with the server's native tokenizer; `/v1/chat/completions` uses strict JSON schema output and checks measured input against completion usage. Unsupported measurement, truncation, bad identity/usage/JSON or exhausted budgets fail closed. A 16 MiB transport cap is not a token estimate. V1's per-request 131,072-token input/total limits and v2's 131,072-token input/**accumulated task** limits are not automatically enlarged by a 256k model.
 
-The earlier parallel read-only node check confirmed SSH authentication, both health/model endpoints, and 256k/128k context with **two slots each**, which does not satisfy the new one-slot contract. It did **not** exercise generation or the adapter's live template/tokenizer compatibility. The node handoff records Bonsai2 weights as `PQ2_0`, not the earlier proposed 8-bit weights, and Tev1 as `Q8_0`; those weight choices are not validated by model IDs alone. Queried user-systemd unit names were inactive despite responding APIs, so process ownership/autostart/restart recovery and Ubuntu bot deployment are still unverified. On the latest 2026-10-15 retry the Ubuntu peer was offline, after earlier SSH/API connection timeouts. **The new server flags have not been applied remotely**, and live queue/disconnect tests remain pending. No new live PR review or external comment was performed.
+Native structured output uses the OpenAI `response_format.json_schema` envelope with `name`, `strict` and the unchanged request `schema`. The earlier flat `response_format.schema` did not enforce the closed-choice schema on the installed me707 server. The common transport now uses the same supported envelope as the MacBook profile; original response-field, citation, usage and application validation remain in place.
+
+On 2026-10-17 the user confirmed two slots for each me707 server, superseding the earlier one-slot proposal. Native inspection identified the existing `bonsai-llama.service` and `tev1-llama.service` user services. Bonsai was running with two slots; Tev1 was inactive with an existing two-slot configuration and was started through that manager. Current native verification and fixed-input review results are recorded in [milestones](milestones.md). Historical weight descriptions and model aliases alone do not attest the currently loaded weights. A successful sequential review does not establish concurrent queue/disconnect behavior, restart recovery, Ubuntu bot deployment or external publication.
 
 ### Server-side generation capacity
 
@@ -255,18 +257,18 @@ Keep the existing SQLite review queue and shared HTTP admission. Do not add Redi
 
 | Server | Generation flag | Total context flag | Expected `/props` |
 | --- | --- | --- | --- |
-| Bonsai2 | `--parallel 1` | `--ctx-size 262144` | `total_slots=1`, per-slot `n_ctx=262144` |
-| Tev1 | `--parallel 1` | `--ctx-size 131072` | `total_slots=1`, per-slot `n_ctx=131072` |
+| Bonsai2 | `--parallel 2` | `--ctx-size 524288` | `total_slots=2`, per-slot `n_ctx=262144` |
+| Tev1 | `--parallel 2` | `--ctx-size 262144` | `total_slots=2`, per-slot `n_ctx=131072` |
 
-These are replacement flags, **not complete launch commands or an applied deployment**. Replace conflicting command/environment values rather than appending duplicates. llama.cpp's context flag is the total across slots: changing parallelism without adjusting the former `524288`/`262144` totals would change the per-slot context. Model weights, quantization, KV placement, aliases, ports, private-network binding and authentication stay unchanged.
+These are capacity settings, **not complete launch commands**. Replace conflicting command/environment values rather than appending duplicates. llama.cpp's context flag is the total across slots: the totals above preserve 256k/128k per slot. Model weights, quantization, KV placement, aliases, ports, private-network binding and authentication stay unchanged. The existing MacBook 32k, one-slot launch commands below are separate.
 
-With this configuration the two server processes can generate at most **one request each, two combined**. Same-model requests serialize; they cannot use the other server's free slot. The server can defer an excess request even while its HTTP connection is open. Client timeout does not prove that the server stopped computing or removed a queued request. This bounds generation in these two processes, not all GPU applications or all metadata HTTP requests.
+With this configuration each server has two generation slots, so the server processes expose four slots combined. The bot's existing shared SQLite HTTP admission still limits its aggregate in-flight requests to at most two. Same-model requests can use that model's two slots; excess work cannot use another model's slots. The server can defer an excess request even while its HTTP connection is open. Client timeout does not prove that the server stopped computing or removed a queued request. These server slots do not bound other GPU applications; bot admission does not constrain independent non-bot clients.
 
 Apply and verify only when the node is reachable:
 
 1. Identify the actual owner/supervisor for both listening ports and the installed server version. Preserve existing launch settings privately. Historical systemd unit names are not proof of the current manager; do not start a second copy of a server.
 2. Pause new generation senders, including evaluation commands and non-bot clients, and confirm active **and deferred** work has drained. A health response or one idle-slot sample alone is insufficient. Do not interrupt someone else's active request to apply the flags.
-3. Replace only the parallel/context settings in that existing manager. Restart one idle server at a time through its confirmed supervisor. Do not kill arbitrary processes, recreate services or change network/authentication settings.
+3. Apply through the existing manager. Start an inactive service whose configuration already matches; when settings need changing, replace only parallel/context and restart one drained server at a time through its confirmed supervisor. Do not kill arbitrary processes, recreate services or change network/authentication settings.
 4. Check both exact model IDs and `/props` values above. With the two explicit endpoint environment variables set, the existing verification API makes only metadata calls:
 
    ```bash
@@ -274,15 +276,15 @@ Apply and verify only when the node is reachable:
    from review_bot.runtime.model_clients import build_review_client, build_selector_client
    for factory in (build_review_client, build_selector_client):
        factory("me707-llamacpp").verify()
-   print("model, one-slot, context and template checks passed")
+   print("model, two-slot, context and template checks passed")
    '
    ```
 
    These client checks still share HTTP admission and can wait on unresolved tickets. An operator's direct read-only metadata inspection does not release those tickets; do not switch to a fresh admission DB to bypass them.
 
-5. Use short synthetic requests to exercise two requests to one model and one to the other. Observe actual server slots/deferred-work telemetry: no more than one generation per server, the same-model request waits/resumes, and disconnecting a client never raises the bound. Use finite output/deadline limits and drain the test requests before resuming senders. Mock HTTP tests and `/health` alone do not establish this behavior on the installed version.
+5. For a separate capacity test, use bounded synthetic requests and actual slot/deferred-work telemetry to verify a maximum of two generations per server and waiting/resumption of excess work. Retain bot admission when testing bot callers. Use finite output/deadline limits and drain the test requests before resuming senders. Mock HTTP tests, `/health` and a sequential PR review alone do not establish concurrent behavior on the installed version.
 
-This does **not** implement automatic uncertain-ticket reconciliation, durable inference results or server-hang recovery. Existing `sent/uncertain` admission records remain intact and may still block new model calls. Neither the one-slot metadata check nor a service restart by itself authorizes clearing them.
+This does **not** implement automatic uncertain-ticket reconciliation, durable inference results or server-hang recovery. Existing `sent/uncertain` admission records remain intact and may still block new model calls. Neither the two-slot metadata check nor a service restart by itself authorizes clearing them.
 
 ## MacBook local llama.cpp (explicit opt-in)
 

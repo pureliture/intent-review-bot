@@ -79,7 +79,7 @@ class ControlledLlamaHTTP:
             assert request.method == "GET" and request.content == b""
             body = ({"object": "list", "data": [{"id": REVIEW_MODEL}]} if path == "/v1/models" else {
                 "chat_template": "synthetic-system-user-template",
-                "default_generation_settings": {"n_ctx": 262144}, "total_slots": 1,
+                "default_generation_settings": {"n_ctx": 262144}, "total_slots": 2,
             })
             return httpx.Response(200, json=body)
         assert request.method == "POST"
@@ -107,7 +107,8 @@ class ControlledLlamaHTTP:
         assert payload["n"] == 1 and 0 < payload["max_tokens"] <= 4096
         assert payload["stop"] == [] and payload["cache_prompt"] is False and payload["n_keep"] == -1
         assert payload["response_format"]["type"] == "json_schema"
-        schema = payload["response_format"]["schema"]
+        assert payload["response_format"]["json_schema"]["strict"] is True
+        schema = payload["response_format"]["json_schema"]["schema"]
         assert schema["type"] == "object" and schema["additionalProperties"] is False
         model_request = ModelRequest(1, REVIEW_MODEL, messages[0]["content"], messages[1]["content"],
             30, payload["max_tokens"], schema)

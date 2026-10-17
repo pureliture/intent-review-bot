@@ -142,6 +142,8 @@ def _check_output_fields(value: Any, schema: Any) -> None:
 
 
 class _LlamaCppClient:
+    _server_generation_slots = 2
+
     def __init__(
         self, model: str, api_url: str, timeout_seconds: int, *, role_model: str,
         context_tokens: int, max_output_tokens: int, max_output_bytes: int,
@@ -254,8 +256,9 @@ class _LlamaCppClient:
         ):
             raise PermanentModelError("llama.cpp server does not expose the exact role model")
         props = self._request("GET", "/props", deadline)
-        if type(props.get("total_slots")) is not int or props["total_slots"] != 1:
-            raise PermanentModelError("llama.cpp requires exactly one server generation slot")
+        if type(props.get("total_slots")) is not int or props["total_slots"] != self._server_generation_slots:
+            required = "one server generation slot" if self._server_generation_slots == 1 else "two server generation slots"
+            raise PermanentModelError(f"llama.cpp requires exactly {required}")
         settings = props.get("default_generation_settings")
         template = props.get("chat_template")
         if (
@@ -292,7 +295,9 @@ class _LlamaCppClient:
             "model": self.model,
             "messages": [{"role": "system", "content": request.system_prompt},
                          {"role": "user", "content": request.user_content}],
-            "response_format": {"type": "json_schema", "schema": request.response_schema},
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "review_bot", "strict": True, "schema": request.response_schema,
+            }},
             "stream": False, "temperature": 0, "seed": 0, "n": 1, "max_tokens": maximum,
             "stop": [], "cache_prompt": False, "n_keep": -1,
         }
@@ -326,7 +331,7 @@ class _LlamaCppClient:
 
     def _check_output(self, value: dict[str, Any], payload: dict[str, Any]) -> None:
         try:
-            _check_output_fields(value, payload["response_format"]["schema"])
+            _check_output_fields(value, payload["response_format"]["json_schema"]["schema"])
         except RecursionError:
             raise PermanentModelError("Invalid llama.cpp model output nesting") from None
 

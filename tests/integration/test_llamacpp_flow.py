@@ -50,7 +50,7 @@ def test_me707_cli_saves_validated_results_without_posting(tmp_path, monkeypatch
                 failure_stage == "server_capacity_after_goals" and generated
             )
             return httpx.Response(200, json={
-                "default_generation_settings": {"n_ctx": 262144}, "total_slots": 2 if unsafe_capacity else 1,
+                "default_generation_settings": {"n_ctx": 262144}, "total_slots": 3 if unsafe_capacity else 2,
                 "chat_template": "fixture-chat-template",
             })
         payload = json.loads(request.content)

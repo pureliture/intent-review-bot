@@ -107,7 +107,7 @@ def mock_http(monkeypatch: pytest.MonkeyPatch) -> Any:
                 assert request.method == "GET"
                 return httpx.Response(200, json={
                     "default_generation_settings": {"n_ctx": role.context},
-                    "total_slots": 1, "chat_template": "{{ messages }}<assistant>",
+                    "total_slots": 1 if role.is_macbook else 2, "chat_template": "{{ messages }}<assistant>",
                 })
             assert request.method == "POST"
             if request.url.path == "/apply-template":
@@ -220,7 +220,9 @@ def test_plan_generation_allows_more_than_64_tokens_and_preserves_native_wire(ro
         }
     else:
         assert "chat_template_kwargs" not in payload
-        assert payload["response_format"] == {"type": "json_schema", "schema": request.response_schema}
+        assert payload["response_format"] == {"type": "json_schema", "json_schema": {
+            "name": "review_bot", "strict": True, "schema": request.response_schema,
+        }}
     assert template == expected_template
     assert payload["messages"] == messages and payload["model"] == role.model
     assert payload["max_tokens"] == 1024
@@ -269,15 +271,16 @@ def test_plan_context_boundary_keeps_4096_output_reserve(role: Any, mock_http: A
         assert json.loads(requests[-1].content)["max_tokens"] == 4096
 
 
-@pytest.mark.parametrize("fault", ["wrong-model", "wrong-context", "two-slots"])
-def test_plan_verification_keeps_exact_alias_context_and_slot_one(role: Any, mock_http: Any, fault: str) -> None:
+@pytest.mark.parametrize("fault", ["wrong-model", "wrong-context", "wrong-slots"])
+def test_plan_verification_keeps_exact_alias_context_and_profile_slots(role: Any, mock_http: Any, fault: str) -> None:
+    expected_slots = 1 if role.is_macbook else 2
     def handler(request: httpx.Request) -> Any:
         if fault == "wrong-model" and request.url.path == "/v1/models":
             return httpx.Response(200, json={"object": "list", "data": [{"id": "wrong-role"}]})
         if request.url.path == "/props":
             return httpx.Response(200, json={
                 "default_generation_settings": {"n_ctx": role.context + int(fault == "wrong-context")},
-                "total_slots": 2 if fault == "two-slots" else 1, "chat_template": "template",
+                "total_slots": 3 if fault == "wrong-slots" else expected_slots, "chat_template": "template",
             })
         return None
 

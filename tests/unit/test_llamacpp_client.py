@@ -85,7 +85,7 @@ def mock_http(monkeypatch: pytest.MonkeyPatch) -> Any:
                 assert request.method == "GET"
                 return httpx.Response(200, json={
                     "default_generation_settings": {"id": 0, "n_ctx": 262144 if model == MAIN else 131072},
-                    "total_slots": 1, "chat_template": "{{ messages }}<assistant>",
+                    "total_slots": 2, "chat_template": "{{ messages }}<assistant>",
                 })
             if path == "/apply-template":
                 payload = json.loads(request.content)
@@ -197,8 +197,8 @@ def test_warmup_only_verifies_model_and_actual_slot_context(adapter: Any, mock_h
     (MAIN, "verify"), (MAIN, "warmup"), (MAIN, "count_input_tokens"), (MAIN, "complete"),
     (SELECTOR, "verify"), (SELECTOR, "warmup"), (SELECTOR, "complete"),
 ])
-@pytest.mark.parametrize("slots", [None, 0, 2, 3, True, False, 1.0, "1", -1])
-def test_server_generation_slots_are_exactly_one(
+@pytest.mark.parametrize("slots", [None, 0, 1, 3, True, False, 2.0, "2", -1])
+def test_server_generation_slots_are_exactly_two(
     adapter: Any, mock_http: Any, main_request: ModelRequest, decision_request: ModelRequest,
     role: str, operation: str, slots: Any,
 ) -> None:
@@ -224,7 +224,7 @@ def test_server_generation_slots_are_exactly_one(
 def test_generation_rechecks_server_capacity_after_warmup(
     adapter: Any, mock_http: Any, main_request: ModelRequest, decision_request: ModelRequest, role: str,
 ) -> None:
-    slots = [1]
+    slots = [2]
 
     def handler(request: httpx.Request) -> Any:
         if request.url.path == "/props":
@@ -238,7 +238,7 @@ def test_generation_rechecks_server_capacity_after_warmup(
     client_type = adapter.LlamaCppModelClient if role == MAIN else adapter.LlamaCppDecisionClient
     client = client_type(api_url=API_URL)
     client.warmup()
-    slots[0] = 2
+    slots[0] = 3
     with pytest.raises(PermanentModelError):
         client.complete(main_request if role == MAIN else decision_request)
     assert [request.url.path for request in requests] == ["/v1/models", "/props"] * 2
@@ -251,7 +251,7 @@ def test_generation_rechecks_server_capacity_after_warmup(
 ])
 def test_verification_fails_closed(adapter: Any, mock_http: Any, fault: str) -> None:
     models: Any = {"object": "list", "data": [{"id": MAIN, "meta": {"n_ctx_train": 262144}}]}
-    props: Any = {"default_generation_settings": {"n_ctx": 262144}, "total_slots": 1, "chat_template": "template"}
+    props: Any = {"default_generation_settings": {"n_ctx": 262144}, "total_slots": 2, "chat_template": "template"}
     if fault == "wrong_model":
         models["data"][0]["id"] = SELECTOR
     elif fault == "missing_model":
@@ -319,7 +319,9 @@ def test_complete_rechecks_count_and_posts_original_messages_and_schema(
     payload = json.loads(requests[-1].content)
     assert payload["model"] == MAIN
     assert payload["messages"] == json.loads(requests[-3].content)["messages"]
-    assert payload["response_format"] == {"type": "json_schema", "schema": main_request.response_schema}
+    assert payload["response_format"] == {"type": "json_schema", "json_schema": {
+        "name": "review_bot", "strict": True, "schema": main_request.response_schema,
+    }}
     assert payload["stream"] is False and payload["temperature"] == 0
     assert payload["max_tokens"] == 32 and payload["stop"] == []
     assert 0 < requests[-1].extensions["timeout"]["read"] <= 10
@@ -373,7 +375,7 @@ def test_verification_is_not_stale_after_warmup(adapter: Any, mock_http: Any, ma
     def handler(request: httpx.Request) -> Any:
         if changed[0] and request.url.path == "/props":
             return httpx.Response(200, json={"default_generation_settings": {"n_ctx": 1024},
-                                            "total_slots": 1, "chat_template": "changed"})
+                                            "total_slots": 2, "chat_template": "changed"})
         return None
 
     requests = mock_http(handler)

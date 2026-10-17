@@ -86,7 +86,7 @@ def test_actual_adapters_use_closed_choices_native_measurement_and_shared_admiss
         if request.url.path == "/v1/models":
             return httpx.Response(200, json={"object": "list", "data": [{"id": model}]})
         if request.url.path == "/props":
-            return httpx.Response(200, json={"total_slots": 1, "chat_template": "synthetic-intent-template",
+            return httpx.Response(200, json={"total_slots": 1 if local else 2, "chat_template": "synthetic-intent-template",
                 "default_generation_settings": {"n_ctx": 32768 if local else 131072 if selector else 262144}})
         payload = json.loads(request.content)
         if request.url.path == "/apply-template":
@@ -97,8 +97,14 @@ def test_actual_adapters_use_closed_choices_native_measurement_and_shared_admiss
             return httpx.Response(200, json={"tokens": list(range(100))})
         assert request.url.path == "/v1/chat/completions"
         task = json.loads(payload["messages"][1]["content"])
+        assert set(payload["response_format"]) == {"type", "json_schema"}
+        assert payload["response_format"]["json_schema"]["strict"] is True
         if selector:
             assert payload["max_tokens"] == 16 and payload["chat_template_kwargs"] == {"enable_thinking": False}
+            assert payload["response_format"]["json_schema"]["schema"] == {
+                "type": "object", "properties": {"choice": {"type": "string", "enum": ["A", "B", "C"]}},
+                "required": ["choice"], "additionalProperties": False,
+            }
             body, tokens = {"choice": "C"}, 5
         else:
             assert len(task["evidence"]) == 6 and task["reference_text"]
