@@ -1,7 +1,8 @@
-"""A grounded, purpose-first document for one private intent review."""
+"""A grounded, purpose-first document for one intent review."""
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+from typing import Literal
 
 from review_bot.adapters.markdown.intent_formatter import MAX_COMMENT_LENGTH, _escape, _link
 from review_bot.application.intent_context import build_intent_evidence, decode_intent_task_input
@@ -13,11 +14,15 @@ from review_bot.domain.markers import DEFAULT_B_MARKER, valid_intent_marker
 
 def format_intent_perspective_markdown(result: IntentPerspectiveResult, task_input: IntentTaskInput, *,
     marker: str = DEFAULT_B_MARKER, max_length: int = MAX_COMMENT_LENGTH,
+    publication_mode: Literal["artifact_only", "comment"] = "artifact_only",
 ) -> str:
-    if not valid_intent_marker(marker) or len(marker) > 128 or type(max_length) is not int or not 1000 <= max_length <= MAX_COMMENT_LENGTH:
+    if (not valid_intent_marker(marker) or len(marker) > 128 or type(max_length) is not int
+        or not 1000 <= max_length <= MAX_COMMENT_LENGTH or publication_mode not in ("artifact_only", "comment")):
         raise ValueError("invalid_intent_perspective_formatter_options")
     task = decode_intent_task_input(asdict(task_input))
     validate_intent_perspective_result(result, task)
+    if publication_mode == "comment" and result.status != "completed":
+        raise ValueError("incomplete_intent_perspective_comment")
     evidence = {item.id: item for item in build_intent_evidence(task)}
     ko = result.language == "ko"
     names = {item.id: item.name_ko if ko else item.name_en for item in PERSPECTIVES}
@@ -35,12 +40,16 @@ def format_intent_perspective_markdown(result: IntentPerspectiveResult, task_inp
                 values.append(link)
         return ", ".join(values)
 
-    title = "### 의도 리뷰 · 비공개 결과" if ko else "### Intent review · private result"
+    private = publication_mode == "artifact_only"
+    title = ("### 의도 리뷰 · 비공개 결과" if ko else "### Intent review · private result") if private else (
+        "### 의도 리뷰" if ko else "### Intent review")
     status = {"completed": "검토 완료", "partial_review": "부분 검토", "failed": "실행 실패", "not_run": "미실행"}.get(result.status) if ko else result.status
+    scope = ("- 검토 대상은 고정된 PR 입력과 제공된 원문입니다. 대상 코드·빌드·테스트는 실행하지 않았습니다." if ko else
+        "- Scope: the fixed PR input and supplied originals. Target code, builds, and tests were not executed.")
+    if private:
+        scope += " 외부 게시는 시도하지 않았습니다." if ko else " Publication was not attempted."
     intro = [marker, title, "", f"- {status} · {_escape(result.reason)}",
-        f"- base: {task.base.sha}; head: {task.head.sha}",
-        "- 검토 대상은 고정된 PR 입력과 제공된 원문입니다. 대상 코드·빌드·테스트는 실행하지 않았습니다. 외부 게시는 시도하지 않았습니다." if ko else
-        "- Scope: the fixed PR input and supplied originals. Target code, builds, and tests were not executed. Publication was not attempted."]
+        f"- base: {task.base.sha}; head: {task.head.sha}", scope]
     if result.model.get("is_mock"):
         intro.append("- 모의 모델을 사용한 형식 검증 결과입니다. 실제 모델의 리뷰 품질을 입증하지 않습니다." if ko else
             "- Mock model: contract verification only, not evidence of actual model review quality.")
@@ -75,5 +84,7 @@ def format_intent_perspective_markdown(result: IntentPerspectiveResult, task_inp
     text = "\n".join(lines) + "\n"
     if len(text) <= max_length:
         return text
+    if not private:
+        raise ValueError("intent_perspective_comment_too_large")
     return "\n".join([*intro, "", "출력 길이 제한으로 본문을 생략했습니다. 전체 검토 결과는 비공개 산출물을 확인하세요." if ko else
         "Body omitted because of the output limit. The complete review remains in the private artifacts."]) + "\n"

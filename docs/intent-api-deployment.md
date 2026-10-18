@@ -4,7 +4,7 @@
 
 Linux/me707에서 같은 이미지의 `web`과 `worker`를 별도 컨테이너로 실행한다. FastAPI는 입력을 SQLite에 저장하고 `202`를 반환한다. 워커는 기존 SQLite claim·lease·heartbeat·모델 admission을 사용해 리뷰를 실행한다. HTTP 연결이나 SSH 세션을 유지할 필요가 없다. API가 CLI 하위 프로세스를 실행하지 않는다.
 
-`intent.pipeline: perspectives-v1`은 기존 웹훅 워커에서도 선택할 수 있다. 새 관점 리뷰는 `publish.mode: artifact_only`, `b_comments_enabled: false`를 요구하며 외부 댓글을 게시하지 않는다. 기존 declared-v1/code-first-v2 기본값과 게시 계약은 유지한다.
+`intent.pipeline: perspectives-v1`은 기존 웹훅 워커에서도 선택할 수 있다. CLI와 고정 입력 API는 `publish.mode: artifact_only`, `b_comments_enabled: false`를 사용한다. GitHub App 웹훅 운영에서만 `execution.mode/backend: github_app`, `publish.mode: comment`, `b_comments_enabled: true`를 함께 명시해 관점 리뷰 댓글을 활성화할 수 있다. 완료 결과만 기존 봇 소유권·세대 fencing·PR과 원문 최신성 검사를 거쳐 게시한다. 미완료 결과와 댓글 길이를 초과한 결과는 게시하지 않는다. 기존 declared-v1/code-first-v2 기본값과 게시 계약은 유지한다.
 
 ## 고정 입력 API
 
@@ -67,6 +67,14 @@ rtk proxy docker compose --env-file /private/path/compose.env \
 ```
 
 `REVIEW_BOT_APP_KEY_FILE`은 호스트의 비공개 PEM 절대 경로다. 컨테이너에는 `/run/secrets/github-app.pem`으로 연결한다. 기존 GitHub App 환경 변수와 파일 권한 계약을 따른다. `REVIEW_BOT_API_TOKEN`도 명시하면 같은 서버에 고정 입력 API를 추가한다. 이 경우에도 `perspectives-v1`과 비공개 출력 설정이 필요하다. 고정 입력 전용 offline 모드에는 `/webhook` 경로가 없다.
+
+### 개인용 neurons 웹훅
+
+[deploy/personal-neurons.yaml](../deploy/personal-neurons.yaml)은 `purelitention-ai`가 `pureliture/neurons`에 관점 리뷰 댓글을 게시하는 명시적 운영 예제다. 운영 설정의 `service.installation_allowlist`에는 확인한 설치 ID를 추가한다. GitHub App은 해당 저장소만 설치 대상으로 선택하고 Contents read·Pull requests write, `pull_request`·`installation`·`installation_repositories` 이벤트를 사용한다.
+
+기존 고정 입력 API와 함께 실행할 때는 별도 Compose project·상태 디렉터리·포트(예: `127.0.0.1:18081`)를 사용하고, 모델 admission 디렉터리는 기존 경로를 공유한다. 댓글 운영 환경에는 `REVIEW_BOT_API_TOKEN`을 전달하지 않는다. cloudflared는 이 개인용 웹훅 서비스의 `POST /webhook`으로 HTTPS를 전달하며 모델 서버를 공개하지 않는다. 고정 입력 API는 기존 포트와 비공개 출력 설정으로 유지한다.
+
+App ID·PEM·서명 secret, 실제 설치 상태와 HTTPS 전달 결과는 운영 시 별도로 확인해야 한다. 이 예제와 게시 경로 구현만으로 App 연결이나 실PR 댓글 게시가 검증된 것은 아니다.
 
 ## API 검증
 

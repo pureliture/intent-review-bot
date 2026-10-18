@@ -6,7 +6,7 @@
 
 한 번 고정한 입력을 한 번의 리뷰 실행으로 처리하고 비공개 결과를 저장한다. 내부의 관점 선택·초기 분석·최종 검토·필요한 재확인은 이 실행에 포함된다. PR 변경 감지에 따른 반복 리뷰와 게시 후 최신성 보강은 후속 작업이다.
 
-기존 intent CLI의 명시적 평가 모드인 perspectives-v1과 [상시 API·워커](intent-api-deployment.md)를 제공한다. CLI와 고정 입력 API는 저장소를 다시 수집하거나 대상 코드·빌드·테스트·hook을 실행하지 않는다. API는 검증한 입력을 기존 SQLite 대기열에 저장하고 워커에서 같은 코어를 실행한다. 서명 웹훅의 기존 수집 경로에서도 이 파이프라인을 선택할 수 있으며 새 관점 리뷰의 결과는 비공개로만 저장한다. 기존 declared-v1과 code-first-v2 입력·실행 계약은 별도로 보존한다.
+기존 intent CLI의 명시적 평가 모드인 perspectives-v1과 [상시 API·워커](intent-api-deployment.md)를 제공한다. CLI와 고정 입력 API는 저장소를 다시 수집하거나 대상 코드·빌드·테스트·hook을 실행하지 않는다. API는 검증한 입력을 기존 SQLite 대기열에 저장하고 워커에서 같은 코어를 실행한다. 서명 웹훅의 기존 수집 경로에서도 이 파이프라인을 선택할 수 있다. CLI·고정 입력 API의 결과는 비공개로 저장하며, GitHub App 운영에서 댓글 모드와 B 게시를 함께 명시한 경우에만 완료 결과를 게시한다. 기존 declared-v1과 code-first-v2 입력·실행 계약은 별도로 보존한다.
 
 ## 초기 선택지
 
@@ -55,7 +55,7 @@
 
 사용자 결과는 파악한 개발 의도 → 구현과의 연결 → 달성 가능성 판단 → 필요한 확인 질문 순서다. ko가 기본이며 en을 명시할 수 있다. 모델 입력에도 언어를 전달한다. 원문 링크는 검증된 인용에서만 생성하며 모델이 쓴 HTML·링크·mention은 신뢰하지 않는다.
 
-B 디렉터리에 input/result/scope/usage/validation/comment와 catalog.json, selection.json, perspectives.json, judgements.json, context.json, passes.json을 저장한다. 선택과 판단의 수정 이력, 미해결 정보와 해소 이력을 보존한다. 디렉터리는 0700, 파일은 0600이며 기존 결과를 덮어쓰지 않는다. publication은 artifact_only/not_attempted다.
+B 디렉터리에 input/result/scope/usage/validation/comment와 catalog.json, selection.json, perspectives.json, judgements.json, context.json, passes.json을 저장한다. 선택과 판단의 수정 이력, 미해결 정보와 해소 이력을 보존한다. 디렉터리는 0700, 파일은 0600이며 기존 결과를 덮어쓰지 않는다. CLI·고정 입력 API의 publication은 artifact_only/not_attempted다. 명시적으로 활성화한 GitHub App 댓글은 기존 게시 receipt로 실제 시도·결과를 기록하며, 미완료 결과를 댓글로 게시하지 않는다.
 
 최종 검토가 충분하면 CLI는 exit 0, 미실행·실패·부분 검토이면 exit 1이다. 부분 결과도 저장한다. 이 실행에는 결과 재사용이나 최신 PR로의 자동 재게시가 없다.
 
