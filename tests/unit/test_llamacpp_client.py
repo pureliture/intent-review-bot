@@ -129,8 +129,8 @@ def test_role_contracts_are_explicit_and_construction_is_offline(adapter: Any, m
     assert review.profile.provider == "llamacpp"
     assert review.profile.model == MAIN
     assert review.profile.max_input_bytes == 16 * 1024 * 1024
-    assert review.profile.max_input_tokens == 262144 - 4096
-    assert review.profile.max_output_tokens == 4096
+    assert review.profile.max_input_tokens == 262144 - 32678
+    assert review.profile.max_output_tokens == 32678
     assert review.profile.max_output_bytes == 12000 and review.profile.max_attempts == 2
     assert review.token_count_receipt is None
     assert requests == []
@@ -387,7 +387,7 @@ def test_verification_is_not_stale_after_warmup(adapter: Any, mock_http: Any, ma
     assert all(r.url.path not in ("/tokenize", "/v1/chat/completions") for r in requests)
 
 
-@pytest.mark.parametrize("role,limit", [(MAIN, 258048), (SELECTOR, 126976)])
+@pytest.mark.parametrize("role,limit", [(MAIN, 229466), (SELECTOR, 126976)])
 def test_exact_token_boundary_and_output_reserve(
     adapter: Any, mock_http: Any, main_request: ModelRequest, decision_request: ModelRequest, role: str, limit: int,
 ) -> None:
@@ -407,7 +407,7 @@ def test_direct_complete_cannot_bypass_token_limit_or_reuse_an_earlier_count(
     def handler(request: httpx.Request) -> Any:
         if request.url.path == "/tokenize":
             calls[0] += 1
-            return httpx.Response(200, json={"tokens": [7] * (42 if calls[0] == 1 else 258049)})
+            return httpx.Response(200, json={"tokens": [7] * (42 if calls[0] == 1 else 229467)})
         return None
 
     requests = mock_http(handler)
@@ -416,13 +416,13 @@ def test_direct_complete_cannot_bypass_token_limit_or_reuse_an_earlier_count(
     with pytest.raises(PermanentModelError, match="input"):
         client.complete(main_request)
     assert all(r.url.path != "/v1/chat/completions" for r in requests)
-    assert client.count_input_tokens(main_request) == 258049
+    assert client.count_input_tokens(main_request) == 229467
     assert client.token_count_receipt == ZERO_RECEIPT
 
 
 @pytest.mark.parametrize("changes", [
     {"model": SELECTOR}, {"timeout_seconds": 0}, {"timeout_seconds": True}, {"timeout_seconds": math.inf},
-    {"max_output_tokens": 0}, {"max_output_tokens": 4097}, {"max_output_tokens": True},
+    {"max_output_tokens": 0}, {"max_output_tokens": 32679}, {"max_output_tokens": True},
     {"system_prompt": None}, {"user_content": b"bytes"}, {"response_schema": None},
     {"response_schema": {"value": math.nan}}, {"user_content": "\ud800"},
 ])
@@ -666,7 +666,7 @@ def test_selector_over_budget_and_unavailable_mode_never_pass(
         )
 
 
-@pytest.mark.parametrize("role,maximum", [(MAIN, 4096), (SELECTOR, 64)])
+@pytest.mark.parametrize("role,maximum", [(MAIN, 32678), (SELECTOR, 64)])
 def test_none_output_budget_defaults_to_bounded_role_limit(
     adapter: Any, mock_http: Any, main_request: ModelRequest, decision_request: ModelRequest, role: str, maximum: int,
 ) -> None:

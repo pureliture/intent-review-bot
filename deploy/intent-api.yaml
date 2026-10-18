@@ -8,7 +8,7 @@ execution:
   backend: mock
   available_modes: [intent]
   worker_concurrency: 2
-  task_timeout_seconds: 900
+  task_timeout_seconds: 14400
 service: {}
 publish:
   mode: artifact_only
@@ -16,7 +16,7 @@ publish:
 model:
   profile: me707-llamacpp
   max_concurrency: 2
-  call_timeout_seconds: 360
+  call_timeout_seconds: 3600
   max_attempts: 1
 intent:
   pipeline: perspectives-v1

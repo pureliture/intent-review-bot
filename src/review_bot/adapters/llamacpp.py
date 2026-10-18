@@ -22,6 +22,7 @@ SELECTOR_MODEL = "tev1-4b-q8_0"
 _REVIEW_CONTEXT_TOKENS = 262144
 _SELECTOR_CONTEXT_TOKENS = 131072
 _OUTPUT_RESERVE = 4096
+_REVIEW_OUTPUT_TOKENS = 32678
 _SELECTOR_OUTPUT_TOKENS = 64
 _MAX_INPUT_BYTES = 16 * 1024 * 1024
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -157,7 +158,7 @@ class _LlamaCppClient:
         self._origin = self._api_url[:-len("/v1")]
         self.timeout_seconds = timeout_seconds
         self._context_tokens = context_tokens
-        self._max_input_tokens = context_tokens - _OUTPUT_RESERVE
+        self._max_input_tokens = context_tokens - max(_OUTPUT_RESERVE, max_output_tokens)
         self._max_output_tokens = max_output_tokens
         self._max_output_bytes = max_output_bytes
 
@@ -407,6 +408,7 @@ class LlamaCppModelClient(_LlamaCppClient):
 
     _role_model = REVIEW_MODEL
     _role_context_tokens = _REVIEW_CONTEXT_TOKENS
+    _role_max_output_tokens = _REVIEW_OUTPUT_TOKENS
 
     def __init__(
         self, model: str = REVIEW_MODEL, *, api_url: str, timeout_seconds: int = 60,
@@ -417,12 +419,12 @@ class LlamaCppModelClient(_LlamaCppClient):
         if not _positive_integer(max_attempts):
             raise ValueError("llama.cpp attempts must be positive")
         super().__init__(model, api_url, timeout_seconds, role_model=self._role_model,
-                         context_tokens=self._role_context_tokens, max_output_tokens=_OUTPUT_RESERVE,
+                         context_tokens=self._role_context_tokens, max_output_tokens=self._role_max_output_tokens,
                          max_output_bytes=max_output_bytes)
         self.profile = ModelProfile(
             provider="llamacpp", model=model, max_input_bytes=_MAX_INPUT_BYTES, max_output_bytes=max_output_bytes,
             timeout_seconds=timeout_seconds, max_attempts=max_attempts, max_input_tokens=self._max_input_tokens,
-            max_output_tokens=_OUTPUT_RESERVE,
+            max_output_tokens=self._role_max_output_tokens,
         )
         self._receipts = threading.local()
 

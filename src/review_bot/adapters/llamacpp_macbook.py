@@ -66,6 +66,7 @@ class MacBookLlamaCppModelClient(_MacBookLlamaCppClient, LlamaCppModelClient):
 
     _role_model = MACBOOK_REVIEW_MODEL
     _role_context_tokens = MACBOOK_CONTEXT_TOKENS
+    _role_max_output_tokens = 4096
 
     def __init__(
         self, model: str = MACBOOK_REVIEW_MODEL, *, api_url: str, timeout_seconds: int = 60,
