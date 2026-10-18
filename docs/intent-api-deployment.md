@@ -103,3 +103,13 @@ Tev는 봇과 같은 `enable_thinking: false`, 최대 16토큰, 닫힌 A/B/C JSO
 실PR 실패 원인은 캡처한 두 원응답과 당시 설치 어댑터의 재생 검증으로 확인했다. 두 응답 모두 `finish_reason=stop`이고 최종 `content`는 16,254/16,347바이트의 유효한 JSON이며 실제 사용량도 존재했다. 별도 `reasoning_content`는 87,186/95,422바이트였다. 당시 어댑터가 이 필드를 거부해 애플리케이션 결과에는 사용량이 전달되지 않았다.
 
 원본을 보존한 채 메모리상의 복사본에서 추론 필드만 제외해 재생하자 기존 전송 검증과 같은 스키마의 초안 검증이 두 건 모두 통과했다. 이 재생에는 추가 모델 호출이 없었고 후속 어댑터 수정의 근거가 됐다. 실제 최종 리뷰 성공 여부는 수정 후 다시 검증한다. 검증 원응답·패킷·결과 요약은 비공개 evidence 디렉터리에 보존했고 임시 캡처 프로세스와 임시 파일은 정리했다. GitHub 게시도 수행하지 않았다.
+
+## 2026-10-18 reasoning_content 수정 및 실PR 재리뷰
+
+소스 커밋 `2a38480`부터 llama.cpp 어댑터는 문자열 `reasoning_content`를 응답 거부 사유로 삼지 않고 결과에 복사하지 않는다. 리뷰는 최종 `content`만 strict JSON·스키마·usage·truncation 규칙으로 검증한다. 잘못된 reasoning 타입, refusal, 도구 호출, 잘못된 JSON과 사용량 검증은 계속 거부한다. llama.cpp 리뷰·선택·계획 역할 회귀 592건이 통과했다.
+
+커밋 wheel을 비네트워크 빌드로 `github-review-bot:2a384805bbb0`에 배포했다. 실행 중인 이미지의 Python 소스 62개 hash가 해당 커밋과 일치하고, web/worker는 비특권 UID·읽기 전용 루트로 실행 중이다. Health와 API 상태·결과 GET은 200이다.
+
+이전과 byte-for-byte 같은 PR #5 입력 hash `33512688…9ac2d66d`를 새 API 작업 `run-b80a7bf31fb043d2b1b51c83d134bfba`로 한 번 제출했다. 결과는 `succeeded/completed/validated`; Tev 선택 8회와 Bonsai `draft_review`, `final_review` 두 단계가 모두 검증됐다. 총 10회 모델 호출의 usage가 완전하며 입력 34,521·출력 49,696토큰을 기록했다. 저장된 비공개 결과에는 finding 6건, 질문 0건이 있고 입력 hash도 일치한다. 처리 시간은 약 658초다. 게시 모드는 계속 `not_attempted`이며 GitHub 댓글은 만들지 않았다.
+
+최종 readback에서 두 모델은 슬롯당 131,072토큰·2슬롯·Q4_0 GPU KV, Bonsai 생성 상한은 32,678토큰이었다. 두 서버 슬롯과 admission은 유휴 상태고 GPU 여유는 약 2.3GiB다. 이전 `usage_unavailable` 실패 4건은 원상태로 보존했다.
