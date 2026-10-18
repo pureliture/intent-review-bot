@@ -838,7 +838,7 @@ class WorkerLoop:
         try:
             markdown = formatter(result, task_input, marker=marker,
                 max_length=min(60000, self.config.output.max_comment_characters),
-                **({} if perspectives else {"publication_mode": "comment" if reason is None else "artifact_only"}))
+                publication_mode="comment" if reason is None else "artifact_only")
             self._require_active(run, deadline)
             artifacts.save_intent(task_input, result, markdown)
         except (_RunAborted, _CommonFailure, GitHubAuthorizationError):

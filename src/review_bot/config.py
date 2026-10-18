@@ -337,10 +337,17 @@ class ReviewBotConfig(BaseModel):
             raise ValueError("architecture configuration is required for A-only execution")
         if self.execution.mode == "github_app" and "mode" not in self.publish.model_fields_set:
             self.publish.mode = "comment"
-        if self.intent.pipeline == "perspectives-v1" and (
-            self.publish.mode != "artifact_only" or self.publish.b_comments_enabled
-        ):
-            raise ValueError("perspectives-v1 requires artifact_only with B comments disabled")
+        if self.intent.pipeline == "perspectives-v1":
+            private_output = self.publish.mode == "artifact_only" and not self.publish.b_comments_enabled
+            app_comments = (
+                self.execution.mode == "github_app" and self.execution.backend == "github_app"
+                and self.publish.mode == "comment" and self.publish.b_comments_enabled
+            )
+            if not (private_output or app_comments):
+                raise ValueError(
+                    "perspectives-v1 requires artifact_only with B comments disabled "
+                    "or explicit GitHub App comment opt-in"
+                )
         return self
 
     @property
