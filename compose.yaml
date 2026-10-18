@@ -6,8 +6,6 @@ x-bot: &bot
   init: true
   restart: unless-stopped
   network_mode: host
-  extra_hosts:
-    - "ubuntu-ms-7e07:${ME707_MODEL_ADDRESS:?Set the live me707 model bind address}"
   read_only: true
   cap_drop: [ALL]
   security_opt: [no-new-privileges:true]
@@ -21,6 +19,16 @@ x-bot: &bot
     REVIEW_BOT_BIND_ADDRESS: ${REVIEW_BOT_BIND_ADDRESS:-127.0.0.1}
     REVIEW_BOT_PORT: ${REVIEW_BOT_PORT:-18080}
   volumes:
+    - type: bind
+      source: ${REVIEW_BOT_NETWORK_CONFIG_DIR:?Prepare the private network config directory}/hosts
+      target: /etc/hosts
+      read_only: true
+      bind: {create_host_path: false}
+    - type: bind
+      source: ${REVIEW_BOT_NETWORK_CONFIG_DIR:?Prepare the private network config directory}/resolv.conf
+      target: /etc/resolv.conf
+      read_only: true
+      bind: {create_host_path: false}
     - type: bind
       source: ${REVIEW_BOT_CONFIG:?Set the operator config path}
       target: /etc/review-bot.yaml

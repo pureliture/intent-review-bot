@@ -16,7 +16,7 @@ publish:
 model:
   profile: me707-llamacpp
   max_concurrency: 2
-  call_timeout_seconds: 240
+  call_timeout_seconds: 360
   max_attempts: 1
 intent:
   pipeline: perspectives-v1

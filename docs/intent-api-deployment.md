@@ -21,7 +21,7 @@ Linux/me707에서 같은 이미지의 `web`과 `worker`를 별도 컨테이너�
 
 입력 상한은 기존 `MAX_INPUT_BYTES`와 `service.webhook_max_bytes` 중 작은 값이다. 잘못된 원문·hash·schema는 422, 과대 입력은 413, 인증 실패는 401, 저장 실패는 503이다. `202`는 영속 접수 확인이며 리뷰 완료가 아니다. 같은 POST를 다시 보내면 별도 리뷰가 생기므로 받은 ID로 상태를 조회한다. 연결이 끊겨 접수 여부가 불명인 경우 재전송을 성공 복구로 간주하지 않는다.
 
-고정 입력은 SQLite의 기존 `runs` 대기열에 `fixed_intent` 종류로 저장한다. 별도 작업 스케줄러나 프로세스 내부 임시 대기열은 없다. 웹훅의 PR 세대 병합·취소와 고정 입력을 구분하고 전체 동시 lease 상한 2를 공유한다. 결과는 상태 디렉터리의 `artifacts/fixed/{review_id}/attempt-{N}/B/`에 저장한다. 회수된 lease의 새 시도는 새 디렉터리를 사용하므로 이전 결과를 덮어쓰지 않는다. lease 회수는 모델 호출의 exactly-once 보장이 아니며 기존 불확실 admission은 자동 해제하지 않는다.
+고정 입력은 SQLite의 기존 `runs` 대기열에 `fixed_intent` 종류로 저장한다. 별도 작업 스케줄러나 프로세스 내부 임시 대기열은 없다. 웹훅의 PR 세대 병합·취소와 고정 입력을 구분하고 전체 동시 lease 상한 2를 공유한다. 운영 중 평가도 API에 제출해 같은 노드의 공유 model admission으로 관리한다. 결과는 상태 디렉터리의 `artifacts/fixed/{review_id}/attempt-{N}/B/`에 저장한다. 회수된 lease의 새 시도는 새 디렉터리를 사용하므로 이전 결과를 덮어쓰지 않는다. lease 회수는 모델 호출의 exactly-once 보장이 아니며 기존 불확실 admission은 자동 해제하지 않는다.
 
 ## Compose 준비
 
@@ -34,7 +34,7 @@ Linux/me707에서 같은 이미지의 `web`과 `worker`를 별도 컨테이너�
 - `REVIEW_BOT_STATE_PATH`: 컨테이너 실행 UID가 소유한 mode 0700 상태 디렉터리.
 - `REVIEW_BOT_MODEL_STATE_PATH`: 모든 봇 워커가 공유하는 기존 모델 admission 디렉터리. mode 0700을 유지하고 불확실 기록을 우회하려고 새 경로로 바꾸지 않는다. 호스트를 옮길 때는 기존 발신자와 기록을 먼저 확인한다.
 - `REVIEW_BOT_UID`, `REVIEW_BOT_GID`: 상태 소유자 ID. 기본값은 1000이다.
-- `ME707_MODEL_ADDRESS`: 현재 me707 모델 서버가 바인딩된 사설 IP. Compose는 기존 허용 별칭 `ubuntu-ms-7e07`을 이 주소로 해석한다.
+- `REVIEW_BOT_NETWORK_CONFIG_DIR`: 실행 UID가 소유한 mode 0700 디렉터리. 아래 준비 명령이 읽을 수 있는 비밀 없는 hosts/resolver 파일을 생성한다. 모델 서버가 실제 바인딩된 주소를 전달하며 호스트 resolver 내용을 복사한다.
 - 선택적으로 `REVIEW_BOT_BIND_ADDRESS`, `REVIEW_BOT_PORT`: 기본 `127.0.0.1:18080`. me707에서 Tailscale 전용 주소를 명시하면 사설 API로 접근할 수 있다. GitHub webhook에는 별도의 운영 HTTPS 전달 경로가 필요하다.
 
 런타임 env의 모델 URL은 기존 허용 별칭 `http://ubuntu-ms-7e07:11435/v1`, `http://ubuntu-ms-7e07:11437/v1`을 사용한다. 두 서버는 각각 정확히 2슬롯이어야 한다. Docker의 이름 해석이 해당 호스트를 찾을 수 있어야 하며 전체 Tailscale DNS 이름을 임의의 새 endpoint로 대체하지 않는다.
@@ -42,12 +42,16 @@ Linux/me707에서 같은 이미지의 `web`과 `worker`를 별도 컨테이너�
 위 Compose 변수는 비공개 `compose.env` 파일에 저장하고 다음과 같이 실행한다.
 
 ```sh
+rtk proxy python3 deploy/prepare-network.py \
+  --directory /private/path/network --model-address <live-me707-address>
 rtk proxy docker compose --env-file /private/path/compose.env config --quiet
 rtk proxy docker compose --env-file /private/path/compose.env build web
 rtk proxy docker compose --env-file /private/path/compose.env up -d --no-build
 ```
 
-`web`과 `worker`는 같은 state/admission bind mount를 사용한다. 이미지에는 명시적으로 허용한 package·lock 파일만 복사한다. 소스 checkout, `.git`, `.junie`, `.idea`, 키, 모델, 테스트 입력과 생성 결과는 build context에서 제외한다. 컨테이너는 비특권 UID·읽기 전용 루트로 실행한다.
+`web`과 `worker`는 같은 state/admission bind mount를 사용한다. 읽을 수 있는 비밀 없는 hosts/resolver 파일을 명시적인 읽기 전용 bind mount로 제공한다. me707에서 관측된 Docker 생성 파일의 root/0600 권한으로 비특권 프로세스의 이름 해석이 실패하는 문제를 피하며, 호스트의 DNS·방화벽 설정은 변경하지 않는다. 이미지에는 명시적으로 허용한 package·lock 파일만 복사한다. 소스 checkout, `.git`, `.junie`, `.idea`, 키, 모델, 테스트 입력과 생성 결과는 build context에서 제외한다. 컨테이너는 비특권 UID·읽기 전용 루트로 실행한다.
+
+초기 설정의 호출 제한은 360초, 전체 리뷰 작업 제한은 900초다. 짧은 Bonsai 표본의 생성 속도에서 4096 출력 토큰만으로 약 260초가 걸릴 수 있어 여유를 둔 운영 예제이며, 장문 처리 속도나 과거 240초 실패 원인을 확정한 값은 아니다. 모델·출력 토큰·프롬프트·검증 한도는 그대로다.
 
 ## 서명 웹훅 운영
 
