@@ -52,7 +52,7 @@ Supply an operator-owned, full **schema-version-2** configuration using `--confi
 | `architecture.isolation.network`, `read_only_root`, `no_new_privileges` | `none`, `true`, `true` |
 | `architecture.tool_image_digest` | A trusted, preloaded image's exact `sha256:<64 lowercase hex digits>` or `repository@sha256:<64 lowercase hex digits>`; null, tags and malformed pins are rejected |
 
-`execution.available_modes` defaults to `[architecture]`; add or select `intent` explicitly for B. A-only configuration/pin checks and canonical hashes remain compatible. B-only may omit `architecture`. In mixed configurations, A preparation errors fail A without suppressing B; selected A still requires the same pinned-image/rootless checks and has no host/rootful fallback.
+`execution.available_modes` defaults to `[architecture]`; add or select `intent` explicitly for B. A is eligible only for changed Java code in a Gradle module, identified by `build.gradle` or `build.gradle.kts` at the fixed Git revision. A nearer `pom.xml` excludes a Maven module, including inside a Gradle repository. Deleted Java uses the comparison base; current Java uses the head build system. This constraint applies after default, model, timeout and failure selection paths. B eligibility is independent of Java and Gradle. A-only and mixed service configurations require an explicit pinned analyzer image and rootless isolation settings; preparation errors fail A without suppressing B. Target Gradle scripts are not executed.
 
 ### Private environment and Ubuntu preparation
 

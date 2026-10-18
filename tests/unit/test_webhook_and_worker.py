@@ -551,7 +551,7 @@ def test_fast_worker_skips_without_downstream_compute(
 
 
 @pytest.mark.parametrize("path", ["config/appearance.settings", "config/runtime.txt"])
-def test_fast_worker_default_selector_keeps_uncertain_paths_without_model_requests(
+def test_fast_worker_skips_non_java_uncertain_paths_without_model_requests(
     fast_worker: tuple[SQLiteJobStore, WorkerLoop, RunRecord, dict[str, Mock]], path: str,
 ) -> None:
     store, worker, run, calls = fast_worker
@@ -561,13 +561,13 @@ def test_fast_worker_default_selector_keeps_uncertain_paths_without_model_reques
     assert worker.process_run(run) is True
 
     calls["model"].complete.assert_not_called()
-    assert calls["analyzer"].run_analysis.call_count == 2
-    calls["delta"].assert_called_once()
-    calls["context"].assert_called_once()
-    calls["review"].assert_called_once_with(calls["context"].return_value, calls["model"])
+    calls["analyzer"].run_analysis.assert_not_called()
+    calls["delta"].assert_not_called()
+    calls["context"].assert_not_called()
+    calls["review"].assert_not_called()
     assert store._get_connection().execute(
         "SELECT status, reason FROM runs WHERE run_id = ?;", (run.run_id,),
-    ).fetchone() == ("succeeded", None)
+    ).fetchone() == ("skipped", "not_applicable")
 
 
 def test_fast_worker_calls_selector_model_without_review_pipeline(
@@ -714,10 +714,13 @@ def claimed_worker(
     reader.get_changed_files.return_value = (ChangedFile("src/Service.java"),)
     reader.get_rename_map.return_value = {}
     reader.collect_code_snapshot.side_effect = [task.snapshot.base, task.snapshot.head]
-    reader.read_tree_blobs.side_effect = lambda sha: {
-        file.path: file.content.encode("utf-8")
-        for file in (task.snapshot.base if sha == task.snapshot.base.sha else task.snapshot.head).files
-    }
+    def read_blobs(sha, paths=None):
+        blobs = {"build.gradle": b"plugins { id 'java' }\n", **{
+            file.path: file.content.encode("utf-8")
+            for file in (task.snapshot.base if sha == task.snapshot.base.sha else task.snapshot.head).files}}
+        return blobs if paths is None else {path: data for path, data in blobs.items() if path in paths}
+
+    reader.read_tree_blobs.side_effect = read_blobs
 
     def analyze(sha: str, source_root: Path, *args: Any, **kwargs: Any) -> Mock:
         assert isinstance(source_root, Path) and source_root.is_dir()
@@ -771,7 +774,9 @@ def test_worker_tree_cleanup_on_failure(
     analyze = worker.analyzer.run_analysis.side_effect
     write_bytes = Path.write_bytes
 
-    def read(sha: str) -> dict[str, bytes]:
+    def read(sha: str, paths=None) -> dict[str, bytes]:
+        if paths is not None:
+            return read_blobs(sha, paths=paths)
         if sha == failed_sha and failure == "read":
             raise OSError("tree read failed")
         return read_blobs(sha)
@@ -821,6 +826,7 @@ def test_worker_tree_cannot_escape_temporary_root(
     }[path_kind]
     worker.repo_reader.read_tree_blobs.side_effect = None
     worker.repo_reader.read_tree_blobs.return_value = {
+        "build.gradle": b"plugins { id 'java' }\n",
         "src/main/java/Safe.java": b"class Safe {}", unsafe_path: b"overwritten",
     }
 
@@ -870,7 +876,9 @@ def test_worker_tree_materialization_is_fenced(
             lose_fence()
         return applied
 
-    def read(sha: str) -> dict[str, bytes]:
+    def read(sha: str, paths=None) -> dict[str, bytes]:
+        if paths is not None:
+            return read_blobs(sha, paths=paths)
         blobs = read_blobs(sha)
         if boundary == "after_read":
             lose_fence()
@@ -897,7 +905,8 @@ def test_worker_tree_materialization_is_fenced(
 
     assert before is not None
     expected_reads = int(boundary != "before_read")
-    assert worker.repo_reader.read_tree_blobs.call_count == expected_reads
+    assert sum(call.kwargs.get("paths") is None
+        for call in worker.repo_reader.read_tree_blobs.call_args_list) == expected_reads
     assert len(worker_tree_roots) == expected_reads
     assert all(not root.exists() for root in worker_tree_roots)
     assert worker.analyzer.run_analysis.call_count == int(boundary == "between_analyses")

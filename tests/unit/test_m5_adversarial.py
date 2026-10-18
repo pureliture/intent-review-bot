@@ -719,7 +719,7 @@ class TestWorkerGenerationFencingRaceStress:
         store = SQLiteJobStore(db_file)
         config, _ = load_review_config_from_str(valid_config_yaml)
         mock_gh = MockGitHubClient()
-        mock_gh.set_pull_request(pr_number=2, head_sha="sha-mid-1")
+        mock_gh.set_pull_request(pr_number=2, head_sha="b" * 40, base_sha="a" * 40)
 
         req = PrRequestRecord(installation_id=1, repository_id=20, pr_number=2, desired_generation=1)
         store.enqueue_request(req)
@@ -739,7 +739,14 @@ class TestWorkerGenerationFencingRaceStress:
 
         # Setup repo_reader mock to pass PREPARE and SELECT stages
         mock_repo = MagicMock()
-        mock_repo.compute_merge_base.return_value = "base-sha"
+        from review_bot.domain.envelope_v2 import ChangedFile
+        from review_bot.ports import MergeBaseResult
+
+        mock_repo.resolve_merge_base.return_value = MergeBaseResult("a" * 40, "a" * 40, "comparable")
+        mock_repo.get_changed_files.return_value = (ChangedFile("src/Service.java"),)
+        mock_repo.get_rename_map.return_value = {}
+        mock_repo.read_tree_blobs.return_value = {
+            "build.gradle": b"plugins { id 'java' }\n", "src/Service.java": b"class Service {}\n"}
         mock_repo.get_commit.return_value = MagicMock(sha="head-sha", message="msg", author_email="a@b.com", authored_at="")
 
         worker = WorkerLoop(

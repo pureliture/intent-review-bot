@@ -194,6 +194,24 @@ def test_signed_python_pr_creates_private_validated_b_without_java(intent_flow):
 
 
 def use_modes(flow, modes, *, context_paths=None, task_timeout=900):
+    if "architecture" in modes and not getattr(flow, "gradle_java_change", False):
+        # Mixed-mode fixtures must contain a real supported Java/Gradle change.
+        # Preserve the original B sources so its independent assertions still apply.
+        source = flow.reader
+        repo_dir = flow.state / "mixed-gradle-java"
+        repo_dir.mkdir()
+        repo = SyntheticGitRepo(repo_dir)
+        java = "src/main/java/demo/ModeFixture.java"
+        for version in ("base", "head"):
+            for path, content in source.read_tree_blobs(flow.pr[version]["sha"]).items():
+                repo.write_file(path, content)
+            repo.write_file("build.gradle", "plugins { id 'java' }\n")
+            repo.write_file(java, "package demo; class ModeFixture { int value = " +
+                ("0" if version == "base" else "1") + "; }\n")
+            flow.pr[version]["sha"] = repo.commit("Supported mixed " + version)
+        flow.reader = GitRepositoryReader(repo_dir)
+        flow.worker.repo_reader_factory = lambda run, pr_data, client: flow.reader
+        flow.gradle_java_change = True
     raw = flow.config.model_dump()
     raw["execution"].update(available_modes=list(modes), task_timeout_seconds=task_timeout)
     if context_paths is not None:
@@ -203,7 +221,8 @@ def use_modes(flow, modes, *, context_paths=None, task_timeout=900):
 
 
 def enable_a_fixture(flow):
-    flow.analyzer.run_analysis.side_effect = lambda sha, *args: make_test_run(sha, source_files=("app.py",))
+    flow.analyzer.run_analysis.side_effect = lambda sha, *args: make_test_run(sha,
+        source_files=("src/main/java/demo/ModeFixture.java",))
 
 
 @pytest.mark.parametrize("modes", [("architecture",), ("architecture", "intent"), ("intent", "architecture")])
@@ -370,7 +389,8 @@ def test_scope_and_text_are_frozen_before_selection_and_analyzer_is_lazy(intent_
     root, _ = output(flow)
     task = json.loads((root / "B/input.json").read_text())
     assert task["snapshot"]["evidence"][1]["content"]["body"] == old_body
-    assert all(call.kwargs["paths"] == ("app.py", "tests/test_app.py") for call in collected.call_args_list)
+    assert all(call.kwargs["paths"] == ("app.py", "src/main/java/demo/ModeFixture.java", "tests/test_app.py")
+        for call in collected.call_args_list)
     factory.assert_not_called()
     assert not (root / "A").exists()
 

@@ -9,7 +9,9 @@ from datetime import UTC, datetime
 from review_bot.application.classification import classify_pr
 from review_bot.application.context import hash_json
 from review_bot.application.intent_context import collect_intent_code_snapshot, validate_intent_context_paths
-from review_bot.application.selection import DeadlineModeSelector, LightweightModeSelector, select_modes
+from review_bot.application.selection import (
+    DeadlineModeSelector, LightweightModeSelector, constrain_architecture_to_java_gradle, select_modes,
+)
 from review_bot.domain.envelope_v2 import (
     ChangedFile,
     EnvelopeEvidence,
@@ -282,4 +284,5 @@ def assemble_snapshot_bundle(
             selector = DeadlineModeSelector(selector)
         selection = selector.select_modes(review_snapshot, pr_snapshot, available_modes)
 
+    selection = constrain_architecture_to_java_gradle(review_snapshot, pr_snapshot, selection, repo_reader)
     return review_snapshot, pr_snapshot, classification, selection

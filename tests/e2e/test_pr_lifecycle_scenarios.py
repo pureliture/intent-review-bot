@@ -253,6 +253,7 @@ class TestScenario5GuardedConcurrentPublicationRace:
         second_source = first_source.replace("result = -1;", "result = -2;")
         outside = tmp_path / "Outside.java"
         outside.write_text("class Outside {}\n", encoding="utf-8")
+        synthetic_repo.write_file("build.gradle", "plugins { id 'java' }\n")
         synthetic_repo.write_file(path, base_source)
         (synthetic_repo.repo_dir / "src/main/java/demo/Linked.java").symlink_to(outside)
         (synthetic_repo.repo_dir / "external").symlink_to(tmp_path, target_is_directory=True)

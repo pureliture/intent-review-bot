@@ -1,0 +1,18 @@
+# Worker-only access to the dedicated rootless analyzer daemon.
+# Set REVIEW_BOT_CONTAINER_STATE_PATH equal to REVIEW_BOT_STATE_PATH so daemon
+# bind mounts refer to the same absolute paths on the host and in the worker.
+services:
+  worker:
+    environment:
+      DOCKER_HOST: unix:///run/review-bot/docker.sock
+    volumes:
+      - type: bind
+        source: ${REVIEW_BOT_ROOTLESS_DOCKER_SOCKET:?Set the dedicated rootless Docker socket}
+        target: /run/review-bot/docker.sock
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${REVIEW_BOT_DOCKER_CLI:-/usr/bin/docker}
+        target: /usr/local/bin/docker
+        read_only: true
+        bind: {create_host_path: false}

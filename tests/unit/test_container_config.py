@@ -14,7 +14,7 @@ def test_tmpfs_options_are_one_absolute_mount(service):
     assert target["read_only"] is True
     assert target["cap_drop"] == ["ALL"]
     assert target["security_opt"] == ["no-new-privileges:true"]
-    assert target["environment"]["REVIEW_BOT_STATE_DIR"] == "/var/lib/review-bot"
+    assert target["environment"]["REVIEW_BOT_STATE_DIR"] == "${REVIEW_BOT_CONTAINER_STATE_PATH:-/var/lib/review-bot}"
     assert target["environment"]["REVIEW_BOT_MODEL_STATE_DIR"] == "/var/lib/review-bot-models"
 
 

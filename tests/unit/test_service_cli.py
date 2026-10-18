@@ -60,6 +60,27 @@ def test_offline_fixed_service_rejects_absent_api_auth(service_config, monkeypat
     assert "REVIEW_BOT_API_TOKEN" in capsys.readouterr().err
 
 
+def test_mixed_mode_service_requires_a_pinned_analyzer_image(service_config):
+    from review_bot.runtime.service import ServiceConfigurationError, load_service_config
+
+    service_config.raw["execution"]["available_modes"] = ["architecture", "intent"]
+    service_config.raw["architecture"]["tool_image_digest"] = None
+    write_config(service_config)
+    with pytest.raises(ServiceConfigurationError, match="tool_image_digest"):
+        load_service_config(str(service_config.path))
+
+
+def test_mixed_mode_creates_a_private_analyzer_directory(service_config):
+    from review_bot.runtime.service import load_service_config, open_service_state
+
+    service_config.raw["execution"]["available_modes"] = ["architecture", "intent"]
+    write_config(service_config)
+    config = load_service_config(str(service_config.path))
+    with open_service_state(config) as (root, _):
+        assert (root / "analysis").is_dir()
+        assert (root / "analysis").stat().st_mode & 0o777 == 0o700
+
+
 @pytest.fixture(autouse=True)
 def no_external_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     def forbidden(*args, **kwargs):

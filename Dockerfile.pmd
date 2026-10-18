@@ -1,0 +1,17 @@
+# Supply trusted application and JDK 21 image references when building.
+ARG REVIEW_BOT_IMAGE
+ARG JDK_IMAGE
+FROM ${JDK_IMAGE} AS jdk
+FROM ${REVIEW_BOT_IMAGE}
+USER 0
+COPY --from=jdk /usr/lib/jvm/java-21-amazon-corretto /opt/java/corretto-21
+ENV JAVA_HOME=/opt/java/corretto-21 \
+    PMD_LIB_DIR=/opt/pmd/lib \
+    PATH="/opt/java/corretto-21/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+COPY tooling/lib/ /opt/pmd/lib/
+COPY dist/*.whl /tmp/review-bot-wheel/
+# The isolated analyzer uses /usr/local/bin/python3 -I, not the application venv.
+RUN /usr/local/bin/python3 -m pip install --no-index --no-deps /tmp/review-bot-wheel/*.whl \
+    && /usr/local/bin/python3 -I -c "from review_bot.adapters.pmd.provisioning import verify_tool_installation; verify_tool_installation()" \
+    && rm -rf /tmp/review-bot-wheel
+USER 1000:1000

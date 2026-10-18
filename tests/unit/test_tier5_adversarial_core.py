@@ -434,7 +434,7 @@ class TestApplicationCoreAdversarial:
         assert pr_s.rename_map == {}
         mock_reader.get_changed_files.assert_not_called()
         mock_reader.get_rename_map.assert_not_called()
-        assert sel.selected_modes == ("architecture",)
+        assert sel.selected_modes == ()
 
 
 # ==============================================================================

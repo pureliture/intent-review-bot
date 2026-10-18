@@ -1,0 +1,7 @@
+**
+!Dockerfile.pmd
+!dist/
+!dist/*.whl
+!tooling/
+!tooling/lib/
+!tooling/lib/*.jar
