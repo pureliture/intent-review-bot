@@ -36,7 +36,7 @@ def _response(request, *, content=None):
     if request.url.path == "/v1/models":
         return httpx.Response(200, json={"object": "list", "data": [{"id": model, "object": "model"}]})
     if request.url.path == "/props":
-        return httpx.Response(200, json={"default_generation_settings": {"n_ctx": 131072 if selector else 262144},
+        return httpx.Response(200, json={"default_generation_settings": {"n_ctx": 131072 if selector else 131072},
             "chat_template": "fixture-chat-template", "total_slots": 2})
     if request.url.path == "/apply-template":
         return httpx.Response(200, json={"prompt": json.dumps(json.loads(request.content)["messages"])})

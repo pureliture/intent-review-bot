@@ -87,7 +87,7 @@ def test_actual_adapters_use_closed_choices_native_measurement_and_shared_admiss
             return httpx.Response(200, json={"object": "list", "data": [{"id": model}]})
         if request.url.path == "/props":
             return httpx.Response(200, json={"total_slots": 1 if local else 2, "chat_template": "synthetic-intent-template",
-                "default_generation_settings": {"n_ctx": 32768 if local else 131072 if selector else 262144}})
+                "default_generation_settings": {"n_ctx": 32768 if local else 131072 if selector else 131072}})
         payload = json.loads(request.content)
         if request.url.path == "/apply-template":
             if selector:

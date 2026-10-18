@@ -211,7 +211,7 @@ The smaller real [PR #5](https://github.com/pureliture/openai-compatible-bridge/
 
 | Role | Model ID | Required per-slot context | Explicit endpoint variable |
 | --- | --- | --- | --- |
-| Review | `bonsai2-27b` | 262,144 tokens | `ME707_BONSAI_BASE_URL` |
+| Review | `bonsai2-27b` | 131,072 tokens | `ME707_BONSAI_BASE_URL` |
 | Existing System 1 mode selection | `tev1-4b-q8_0` | 131,072 tokens | `ME707_TEV1_BASE_URL` |
 | Separate code-first B planning | `tev1-4b-q8_0` | 131,072 tokens | `ME707_TEV1_BASE_URL` |
 
@@ -255,14 +255,16 @@ On 2026-10-17 the user confirmed two slots for each me707 server, superseding th
 
 ### Server-side generation capacity
 
-Keep the existing SQLite review queue and shared HTTP admission. Do not add Redis, a gateway or another scheduler just to enforce this bound. Configure the **existing** llama.cpp launch commands as follows, preserving every other flag:
+Keep the existing SQLite review queue and shared HTTP admission. Configure the **existing** llama.cpp launch commands with two slots and 128K context per slot. The user approved GPU KV placement and Q4_0 K/V caches for both models on 2026-10-18:
 
 | Server | Generation flag | Total context flag | Expected `/props` |
 | --- | --- | --- | --- |
-| Bonsai2 | `--parallel 2` | `--ctx-size 524288` | `total_slots=2`, per-slot `n_ctx=262144` |
+| Bonsai2 | `--parallel 2` | `--ctx-size 262144` | `total_slots=2`, per-slot `n_ctx=131072` |
 | Tev1 | `--parallel 2` | `--ctx-size 262144` | `total_slots=2`, per-slot `n_ctx=131072` |
 
-These are capacity settings, **not complete launch commands**. Replace conflicting command/environment values rather than appending duplicates. llama.cpp's context flag is the total across slots: the totals above preserve 256k/128k per slot. Model weights, quantization, KV placement, aliases, ports, private-network binding and authentication stay unchanged. The existing MacBook 32k, one-slot launch commands below are separate.
+These are capacity settings, **not complete launch commands**. Replace conflicting command/environment values rather than appending duplicates. llama.cpp's context flag is the total across slots. Both servers use `--kv-offload --cache-type-k q4_0 --cache-type-v q4_0`; remove Bonsai's old `--no-kv-offload`. Weight quantization is separate: Bonsai retains PQ2_0 weights and Tev1 retains Q8_0 weights. Preserve model files, the existing Bonsai mean-centering bias and attention-rotation setting, aliases, ports, private-network binding and authentication. The MacBook 32k, one-slot launch commands below are separate.
+
+Bonsai reserves 32,678 output tokens, leaving 98,394 native input tokens. The application's existing task token and JSON limits still apply. Q4 KV support and memory calculations alone do not establish successful GPU allocation, generation throughput or unchanged Tev selection quality; read back the live configuration and measure those separately after applying it.
 
 With this configuration each server has two generation slots, so the server processes expose four slots combined. The bot's existing shared SQLite HTTP admission still limits its aggregate in-flight requests to at most two. Same-model requests can use that model's two slots; excess work cannot use another model's slots. The server can defer an excess request even while its HTTP connection is open. Client timeout does not prove that the server stopped computing or removed a queued request. These server slots do not bound other GPU applications; bot admission does not constrain independent non-bot clients.
 
@@ -270,7 +272,7 @@ Apply and verify only when the node is reachable:
 
 1. Identify the actual owner/supervisor for both listening ports and the installed server version. Preserve existing launch settings privately. Historical systemd unit names are not proof of the current manager; do not start a second copy of a server.
 2. Pause new generation senders, including evaluation commands and non-bot clients, and confirm active **and deferred** work has drained. A health response or one idle-slot sample alone is insufficient. Do not interrupt someone else's active request to apply the flags.
-3. Apply through the existing manager. Start an inactive service whose configuration already matches; when settings need changing, replace only parallel/context and restart one drained server at a time through its confirmed supervisor. Do not kill arbitrary processes, recreate services or change network/authentication settings.
+3. Back up both units and apply context/KV settings through the existing manager. Restart drained Tev first to release its larger Q8 KV allocation, then restart Bonsai with GPU KV. If either startup fails, restore the saved configuration through that manager. Do not kill arbitrary processes, recreate services or change network/authentication settings.
 4. Check both exact model IDs and `/props` values above. With the two explicit endpoint environment variables set, the existing verification API makes only metadata calls:
 
    ```bash

@@ -84,7 +84,7 @@ def mock_http(monkeypatch: pytest.MonkeyPatch) -> Any:
             if path == "/props":
                 assert request.method == "GET"
                 return httpx.Response(200, json={
-                    "default_generation_settings": {"id": 0, "n_ctx": 262144 if model == MAIN else 131072},
+                    "default_generation_settings": {"id": 0, "n_ctx": 131072},
                     "total_slots": 2, "chat_template": "{{ messages }}<assistant>",
                 })
             if path == "/apply-template":
@@ -129,7 +129,7 @@ def test_role_contracts_are_explicit_and_construction_is_offline(adapter: Any, m
     assert review.profile.provider == "llamacpp"
     assert review.profile.model == MAIN
     assert review.profile.max_input_bytes == 16 * 1024 * 1024
-    assert review.profile.max_input_tokens == 262144 - 32678
+    assert review.profile.max_input_tokens == 131072 - 32678
     assert review.profile.max_output_tokens == 32678
     assert review.profile.max_output_bytes == 12000 and review.profile.max_attempts == 2
     assert review.token_count_receipt is None
@@ -205,7 +205,7 @@ def test_server_generation_slots_are_exactly_two(
     def handler(request: httpx.Request) -> Any:
         if request.url.path == "/props":
             return httpx.Response(200, json={
-                "default_generation_settings": {"n_ctx": 262144 if role == MAIN else 131072},
+                "default_generation_settings": {"n_ctx": 131072},
                 "total_slots": slots, "chat_template": "template",
             })
         return None
@@ -229,7 +229,7 @@ def test_generation_rechecks_server_capacity_after_warmup(
     def handler(request: httpx.Request) -> Any:
         if request.url.path == "/props":
             return httpx.Response(200, json={
-                "default_generation_settings": {"n_ctx": 262144 if role == MAIN else 131072},
+                "default_generation_settings": {"n_ctx": 131072},
                 "total_slots": slots[0], "chat_template": "template",
             })
         return None
@@ -251,7 +251,7 @@ def test_generation_rechecks_server_capacity_after_warmup(
 ])
 def test_verification_fails_closed(adapter: Any, mock_http: Any, fault: str) -> None:
     models: Any = {"object": "list", "data": [{"id": MAIN, "meta": {"n_ctx_train": 262144}}]}
-    props: Any = {"default_generation_settings": {"n_ctx": 262144}, "total_slots": 2, "chat_template": "template"}
+    props: Any = {"default_generation_settings": {"n_ctx": 131072}, "total_slots": 2, "chat_template": "template"}
     if fault == "wrong_model":
         models["data"][0]["id"] = SELECTOR
     elif fault == "missing_model":
@@ -264,7 +264,7 @@ def test_verification_fails_closed(adapter: Any, mock_http: Any, fault: str) -> 
         props["default_generation_settings"] = {"n_ctx_train": 262144}
     elif fault in ("small_context", "total_context", "boolean_context", "string_context"):
         props["default_generation_settings"]["n_ctx"] = {
-            "small_context": 131072, "total_context": 524288, "boolean_context": True, "string_context": "262144",
+            "small_context": 65536, "total_context": 262144, "boolean_context": True, "string_context": "131072",
         }[fault]
     elif fault == "missing_slots":
         del props["total_slots"]
@@ -387,7 +387,7 @@ def test_verification_is_not_stale_after_warmup(adapter: Any, mock_http: Any, ma
     assert all(r.url.path not in ("/tokenize", "/v1/chat/completions") for r in requests)
 
 
-@pytest.mark.parametrize("role,limit", [(MAIN, 229466), (SELECTOR, 126976)])
+@pytest.mark.parametrize("role,limit", [(MAIN, 98394), (SELECTOR, 126976)])
 def test_exact_token_boundary_and_output_reserve(
     adapter: Any, mock_http: Any, main_request: ModelRequest, decision_request: ModelRequest, role: str, limit: int,
 ) -> None:
@@ -407,7 +407,7 @@ def test_direct_complete_cannot_bypass_token_limit_or_reuse_an_earlier_count(
     def handler(request: httpx.Request) -> Any:
         if request.url.path == "/tokenize":
             calls[0] += 1
-            return httpx.Response(200, json={"tokens": [7] * (42 if calls[0] == 1 else 229467)})
+            return httpx.Response(200, json={"tokens": [7] * (42 if calls[0] == 1 else 98395)})
         return None
 
     requests = mock_http(handler)
@@ -416,7 +416,7 @@ def test_direct_complete_cannot_bypass_token_limit_or_reuse_an_earlier_count(
     with pytest.raises(PermanentModelError, match="input"):
         client.complete(main_request)
     assert all(r.url.path != "/v1/chat/completions" for r in requests)
-    assert client.count_input_tokens(main_request) == 229467
+    assert client.count_input_tokens(main_request) == 98395
     assert client.token_count_receipt == ZERO_RECEIPT
 
 
