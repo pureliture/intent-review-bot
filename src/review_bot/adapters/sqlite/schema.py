@@ -48,7 +48,14 @@ CREATE TABLE IF NOT EXISTS runs (
     started_at TEXT,
     completed_at TEXT,
     error TEXT,
-    reason TEXT
+    reason TEXT,
+    kind TEXT NOT NULL DEFAULT 'github_pr'
+);
+
+CREATE TABLE IF NOT EXISTS fixed_intent_inputs (
+    run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+    input_json TEXT NOT NULL,
+    language TEXT NOT NULL CHECK (language IN ('ko', 'en'))
 );
 
 CREATE TABLE IF NOT EXISTS publication_receipts (

@@ -27,6 +27,8 @@ uv run pytest
 
 ## GitHub App service (operator-prepared)
 
+For the Docker Compose web/worker deployment and authenticated fixed-input intent API, see [의도 리뷰 API와 컨테이너 운영](docs/intent-api-deployment.md). `perspectives-v1` is available to the leased worker with private artifacts; the fixed-input API also runs without GitHub credentials. Live deployment and model-review evidence are recorded separately in `milestones.md`.
+
 The default path is **App installation → repository selection → signed PR event → SQLite lease → A architecture review → create or update one A comment**. Explicitly available/selected B intent review uses the same Worker, with separate files, receipts and an independently approved publication gate. The CLI composes the existing signed FastAPI receiver, SQLite job store, installation-scoped GitHub/repository adapters and `WorkerLoop`; it does not install an App or deploy a service.
 
 - **D1 — installation-based eligibility:** repositories selected during installation are eligible without operator registration. Empty `service.installation_allowlist` and `service.repository_allowlist` allow installed repositories; nonempty lists add restrictions. Installation/repository binding and installation-token scope still apply.

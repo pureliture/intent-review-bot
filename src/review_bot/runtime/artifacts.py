@@ -131,8 +131,8 @@ class RunArtifacts:
             "input_fingerprint": result.run_key, "prompt_version": result.prompt_version,
             "prompt_hash": result.prompt_hash, "status": result.status, "reason": result.reason,
             "publication": None}
-        if result.schema_version == 2:
-            self.manifest["modes"]["intent"]["result_schema_version"] = 2
+        if result.schema_version in (2, 3):
+            self.manifest["modes"]["intent"]["result_schema_version"] = result.schema_version
         self.write_json("manifest.json", self.manifest)
 
     def save_receipt(self, receipt: Any) -> None:

@@ -26,6 +26,40 @@ SECRET = "synthetic-step7-secret"
 IMAGE = "sha256:" + "a" * 64
 
 
+def test_offline_intent_service_needs_no_github_credentials(service_config, monkeypatch):
+    from dataclasses import asdict
+    from tests.fixtures.intent_perspectives import make_task
+
+    service_config.raw["execution"].update(mode="offline", available_modes=["intent"])
+    service_config.raw["intent"] = {"pipeline": "perspectives-v1"}
+    service_config.raw["publish"].update(mode="artifact_only", b_comments_enabled=False)
+    write_config(service_config)
+    monkeypatch.setenv("REVIEW_BOT_API_TOKEN", "synthetic-fixed-api-token")
+    for name in ("STEP7_APP_ID", "STEP7_KEY_FILE", "STEP7_SECRET"):
+        monkeypatch.delenv(name)
+
+    def serve(app, **options):
+        with TestClient(app) as client:
+            assert client.get("/health").status_code == 200
+            assert client.post("/webhook", json={}).status_code == 404
+            response = client.post("/reviews/intent", json=asdict(make_task()),
+                headers={"Authorization": "Bearer synthetic-fixed-api-token"})
+            assert response.status_code == 202, response.text
+
+    monkeypatch.setattr(uvicorn, "run", serve)
+    assert main(["webhook", "--config", str(service_config.path)]) == 0
+
+
+def test_offline_fixed_service_rejects_absent_api_auth(service_config, monkeypatch, capsys):
+    service_config.raw["execution"].update(mode="offline", available_modes=["intent"])
+    service_config.raw["intent"] = {"pipeline": "perspectives-v1"}
+    service_config.raw["publish"].update(mode="artifact_only", b_comments_enabled=False)
+    write_config(service_config)
+    monkeypatch.delenv("REVIEW_BOT_API_TOKEN", raising=False)
+    assert main(["webhook", "--config", str(service_config.path)]) == 1
+    assert "REVIEW_BOT_API_TOKEN" in capsys.readouterr().err
+
+
 @pytest.fixture(autouse=True)
 def no_external_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     def forbidden(*args, **kwargs):

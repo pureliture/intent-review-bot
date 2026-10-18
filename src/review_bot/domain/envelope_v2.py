@@ -15,6 +15,7 @@ from .status import (
 if TYPE_CHECKING:
     from .intent_models import ReviewBResult
     from .code_first_intent_models import CodeFirstReviewResult
+    from .intent_perspectives import IntentPerspectiveResult
 
 
 @dataclass(frozen=True)
@@ -110,7 +111,7 @@ class ExecutionReceipt:
     limitations: tuple[str, ...] = ()
     error_code: str | None = None
     publication: PublicationReceipt | None = None
-    b_result: ReviewBResult | CodeFirstReviewResult | None = None
+    b_result: ReviewBResult | CodeFirstReviewResult | IntentPerspectiveResult | None = None
     usage: dict[str, object] | None = None
     input_fingerprint: str | None = None
     reused: bool = False
@@ -155,3 +156,4 @@ class RunRecord:
     completed_at: str | None = None
     error: str | None = None
     reason: str | None = None
+    kind: str = "github_pr"

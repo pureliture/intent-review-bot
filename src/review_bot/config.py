@@ -257,7 +257,7 @@ class RepositorySettingsConfig(BaseModel):
 
 class IntentConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
-    pipeline: Literal["declared-v1", "code-first-v2"] = "declared-v1"
+    pipeline: Literal["declared-v1", "code-first-v2", "perspectives-v1"] = "declared-v1"
     context_paths: list[str] = Field(default_factory=list, max_length=5000)
 
     @field_validator("context_paths")
@@ -337,6 +337,10 @@ class ReviewBotConfig(BaseModel):
             raise ValueError("architecture configuration is required for A-only execution")
         if self.execution.mode == "github_app" and "mode" not in self.publish.model_fields_set:
             self.publish.mode = "comment"
+        if self.intent.pipeline == "perspectives-v1" and (
+            self.publish.mode != "artifact_only" or self.publish.b_comments_enabled
+        ):
+            raise ValueError("perspectives-v1 requires artifact_only with B comments disabled")
         return self
 
     @property

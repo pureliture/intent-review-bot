@@ -172,6 +172,18 @@ class JobStore(Protocol):
         """Upsert PR request and coalesce desired_generation."""
         ...
 
+    def enqueue_fixed_intent(self, input_json: str, repository_id: int, pr_number: int, language: str) -> str:
+        """Atomically retain an immutable input and queue an independent review."""
+        ...
+
+    def get_fixed_intent_input(self, run_id: str) -> tuple[str, str] | None:
+        """Load a fixed review's original input and chosen language."""
+        ...
+
+    def get_fixed_intent_status(self, run_id: str) -> dict | None:
+        """Read only fixed-input job state for the authenticated review API."""
+        ...
+
     def claim_next_run(self, worker_id: str, lease_seconds: float) -> RunRecord | None:
         """Atomically claim the next runnable execution with an expiring lease."""
         ...

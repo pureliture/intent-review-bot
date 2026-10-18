@@ -22,6 +22,7 @@ from review_bot.ports import GitHubClient, RepositoryReader
 from review_bot.runtime.github_app import GitHubAppAdapters
 from review_bot.runtime.webhook import create_webhook_app
 from review_bot.runtime.worker import WorkerLoop
+from review_bot.runtime.intent_api import API_TOKEN_ENV, attach_intent_api, create_intent_app
 
 
 class ServiceConfigurationError(ValueError):
@@ -40,9 +41,10 @@ def load_service_config(path: str | None) -> ReviewBotConfig:
                 if (section, field) in locations:
                     raise ServiceConfigurationError(f"{section}.{field} must be 1 or 2") from None
         raise ServiceConfigurationError("Cannot load operator --config") from None
-    if config.execution.mode != "github_app":
-        raise ServiceConfigurationError("execution.mode must be github_app")
-    if config.execution.backend != "github_app":
+    fixed_only = config.execution.mode == "offline" and config.execution.available_modes == ["intent"] and config.intent.pipeline == "perspectives-v1"
+    if config.execution.mode != "github_app" and not fixed_only:
+        raise ServiceConfigurationError("execution.mode must be github_app (or offline for fixed perspectives-v1)")
+    if not fixed_only and config.execution.backend != "github_app":
         raise ServiceConfigurationError("execution.backend must be github_app")
     if config.execution.worker_concurrency not in (1, 2):
         raise ServiceConfigurationError("execution.worker_concurrency must be 1 or 2")
@@ -54,10 +56,14 @@ def load_service_config(path: str | None) -> ReviewBotConfig:
         raise ServiceConfigurationError("service.lease_and_generation_fencing must be true")
     if "architecture" in config.execution.available_modes and "intent" not in config.execution.available_modes:
         _validate_architecture_runtime(config)
-    try:
-        validate_active_environment(config)
-    except Exception:
-        raise ServiceConfigurationError("Required GitHub App environment references must be set") from None
+    if fixed_only:
+        if not os.environ.get(API_TOKEN_ENV, "").strip():
+            raise ServiceConfigurationError("REVIEW_BOT_API_TOKEN must be set for the fixed-input API")
+    else:
+        try:
+            validate_active_environment(config)
+        except Exception:
+            raise ServiceConfigurationError("Required GitHub App environment references must be set") from None
     if not os.environ.get(config.service.state_root_env, "").strip():
         raise ServiceConfigurationError("service.state_root_env must reference a private absolute directory")
     return config
@@ -207,8 +213,13 @@ def run_webhook(config_path: str | None, *, host: str = "127.0.0.1", port: int =
     config = load_service_config(config_path)
     if not host or not 1 <= port <= 65535:
         raise ServiceConfigurationError("A host and port in 1..65535 are required")
-    with open_service_state(config) as (_, job_store):
-        app = create_webhook_app(config, job_store)
+    with open_service_state(config) as (root, job_store):
+        if config.execution.mode == "offline":
+            app = create_intent_app(config, job_store, root / "artifacts")
+        else:
+            app = create_webhook_app(config, job_store)
+            if os.environ.get(API_TOKEN_ENV, "").strip():
+                attach_intent_api(app, config, job_store, root / "artifacts")
         uvicorn.run(app, host=host, port=port)
     return 0
 
