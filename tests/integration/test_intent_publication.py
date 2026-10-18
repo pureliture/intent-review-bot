@@ -144,6 +144,7 @@ def test_a_output_failure_preserves_called_core_and_usage_without_suppressing_b(
     repo_dir = flow.state / "a-source"
     repo_dir.mkdir()
     repo = SyntheticGitRepo(repo_dir)
+    repo.write_file("build.gradle", "plugins { id 'java' }\n")
     source_path = "src/main/java/demo/App.java"
     repo.write_file(source_path, "class App { void handle() {} }\n")
     repo.write_file("tests/test_app.py", "def test_handle():\n    assert handle() == 1\n")

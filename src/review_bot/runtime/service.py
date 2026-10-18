@@ -54,7 +54,7 @@ def load_service_config(path: str | None) -> ReviewBotConfig:
         raise ServiceConfigurationError("service.sqlite_wal must be true")
     if not config.service.lease_and_generation_fencing:
         raise ServiceConfigurationError("service.lease_and_generation_fencing must be true")
-    if "architecture" in config.execution.available_modes and "intent" not in config.execution.available_modes:
+    if "architecture" in config.execution.available_modes:
         _validate_architecture_runtime(config)
     if fixed_only:
         if not os.environ.get(API_TOKEN_ENV, "").strip():
@@ -155,7 +155,7 @@ def open_service_state(config: ReviewBotConfig) -> Iterator[tuple[Path, SQLiteJo
     try:
         root = _private_directory(Path(os.environ[config.service.state_root_env]))
         directories = ("repositories", "artifacts")
-        if "architecture" in config.execution.available_modes and "intent" not in config.execution.available_modes:
+        if "architecture" in config.execution.available_modes:
             directories += ("analysis",)
         for name in directories:
             _private_directory(root / name)

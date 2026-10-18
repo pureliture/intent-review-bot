@@ -70,11 +70,19 @@ rtk proxy docker compose --env-file /private/path/compose.env \
 
 ### 개인용 neurons 웹훅
 
-[deploy/personal-neurons.yaml](../deploy/personal-neurons.yaml)은 `purelitention-ai`가 `pureliture/neurons`에 관점 리뷰 댓글을 게시하는 명시적 운영 예제다. 운영 설정의 `service.installation_allowlist`에는 확인한 설치 ID를 추가한다. GitHub App은 해당 저장소만 설치 대상으로 선택하고 Contents read·Pull requests write, `pull_request`·`installation`·`installation_repositories` 이벤트를 사용한다.
+[deploy/personal-neurons.yaml](../deploy/personal-neurons.yaml)은 `purelitention-ai`가 `pureliture/neurons`에 아키텍처·의도 리뷰를 제공하는 운영 예제다. Java 코드 변경이 있고 해당 모듈의 고정 Git 원문에 `build.gradle` 또는 `build.gradle.kts`가 있을 때만 PMD/CPD 아키텍처 리뷰를 선택한다. 더 가까운 `pom.xml`이 있는 Maven 모듈은 제외하며, Java·Gradle과 무관한 PR의 의도 리뷰는 계속 선택할 수 있다. 운영 설정의 `service.installation_allowlist`에는 확인한 설치 ID를 추가한다. GitHub App은 해당 저장소만 설치 대상으로 선택하고 Contents read·Pull requests write, `pull_request`·`installation`·`installation_repositories` 이벤트를 사용한다.
 
 기존 고정 입력 API와 함께 실행할 때는 별도 Compose project·상태 디렉터리·포트(예: `127.0.0.1:18081`)를 사용하고, 모델 admission 디렉터리는 기존 경로를 공유한다. 댓글 운영 환경에는 `REVIEW_BOT_API_TOKEN`을 전달하지 않는다. cloudflared는 이 개인용 웹훅 서비스의 `POST /webhook`으로 HTTPS를 전달하며 모델 서버를 공개하지 않는다. 고정 입력 API는 기존 포트와 비공개 출력 설정으로 유지한다.
 
 App ID·PEM·서명 secret, 실제 설치 상태와 HTTPS 전달 결과는 운영 시 별도로 확인해야 한다. 이 예제와 게시 경로 구현만으로 App 연결이나 실PR 댓글 게시가 검증된 것은 아니다.
+
+### PMD/CPD 분석기 연결
+
+개인용 예제의 `architecture.tool_image_digest`는 비어 있는 준비 항목이다. [Dockerfile.pmd](../Dockerfile.pmd)를 신뢰할 수 있는 애플리케이션 이미지·Corretto JDK 21 이미지와 검증된 `tooling/lib` JAR 24개로 빌드하고, 전용 rootless Docker daemon에 미리 적재한 뒤 실제 image ID 또는 repository digest로 채운다. Wheel은 정본 `tooling/tools.lock.json`을 package resource로 포함하며, 분석기 이미지는 잠금 파일의 JAR·ruleset 크기와 SHA-256을 검사한다.
+
+[compose.architecture.yaml](../compose.architecture.yaml)을 기본 Compose와 GitHub App overlay에 추가한다. `REVIEW_BOT_ROOTLESS_DOCKER_SOCKET`은 전용 rootless socket, `REVIEW_BOT_DOCKER_CLI`는 검증된 host Docker CLI다. 이 연결은 worker에만 제공한다. `REVIEW_BOT_CONTAINER_STATE_PATH`는 `REVIEW_BOT_STATE_PATH`와 같은 절대 경로로 지정해 worker가 staging한 경로를 rootless daemon도 같은 위치에서 읽게 한다. 기존 API의 기본 경로는 이 변수를 지정하지 않으면 유지된다.
+
+분석은 PMD/CPD 7.3.0·Java 21·JDK-only 프로필로 base와 head의 Java 원문을 대상으로 한다. 대상 Gradle·Maven 빌드나 테스트는 실행하지 않는다. 도구 컨테이너는 rootless daemon의 UID 매핑, network none, read-only root, capability 제거와 CPU·메모리·PID 제한을 요구한다. Rootful daemon이나 host subprocess로 대체 실행하지 않는다.
 
 ## API 검증
 

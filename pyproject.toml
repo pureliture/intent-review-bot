@@ -23,6 +23,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/review_bot"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"tooling/tools.lock.json" = "review_bot/resources/pmd/tools.lock.json"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",

@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Sequence
 from contextvars import copy_context
+from pathlib import PurePosixPath
 from typing import Any
 
 from review_bot.application.intent_context import strict_json_loads
@@ -16,7 +17,7 @@ from review_bot.application.intent_context import strict_json_loads
 from review_bot.domain.envelope_v2 import ModeSelection, ReviewSnapshot
 from review_bot.domain.models_v1 import ModelRequest, PrSnapshot
 from review_bot.domain.status import SelectionStatus
-from review_bot.ports import ModeSelectorPort, ModelClient
+from review_bot.ports import GitHubAuthorizationError, ModeSelectorPort, ModelClient, RepositoryReader
 
 REGISTERED_MODES: frozenset[str] = frozenset({"architecture", "intent"})
 SELECTOR_TIMEOUT_SECONDS = 0.75
@@ -193,6 +194,62 @@ def _selection_record(
         policy_version=policy, selection_digest=digest, available_modes=fallback.available_modes,
         selected_modes=ModeSequence(selected), selection_status=SelectionStatus.COMPLETED.value,
     )
+
+
+def constrain_architecture_to_java_gradle(
+    snapshot: ReviewSnapshot, pr: PrSnapshot, selection: ModeSelection, reader: RepositoryReader,
+) -> ModeSelection:
+    """Only changed Java owned by a Gradle module can enter PMD/CPD review.
+
+    Read manifests from immutable Git revisions, including unchanged build files.
+    A nearer Maven module takes precedence over a parent Gradle build. Deleted
+    Java uses the comparison base; current Java uses the head build system.
+    The constraint applies after every selector and its failure/timeout fallback.
+    """
+    if "architecture" not in selection.selected_modes:
+        return selection
+    java_by_revision: dict[str, set[str]] = {}
+    for change in snapshot.changed_files:
+        path = change.path.replace("\\", "/")
+        if path.lower().endswith(".java"):
+            revision = pr.base_sha if change.change_type == "deleted" else pr.head_sha
+        elif change.previous_path and change.previous_path.lower().endswith(".java"):
+            path, revision = change.previous_path.replace("\\", "/"), pr.base_sha
+        else:
+            continue
+        java_by_revision.setdefault(revision, set()).add(path)
+
+    supported = False
+    policy = "java-gradle-v1"
+    try:
+        for revision, paths in java_by_revision.items():
+            parents = {parent for path in paths for parent in PurePosixPath(path).parents}
+            names = ("build.gradle", "build.gradle.kts", "pom.xml")
+            candidates = tuple(sorted(str(parent / name) for parent in parents for name in names))
+            manifests = reader.read_tree_blobs(revision, paths=candidates)
+            if not isinstance(manifests, dict):
+                raise ValueError("invalid_build_manifest_inventory")
+            for path in paths:
+                for parent in PurePosixPath(path).parents:
+                    if str(parent / "pom.xml") in manifests:
+                        break
+                    if any(str(parent / name) in manifests for name in names[:2]):
+                        supported = True
+                        break
+                if supported:
+                    break
+            if supported:
+                break
+    except GitHubAuthorizationError:
+        raise
+    except Exception as exc:
+        logger.warning("architecture_build_system_unavailable:%s", type(exc).__name__)
+        policy = "java-gradle-metadata-unavailable-v1"
+    if supported:
+        return selection
+    return _selection_record(snapshot, selection.available_modes,
+        tuple(mode for mode in selection.selected_modes if mode != "architecture"),
+        f"{selection.policy_version}:{policy}")
 
 
 class LightweightModeSelector:

@@ -356,8 +356,8 @@ def test_snapshot_selection_respects_config_and_passes_metadata(uses_model: bool
         assert selection.selected_modes == ()
     else:
         selector.select_modes.assert_not_called()
-        assert selection.selected_modes == ("architecture",)
-        assert selection.policy_version == "all_available"
+        assert selection.selected_modes == ()
+        assert selection.policy_version == "all_available:java-gradle-v1"
 
 
 @pytest.mark.parametrize("path", [

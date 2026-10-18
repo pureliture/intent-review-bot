@@ -14,7 +14,7 @@ x-bot: &bot
   env_file:
     - ${REVIEW_BOT_RUNTIME_ENV:?Set the private runtime env file}
   environment:
-    REVIEW_BOT_STATE_DIR: /var/lib/review-bot
+    REVIEW_BOT_STATE_DIR: ${REVIEW_BOT_CONTAINER_STATE_PATH:-/var/lib/review-bot}
     REVIEW_BOT_MODEL_STATE_DIR: /var/lib/review-bot-models
     REVIEW_BOT_BIND_ADDRESS: ${REVIEW_BOT_BIND_ADDRESS:-127.0.0.1}
     REVIEW_BOT_PORT: ${REVIEW_BOT_PORT:-18080}
@@ -36,7 +36,7 @@ x-bot: &bot
       bind: {create_host_path: false}
     - type: bind
       source: ${REVIEW_BOT_STATE_PATH:?Prepare the private state directory}
-      target: /var/lib/review-bot
+      target: ${REVIEW_BOT_CONTAINER_STATE_PATH:-/var/lib/review-bot}
       bind: {create_host_path: false}
     - type: bind
       source: ${REVIEW_BOT_MODEL_STATE_PATH:?Use the shared private model admission directory}

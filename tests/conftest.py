@@ -126,6 +126,7 @@ class SyntheticGitRepo:
         3. If advance_base is True, base branch moves ahead (target_base_sha != comparison_base_sha)
         """
         self.checkout(base_branch)
+        self.write_file("build.gradle", "plugins { id 'java' }\n")
         self.write_file("src/main/java/Root.java", "public class Root {}")
         comparison_base = self.commit("Initial root commit")
 
@@ -678,9 +679,12 @@ def worker_pipeline_ports(worker_review_inputs: tuple[Any, Any]) -> dict[str, An
     reader.get_rename_map.return_value = {}
     code = {"a" * 40: task.snapshot.base, "b" * 40: task.snapshot.head}
     reader.collect_code_snapshot.side_effect = code.__getitem__
-    reader.read_tree_blobs.side_effect = lambda sha: {
-        file.path: file.content.encode("utf-8") for file in code[sha].files
-    }
+    def read_blobs(sha, paths=None):
+        blobs = {"build.gradle": b"plugins { id 'java' }\n", **{
+            file.path: file.content.encode("utf-8") for file in code[sha].files}}
+        return blobs if paths is None else {path: content for path, content in blobs.items() if path in paths}
+
+    reader.read_tree_blobs.side_effect = read_blobs
     runs = {
         "a" * 40: make_test_run("a" * 40, source_files=(path,)),
         "b" * 40: make_test_run("b" * 40, source_files=(path,), pmd_violations=(

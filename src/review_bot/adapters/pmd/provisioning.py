@@ -83,7 +83,8 @@ def load_tools_lock(lock_path: Path | str | None = None) -> ToolsLock:
         current = Path(__file__).resolve()
         # file is in src/review_bot/adapters/pmd/ -> project root is parents[3]
         project_root = current.parents[4]
-        lock_file = project_root / "tooling" / "tools.lock.json"
+        packaged_lock = current.parents[2] / "resources" / "pmd" / "tools.lock.json"
+        lock_file = packaged_lock if packaged_lock.is_file() else project_root / "tooling" / "tools.lock.json"
     else:
         lock_file = Path(lock_path)
 
@@ -384,9 +385,7 @@ def verify_tool_installation(
     if ruleset_path is not None:
         ruleset_file = Path(ruleset_path)
     else:
-        ruleset_lock = lock.artifacts.get("ruleset.xml")
-        rel = ruleset_lock.relative_path if ruleset_lock else "src/review_bot/resources/pmd/ruleset.xml"
-        ruleset_file = project_root / (rel or "src/review_bot/resources/pmd/ruleset.xml")
+        ruleset_file = Path(__file__).resolve().parents[2] / "resources" / "pmd" / "ruleset.xml"
 
     if not ruleset_file.exists():
         raise ToolVerificationError("missing_artifact", f"Ruleset not found: {ruleset_file}", ruleset_file)
