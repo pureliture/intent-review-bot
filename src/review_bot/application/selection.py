@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from collections.abc import Sequence
+from contextvars import copy_context
 from typing import Any
 
 from review_bot.application.intent_context import strict_json_loads
@@ -254,7 +255,7 @@ class DeadlineModeSelector:
                 self._inflight.release()
                 done.set()
 
-        thread = threading.Thread(target=invoke, name="mode-selector", daemon=True)
+        thread = threading.Thread(target=copy_context().run, args=(invoke,), name="mode-selector", daemon=True)
         try:
             thread.start()
         except Exception:

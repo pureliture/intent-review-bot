@@ -446,6 +446,10 @@ publish:
   automatic_approval: false
   automatic_request_changes: false
   recheck_before_and_after_write: true
+  legacy_migration:
+    enabled: false
+    marker: "<!-- seulgi-review:A -->"
+    exact_title: "## 리팩토링 신호 — 이번 PR 변경 파일 기준"
 model:
   profile: null
   profile_env: REVIEW_MODEL_PROFILE
@@ -620,7 +624,7 @@ def mock_github() -> MockGitHubClient:
 def worker_review_inputs() -> tuple[Any, Any]:
     from review_bot.application.context import build_task_input
     from review_bot.application.delta import compute_delta
-    from review_bot.application.review_a import MockModelClient, ModelProfile, run_review_a_pipeline
+    from review_bot.application.architecture_review import MockModelClient, ModelProfile, run_review_a_pipeline
     from review_bot.domain.models_v1 import (
         Classification, CodeFile, CodeSnapshot, ModelResponse, PrSnapshot, Snapshot,
     )
@@ -660,7 +664,7 @@ def worker_review_inputs() -> tuple[Any, Any]:
 def worker_pipeline_ports(worker_review_inputs: tuple[Any, Any]) -> dict[str, Any]:
     from unittest.mock import Mock
 
-    from review_bot.application.review_a import MockModelClient
+    from review_bot.application.architecture_review import MockModelClient
     from review_bot.domain.envelope_v2 import ChangedFile
     from review_bot.domain.models_v1 import ModelResponse
     from review_bot.ports import MergeBaseResult, RepositoryReader, StaticAnalyzer
@@ -714,3 +718,9 @@ def temp_sqlite_db(tmp_path: Path) -> Generator[Path, None, None]:
     yield db_file
     if db_file.exists():
         db_file.unlink(missing_ok=True)
+
+
+@pytest.fixture(autouse=True)
+def private_model_admission_state(tmp_path_factory, monkeypatch):
+    root = tmp_path_factory.mktemp("model-admission")
+    monkeypatch.setenv("REVIEW_BOT_MODEL_STATE_DIR", str(root))

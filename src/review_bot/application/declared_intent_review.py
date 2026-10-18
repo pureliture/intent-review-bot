@@ -24,8 +24,8 @@ from review_bot.application.intent_context import (
     strict_json_loads,
     unavailable_context,
 )
-from review_bot.application.review_a import ModelProfile, TransientModelError
-from review_bot.domain.models_b import (
+from review_bot.application.architecture_review import ModelProfile, TransientModelError
+from review_bot.domain.intent_models import (
     DeclaredConstraint,
     DeclaredGoal,
     ImplementationObservation,
@@ -60,6 +60,10 @@ Test source describes expectations; only supplied recorded test_run evidence des
 Do not infer whole-repository absence or successful runtime behavior from the supplied scope.
 Return strict JSON only, exactly the response schema. Use only original supplied evidence IDs.
 Never create Evidence, source locations, execution status, review targets or publication metadata.
+Assign unique new result IDs: G1... goals, C1... constraints, O1... observations, H1... hypotheses,
+S1... assumptions, F1... findings and Q1... questions. Increment within each array; never reuse an ID.
+References copy existing IDs exactly; a new finding or question must not reuse an observation ID.
+related_finding_ids may reference only F-prefixed findings in this response, never hypotheses or assumptions.
 """
 SYSTEM_PROMPTS = {
     "extract_goals": _COMMON_PROMPT + f"""Extract only explicitly stated problems, outcomes and constraints
@@ -84,6 +88,11 @@ successful test execution, sequential retry behavior, or absence of other existi
 evidence. Link declared goal/constraint IDs to implementation observation IDs.
 consistent_with_evidence and evidence_conflict both require a declared goal/constraint and an
 implementation observation, with all their evidence included. A hypothesis alone cannot justify either.
+Each finding.evidence_ids must include EVERY original evidence ID used by all goals, constraints,
+observations and hypotheses referenced by that finding. Reference only records relevant to the claim.
+Each question.evidence_ids must include EVERY evidence ID of each finding in its related_finding_ids.
+Every question needs at least one actual finding from this response. Omit independent questions.
+Do not link a finding with partial evidence: copy its complete evidence_ids into the question.
 Use insufficient_context with nonempty missing_evidence when goals, existing functionality,
 operational assumptions or execution results are missing. Do not prefer an architectural alternative
 as a business requirement. Never claim automatic approval, change request, or complete PR correctness.
@@ -104,9 +113,16 @@ def _array_schema(item: dict[str, object], *, maximum: int = 20) -> dict[str, ob
 def _entity_schema(cls) -> dict[str, object]:
     properties: dict[str, object] = {}
     identifier = {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"}
+    prefixes = {"goal_id": "G", "constraint_id": "C", "observation_id": "O", "hypothesis_id": "H",
+        "assumption_id": "S", "finding_id": "F", "question_id": "Q"}
     for field in fields(cls):
         if field.name.endswith("_ids"):
-            properties[field.name] = _array_schema(identifier, maximum=128)
+            reference = {**identifier, "pattern": "^F[1-9][0-9]*$"} if field.name == "related_finding_ids" else identifier
+            properties[field.name] = _array_schema(reference, maximum=128)
+            if field.name == "related_finding_ids" or (field.name == "evidence_ids" and cls is not IntentAssumption):
+                properties[field.name]["minItems"] = 1
+        elif field.name in prefixes:
+            properties[field.name] = {**identifier, "pattern": f"^{prefixes[field.name]}[1-9][0-9]*$"}
         elif field.name.endswith("_id"):
             properties[field.name] = identifier
         elif field.name == "missing_evidence":
@@ -141,6 +157,17 @@ def _prompt_hashes() -> dict[str, str]:
     return {stage: hash_json({"system": SYSTEM_PROMPTS[stage], "response_schema": response_schema(stage)}) for stage in STAGES}
 
 
+def _bind_schema_ids(schema: dict[str, Any], references: dict[str, set[str]]) -> dict[str, Any]:
+    for collection in schema["properties"].values():
+        for name, field in collection.get("items", {}).get("properties", {}).items():
+            if name in references:
+                allowed = sorted(references[name])
+                field["maxItems"] = min(field["maxItems"], len(allowed))
+                if allowed:
+                    field["items"] = {**field["items"], "enum": allowed}
+    return schema
+
+
 def build_intent_model_request(
     task: IntentTaskInput, stage: str, profile: ModelProfile, *, goals: IntentGoals | None = None,
     observations: IntentObservations | None = None,
@@ -163,9 +190,20 @@ def build_intent_model_request(
             "evidence": [asdict(item) for item in evidence], "unavailable_context": list(unavailable_context(task))}
     else:
         raise ValueError("unvalidated_intent_stage_input")
+    references = {"evidence_ids": {item["id"] for item in payload["evidence"]}}
+    if stage == "assess":
+        references.update({"goal_ids": {item.goal_id for item in goals.declared_goals},
+            "constraint_ids": {item.constraint_id for item in goals.declared_constraints},
+            "observation_ids": {item.observation_id for item in observations.implementation_observations},
+            "hypothesis_ids": {item.hypothesis_id for item in observations.intent_hypotheses}})
+    schema = _bind_schema_ids(response_schema(stage), references)
+    if stage == "assess" and (not _goal_ids(goals) or not observations.implementation_observations):
+        finding_fields = schema["properties"]["findings"]["items"]["properties"]
+        finding_fields["assessment"]["enum"] = ["insufficient_context"]
+        finding_fields["missing_evidence"]["minItems"] = 1
     return ModelRequest(1, profile.model, SYSTEM_PROMPTS[stage],
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
-        profile.timeout_seconds, profile.max_output_tokens, response_schema(stage))
+        profile.timeout_seconds, profile.max_output_tokens, schema)
 
 
 def _strings(value: Any, *, maximum: int = 20) -> tuple[str, ...]:
@@ -336,6 +374,8 @@ def _measurement_receipt(record: IntentStageRecord, client: ModelClient, profile
             token_measurement_usage={"input_tokens": 0, "output_tokens": 0})
     if isinstance(receipt, dict) and set(receipt) == {"delivery", "model_calls", "usage"}:
         usage = _usage(ModelResponse("", receipt["usage"]))
+        if receipt["delivery"] in ("not_sent", "sent") and type(receipt["model_calls"]) is int and receipt["model_calls"] == 0 and usage == {"input_tokens": 0, "output_tokens": 0}:
+            return replace(record, token_measurement_delivery=receipt["delivery"], token_measurement_model_calls=0, token_measurement_usage=usage)
         if receipt["delivery"] == "sent" and type(receipt["model_calls"]) is int and receipt["model_calls"] == 1 and usage is not None and usage["output_tokens"] <= 1:
             return replace(record, token_measurement_delivery="sent", token_measurement_model_calls=1, token_measurement_usage=usage)
     return replace(record, token_measurement_delivery="unknown", token_measurement_model_calls=None, token_measurement_usage=None)

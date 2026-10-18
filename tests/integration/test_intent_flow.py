@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from review_bot.adapters.git import GitRepositoryReader
 from review_bot.adapters.github.client import GitHubApiClient
 from review_bot.adapters.sqlite.store import SQLiteJobStore
-from review_bot.application.review_a import MockModelClient
+from review_bot.application.architecture_review import MockModelClient
 from review_bot.config import load_review_config_from_str
 from review_bot.domain.models_v1 import ModelResponse
 from review_bot.runtime.webhook import create_webhook_app

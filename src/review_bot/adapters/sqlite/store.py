@@ -31,11 +31,11 @@ _WORKER_FENCE_SQL = """
 """
 
 _GENERATION_FENCE_SQL = """
-    AND NOT EXISTS (
+    AND (runs.kind = 'fixed_intent' OR NOT EXISTS (
         SELECT 1 FROM pr_requests
         WHERE repository_id = runs.repository_id AND pr_number = runs.pr_number
           AND desired_generation > runs.generation
-    )
+    ))
 """
 
 
@@ -76,6 +76,8 @@ class SQLiteJobStore:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(runs);")}
             if "reason" not in columns:
                 conn.execute("ALTER TABLE runs ADD COLUMN reason TEXT;")
+            if "kind" not in columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'github_pr';")
             receipt_columns = {row[1] for row in conn.execute("PRAGMA table_info(publication_receipts);")}
             if "status" not in receipt_columns:
                 conn.execute("ALTER TABLE publication_receipts ADD COLUMN status TEXT NOT NULL DEFAULT 'unknown';")
@@ -130,6 +132,7 @@ class SQLiteJobStore:
         conn.execute(
             "UPDATE runs SET status = 'cancelled', reason = ?, completed_at = datetime('now'), lease_expires_at = NULL "
             "WHERE installation_id = ? AND repository_id = ? AND pr_number = ? "
+            "AND kind = 'github_pr' "
             "AND LOWER(status) IN ('pending', 'queued', 'running', 'claimed');",
             (reason, installation_id, repository_id, pr_number),
         )
@@ -215,7 +218,7 @@ class SQLiteJobStore:
             cur = conn.execute(
                 """
                 SELECT run_id FROM runs
-                WHERE repository_id = ? AND pr_number = ? AND LOWER(status) IN ('pending', 'queued');
+                WHERE repository_id = ? AND pr_number = ? AND kind = 'github_pr' AND LOWER(status) IN ('pending', 'queued');
                 """,
                 (request.repository_id, request.pr_number),
             )
@@ -245,29 +248,69 @@ class SQLiteJobStore:
                     ),
                 )
 
+    def enqueue_fixed_intent(self, input_json: str, repository_id: int, pr_number: int, language: str) -> str:
+        """Persist one immutable input and queued run atomically; never coalesce PR events."""
+        if language not in ("ko", "en"):
+            raise ValueError("invalid_review_language")
+        run_id = f"run-{uuid4().hex}"
+        with self.transaction() as conn:
+            conn.execute("INSERT INTO runs (run_id, repository_id, pr_number, status, stage, created_at, kind) "
+                "VALUES (?, ?, ?, 'queued', 'prepare', datetime('now'), 'fixed_intent')",
+                (run_id, repository_id, pr_number))
+            conn.execute("INSERT INTO fixed_intent_inputs (run_id, input_json, language) VALUES (?, ?, ?)",
+                (run_id, input_json, language))
+        return run_id
+
+    def get_fixed_intent_input(self, run_id: str) -> tuple[str, str] | None:
+        row = self._get_connection().execute(
+            "SELECT input_json, language FROM fixed_intent_inputs WHERE run_id = ?", (run_id,)).fetchone()
+        return tuple(row) if row is not None else None
+
+    def get_fixed_intent_status(self, run_id: str) -> dict | None:
+        fields = ("run_id", "status", "stage", "attempts", "created_at", "started_at", "completed_at", "error", "reason")
+        row = self._get_connection().execute(
+            "SELECT " + ", ".join(fields) + " FROM runs WHERE run_id = ? AND kind = 'fixed_intent'", (run_id,)).fetchone()
+        return dict(zip(fields, row)) if row is not None else None
+
     def claim_next_run(self, worker_id: str, lease_seconds: float) -> RunRecord | None:
         """Atomically claim the next runnable execution with an expiring lease."""
         with self.transaction(immediate=True) as conn:
             now = time.time()
             lease_expires_at = now + lease_seconds
+            active = conn.execute(
+                "SELECT COUNT(*) FROM runs WHERE LOWER(status) IN ('running', 'claimed') AND lease_expires_at > ?;",
+                (now,),
+            ).fetchone()[0]
+            if active >= 2:
+                return None
             # Find next runnable job: pending OR expired lease
             cur = conn.execute(
                 """
-                SELECT run_id, installation_id, repository_id, pr_number, generation,
-                       fingerprint, status, stage, attempts, started_at, completed_at, error, reason
-                FROM runs
+                SELECT candidate.run_id, candidate.installation_id, candidate.repository_id, candidate.pr_number,
+                       candidate.generation, candidate.fingerprint, candidate.status, candidate.stage,
+                       candidate.attempts, candidate.started_at, candidate.completed_at, candidate.error, candidate.reason, candidate.kind
+                FROM runs AS candidate
                 WHERE (
-                    LOWER(status) IN ('pending', 'queued')
+                    LOWER(candidate.status) IN ('pending', 'queued')
                     OR (
-                        LOWER(status) IN ('running', 'claimed')
-                        AND lease_expires_at IS NOT NULL
-                        AND lease_expires_at <= ?
+                        LOWER(candidate.status) IN ('running', 'claimed')
+                        AND candidate.lease_expires_at IS NOT NULL
+                        AND candidate.lease_expires_at <= ?
                     )
                 )
-                ORDER BY created_at ASC
+                AND NOT EXISTS (
+                    SELECT 1 FROM runs AS active
+                    WHERE active.run_id != candidate.run_id
+                      AND active.repository_id = candidate.repository_id
+                      AND active.pr_number = candidate.pr_number
+                      AND active.kind = candidate.kind
+                      AND LOWER(active.status) IN ('running', 'claimed')
+                      AND active.lease_expires_at > ?
+                )
+                ORDER BY candidate.created_at ASC, candidate.rowid ASC
                 LIMIT 1;
                 """,
-                (now,),
+                (now, now),
             )
             row = cur.fetchone()
             if not row:
@@ -315,6 +358,7 @@ class SQLiteJobStore:
                 completed_at=row[10],
                 error=row[11],
                 reason=row[12],
+                kind=row[13],
             )
 
     def renew_lease(self, run_id: str, worker_id: str, lease_seconds: float) -> bool:
@@ -508,7 +552,8 @@ class SQLiteJobStore:
                 f"""
                 SELECT generation, COALESCE((
                     SELECT desired_generation FROM pr_requests
-                    WHERE repository_id = runs.repository_id AND pr_number = runs.pr_number
+                    WHERE runs.kind = 'github_pr'
+                      AND repository_id = runs.repository_id AND pr_number = runs.pr_number
                 ), generation)
                 FROM runs WHERE run_id = ? {fence};
                 """,

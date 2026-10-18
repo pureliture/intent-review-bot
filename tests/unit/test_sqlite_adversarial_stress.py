@@ -14,7 +14,7 @@ import multiprocessing
 import sqlite3
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -38,6 +38,9 @@ def _worker_process_claim(db_path_str: str, worker_id: str, max_claims: int) -> 
         run = store.claim_next_run(worker_id, lease_seconds=30.0)
         if run:
             claimed.append(run.run_id)
+            assert store.update_run(
+                run.run_id, RunStatus.SUCCEEDED, worker_id=worker_id, generation=run.generation,
+            )
         time.sleep(0.01)
     store.close()
     return claimed
@@ -135,13 +138,13 @@ def test_multiprocess_concurrent_worker_claims(tmp_path: Path) -> None:
     assert len(all_claimed) == total_jobs, f"Expected {total_jobs} claims, got {len(all_claimed)}"
     assert len(set(all_claimed)) == total_jobs, "Duplicate claim detected across processes!"
 
-    # Verify all jobs in DB are marked running with attempts == 1
+    # Every claimed job completed before returning its capacity, with no duplicate attempt.
     verify_store = SQLiteJobStore(db_file)
     conn = verify_store._get_connection()
     rows = conn.execute("SELECT status, attempts FROM runs;").fetchall()
     assert len(rows) == total_jobs
     for status, attempts in rows:
-        assert status == "running"
+        assert status == "succeeded"
         assert attempts == 1
     verify_store.close()
 
@@ -167,25 +170,44 @@ def test_concurrent_claim_with_active_and_pending_jobs(tmp_path: Path) -> None:
     claimed_by_threads: list[str] = []
     lock = threading.Lock()
 
-    def worker_claim(idx: int) -> None:
+    def worker_claim(idx: int, drain: bool = False) -> None:
         t_store = SQLiteJobStore(db_file, timeout=10.0)
-        run = t_store.claim_next_run(f"pool-{idx}", lease_seconds=10.0)
-        if run:
-            with lock:
-                claimed_by_threads.append(run.run_id)
-        t_store.close()
+        try:
+            while True:
+                run = t_store.claim_next_run(f"pool-{idx}", lease_seconds=10.0)
+                if run is None:
+                    break
+                with lock:
+                    claimed_by_threads.append(run.run_id)
+                assert t_store.update_run(
+                    run.run_id, RunStatus.SUCCEEDED, worker_id=f"pool-{idx}", generation=run.generation,
+                )
+                if not drain:
+                    break
+        finally:
+            t_store.close()
 
-    threads = [threading.Thread(target=worker_claim, args=(i,)) for i in range(20)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        list(executor.map(worker_claim, range(20)))
+    assert claimed_by_threads == []
+    assert store.renew_lease(claimed_1.run_id, "active-worker-1", 60.0)
+    assert store.renew_lease(claimed_2.run_id, "active-worker-2", 60.0)
+
+    # Release one slot; the other original active lease must remain protected throughout draining.
+    assert store.update_run(
+        claimed_1.run_id, RunStatus.SUCCEEDED, worker_id="active-worker-1", generation=claimed_1.generation,
+    )
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = [executor.submit(worker_claim, i, True) for i in range(20)]
+        for future in futures:
+            future.result()
 
     # Exactly 3 remaining runs must be claimed, and none of active_ids may be re-claimed
     assert len(claimed_by_threads) == 3
     assert len(set(claimed_by_threads)) == 3
     for cid in claimed_by_threads:
         assert cid not in active_ids, f"Active run {cid} was unlawfully claimed!"
+    assert store.renew_lease(claimed_2.run_id, "active-worker-2", 60.0)
     store.close()
 
 
@@ -270,12 +292,16 @@ def test_multiple_expired_runs_fifo_reclaim_order(tmp_path: Path) -> None:
     # Reclaiming worker must get them strictly in created_at ASC order
     c1 = store.claim_next_run("new-worker", lease_seconds=10.0)
     assert c1 is not None and c1.run_id == "run-early"
+    assert store.claim_next_run("other-worker", lease_seconds=10.0) is None
+    assert store.update_run(c1.run_id, RunStatus.SUCCEEDED)
 
     c2 = store.claim_next_run("new-worker", lease_seconds=10.0)
     assert c2 is not None and c2.run_id == "run-mid"
+    assert store.update_run(c2.run_id, RunStatus.SUCCEEDED)
 
     c3 = store.claim_next_run("new-worker", lease_seconds=10.0)
     assert c3 is not None and c3.run_id == "run-late"
+    assert store.update_run(c3.run_id, RunStatus.SUCCEEDED)
 
     c4 = store.claim_next_run("new-worker", lease_seconds=10.0)
     assert c4 is None

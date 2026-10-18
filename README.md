@@ -2,6 +2,8 @@
 
 Standalone GitHub Architecture (A) and Intent (B) Review Bot (`review_bot`) implementing Port-Adapter (Hexagonal) Architecture.
 
+**Design conformance:** the [2026-10-16 audit](docs/design-conformance-20261016.md) records unresolved review-contract gaps and risks requiring reproduction. Passing execution/schema/citation tests is not proof of complete design conformance or review quality.
+
 ## Requirements
 - Python >= 3.11
 - uv >= 0.10.0
@@ -25,6 +27,8 @@ uv run pytest
 
 ## GitHub App service (operator-prepared)
 
+For the Docker Compose web/worker deployment and authenticated fixed-input intent API, see [의도 리뷰 API와 컨테이너 운영](docs/intent-api-deployment.md). `perspectives-v1` is available to the leased worker with private artifacts; the fixed-input API also runs without GitHub credentials. Live deployment and model-review evidence are recorded separately in `milestones.md`.
+
 The default path is **App installation → repository selection → signed PR event → SQLite lease → A architecture review → create or update one A comment**. Explicitly available/selected B intent review uses the same Worker, with separate files, receipts and an independently approved publication gate. The CLI composes the existing signed FastAPI receiver, SQLite job store, installation-scoped GitHub/repository adapters and `WorkerLoop`; it does not install an App or deploy a service.
 
 - **D1 — installation-based eligibility:** repositories selected during installation are eligible without operator registration. Empty `service.installation_allowlist` and `service.repository_allowlist` allow installed repositories; nonempty lists add restrictions. Installation/repository binding and installation-token scope still apply.
@@ -40,7 +44,8 @@ Supply an operator-owned, full **schema-version-2** configuration using `--confi
 | Field | Required setting |
 | --- | --- |
 | `execution.mode`, `execution.backend` | `github_app` |
-| `execution.worker_concurrency` | `1`; multiple workers are rejected, not silently ignored |
+| `execution.worker_concurrency` | `1` (default) or `2`; larger values are rejected |
+| `model.max_concurrency` | `1` (default) or `2`; the shared model-admission group never exceeds two |
 | `service.worker` | `synchronous` |
 | `service.sqlite_wal`, `service.lease_and_generation_fencing` | `true` |
 | `architecture.isolation.runtime` | `rootless_docker`; no host subprocess fallback |
@@ -58,7 +63,7 @@ The configuration stores **environment variable references**, not raw secrets. R
 | `service.app_id_env` | `REVIEW_BOT_APP_ID` | GitHub App's positive decimal ID |
 | `service.app_private_key_file_env` | `REVIEW_BOT_APP_PRIVATE_KEY_FILE` | Absolute path to an owned, regular private-key file, mode `0600` or read-only `0400` |
 | `service.webhook_secret_env` | `REVIEW_BOT_WEBHOOK_SECRET` | Webhook signing secret from the operator's secret facility |
-| `service.state_root_env` | `REVIEW_BOT_STATE_DIR` | Absolute, private service-state directory shared by the receiver and its single worker |
+| `service.state_root_env` | `REVIEW_BOT_STATE_DIR` | Absolute, private service-state directory shared by the receiver and its one or two workers |
 
 Do not commit the key, secrets or private state. Paths must not contain symlink components; root/HOME state paths, shared state directories, foreign ownership and linked database/key files are rejected. Existing unsafe permissions are not repaired. State/cache/analysis/artifact directories are created with mode `0700`, SQLite database and sidecars must be `0600`, and service execution uses `umask 077`, restoring the caller's mask on exit. Key reading, JWT signing and GitHub access occur only after a run is claimed; `/health` is liveness, not proof that credentials or publication work.
 
@@ -85,9 +90,34 @@ Without a model profile, A model review is explicitly `not_run`; static analysis
 
 Automated service CLI tests use in-process signed FastAPI requests, real SQLite and `WorkerLoop`, with mock GitHub/repository/analyzer boundaries and a fake server runner. Existing integration tests separately exercise local Git/PMD/CPD and the A pipeline against mock GitHub. This is **not** live App installation, live comment publication, a deployment/public release or an Actions cutover. Actual Ubuntu rootless execution, UID bind access and live GitHub/model behavior on this service path remain unverified.
 
+### Two workers and shared model admission
+
+The receiver stores accepted work before returning `202`; it does not wait for analysis or model execution. Continuous workers poll the existing SQLite queue when idle (default one second), not cron. With `execution.worker_concurrency: 2`, the service runs two independent Workers with separate DB connections, leases and App adapters, and shared shutdown. The atomic claim admits at most **two live leases** across processes sharing that jobs DB and at most **one live lease per repository/PR**. Third and later requests remain queued. New events still coalesce to the latest PR generation; expired leases can recover, but execution is not exactly-once. `--once` still claims only one task.
+
+Every actual model HTTP request uses a separate **shared SQLite admission group**, including selection, native/legacy token measurement, review, retries and warmup. For me707/Ollama, set `REVIEW_BOT_MODEL_STATE_DIR` to the same absolute, owned private directory in **every participating Worker and evaluation CLI** for the same GPU/model group. If omitted, all processes under the same OS account use `~/.local/state/github-review-bot/model-admission`. The isolated [MacBook profile](#macbook-local-llamacpp-explicit-opt-in) uses its own group/variable instead. Different group directories, other OS accounts and non-bot clients are not controlled by this limit. A caller configured for one request can conservatively lower active group concurrency; neither setting enables parallel stages inside one PR.
+
+The admission DB stores reservation tokens/state/deadlines/limits, never prompts, source or credentials. Directories are `0700`, DB/sidecars `0600`; unsafe paths/ownership fail closed. Waiting consumes the original request/task deadline, and queued calls recheck worker cancellation and generation/lease fences before HTTP. Unused reservations can expire. **A sent generation with a lost response or crashed caller is not automatically freed by TTL:** the server may still be running it. Capacity remains conservatively reserved until actual server idleness is confirmed and an operator uses `SQLiteModelAdmission.resolve_uncertain(token, confirmed_idle=True)`. There is no automatic reconciliation or recovery CLI; never clear that state merely to bypass the limit.
+
+The me707 llama.cpp deployment contract requires **two actual generation slots per model server**, independent of that shared HTTP admission group. The separate MacBook profile retains one slot per server. See [server-side generation capacity](#server-side-generation-capacity). Slot verification does not release uncertain SQLite tickets or recover a lost response.
+
+The existing `seulgi-server` CI PMD/CPD analysis is **not migrated or replaced** by this general-purpose bot. Optional A retains its rootless/pinned-image requirements. Company use is deferred to a separate repository after personal development; no PAT support or personal/company authentication-switch framework is added here.
+
+## 1회 의도 리뷰 (perspectives-v1)
+
+승인된 8개 관점으로 PR 본문과 고정된 변경 전후 코드를 함께 검토하는 명시적 평가 모드다. Tev1이 관점별 적용·비적용·판단불가를 선택하고, 주 리뷰 LLM이 원문을 읽어 의도와 구현의 연결 및 달성 가능성을 검토한다. 관점 추가·제외, 기존 원문의 재해석에 따른 판단 정정, 필요한 맥락의 누적과 부분 검토를 지원한다.
+
+    rtk proxy uv run --locked --offline review-bot intent \
+      --input /path/to/private/input.json --output /path/to/private/review-001 \
+      --pipeline perspectives-v1 --model-profile me707-llamacpp \
+      --language ko --call-timeout-seconds 120
+
+이 모드는 고정 입력 한 번을 리뷰하고 비공개 결과를 저장한다. 기본은 선택 8회와 주 리뷰 2회이며, 한도 안에서 최대 1회 원문 재확인이 추가될 수 있다. 입력·ModelRequest schema 1을 유지하고 새 결과만 schema 3이다. CLI는 완료 0, 미완료 1을 반환한다. 생성 전 전체 원문 한도를 검사하며 실제 사용량·실패·이력을 보존한다.
+
+사용자 설명은 의도 → 구현과의 연결 → 달성 가능성 → 질문 순서이며, 기본 언어는 ko다. 기존 declared-v1/code-first-v2와 구별되는 명시적 옵션이고 Worker·게시기·반복 리뷰를 구성하지 않는다. 최신성 보강은 후순위다. [선택지와 실행 계약](docs/intent-review-single-run.md)을 참고한다.
+
 ## B intent evaluation (fixed input, never posts)
 
-The offline `intent` command evaluates **text code of any language** through `extract_goals → observe_changes → assess`. It does not read a target checkout, execute target code/builds/tests/hooks, initialize PMD/CPD, require Java or an analysis image, enqueue work, or compose a GitHub publisher. The same core is registered as `intent` in the shared Worker; **B automatic posting remains disabled by default**, including when `publish.mode: comment`.
+The offline `intent` command evaluates **text code of any language**. The default `declared-v1` pipeline preserves `extract_goals → observe_changes → assess`; the explicitly selected [code-first v2](#code-first-b-and-tev1-planning-v2-explicit-opt-in) reads code before reconstructing purpose. Neither pipeline reads a target checkout, executes target code/builds/tests/hooks, initializes PMD/CPD, requires Java or an analysis image, enqueues work, or composes a GitHub publisher. Both use the shared Worker's `intent` mode; **B automatic posting remains disabled by default**, including when `publish.mode: comment`.
 
 Prepare a fixed `IntentTaskInput` v1 with `build_intent_task_input(snapshot, base, head, related_paths=())` in `review_bot.application.intent_context`. It contains exactly `schema_version`, the existing service-v2 `snapshot`, full-file `base`/`head` code snapshots, sorted `reviewed_paths`, and `input_hash`. Supply PR/issue original text in `snapshot.evidence`; a text digest alone is not original text. The builder includes changed/rename paths and explicitly related paths, checks file/evidence/inventory hashes and fixed versions, and computes the input hash over the complete record excluding `input_hash`. Serialize it with `dataclasses.asdict` and JSON; do not hand-edit the resulting record or reuse a hash after material changes.
 
@@ -98,17 +128,46 @@ rtk proxy uv run --locked review-bot intent --input /path/to/private/fixed-B-inp
   --output /path/to/private/evaluation-001
 ```
 
-Without `--model-profile`, the result is `not_run/model_profile_unset`, with zero review or metering calls. Ambient model opt-in does not enable this command. To explicitly use the **existing local** profile, add `--model-profile ollama-local-128k`; model preparation is the operator's responsibility and no provider is added or downloaded.
+Without `--model-profile`, the result is `not_run/model_profile_unset`, with zero review or metering calls. Ambient model opt-in does not enable this command. Explicit profiles are `ollama-local-128k`, `me707-llamacpp` and `macbook-llamacpp`; model preparation is the operator's responsibility, with no model download or provider fallback.
 
-Each valid evaluation stores `B/{input,goals,observations,result,scope,usage,validation}.json`, `B/comment.md` and a mode-specific `manifest.json` with `publication=not_attempted/artifact_only`. Unattempted or invalid stage data is JSON `null`; earlier validated stages and actual call usage survive later failures. Exit `0` means artifacts were saved for a completed or explicitly `not_run` outcome, **not** that a real review completed. Invalid input, unsafe paths, pipeline failure or storage failure exits `1`; no source or raw exception value is printed.
+Each default v1 evaluation stores `B/{input,goals,observations,result,scope,usage,validation}.json`, `B/comment.md` and a mode-specific `manifest.json` with `publication=not_attempted/artifact_only`. Unattempted or invalid stage data is JSON `null`; earlier validated stages and actual call usage survive later failures. For v1, exit `0` means artifacts were saved for a completed or explicitly `not_run` outcome, **not** that a real review completed. V2 instead exits `0` only for `completed`; `partial_review`, `not_run` and failure exit `1` while preserving their files. Invalid input, unsafe paths or storage failure exits `1`; no source or raw exception value is printed.
 
-Goals receive PR/issue text only; observations receive full code/test files, change metadata and supplied execution records only, never goals or PR descriptions. Assessment receives the validated two results and original evidence. Duplicate JSON keys, extra fields, invalid types/enums/IDs/quotes, forged SHA/path/line evidence and hypothesis-only conflicts fail closed without another review call. Incomplete prepared scope or input overflow is not replaced by fewer paths, summaries, splitting or truncation. Default B limits are 131,072 input/total context tokens per request and 900 seconds per task, additionally constrained by the existing profile's byte/input/output limits; at most three attempts per stage are permitted. Output entities are bounded to 20 per array, strings to 4,000 characters and evidence references to 128.
+In `declared-v1`, goals receive PR/issue text only; observations receive full code/test files, change metadata and supplied execution records only, never goals or PR descriptions. Assessment receives the validated two results and original evidence. Duplicate JSON keys, extra fields, invalid types/enums/IDs/quotes, forged SHA/path/line evidence and hypothesis-only conflicts fail closed without another review call. Incomplete prepared scope or input overflow is not replaced by fewer paths, summaries, splitting or truncation. Default v1 limits are 131,072 input/total context tokens per request and 900 seconds per task, additionally constrained by the existing profile's byte/input/output limits; at most three attempts per stage are permitted. Output entities are bounded to 20 per array, strings to 4,000 characters and evidence references to 128.
 
 Goal/constraint quotes must be literal contiguous spans present in every referenced original text and contain at least **12 non-whitespace Unicode characters**. A shorter quote is accepted only when it equals a complete original `title` or `body` field (after stripping leading/trailing whitespace) in each referenced text record, while still occurring literally in every record. The trusted prompt instructs the model to include surrounding original text in the same contiguous span for brief intent embedded in a longer field, without padding, joining separate spans or rewriting text; short sentences/lines are not additional exceptions. These citation checks do not prove that the statement faithfully represents the quoted meaning.
 
-`usage.calls` counts review-completion attempts. The local native token counter itself makes a one-output-token preflight: B records its delivery/usage separately and includes it in total tokens and `model_calls` (normally **three review calls + three preflights**, plus a non-generating metadata request). Unknown transport/usage remains `null` with known subtotals, not zero. Supplied `test_run` records are integrity-checked and version/path-bound, **not independently attested**; reading test source never creates a run record. Drafts show scope, unexecuted tests, missing goals/context, and uncertainty, and construct links only from verified evidence.
+`usage.calls` counts completion attempts, including v2 planning. The **Ollama** token counter makes a one-output-token preflight; B includes its separate delivery/usage in total tokens and `model_calls` (normally three v1 review calls plus three generating preflights). The **llama.cpp** native template/tokenizer generates no answer and records zero generation calls/tokens for measurement. Metadata/template/tokenizer HTTP requests still share admission. Unknown transport/usage remains `null` with known subtotals, not zero. Supplied `test_run` records are integrity-checked and version/path-bound, **not independently attested**; reading test source never creates a run record. Drafts show scope, unexecuted tests, missing context, and uncertainty, and construct links only from verified evidence.
 
 Synthetic Python/JavaScript/Java fixtures and CLI tests exercise the real B pipeline using mock models/HTTP. They establish integration and validation, not model quality or completion of the live PR #36 evaluation. A v1 records, commands, `A/` artifacts and marker remain unchanged.
+
+### Code-first B and Tev1 planning (v2, explicit opt-in)
+
+```bash
+rtk proxy uv run --locked review-bot intent --input /path/to/private/fixed-B-input.json \
+  --output /path/to/private/code-first-001 --pipeline code-first-v2 \
+  --model-profile macbook-llamacpp --call-timeout-seconds 120
+```
+
+For the shared Worker, select `intent.pipeline: code-first-v2` in trusted operator configuration; retain the existing mode/profile/context-path settings. The default remains `declared-v1` and old configuration hashes are preserved. `--call-timeout-seconds` only exposes the existing per-call `ModelConfig` setting for both planning/review; omitted means the existing 60s default, not a change to the 900s task, context, token or admission limits.
+
+The implemented sequence is:
+
+```text
+Native full-input measurement → first-pass Tev1 plan + program validation
+→ complete-original group observation → bounded direct original recheck if needed
+→ code-based intent hypotheses → final assessment with optional PR/issue reference text
+```
+
+- **Whole input first:** if it fits, every complete prepared file is reviewed together. Tev1 receives the measured fit, complete change list/diffs and path/size/version metadata; its full-fit schema and validator require one group covering every prepared path. An absent/unsupported planner or safely accounted planner failure cannot unnecessarily block a fitting joint review. If the whole input exceeds limits, a valid relationship-group plan is required; no silent per-file fallback or dropped/trimmed large file is allowed.
+- **Separate model roles:** explicit llama.cpp profiles supply a new planning client for their Tev model, using the same transport/native counting/admission. Existing A/B mode selection and its 64-token metadata-only selector are unchanged. Planning is not `/v1/systemone`, never decides whether to trust a PR body, and never triggers a Tev replan loop. Ollama has no new planning client; fitting joint v2 review remains possible without one.
+- **Code first:** observations receive complete fixed base/head originals, full unified diffs and test source; reconstruction receives verified observations/relationships and their original source spans. Neither receives PR/issue purpose text. Final assessment can identify code defects with no body or a false body, but inferred purpose stays a hypothesis with counterevidence, alternatives and uncertainty, never a confirmed requirement.
+- **Relationships, not file-only verdicts:** discovered relations retain `unreviewed/consistent/conflict/insufficient_context`, their two endpoints and original support. At most one direct B recheck supplies the relationship's originals together. Additional requests stay inside fixed `reviewed_paths`; already-delivered whole originals do not cause no-progress rereads. Unknown/excluded/out-of-scope information remains missing; no automatic repository exploration is implemented.
+- **Validated records:** models cannot generate new result IDs, Evidence, SHA/path/URL or publication fields. The program assigns `O/I/R/F/Q` IDs and constructs original quotes from validated `evidence_id/start_line/end_line`. `code_defect`, `conditional_risk`, `insufficient_context` and `explanation_mismatch` remain distinct. Linked relation findings require both endpoint citations; this does not guarantee semantic correctness or discovery of every relationship.
+- **Bounded work:** defaults are 131,072 input tokens and **131,072 accumulated task tokens**, 900 seconds, max 12 model calls including paid measurements/retries, max 8 groups and at most one direct recheck. Calls/output-token capacity for final reconstruction/assessment are reserved; the original task deadline is checked at boundaries and can still expire. Profile input allowances already exclude output reserve and are not reduced twice. Failed validation stops subsequent stages and preserves completed evidence/actual usage.
+
+V2 results use `schema_version=2` and `review-b/code-first-v2` while fixed task inputs remain schema 1. `B/` stores `plan.json`, `observations.json`, `intents.json`, `relations.json` plus input/result/scope/usage/validation/comment files; the Worker also stores a v2 mode receipt. Old `goals.json` data is not reinterpreted as inferred purpose. V1/v2 and different planner profiles cannot reuse each other's result fingerprints.
+
+`scope.review_complete`, `review_sufficient` and `no_findings` distinguish execution, scoped judgement and absence of findings. Unresolved important relations or unavailable context yield `partial_review`, not a successful complete review. Only a `completed` validated result can pass the existing separate B opt-in/publication freshness/fence gates. **Automatic B posting remains off.**
 
 ### B in the shared Worker (posting opt-in)
 
@@ -116,7 +175,7 @@ In the operator configuration, select `execution.available_modes: [intent]` (or 
 
 When B is available, PR title/body and explicit same-repository references (`#12`, `owner/repo#12`, `https://github.com/owner/repo/issues/12`) are frozen **before selection**. Only the bound repository's issue endpoint is used; issue bodies are not recursively followed. The collector admits at most eight distinct references, 256 KiB per original text, 1 MiB total original text and ten seconds of issue-request time; individual PR/issue responses are capped at 512 KiB. No permissions are widened. Missing references, 403/404, limits and unavailable historical versions are explicit; 401/installation authorization loss aborts the shared run. Source bodies/versions, complete scoped files and missing states affect `context_digest`/`snapshot_id`. Retrieval-time-only changes do not change that material digest; the fixed input still records collection/as-of times and hashes its entire record.
 
-Selected A/B executors run sequentially in the existing SQLite task/lease. A eligibility or empty PMD signals do not exclude B. Existing local/model/Tev selectors accept available subsets independently; the native System 1 bridge still uses one existing `/v1/systemone` decision request. Mode preparation/review/storage/publication failures preserve the other mode; common collection/authorization failures, PR close, worker stop, deadline or generation/lease loss abort all remaining work. Normal completed/`not_run` outcomes aggregate to `succeeded`; execution/publication failures aggregate to `failed`.
+Selected A/B executors run sequentially in the existing SQLite task/lease. A eligibility or empty PMD signals do not exclude B. Existing local/model/Tev selectors accept available subsets independently: Ollama keeps `/v1/systemone`, while the explicit llama.cpp profile uses schema-constrained chat completion for its separate Tev1 model. Mode preparation/review/storage/publication failures preserve the other mode; common collection/authorization failures, PR close, worker stop, deadline or generation/lease loss abort all remaining work. Normal completed/`not_run` outcomes aggregate to `succeeded`; execution/publication failures aggregate to `failed`.
 
 Common `snapshot.json`/`selection.json`/`manifest.json` stay at the run root; A's filenames remain under `A/`, and B stores its stage files under `B/`. Each mode has `receipt.json` (service v2, optional `a_result`/`b_result`, separate usage/delivery/publication); the shared manifest records mode input fingerprints and statuses. A completed core result/usage survives mode-local output failures as well as publication failures. Directories/files remain 0700/0600. SQLite run status is authoritative after external cancellation or lease loss: an interrupted manifest may remain `running`, because the lost owner must not write it.
 
@@ -136,9 +195,157 @@ SQLite adds nullable `publication_receipts.input_fingerprint` non-destructively.
 
 ### Implementation evidence and actual PR evaluation
 
-Signed real-Git/SQLite fixtures with mock HTTP/models verify per-mode creation and same-ID updates, reuse from partial failure, unsafe/stale comment blocking, issue changes and A-only/security regressions. Current full regression: **2,037 passed**; commands and commit evidence are in `milestones.md`. The functional fix for A/B output accounting was commit `2c95536`. This proves implementation/integration, not model quality, live automated publication or deployment. Automatic B posting has not been enabled in operational configuration.
+Signed real-Git/SQLite fixtures with mock HTTP/models verify per-mode creation and same-ID updates, reuse from partial failure, unsafe/stale comment blocking, issue changes and A-only/security regressions. They include code-first CLI/Worker/plan/citation/failure/cache paths, four signed PRs through two Workers, native llama.cpp HTTP/measurement and stale-generation suppression. Current full regression at functional commit **`9616396`**: **2,946 passed in 74.12s**; exact commands/checkpoints are in `milestones.md`. Earlier 2,703/2,426/2,357/2,037 counts remain historical. Automated checks prove implementation/integration, not model quality, live automated publication, Ubuntu server reconfiguration or deployment. Separate [actual MacBook tests](#macbook-local-llamacpp-explicit-opt-in) now also complete validated code-first reviews with real Tev1/LFM2.5. Automatic B posting has not been enabled in operational configuration.
 
-The existing read-only PR #36 evaluation pinned base `20f911fb4c73a9f0b016ba9876a5daa9e0772572` and head `f149d9a4dc04f37198e0c53025f479b211ea2b43`, collecting current PR text separately from the historical code date. The existing approved Granite profile actually completed and citation-validated `extract_goals` (one review generation plus one token preflight). The intact `observe_changes` request needs **215,531 bytes**, over the profile's **92,160-byte** cap, so it was not called and `assess` was not attempted: **`not_run/input_limit_exceeded`, not a completed B review**. No target tests/build/hooks or external comment were executed. Full replay requires separately approved whole-input budgets and reverified trusted existing runtime/token/output/deadline gates; no truncation, alternate provider or limit increase is implied by test success.
+The read-only PR #36 input pins base `20f911fb4c73a9f0b016ba9876a5daa9e0772572` and head `f149d9a4dc04f37198e0c53025f479b211ea2b43`, with text collection separately dated. Historical Granite v1 ran goals only, then stopped at **215,531 > 92,160 bytes**. The unchanged fixed input was now tried through code-first v2/MacBook: native whole-input **50,733 tokens**, Tev-proposed joint group **50,878**, over the Mac input allowance **28,672**. Exactly one Tev plan generation (1256 input/323 output tokens) and three free measurements occurred; **zero code-review generations** were sent. It remains **`not_run/input_limit_exceeded`, not a completed PR review**. Whole base/head files and tests were not cut or omitted. Larger-model/Ubuntu validation remains separate; no target tests/build/hooks, external comment or automatic context increase occurred.
+
+The smaller real [PR #5](https://github.com/pureliture/openai-compatible-bridge/pull/5) subsequently completed the ordinary `code-first-v2` CLI with real MacBook Tev1/LFM2.5: **`completed/validated`, exit 0**. Both changed files' entire base/head contents total **16,077 bytes**; native joint observation is **6,688 input tokens**, and the largest later request is **17,811**, below the unchanged **28,672** input allowance. One Tev plan plus three review generations used **40,105 input / 2,211 output tokens cumulatively**, with five generation-free measurements. No target code was run or comment posted.
+
+**This is execution/structural-evidence success, not semantic-quality approval.** Readback found one false-positive finding: the model describes the fix as a `code_defect` and asks to change the historical base version rather than identifying a remaining head defect. All 11 stored citation instances match the pinned originals, illustrating that valid citations do not guarantee a correct conclusion. The private draft is retained unchanged; automatic B posting stays disabled, and PR #36 is still incomplete. Exact SHAs, command, usage and provenance are in `milestones.md`.
+
+**Code-first B and first-pass Tev1 planning are implemented and actually exercised**, not still-unimplemented proposals. Automatic additional repository discovery, large-file internal splitting, general model-quality validation, Ubuntu operation and uncertain-ticket automatic recovery remain outside this delivery.
+
+## Local llama.cpp (explicit opt-in)
+
+`me707-llamacpp` uses separate OpenAI-compatible servers and exact model IDs:
+
+| Role | Model ID | Required per-slot context | Explicit endpoint variable |
+| --- | --- | --- | --- |
+| Review | `bonsai2-27b` | 131,072 tokens | `ME707_BONSAI_BASE_URL` |
+| Existing System 1 mode selection | `tev1-4b-q8_0` | 131,072 tokens | `ME707_TEV1_BASE_URL` |
+| Separate code-first B planning | `tev1-4b-q8_0` | 131,072 tokens | `ME707_TEV1_BASE_URL` |
+
+Endpoints must be uncredentialed HTTP `/v1` URLs on loopback or the approved `ubuntu-ms-7e07` host. Proxy environment variables and redirects are not used. Neither the service nor CLI infers a node IP, downloads a model or falls back to Ollama. Keep model APIs on the approved private network; the webhook forwarding path is not model authentication.
+
+For example, prepare these environment references in the process environment (not a committed secret/config file):
+
+```bash
+export ME707_BONSAI_BASE_URL=http://ubuntu-ms-7e07:11435/v1
+export ME707_TEV1_BASE_URL=http://ubuntu-ms-7e07:11437/v1
+export REVIEW_BOT_MODEL_STATE_DIR=/home/review-bot/private-model-admission
+```
+
+The following is only a fragment of the existing operator configuration; it does not generate or activate a deployment:
+
+```yaml
+execution:
+  available_modes: [intent]
+  worker_concurrency: 2
+  selector_uses_model: true
+model:
+  profile: me707-llamacpp
+  max_concurrency: 2
+publish:
+  mode: artifact_only
+  b_comments_enabled: false
+```
+
+For a non-publishing fixed-input evaluation, explicitly select the profile:
+
+```bash
+rtk proxy uv run --locked review-bot intent --input /path/to/private/fixed-B-input.json \
+  --output /path/to/private/evaluation-llamacpp-001 --model-profile me707-llamacpp
+```
+
+Construction remains offline. Preparation verifies model identity, exactly two server generation slots, per-slot context and a chat template through `/v1/models` and `/props`, without a warmup generation. For me707 the slot count must be integer `2`; one, three or more, missing, boolean, float and string values are rejected before template/tokenizer or generation calls. The MacBook profile separately requires integer `1`. Clients recheck this on each completion and review/planning token measurement. Before generation, `/apply-template` and `/tokenize` measure the intact request with the server's native tokenizer; `/v1/chat/completions` uses strict JSON schema output and checks measured input against completion usage. Unsupported measurement, truncation, bad identity/usage/JSON or exhausted budgets fail closed. A 16 MiB transport cap is not a token estimate. V1's per-request 131,072-token input/total limits and v2's 131,072-token input/**accumulated task** limits are not automatically enlarged by a 256k model.
+
+Native structured output uses the OpenAI `response_format.json_schema` envelope with `name`, `strict` and the unchanged request `schema`. The earlier flat `response_format.schema` did not enforce the closed-choice schema on the installed me707 server. The common transport now uses the same supported envelope as the MacBook profile; original response-field, citation, usage and application validation remain in place.
+
+On 2026-10-17 the user confirmed two slots for each me707 server, superseding the earlier one-slot proposal. Native inspection identified the existing `bonsai-llama.service` and `tev1-llama.service` user services. Bonsai was running with two slots; Tev1 was inactive with an existing two-slot configuration and was started through that manager. Current native verification and fixed-input review results are recorded in [milestones](milestones.md). Historical weight descriptions and model aliases alone do not attest the currently loaded weights. A successful sequential review does not establish concurrent queue/disconnect behavior, restart recovery, Ubuntu bot deployment or external publication.
+
+### Server-side generation capacity
+
+Keep the existing SQLite review queue and shared HTTP admission. Configure the **existing** llama.cpp launch commands with two slots and 128K context per slot. The user approved GPU KV placement and Q4_0 K/V caches for both models on 2026-10-18:
+
+| Server | Generation flag | Total context flag | Expected `/props` |
+| --- | --- | --- | --- |
+| Bonsai2 | `--parallel 2` | `--ctx-size 262144` | `total_slots=2`, per-slot `n_ctx=131072` |
+| Tev1 | `--parallel 2` | `--ctx-size 262144` | `total_slots=2`, per-slot `n_ctx=131072` |
+
+These are capacity settings, **not complete launch commands**. Replace conflicting command/environment values rather than appending duplicates. llama.cpp's context flag is the total across slots. Both servers use `--kv-offload --cache-type-k q4_0 --cache-type-v q4_0`; remove Bonsai's old `--no-kv-offload`. Weight quantization is separate: Bonsai retains PQ2_0 weights and Tev1 retains Q8_0 weights. Preserve model files, the existing Bonsai mean-centering bias and attention-rotation setting, aliases, ports, private-network binding and authentication. The MacBook 32k, one-slot launch commands below are separate.
+
+Bonsai reserves 32,678 output tokens, leaving 98,394 native input tokens. The application's existing task token and JSON limits still apply. Q4 KV support and memory calculations alone do not establish successful GPU allocation, generation throughput or unchanged Tev selection quality; read back the live configuration and measure those separately after applying it.
+
+With this configuration each server has two generation slots, so the server processes expose four slots combined. The bot's existing shared SQLite HTTP admission still limits its aggregate in-flight requests to at most two. Same-model requests can use that model's two slots; excess work cannot use another model's slots. The server can defer an excess request even while its HTTP connection is open. Client timeout does not prove that the server stopped computing or removed a queued request. These server slots do not bound other GPU applications; bot admission does not constrain independent non-bot clients.
+
+Apply and verify only when the node is reachable:
+
+1. Identify the actual owner/supervisor for both listening ports and the installed server version. Preserve existing launch settings privately. Historical systemd unit names are not proof of the current manager; do not start a second copy of a server.
+2. Pause new generation senders, including evaluation commands and non-bot clients, and confirm active **and deferred** work has drained. A health response or one idle-slot sample alone is insufficient. Do not interrupt someone else's active request to apply the flags.
+3. Back up both units and apply context/KV settings through the existing manager. Restart drained Tev first to release its larger Q8 KV allocation, then restart Bonsai with GPU KV. If either startup fails, restore the saved configuration through that manager. Do not kill arbitrary processes, recreate services or change network/authentication settings.
+4. Check both exact model IDs and `/props` values above. With the two explicit endpoint environment variables set, the existing verification API makes only metadata calls:
+
+   ```bash
+   rtk proxy uv run --locked python -c '
+   from review_bot.runtime.model_clients import build_review_client, build_selector_client
+   for factory in (build_review_client, build_selector_client):
+       factory("me707-llamacpp").verify()
+   print("model, two-slot, context and template checks passed")
+   '
+   ```
+
+   These client checks still share HTTP admission and can wait on unresolved tickets. An operator's direct read-only metadata inspection does not release those tickets; do not switch to a fresh admission DB to bypass them.
+
+5. For a separate capacity test, use bounded synthetic requests and actual slot/deferred-work telemetry to verify a maximum of two generations per server and waiting/resumption of excess work. Retain bot admission when testing bot callers. Use finite output/deadline limits and drain the test requests before resuming senders. Mock HTTP tests, `/health` and a sequential PR review alone do not establish concurrent behavior on the installed version.
+
+This does **not** implement automatic uncertain-ticket reconciliation, durable inference results or server-hang recovery. Existing `sent/uncertain` admission records remain intact and may still block new model calls. Neither the two-slot metadata check nor a service restart by itself authorizes clearing them.
+
+## MacBook local llama.cpp (explicit opt-in)
+
+`macbook-llamacpp` reuses the common review engine and llama.cpp transport with thin local adapters. It does not modify `me707-llamacpp` or Ollama, select an environment automatically, or fall back to Ubuntu when a local endpoint fails. Both endpoints must be loopback HTTP `/v1`; the model aliases and configured **32k test context** are exact, not claims about maximum training context.
+
+| Role | Required server alias | Endpoint variable | Configured context | Maximum output |
+| --- | --- | --- | --- | --- |
+| Review | `lfm2.5-2.6b-q8_0` | `MACBOOK_LFM_BASE_URL` | 32768 | 4096 tokens |
+| Existing mode selector | `tev1-0.8b-q8_0` | `MACBOOK_TEV1_BASE_URL` | 32768 | 64 tokens |
+| Separate code-first B planning | `tev1-0.8b-q8_0` | `MACBOOK_TEV1_BASE_URL` | 32768 | 4096 tokens |
+
+Keep model files in a private ignored directory. This session prepared the author's [LFM2.5 Q8_0 GGUF](https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF) and the unchanged Q8_0 model layer from official [Ollama `tev1:0.8b`](https://ollama.com/library/tev1); no Ollama server, converted replacement or external inference provider is used. Exact revisions, file sizes and verified SHA-256 hashes are in `milestones.md`.
+
+Use a build that supports this Tev1 GGUF's decision metadata: official ARM64 **b11447** (`da263e727`) was actually verified. Homebrew 0.6.0/build 11429 rejected it as `unsupported decision model type: pplx-decider`. Installing that older package alone is not sufficient. The pinned [official release](https://github.com/ggml-org/llama.cpp/releases/tag/b11447) was prepared locally under the ignored runtime directory; these binaries/models are not included in Git.
+
+From this feature worktree, run one server per terminal using that verified binary and prepared files (do not start a second copy on an occupied port):
+
+```bash
+rtk proxy .review-bot-state/macbook-runtime/runtime-b11447/llama-b11447/llama-server \
+  --model .review-bot-state/macbook-runtime/models/LFM2.5-2.6B-Q8_0.gguf \
+  --alias lfm2.5-2.6b-q8_0 --host 127.0.0.1 --port 18135 \
+  --parallel 1 --ctx-size 32768 -ngl 99 --slots --metrics --no-webui \
+  --no-context-shift --reasoning-format auto --reasoning-budget 0
+```
+
+```bash
+rtk proxy .review-bot-state/macbook-runtime/runtime-b11447/llama-b11447/llama-server \
+  --model .review-bot-state/macbook-runtime/models/Tev1-0.8B-Q8_0.gguf \
+  --alias tev1-0.8b-q8_0 --host 127.0.0.1 --port 18137 \
+  --parallel 1 --ctx-size 32768 -ngl 99 --slots --metrics --no-webui \
+  --no-context-shift --reasoning-format auto --reasoning-budget 0
+```
+
+The LFM template prefixes `<think>` even with `enable_thinking=false`. The supported server reasoning flags above are necessary: `--reasoning-format none` produced HTTP 400 with structured-output grammar in the live test. The MacBook adapter sends identical template kwargs during native preflight and generation, uses the server's `response_format.json_schema` envelope, and retains strict usage/output validation. Input is limited to **28672 tokens**, reserving 4096 output tokens; the 16 MiB transport guard is not a token estimate, and oversized input is rejected rather than trimmed.
+
+In the bot/test shell:
+
+```bash
+export MACBOOK_LFM_BASE_URL=http://127.0.0.1:18135/v1
+export MACBOOK_TEV1_BASE_URL=http://127.0.0.1:18137/v1
+export REVIEW_BOT_MACBOOK_MODEL_STATE_DIR="$PWD/.review-bot-state/macbook-runtime/admission"
+rtk proxy uv run --locked review-bot intent --input /path/to/fixed-input.json \
+  --output "$PWD/.review-bot-state/macbook-runtime/evaluation-new" --model-profile macbook-llamacpp \
+  --pipeline code-first-v2 --call-timeout-seconds 120
+```
+
+Use a fresh output directory for each evaluation. Service/review commands use the same explicit profile through `model.profile` or `--model-profile`. For B-only local operation keep `execution.available_modes: [intent]`; optional A still requires its existing Linux/rootless analysis environment. `intent` directly chooses B and does not call the A/B mode selector. Explicit code-first v2 can call the **separate first-pass Tev1 planning client**, not the metadata-only selector or `/v1/systemone`. Omitting `--pipeline` keeps v1.
+
+Both local roles share their own private SQLite admission group; absent an override, its directory is the current user's `.local/state/github-review-bot/macbook-model-admission`. The production default/explicit `REVIEW_BOT_MODEL_STATE_DIR` cannot be reused. Existing `model.max_concurrency: 1|2` applies (default 1), with direct-client defaults bounded at 2; server parallel 1 additionally serializes same-model generation. Separate local endpoints/state/results prevent profile/cache mixing, not permission to bypass unresolved tickets. The conservative `sent/uncertain` rules remain unchanged.
+
+### Actual local verification, not review quality
+
+- Real production-factory calls verified both aliases/context/one-slot contracts, native template/tokenizer and matching generation usage. A three-request workload measured participating HTTP/SQLite peak **2**, generation **1 per server / 2 combined**; the third request waited until an earlier response completed, then all three succeeded.
+- Closing an actual streaming connection while another LFM request was deferred left the server bound at **1**, and the waiting request completed. This direct server component test did **not** create/reconcile uncertain app tickets. Both servers and the existing admission DB returned to idle/empty; no server restart or manual ticket clearing was used to make the workload pass.
+- The earlier v1 run failed for `duplicate_result_id` at **2508/1490 tokens**. That failure is retained as history. V1 generation now uses distinct entity namespaces and valid reference choices while keeping strict duplicate/evidence checks; a new actual v1 CLI run completes **`completed/validated`, 2964/1516 tokens**.
+- Actual **code-first v2** finishes **`completed/validated`, exit 0** for both a body-absent and an incorrect-body multi-file fixture. Each uses one validated Tev plan plus three LFM review generations and five free native measurements. The ordinary unwrapped CLI succeeds with **7117 input/2455 output tokens**; the wrong-body run uses **7240/2396**. Both preserve a grounded code defect and original relationship citations, non-mock profiles, complete usage, private files and `artifact_only/not_attempted` publication. The source/tests were not executed. Earlier failed/partial runs are retained; neither IDs nor evidence validation was weakened to make a result pass.
+- The real PR #36 still exceeds the local 32k context as detailed above. Small-model general review quality, Ubuntu capacity/deployment and automatic uncertain-ticket recovery remain unverified or incomplete. Test servers were confirmed idle and only the session-owned processes stopped; the prepared private binaries/models/results remain available. No permanent daemon, external comment, merge or push was performed.
 
 ## Local Ollama (explicit opt-in)
 

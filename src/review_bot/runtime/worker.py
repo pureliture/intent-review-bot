@@ -18,21 +18,23 @@ from typing import Any
 
 from review_bot.adapters.github.auth import GitHubAppAuthError
 from review_bot.adapters.github.intent_sources import collect_intent_sources, intent_sources_current
+from review_bot.adapters.llamacpp import LlamaCppModelClient
 from review_bot.adapters.markdown.formatter import format_review_markdown
 from review_bot.adapters.markdown.intent_formatter import format_intent_markdown
-from review_bot.adapters.ollama import OLLAMA_PROFILE, SELECTOR_MODEL, OllamaDecisionClient, OllamaModelClient
+from review_bot.adapters.model_http import reset_model_request_context, set_model_request_context
+from review_bot.adapters.ollama import OllamaModelClient
 from review_bot.application.classification import classify_pr
 from review_bot.application.context import build_task_input
 from review_bot.application.delta import build_delta
 from review_bot.application.intent_context import IntentInputError, build_intent_task_input
 from review_bot.application.publication import PublicationAuthorizationError, publication_fingerprint, publish_review_comment
-from review_bot.application.review_a import run_review_a_pipeline
-from review_bot.application.review_b import run_review_b_pipeline
+from review_bot.application.architecture_review import run_review_a_pipeline
+from review_bot.application.declared_intent_review import run_review_b_pipeline
 from review_bot.application.selection import DeadlineModeSelector, LightweightModeSelector, ModelModeSelector
 from review_bot.application.snapshot import assemble_snapshot_bundle, collect_snapshot_material
 from review_bot.config import ReviewBotConfig
 from review_bot.domain.envelope_v2 import ExecutionReceipt, PublicationReceipt, RunRecord
-from review_bot.domain.models_b import IntentReviewLimits
+from review_bot.domain.intent_models import IntentReviewLimits
 from review_bot.domain.models_v1 import AnalysisRun, Snapshot
 from review_bot.domain.status import RunStage, RunStatus
 from review_bot.ports import (
@@ -46,7 +48,7 @@ from review_bot.ports import (
 )
 from review_bot.runtime.artifacts import RunArtifacts
 from review_bot.runtime.mode_fingerprints import architecture_input_fingerprint, intent_input_fingerprint
-from review_bot.runtime.model_clients import build_review_client
+from review_bot.runtime.model_clients import build_intent_selection_client, build_planning_client, build_review_client, build_selector_client
 
 logger = logging.getLogger("review_bot.worker")
 
@@ -67,8 +69,8 @@ class WorkerLoop:
     """Worker daemon executing claimed jobs with lease heartbeats and generation fencing.
 
     Fast selection defaults to a local selector and never reuses model_client.
-    The explicit ollama-local-128k profile composes Granite and, when enabled,
-    a separate Tev selector. run_once prepares models before claiming a lease;
+    Explicit model profiles compose review and, when enabled, a separate
+    selector client. run_once prepares models before claiming a lease;
     callers claiming manually must call prepare_models before claiming work.
     For other lightweight models, explicitly inject
     mode_selector=ModelModeSelector(selector_client, model="<provider-model>").
@@ -90,6 +92,9 @@ class WorkerLoop:
         repo_reader_factory: Callable[[RunRecord, dict[str, Any], GitHubClient], RepositoryReader] | None = None,
         artifact_root: Path | None = None,
         analyzer_factory: Callable[[], StaticAnalyzer] | None = None,
+        stop_event: threading.Event | None = None,
+        planning_client: ModelClient | None = None,
+        intent_selection_client: ModelClient | None = None,
     ) -> None:
         self.config = config
         self.job_store = job_store
@@ -102,15 +107,17 @@ class WorkerLoop:
         model_settings = getattr(config, "model", None)
         profile = getattr(model_settings, "profile", None)
         self.model_client = model_client if model_client is not None else build_review_client(profile, model_settings)
+        self.planning_client = planning_client
+        self.intent_selection_client = intent_selection_client
         self.github_client = github_client
-        self._ollama_selector_client: OllamaDecisionClient | None = None
+        self._ollama_selector_client: ModelClient | None = None
         self._models_prepared = False
         if (
-            mode_selector is None and profile == OLLAMA_PROFILE
+            mode_selector is None and profile is not None
             and getattr(getattr(config, "execution", None), "selector_uses_model", False)
         ):
-            self._ollama_selector_client = OllamaDecisionClient()
-            mode_selector = ModelModeSelector(self._ollama_selector_client, model=SELECTOR_MODEL)
+            self._ollama_selector_client = build_selector_client(profile, model_settings)
+            mode_selector = ModelModeSelector(self._ollama_selector_client, model=self._ollama_selector_client.model)
         selector = mode_selector if mode_selector is not None else LightweightModeSelector()
         self.mode_selector = selector if isinstance(selector, DeadlineModeSelector) else DeadlineModeSelector(selector)
         self.worker_id = (
@@ -120,7 +127,15 @@ class WorkerLoop:
         self.poll_interval = poll_interval
         self.lease_duration = lease_duration
 
-        self._stop_event = threading.Event()
+        self._stop_event = stop_event if stop_event is not None else threading.Event()
+        if isinstance(self.intent_selection_client, LlamaCppModelClient):
+            self.intent_selection_client.request_cancelled = self._stop_event.is_set
+        if isinstance(self.model_client, (OllamaModelClient, LlamaCppModelClient)):
+            self.model_client.request_cancelled = self._stop_event.is_set
+        if self._ollama_selector_client is not None:
+            self._ollama_selector_client.request_cancelled = self._stop_event.is_set
+        if isinstance(self.planning_client, LlamaCppModelClient):
+            self.planning_client.request_cancelled = self._stop_event.is_set
         self._lease_lost = False
         self._current_run_id: str | None = None
         self._setup_signals()
@@ -146,11 +161,31 @@ class WorkerLoop:
         """Verify and warm explicitly configured local models before taking a job lease."""
         if self._models_prepared:
             return
-        if isinstance(self.model_client, OllamaModelClient):
+        if isinstance(self.model_client, (OllamaModelClient, LlamaCppModelClient)):
             self.model_client.warmup()
         if self._ollama_selector_client is not None:
             self._ollama_selector_client.warmup()
+        if getattr(getattr(self.config, "intent", None), "pipeline", None) == "perspectives-v1":
+            self._prepare_intent_selector()
+            if isinstance(self.intent_selection_client, LlamaCppModelClient):
+                self.intent_selection_client.warmup()
         self._models_prepared = True
+
+    def _prepare_intent_selector(self) -> None:
+        if self.intent_selection_client is None:
+            self.intent_selection_client = build_intent_selection_client(self.config.model.profile, self.config.model)
+            if isinstance(self.intent_selection_client, LlamaCppModelClient):
+                self.intent_selection_client.request_cancelled = self._stop_event.is_set
+
+    def _review_perspectives(self, task_input, run, deadline, language):
+        from review_bot.application.intent_perspective_review import run_intent_perspective_review
+        from review_bot.domain.intent_perspectives import IntentPerspectiveLimits
+
+        self._prepare_intent_selector()
+        limits = IntentPerspectiveLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
+        return run_intent_perspective_review(task_input, self.model_client,
+            selection_client=self.intent_selection_client, language=language,
+            limits=limits, before_stage=lambda: self._active(run, deadline))
 
     def _start_heartbeat(self, run_id: str) -> tuple[threading.Event, threading.Thread]:
         """Launch background thread renewing lease at 1/3 lease_duration interval."""
@@ -244,11 +279,21 @@ class WorkerLoop:
         deadline = time.monotonic() + getattr(getattr(self.config, "execution", None), "task_timeout_seconds", 900)
         receipts: dict[str, ExecutionReceipt] = {}
         heartbeat_stop, heartbeat_thread = self._start_heartbeat(run_id)
+        request_scope_lock = threading.Lock()
+        request_scope_closed = threading.Event()
+
+        def request_cancelled() -> bool:
+            with request_scope_lock:
+                return request_scope_closed.is_set() or not self._active(run, deadline)
+
+        request_context = set_model_request_context(request_cancelled, deadline)
 
         try:
             self.config.publish.validate_b_marker()
             # 1. Stage: PREPARE, with installation/repository-bound dependencies.
             self._stage(run, RunStage.PREPARE, deadline)
+            if run.kind == "fixed_intent":
+                return self._process_fixed_intent(run, deadline)
             if self.github_client_factory is not None:
                 self.github_client = self.github_client_factory(run)
             if self.repo_reader_factory is not None:
@@ -435,6 +480,9 @@ class WorkerLoop:
             return False
 
         finally:
+            with request_scope_lock:
+                request_scope_closed.set()
+            reset_model_request_context(request_context)
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=2.0)
             self._current_run_id = None
@@ -694,6 +742,33 @@ class WorkerLoop:
                 return receipt
         return replace(core_receipt, publication=publication)
 
+    def _process_fixed_intent(self, run: RunRecord, deadline: float) -> bool:
+        from review_bot.adapters.markdown.intent_perspective_formatter import format_intent_perspective_markdown
+        from review_bot.application.intent_context import decode_intent_task_input
+        from review_bot.runtime.artifacts import IntentArtifacts
+
+        if self.config.intent.pipeline != "perspectives-v1" or self.config.publish.mode != "artifact_only":
+            raise _ModeFailure("fixed_intent_requires_artifact_only_perspectives")
+        if self.artifact_root is None:
+            raise _ModeFailure("artifact_root_required")
+        stored = self.job_store.get_fixed_intent_input(run.run_id)
+        if stored is None:
+            raise _ModeFailure("fixed_intent_input_unavailable")
+        task_input = decode_intent_task_input(stored[0])
+        self._stage(run, RunStage.REVIEW, deadline)
+        result = self._review_perspectives(task_input, run, deadline, stored[1])
+        self._stage(run, RunStage.VALIDATE, deadline)
+        markdown = format_intent_perspective_markdown(result, task_input)
+        output = self.artifact_root / "fixed" / run.run_id / f"attempt-{run.attempts}"
+        artifacts = IntentArtifacts(output)
+        artifacts.save(task_input, result, markdown)
+        self._require_active(run, deadline)
+        complete = result.status == "completed"
+        applied = self._update_run(run, RunStatus.SUCCEEDED if complete else RunStatus.FAILED,
+            RunStage.VALIDATE, reason=result.reason, error=None if complete else result.reason,
+            fingerprint=result.run_key)
+        return applied and complete
+
     def _execute_intent(
         self, run: RunRecord, review_snap: Any, mode_sel: Any, material: Any,
         artifacts: RunArtifacts | None, deadline: float, *, draft: bool = False,
@@ -706,7 +781,21 @@ class WorkerLoop:
         task_input = build_intent_task_input(review_snap, material.base, material.head,
             related_paths=tuple(self.config.intent.context_paths))
         marker = self.config.publish.b_marker
-        input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client)
+        code_first = self.config.intent.pipeline == "code-first-v2"
+        perspectives = self.config.intent.pipeline == "perspectives-v1"
+        if perspectives:
+            self._prepare_intent_selector()
+            input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client,
+                selection_client=self.intent_selection_client)
+        elif code_first:
+            if self.planning_client is None and self.model_client is not None:
+                self.planning_client = build_planning_client(self.config.model.profile, self.config.model)
+                if isinstance(self.planning_client, LlamaCppModelClient):
+                    self.planning_client.request_cancelled = self._stop_event.is_set
+            input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client,
+                planning_client=self.planning_client)
+        else:
+            input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client)
 
         def source_guard(current: dict[str, Any]) -> bool:
             self._require_active(run, deadline)
@@ -715,25 +804,41 @@ class WorkerLoop:
             self._require_active(run, deadline)
             return fresh
 
-        if not (draft and not self.config.publish.draft_comments):
+        if not perspectives and not (draft and not self.config.publish.draft_comments):
             reused = self._reuse_publication(run, "intent", review_snap, mode_sel, input_fingerprint, deadline, source_guard=source_guard)
             if reused is not None:
                 return reused
         self._stage(run, RunStage.REVIEW, deadline)
-        limits = IntentReviewLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
-        result = run_review_b_pipeline(task_input, self.model_client, before_stage=lambda: self._active(run, deadline), limits=limits)
+        if perspectives:
+            from review_bot.adapters.markdown.intent_perspective_formatter import format_intent_perspective_markdown
+            result = self._review_perspectives(task_input, run, deadline, self.config.output.language)
+            formatter = format_intent_perspective_markdown
+        elif code_first:
+            from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
+            from review_bot.application.code_first_intent_review import run_code_first_review
+            from review_bot.domain.code_first_intent_models import CodeFirstReviewLimits
+
+            limits = CodeFirstReviewLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
+            result = run_code_first_review(task_input, self.model_client, planning_client=self.planning_client,
+                before_stage=lambda: self._active(run, deadline), limits=limits)
+            formatter = format_code_intent_markdown
+        else:
+            limits = IntentReviewLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
+            result = run_review_b_pipeline(task_input, self.model_client, before_stage=lambda: self._active(run, deadline), limits=limits)
+            formatter = format_intent_markdown
         self._stage(run, RunStage.VALIDATE, deadline)
+        execution_status = "failed" if perspectives and result.status != "completed" else result.status
         core_receipt = ExecutionReceipt(2, "intent", mode_sel.selection_id, review_snap.snapshot_id, run.generation,
-            result.run_key, result.status, usage=result.usage,
+            result.run_key, execution_status, usage=result.usage,
             coverage=result.scope, limitations=result.limitations, model_delivery=result.model_delivery,
-            error_code=result.reason if result.status == "failed" else None, b_result=result, input_fingerprint=input_fingerprint)
+            error_code=result.reason if execution_status == "failed" else None, b_result=result, input_fingerprint=input_fingerprint)
         reason = ("artifact_only" if self.config.publish.mode == "artifact_only" else "b_comments_disabled"
             if not self.config.publish.b_comments_enabled else "draft_comments_disabled"
             if draft and not self.config.publish.draft_comments else result.reason if result.status != "completed" else None)
         try:
-            markdown = format_intent_markdown(result, task_input, marker=marker,
+            markdown = formatter(result, task_input, marker=marker,
                 max_length=min(60000, self.config.output.max_comment_characters),
-                publication_mode="comment" if reason is None else "artifact_only")
+                **({} if perspectives else {"publication_mode": "comment" if reason is None else "artifact_only"}))
             self._require_active(run, deadline)
             artifacts.save_intent(task_input, result, markdown)
         except (_RunAborted, _CommonFailure, GitHubAuthorizationError):

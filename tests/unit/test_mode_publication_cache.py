@@ -66,6 +66,7 @@ def test_receipt_migration_preserves_legacy_body_hash_and_never_infers_b_success
             store.enqueue_request(PrRequestRecord(44, 99, 7, 1))
             run = store.claim_next_run("worker", 60)
             assert store.get_current_publication(run, B_MARKER, input_fingerprint="b" * 64) is None
+            assert store.update_run(run.run_id, RunStatus.SUCCEEDED, worker_id="worker", generation=run.generation)
         finally:
             store.close()
 

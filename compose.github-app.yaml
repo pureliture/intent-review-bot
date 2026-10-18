@@ -1,0 +1,17 @@
+# Add with: docker compose -f compose.yaml -f compose.github-app.yaml ...
+x-key: &key
+  type: bind
+  source: ${REVIEW_BOT_APP_KEY_FILE:?Set the private GitHub App PEM file}
+  target: /run/secrets/github-app.pem
+  read_only: true
+  bind: {create_host_path: false}
+
+services:
+  web:
+    environment:
+      REVIEW_BOT_APP_PRIVATE_KEY_FILE: /run/secrets/github-app.pem
+    volumes: [*key]
+  worker:
+    environment:
+      REVIEW_BOT_APP_PRIVATE_KEY_FILE: /run/secrets/github-app.pem
+    volumes: [*key]

@@ -74,7 +74,7 @@ Ranked by operational impact and severity, the following eight remediations repr
 6. **[P1 - High] Replace Subprocess Environment Denylist with Strict Allowlist (`R1-2`)**:  
    In `src/review_bot/adapters/pmd/runner.py` and `provisioning.py`, replace the 12-key denylist with an explicit allowlist (`PATH`, `JAVA_HOME`, `LC_ALL`, `LANG`, `TMPDIR`), preventing leakage of `REVIEW_BOT_*` tokens and host secrets.
 7. **[P1 - High] Complete Response Gate Finding Schema and Grounding Validation (`R4-1`, `GAP-13`)**:  
-   In `src/review_bot/application/review_a.py`, validate all finding objects against required fields (`title`, `reason`, `recommendation`), check that `signal_id` exists in `task_input.signals`, verify `evidence_ids` in `task_input.evidence`, and ensure `change` matches the static delta.
+   In `src/review_bot/application/architecture_review.py`, validate all finding objects against required fields (`title`, `reason`, `recommendation`), check that `signal_id` exists in `task_input.signals`, verify `evidence_ids` in `task_input.evidence`, and ensure `change` matches the static delta.
 8. **[P1 - High] Redact Exceptions Before SQLite Persistence and Logging (`R1-4`)**:  
    Install a centralized regex-based secret scrubber to scrub authorization headers, bearer tokens, and API keys from `WorkerLoop` exception handlers and log output before persisting to `runs.error`.
 
@@ -97,7 +97,7 @@ Across all seven audit perspectives, the target codebase demonstrated several st
 5. **Durable SQLite WAL Transaction Discipline**:  
    `SQLiteJobStore` strictly enforces `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, and `PRAGMA busy_timeout = 5000`. All write queries execute inside `with self.transaction(immediate=True)`, acquiring a SQLite `RESERVED` lock at transaction inception and preventing deadlock during concurrent write upgrades.
 6. **Strict "Full Source Context or Fail-Closed" Context Assembly**:  
-   In `src/review_bot/application/context.py` and `review_a.py`, snapshot code inputs are assembled in full without arbitrary file splitting, sliding windows, or silent heuristic omissions. If inputs exceed `max_input_bytes` or `max_input_tokens`, the pipeline halts with `status="not_run", reason="input_limit_exceeded"`, refusing to produce degraded hallucinations from partial context.
+   In `src/review_bot/application/context.py` and `architecture_review.py`, snapshot code inputs are assembled in full without arbitrary file splitting, sliding windows, or silent heuristic omissions. If inputs exceed `max_input_bytes` or `max_input_tokens`, the pipeline halts with `status="not_run", reason="input_limit_exceeded"`, refusing to produce degraded hallucinations from partial context.
 7. **Adversarial Input Sanitization in Git & Markdown Adapters**:  
    The Git adapter enforces hex regexes (`^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z`) on all commit hashes, executes Git with `-c protocol.allow=never` and `--no-replace-objects`, and filters symlinks (`mode 120000`). The Markdown formatter defuses user mentions by injecting zero-width spaces (`@\u200b`) and parses artifact URLs to forbid embedded credentials (`user:password@host`).
 8. **Offline CLI Fidelity**:  
@@ -576,7 +576,7 @@ Across all seven audit perspectives, the target codebase demonstrated several st
 ### Finding [R4-1]: Incomplete Response Gate Validation: Missing Schema Enforcement and Hallucination Checks for Finding Fields
 - **Perspective**: R4. LLM Pipeline & Hallucination Defense
 - **Severity**: High
-- **Location**: `src/review_bot/application/review_a.py:446-524, 537-573`
+- **Location**: `src/review_bot/application/architecture_review.py:446-524, 537-573`
 - **Evidence / Rationale**:
   In `build_response_schema` (lines 140–195), a rigorous JSON schema is defined specifying required properties (`signal_id`, `judgement`, `change`, `title`, `reason`, `recommendation`, `evidence_ids`) and enums.
   However, `validate_model_response` (lines 446–524) does NOT use a schema validator and only executes hand-rolled checks. It omits:
@@ -600,7 +600,7 @@ Across all seven audit perspectives, the target codebase demonstrated several st
 ### Finding [R4-2]: Quote-to-Line Desynchronization: Citations Can Quote Remote File Snippets with Arbitrary Line Numbers
 - **Perspective**: R4. LLM Pipeline & Hallucination Defense
 - **Severity**: High
-- **Location**: `src/review_bot/application/review_a.py:321-324, 360-388`
+- **Location**: `src/review_bot/application/architecture_review.py:321-324, 360-388`
 - **Evidence / Rationale**:
   In `_validate_citation`, line bounds and quote verification are disconnected:
   1. Lines 321–324 check if `quote in ev_content_map[ev_id]`. For full-file code evidence, `ev_content_map[ev_id]` is the entire file.
@@ -628,7 +628,7 @@ Across all seven audit perspectives, the target codebase demonstrated several st
 ### Finding [R4-4]: Lack of PR-Diff Relevance Gate for Citation File Paths
 - **Perspective**: R4. LLM Pipeline & Hallucination Defense
 - **Severity**: Medium
-- **Location**: `src/review_bot/application/review_a.py:328-334`
+- **Location**: `src/review_bot/application/architecture_review.py:328-334`
 - **Evidence / Rationale**:
   `_validate_citation` verifies that `cit["path"]` matches `ev.path`. However, `task_input.evidence` contains full-file code evidence for all files across the repository. The validator does not check whether `cit["path"]` belongs to `snapshot.pr.changed_files`. The model can cite an unmodified, unrelated file (e.g. `gradle-wrapper.properties`), and the Response Gate accepts it.
 - **Actionable Remediation**:
@@ -639,10 +639,10 @@ Across all seven audit perspectives, the target codebase demonstrated several st
 ### Finding [R4-5]: Hidden Protocol Leak: `count_input_tokens` Undeclared on `ModelClient` Protocol
 - **Perspective**: R4. LLM Pipeline & Hallucination Defense
 - **Severity**: Medium
-- **Location**: `src/review_bot/ports.py:121-127`, `src/review_bot/application/review_a.py:699-709`
+- **Location**: `src/review_bot/ports.py:121-127`, `src/review_bot/application/architecture_review.py:699-709`
 - **Evidence / Rationale**:
   `ports.ModelClient` defines only `def complete(self, request: ModelRequest) -> ModelResponse: ...`.
-  However, in `review_a.py:700`, if `max_input_tokens` is configured, it checks `if hasattr(client, "count_input_tokens"):` and otherwise returns `"not_run", "token_count_unavailable"`. Any client strictly implementing `ports.ModelClient` fails with `"token_count_unavailable"`.
+  However, in `architecture_review.py:700`, if `max_input_tokens` is configured, it checks `if hasattr(client, "count_input_tokens"):` and otherwise returns `"not_run", "token_count_unavailable"`. Any client strictly implementing `ports.ModelClient` fails with `"token_count_unavailable"`.
 - **Actionable Remediation**:
   Add `def count_input_tokens(self, request: ModelRequest) -> int: ...` to `ModelClient` in `ports.py`.
 
@@ -813,9 +813,9 @@ Across all seven audit perspectives, the target codebase demonstrated several st
 ### Finding [R6-3]: Leaky Adapter / Mock Implementations Co-located Inside Application Layer
 - **Perspective**: R6. Software Architecture & Maintainability
 - **Severity**: Medium
-- **Location**: `src/review_bot/application/review_a.py:60-103`
+- **Location**: `src/review_bot/application/architecture_review.py:60-103`
 - **Evidence / Rationale**:
-  `UnconfiguredModelClient` and `MockModelClient` are defined in `application/review_a.py`. Concrete port adapters belong in `adapters/` (`adapters/model/clients.py`), keeping `application/` purely focused on use-case logic.
+  `UnconfiguredModelClient` and `MockModelClient` are defined in `application/architecture_review.py`. Concrete port adapters belong in `adapters/` (`adapters/model/clients.py`), keeping `application/` purely focused on use-case logic.
 - **Actionable Remediation**:
   Create `src/review_bot/adapters/model/` and move client implementations there.
 
@@ -882,7 +882,7 @@ Using the formula $\text{Priority} = (\text{Impact} + \text{Risk}) \times (6 - \
 |---|---|---|---|:---:|:---:|:---:|:---:|
 | **TD-1** | Worker Publication Disconnection | Operational | `runtime/worker.py:305` | 5 | 4 | 2 | **36** |
 | **TD-2** | Missing Application Boundary Tests | Test Debt | `tests/unit/test_domain_purity.py` | 3 | 3 | 1 | **30** |
-| **TD-3** | Model Clients Inside Application Layer | Design | `application/review_a.py:60` | 3 | 2 | 1 | **25** |
+| **TD-3** | Model Clients Inside Application Layer | Design | `application/architecture_review.py:60` | 3 | 2 | 1 | **25** |
 | **TD-4** | Hardcoded Review Mode Registry & OCP | Design | `application/selection.py:11` | 4 | 4 | 3 | **24** |
 | **TD-5** | GitHubClient Protocol Signature Ambiguity | Code Debt | `application/publication.py:16` | 3 | 3 | 2 | **24** |
 | **TD-6** | Shallow Immutability in Frozen Domain Models | Code Debt | `domain/envelope_v2.py:103` | 2 | 2 | 2 | **16** |
@@ -1065,7 +1065,7 @@ Audit of the 967 automated tests identified 15 high-impact edge case gaps. Concr
 ### Finding [GAP-13]: Response Gate Validation Omissions: Unvalidated Finding `evidence_ids`, `criterion_ids`, `observation_ids`, and Judgements
 - **Perspective**: Test Coverage Gap Analysis
 - **Severity**: High
-- **Location**: `src/review_bot/application/review_a.py:320-324, 440-524`
+- **Location**: `src/review_bot/application/architecture_review.py:320-324, 440-524`
 - **Evidence / Rationale**:
   Finding `evidence_ids` and enums are never validated against `task_input.evidence` or allowed values.
 - **Actionable Remediation**:

@@ -1,0 +1,28 @@
+schema_version: 2
+codebase:
+  product: github-review-bot
+  python_package: review_bot
+  python_min_version: "3.11"
+execution:
+  mode: offline
+  backend: mock
+  available_modes: [intent]
+  worker_concurrency: 2
+  task_timeout_seconds: 14400
+service: {}
+publish:
+  mode: artifact_only
+  b_comments_enabled: false
+model:
+  profile: me707-llamacpp
+  max_concurrency: 2
+  call_timeout_seconds: 3600
+  max_attempts: 1
+intent:
+  pipeline: perspectives-v1
+repository_settings: {}
+comparison: {}
+code_input: {}
+artifacts: {}
+output:
+  language: ko

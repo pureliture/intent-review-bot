@@ -4,11 +4,13 @@ from __future__ import annotations
 import ipaddress
 import json
 import math
+import time
 from typing import Any
 
 import httpx
 
-from review_bot.application.review_a import ModelProfile, PermanentModelError, TransientModelError
+from review_bot.adapters.model_http import mark_model_request_sent, model_request_slot
+from review_bot.application.architecture_review import ModelProfile, PermanentModelError, TransientModelError
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 
 OLLAMA_PROFILE = "ollama-local-128k"
@@ -57,16 +59,30 @@ class _LocalOllamaClient:
         self._verified = False
 
     def _post(self, path: str, payload: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
+        content = _encode(payload)
+        deadline = time.monotonic() + timeout_seconds
         try:
-            with httpx.Client(trust_env=False, follow_redirects=False, timeout=timeout_seconds) as client:
-                response = client.post(
-                    f"{self.api_url}{path}", content=_encode(payload),
-                    headers={"Content-Type": "application/json"},
-                )
-                response.raise_for_status()
-                if len(response.content) > _MAX_RESPONSE_BYTES:
-                    raise PermanentModelError("Ollama response exceeds byte limit")
-                result = response.json()
+            with model_request_slot(self, deadline, generates=path != "/api/show") as (ticket, deadline):
+                try:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Ollama request timed out")
+                    with httpx.Client(trust_env=False, follow_redirects=False, timeout=remaining) as client:
+                        mark_model_request_sent(ticket)
+                        response = client.post(
+                            f"{self.api_url}{path}", content=content,
+                            headers={"Content-Type": "application/json"},
+                        )
+                        ticket.finish()
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Ollama request timed out")
+                        response.raise_for_status()
+                        if len(response.content) > _MAX_RESPONSE_BYTES:
+                            raise PermanentModelError("Ollama response exceeds byte limit")
+                        result = response.json()
+                except (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout):
+                    ticket.finish()
+                    raise
         except httpx.TimeoutException as exc:
             raise TimeoutError("Ollama request timed out") from exc
         except httpx.HTTPStatusError as exc:

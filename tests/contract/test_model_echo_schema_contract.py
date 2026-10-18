@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from review_bot.application.review_a import validate_model_response  # type: ignore
+    from review_bot.application.architecture_review import validate_model_response  # type: ignore
 except ImportError:
     validate_model_response = None  # type: ignore
 

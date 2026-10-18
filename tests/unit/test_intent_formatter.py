@@ -7,9 +7,9 @@ from dataclasses import replace
 import pytest
 
 from review_bot.adapters.markdown.intent_formatter import DEFAULT_B_MARKER, format_intent_markdown
-from review_bot.application.review_a import MockModelClient
-from review_bot.application.review_b import run_review_b_pipeline
-from tests.fixtures.review_b import make_task, responses, stage_bodies
+from review_bot.application.architecture_review import MockModelClient
+from review_bot.application.declared_intent_review import run_review_b_pipeline
+from tests.fixtures.intent_review import make_task, responses, stage_bodies
 
 
 def test_untrusted_html_markers_mentions_and_urls_are_inert() -> None:

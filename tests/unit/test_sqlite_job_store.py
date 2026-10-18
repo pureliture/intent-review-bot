@@ -292,6 +292,9 @@ def test_concurrent_worker_claiming_thread_safety(tmp_path: Path) -> None:
             if run:
                 with lock:
                     claimed_run_ids.append(run.run_id)
+                assert thread_store.update_run(
+                    run.run_id, RunStatus.SUCCEEDED, worker_id=f"worker-{worker_num}", generation=run.generation,
+                )
             time.sleep(0.01)
         thread_store.close()
 

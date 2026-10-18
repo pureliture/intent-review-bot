@@ -1,0 +1,62 @@
+# Linux/me707: both processes share durable state and the model admission group.
+x-bot: &bot
+  image: github-review-bot:${REVIEW_BOT_IMAGE_TAG:-local}
+  build: .
+  user: "${REVIEW_BOT_UID:-1000}:${REVIEW_BOT_GID:-1000}"
+  init: true
+  restart: unless-stopped
+  network_mode: host
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: ["/tmp:mode=1777,size=64m"]
+  stop_grace_period: 5m
+  env_file:
+    - ${REVIEW_BOT_RUNTIME_ENV:?Set the private runtime env file}
+  environment:
+    REVIEW_BOT_STATE_DIR: /var/lib/review-bot
+    REVIEW_BOT_MODEL_STATE_DIR: /var/lib/review-bot-models
+    REVIEW_BOT_BIND_ADDRESS: ${REVIEW_BOT_BIND_ADDRESS:-127.0.0.1}
+    REVIEW_BOT_PORT: ${REVIEW_BOT_PORT:-18080}
+  volumes:
+    - type: bind
+      source: ${REVIEW_BOT_NETWORK_CONFIG_DIR:?Prepare the private network config directory}/hosts
+      target: /etc/hosts
+      read_only: true
+      bind: {create_host_path: false}
+    - type: bind
+      source: ${REVIEW_BOT_NETWORK_CONFIG_DIR:?Prepare the private network config directory}/resolv.conf
+      target: /etc/resolv.conf
+      read_only: true
+      bind: {create_host_path: false}
+    - type: bind
+      source: ${REVIEW_BOT_CONFIG:?Set the operator config path}
+      target: /etc/review-bot.yaml
+      read_only: true
+      bind: {create_host_path: false}
+    - type: bind
+      source: ${REVIEW_BOT_STATE_PATH:?Prepare the private state directory}
+      target: /var/lib/review-bot
+      bind: {create_host_path: false}
+    - type: bind
+      source: ${REVIEW_BOT_MODEL_STATE_PATH:?Use the shared private model admission directory}
+      target: /var/lib/review-bot-models
+      bind: {create_host_path: false}
+
+services:
+  web:
+    <<: *bot
+    command: [webhook, --config, /etc/review-bot.yaml, --host, "${REVIEW_BOT_BIND_ADDRESS:-127.0.0.1}", --port, "${REVIEW_BOT_PORT:-18080}"]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request; h=os.environ['REVIEW_BOT_BIND_ADDRESS']; h='127.0.0.1' if h=='0.0.0.0' else h; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://'+h+':'+os.environ['REVIEW_BOT_PORT']+'/health',timeout=3).read()"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+  worker:
+    <<: *bot
+    command: [worker, --config, /etc/review-bot.yaml]

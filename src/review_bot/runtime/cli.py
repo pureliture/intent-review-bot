@@ -14,15 +14,14 @@ from review_bot import __version__
 from review_bot.adapters.git import CommitNotFoundError, GitError, GitRepositoryReader
 from review_bot.adapters.markdown.formatter import format_review_markdown
 from review_bot.adapters.markdown.intent_formatter import format_intent_markdown
-from review_bot.adapters.ollama import OLLAMA_PROFILE
 from review_bot.adapters.pmd.runner import PmdRunner
 from review_bot.application.classification import classify_pr
 from review_bot.application.context import build_task_input
 from review_bot.application.delta import build_delta
 from review_bot.application.intent_context import MAX_INPUT_BYTES, decode_intent_task_input
-from review_bot.application.review_a import run_review_a_pipeline
-from review_bot.application.review_b import run_review_b_pipeline
-from review_bot.config import load_review_config
+from review_bot.application.architecture_review import run_review_a_pipeline
+from review_bot.application.declared_intent_review import run_review_b_pipeline
+from review_bot.config import ModelConfig, load_review_config
 from review_bot.domain.models_v1 import (
     AnalysisRun,
     CpdDuplication,
@@ -34,7 +33,7 @@ from review_bot.domain.models_v1 import (
     ToolAnalysis,
 )
 from review_bot.runtime.artifacts import IntentArtifacts, read_private_intent_input
-from review_bot.runtime.model_clients import build_review_client
+from review_bot.runtime.model_clients import MODEL_PROFILES, build_planning_client, build_review_client
 
 logger = logging.getLogger(__name__)
 
@@ -228,8 +227,8 @@ def create_parser() -> argparse.ArgumentParser:
     )
     for review_command in (review_parser, offline_parser):
         review_command.add_argument(
-            "--model-profile", choices=[OLLAMA_PROFILE], default=None,
-            help="Explicitly enable local Ollama review (default: no model calls)",
+            "--model-profile", choices=MODEL_PROFILES, default=None,
+            help="Explicitly enable an Ollama or llama.cpp profile (default: no model calls)",
         )
 
     # 2. analyze
@@ -351,8 +350,14 @@ def create_parser() -> argparse.ArgumentParser:
     )
     intent_parser.add_argument("--input", required=True, help="Private fixed B v1 input JSON (owned 0600/0400 file)")
     intent_parser.add_argument("--output", required=True, help="Fresh private output directory (0700)")
-    intent_parser.add_argument("--model-profile", choices=[OLLAMA_PROFILE], default=None,
-        help="Explicitly enable the existing local review profile (default: no model calls)")
+    intent_parser.add_argument("--model-profile", choices=MODEL_PROFILES, default=None,
+        help="Explicitly enable a review profile (default: no model calls)")
+    intent_parser.add_argument("--pipeline", choices=("declared-v1", "code-first-v2", "perspectives-v1"), default="declared-v1",
+        help="B review contract; perspectives-v1 performs one fixed-input intent review with closed perspective choices")
+    intent_parser.add_argument("--language", choices=("ko", "en"), default="ko",
+        help="Human output language for perspectives-v1 (default: ko)")
+    intent_parser.add_argument("--call-timeout-seconds", type=int, default=None,
+        help="Explicit per-call model timeout; task, context and token budgets remain unchanged")
 
     return parser
 
@@ -625,14 +630,37 @@ def run_intent(args: argparse.Namespace) -> int:
         sys.stderr.write("Error: unsafe_intent_output\n")
         return 1
     try:
-        model_client = build_review_client(args.model_profile)
-        result = run_review_b_pipeline(task_input, model_client)
-        markdown = format_intent_markdown(result, task_input)
+        timeout = getattr(args, "call_timeout_seconds", None)
+        settings = ModelConfig(call_timeout_seconds=timeout) if timeout is not None else None
+        model_client = build_review_client(args.model_profile, settings) if settings is not None else build_review_client(args.model_profile)
+        if getattr(args, "pipeline", "declared-v1") == "perspectives-v1":
+            from review_bot.adapters.markdown.intent_perspective_formatter import format_intent_perspective_markdown
+            from review_bot.application.intent_perspective_review import run_intent_perspective_review
+            from review_bot.runtime.model_clients import build_intent_selection_client
+
+            selector = (build_intent_selection_client(args.model_profile, settings) if settings is not None
+                else build_intent_selection_client(args.model_profile))
+            result = run_intent_perspective_review(task_input, model_client, selection_client=selector,
+                language=getattr(args, "language", "ko"))
+            markdown = format_intent_perspective_markdown(result, task_input)
+        elif getattr(args, "pipeline", "declared-v1") == "code-first-v2":
+            from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
+            from review_bot.application.code_first_intent_review import run_code_first_review
+
+            planning_client = (build_planning_client(args.model_profile, settings) if settings is not None
+                else build_planning_client(args.model_profile))
+            result = run_code_first_review(task_input, model_client, planning_client=planning_client)
+            markdown = format_code_intent_markdown(result, task_input)
+        else:
+            result = run_review_b_pipeline(task_input, model_client)
+            markdown = format_intent_markdown(result, task_input)
         artifacts.save(task_input, result, markdown)
     except Exception:
         sys.stderr.write("Error: intent_evaluation_failed\n")
         return 1
     print(f"intent: {result.status}/{result.reason}")
+    if getattr(args, "pipeline", "declared-v1") in ("code-first-v2", "perspectives-v1"):
+        return 0 if result.status == "completed" else 1
     return 1 if result.status == "failed" else 0
 
 

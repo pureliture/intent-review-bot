@@ -11,7 +11,7 @@ from typing import Any
 
 from review_bot.application.context import hash_json
 from review_bot.domain.envelope_v2 import ChangedFile, EnvelopeEvidence, ReviewSnapshot, UnavailableSource
-from review_bot.domain.models_b import IntentTaskInput
+from review_bot.domain.intent_models import IntentTaskInput
 from review_bot.domain.models_v1 import CodeFile, CodeSnapshot, SourceExclusion
 from review_bot.ports import RepositoryReader
 

@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 import pytest
 
-from review_bot.application.review_a import PermanentModelError, TransientModelError, run_review_a_pipeline
+from review_bot.application.architecture_review import PermanentModelError, TransientModelError, run_review_a_pipeline
 from review_bot.application.selection import ModelModeSelector
 from review_bot.domain.models_v1 import ModelRequest
 from review_bot.ports import ModelClient
@@ -117,7 +117,7 @@ def test_granite_warmup_uses_load_only_request(mock_http: Any) -> None:
     payload = json.loads(requests[-1].content)
     assert payload == {"model": MAIN, "keep_alive": "5m", "options": {"num_ctx": 131072}}
     assert "prompt" not in payload and "stream" not in payload
-    assert requests[-1].extensions["timeout"]["read"] == 17
+    assert 0 < requests[-1].extensions["timeout"]["read"] <= 17
 
 
 @pytest.mark.parametrize("response", [
@@ -153,7 +153,7 @@ def test_granite_port_posts_chat_schema_and_128k(mock_http: Any, main_request: M
         {"role": "system", "content": main_request.system_prompt},
         {"role": "user", "content": main_request.user_content},
     ]
-    assert requests[-1].extensions["timeout"]["read"] == 10
+    assert 0 < requests[-1].extensions["timeout"]["read"] <= 10
 
 
 def test_token_preflight_returns_native_count_not_byte_estimate(mock_http: Any, main_request: ModelRequest) -> None:
@@ -383,7 +383,7 @@ def test_tev_warmup_is_explicit_and_outside_selector_deadline(mock_http: Any) ->
     assert requests == []
     client.warmup()
     assert [r.url.path for r in requests] == ["/api/show", "/v1/systemone"]
-    assert requests[-1].extensions["timeout"]["read"] == 60
+    assert 0 < requests[-1].extensions["timeout"]["read"] <= 60
 
 
 @pytest.mark.parametrize("fault", ["context", "parameters", "capability", "remote", "tokenizer"])

@@ -2,16 +2,76 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from dataclasses import replace
 
 import pytest
 
-from review_bot.application.review_a import MockModelClient, ModelProfile, TransientModelError
-from review_bot.application.review_b import MIN_QUOTE_NONSPACE_CHARS, run_review_b_pipeline
-from review_bot.domain.models_b import IntentReviewLimits
+from review_bot.application.architecture_review import MockModelClient, ModelProfile, TransientModelError
+from review_bot.application.declared_intent_review import MIN_QUOTE_NONSPACE_CHARS, response_schema, run_review_b_pipeline
+from review_bot.domain.intent_models import IntentReviewLimits
 from review_bot.domain.models_v1 import ModelResponse
-from tests.fixtures.review_b import GOAL, make_task, responses, stage_bodies
+from tests.fixtures.intent_review import GOAL, make_task, responses, stage_bodies
+
+
+def test_generation_schema_separates_new_result_ids_from_other_entity_types() -> None:
+    namespaces = {
+        "extract_goals": {"declared_goals": ("goal_id", "G"), "declared_constraints": ("constraint_id", "C")},
+        "observe_changes": {"implementation_observations": ("observation_id", "O"),
+            "intent_hypotheses": ("hypothesis_id", "H"), "assumptions": ("assumption_id", "S")},
+        "assess": {"findings": ("finding_id", "F"), "questions": ("question_id", "Q")},
+    }
+    for stage, entities in namespaces.items():
+        properties = response_schema(stage)["properties"]
+        for collection, (key, prefix) in entities.items():
+            pattern = properties[collection]["items"]["properties"][key]["pattern"]
+            assert re.fullmatch(pattern, f"{prefix}1")
+            assert all(not re.fullmatch(pattern, f"{other}1") for other in "GCOHSFQ" if other != prefix)
+
+
+def test_generation_references_are_bound_to_the_current_stage_originals_and_validated_results() -> None:
+    client = MockModelClient(responses(), input_tokens=100)
+    assert run_review_b_pipeline(make_task(), client).status == "completed"
+    expected_evidence = [["E-PR-01"], ["E-CODE-base-0001", "E-CODE-head-0001", "E-CODE-head-0002"],
+        ["E-CODE-base-0001", "E-CODE-head-0001", "E-CODE-head-0002", "E-PR-01"]]
+    for request, collection, allowed in zip(client.requests, ["declared_goals", "intent_hypotheses", "findings"], expected_evidence):
+        fields = request.response_schema["properties"][collection]["items"]["properties"]
+        assert fields["evidence_ids"]["items"]["enum"] == allowed
+        assert fields["evidence_ids"]["maxItems"] == len(allowed)
+    finding_fields = client.requests[2].response_schema["properties"]["findings"]["items"]["properties"]
+    assert finding_fields["goal_ids"]["items"]["enum"] == ["G1"]
+    assert finding_fields["constraint_ids"]["maxItems"] == 0
+    assert finding_fields["observation_ids"]["items"]["enum"] == ["O1", "O2"]
+    question_fields = client.requests[2].response_schema["properties"]["questions"]["items"]["properties"]
+    related_pattern = question_fields["related_finding_ids"]["items"]["pattern"]
+    assert question_fields["related_finding_ids"]["minItems"] == 1
+    assert re.fullmatch(related_pattern, "F1")
+    assert not re.fullmatch(related_pattern, "H1") and not re.fullmatch(related_pattern, "S1")
+
+
+def test_no_declared_goal_generation_cannot_claim_a_conflict_or_consistency() -> None:
+    client = MockModelClient(responses(stage_bodies(no_goals=True)), input_tokens=100)
+    assert run_review_b_pipeline(make_task(body=""), client).status == "completed"
+    fields = client.requests[2].response_schema["properties"]["findings"]["items"]["properties"]
+    assert fields["assessment"]["enum"] == ["insufficient_context"]
+    assert fields["missing_evidence"]["minItems"] == 1
+
+
+@pytest.mark.parametrize("collision", ["prior_observation", "finding_question", "repeated_finding"])
+def test_final_duplicate_ids_are_rejected_without_rewriting_or_discarding_usage(collision: str) -> None:
+    bodies = deepcopy(stage_bodies())
+    if collision == "prior_observation":
+        bodies[2]["findings"][0]["finding_id"] = "O1"
+    elif collision == "finding_question":
+        bodies[2]["questions"][0]["question_id"] = "B1"
+    else:
+        bodies[2]["findings"].append(deepcopy(bodies[2]["findings"][0]))
+    result = run_review_b_pipeline(make_task(), MockModelClient(responses(bodies), input_tokens=100))
+    assert (result.status, result.reason) == ("failed", "invalid_model_response")
+    assert not result.findings and not result.questions
+    assert result.goals and result.observations
+    assert result.usage["calls"] == 3 and result.usage["output_tokens"] == 150
 
 
 @pytest.mark.parametrize("language", ["python", "javascript", "java"])
@@ -227,10 +287,10 @@ def test_output_and_usage_fail_closed_without_raw_exception_values(failure: str)
 
 
 def test_deadline_after_a_call_stops_and_keeps_that_calls_usage(monkeypatch) -> None:
-    from review_bot.application import review_b
+    from review_bot.application import declared_intent_review
 
     clock = [0.0]
-    monkeypatch.setattr(review_b.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(declared_intent_review.time, "monotonic", lambda: clock[0])
 
     class SlowClient(MockModelClient):
         def complete(self, request):
@@ -257,7 +317,7 @@ def test_declared_and_observed_evidence_can_support_noninsufficient_assessments(
 
 
 def test_assessment_request_builder_revalidates_prior_results() -> None:
-    from review_bot.application.review_b import build_intent_model_request, validate_intent_goals, validate_intent_observations
+    from review_bot.application.declared_intent_review import build_intent_model_request, validate_intent_goals, validate_intent_observations
 
     task = make_task()
     bodies = stage_bodies()

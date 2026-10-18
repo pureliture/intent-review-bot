@@ -26,6 +26,40 @@ SECRET = "synthetic-step7-secret"
 IMAGE = "sha256:" + "a" * 64
 
 
+def test_offline_intent_service_needs_no_github_credentials(service_config, monkeypatch):
+    from dataclasses import asdict
+    from tests.fixtures.intent_perspectives import make_task
+
+    service_config.raw["execution"].update(mode="offline", available_modes=["intent"])
+    service_config.raw["intent"] = {"pipeline": "perspectives-v1"}
+    service_config.raw["publish"].update(mode="artifact_only", b_comments_enabled=False)
+    write_config(service_config)
+    monkeypatch.setenv("REVIEW_BOT_API_TOKEN", "synthetic-fixed-api-token")
+    for name in ("STEP7_APP_ID", "STEP7_KEY_FILE", "STEP7_SECRET"):
+        monkeypatch.delenv(name)
+
+    def serve(app, **options):
+        with TestClient(app) as client:
+            assert client.get("/health").status_code == 200
+            assert client.post("/webhook", json={}).status_code == 404
+            response = client.post("/reviews/intent", json=asdict(make_task()),
+                headers={"Authorization": "Bearer synthetic-fixed-api-token"})
+            assert response.status_code == 202, response.text
+
+    monkeypatch.setattr(uvicorn, "run", serve)
+    assert main(["webhook", "--config", str(service_config.path)]) == 0
+
+
+def test_offline_fixed_service_rejects_absent_api_auth(service_config, monkeypatch, capsys):
+    service_config.raw["execution"].update(mode="offline", available_modes=["intent"])
+    service_config.raw["intent"] = {"pipeline": "perspectives-v1"}
+    service_config.raw["publish"].update(mode="artifact_only", b_comments_enabled=False)
+    write_config(service_config)
+    monkeypatch.delenv("REVIEW_BOT_API_TOKEN", raising=False)
+    assert main(["webhook", "--config", str(service_config.path)]) == 1
+    assert "REVIEW_BOT_API_TOKEN" in capsys.readouterr().err
+
+
 @pytest.fixture(autouse=True)
 def no_external_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     def forbidden(*args, **kwargs):
@@ -171,6 +205,64 @@ def write_config(service_config) -> None:
     service_config.path.write_text(yaml.safe_dump(service_config.raw), encoding="utf-8")
 
 
+@pytest.mark.parametrize("fail_worker", [False, True])
+def test_two_worker_service_owns_independent_connections_and_shared_shutdown(
+    service_config, monkeypatch: pytest.MonkeyPatch, fail_worker: bool, capsys,
+) -> None:
+    import threading
+    from review_bot.runtime import service
+
+    service_config.raw["execution"]["worker_concurrency"] = 2
+    write_config(service_config)
+    barrier = threading.Barrier(2)
+    workers = []
+    connections = []
+    worker_threads = []
+    lock = threading.Lock()
+
+    class Worker:
+        def __init__(self, config, store, **ports):
+            self.store = store
+            self.stop_event = ports["stop_event"]
+            self.worker_id = ports["worker_id"]
+            workers.append(self)
+
+        def run_forever(self):
+            with lock:
+                connections.append(self.store._get_connection())
+                worker_threads.append(threading.get_ident())
+            barrier.wait(timeout=5)
+            if self.worker_id.endswith("-0"):
+                if fail_worker:
+                    raise RuntimeError("private-worker-details")
+                self.stop_event.set()
+            else:
+                assert self.stop_event.wait(timeout=5)
+
+    monkeypatch.setattr(service, "WorkerLoop", Worker)
+    assert main(["worker", "--config", str(service_config.path)]) == (1 if fail_worker else 0)
+    assert len(workers) == 2
+    assert workers[0].store is not workers[1].store
+    assert workers[0].stop_event is workers[1].stop_event
+    assert workers[0].stop_event.is_set()
+    assert len({worker.worker_id for worker in workers}) == 2
+    assert len(set(worker_threads)) == 2
+    assert connections[0] is not connections[1]
+    for connection in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")
+    assert "private-worker-details" not in capsys.readouterr().err
+
+
+def test_two_worker_configuration_preserves_once_one_task_semantics(service_config, dependencies):
+    service_config.raw["execution"]["worker_concurrency"] = 2
+    write_config(service_config)
+    assert main(["worker", "--config", str(service_config.path), "--once"]) == 0
+    assert dependencies.worker_factory.call_count == 1
+    dependencies.loop.prepare_models.assert_called_once_with()
+    dependencies.loop.run_forever.assert_not_called()
+
+
 def test_worker_once_empty_composes_ports_without_reading_key(
     service_config, dependencies, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -254,7 +346,8 @@ def test_service_requires_active_environment(
 @pytest.mark.parametrize("section, field, value", [
     ("execution", "mode", "offline"),
     ("execution", "backend", "mock"),
-    ("execution", "worker_concurrency", 2),
+    ("execution", "worker_concurrency", 3),
+    ("model", "max_concurrency", 3),
     ("service", "worker", "asynchronous"),
     ("service", "sqlite_wal", False),
     ("service", "lease_and_generation_fencing", False),

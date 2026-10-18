@@ -124,7 +124,7 @@ class ExecutionConfig(BaseModel):
     run_only_selected_modes: bool = True
     selector_policy: Literal["all_available"] = "all_available"
     selector_uses_model: bool = False
-    worker_concurrency: int = Field(ge=1, default=1)
+    worker_concurrency: int = Field(ge=1, le=2, default=1)
     task_timeout_seconds: int = Field(ge=1, default=900)
     pr_actions: list[str] = Field(
         default_factory=lambda: [
@@ -198,7 +198,7 @@ class ModelConfig(BaseModel):
     allow_summarization: bool = False
     allow_truncation: bool = False
     allow_automatic_splitting: bool = False
-    max_concurrency: int = Field(ge=1, default=1)
+    max_concurrency: int = Field(ge=1, le=2, default=1)
     call_timeout_seconds: int = Field(ge=1, default=60)
     max_attempts: int = Field(ge=1, default=1)
     max_output_bytes: int = Field(ge=1, default=32768)
@@ -257,6 +257,7 @@ class RepositorySettingsConfig(BaseModel):
 
 class IntentConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
+    pipeline: Literal["declared-v1", "code-first-v2", "perspectives-v1"] = "declared-v1"
     context_paths: list[str] = Field(default_factory=list, max_length=5000)
 
     @field_validator("context_paths")
@@ -336,6 +337,10 @@ class ReviewBotConfig(BaseModel):
             raise ValueError("architecture configuration is required for A-only execution")
         if self.execution.mode == "github_app" and "mode" not in self.publish.model_fields_set:
             self.publish.mode = "comment"
+        if self.intent.pipeline == "perspectives-v1" and (
+            self.publish.mode != "artifact_only" or self.publish.b_comments_enabled
+        ):
+            raise ValueError("perspectives-v1 requires artifact_only with B comments disabled")
         return self
 
     @property
@@ -360,6 +365,8 @@ class TargetRepositoryConfig(BaseModel):
 def compute_config_hash(data: dict[str, Any] | BaseModel) -> str:
     """Computes a deterministic SHA-256 digest over normalized canonical JSON."""
     raw_dict = data.model_dump(mode="json") if isinstance(data, BaseModel) else data
+    if isinstance(raw_dict.get("intent"), dict) and raw_dict["intent"].get("pipeline") == "declared-v1":
+        raw_dict = {**raw_dict, "intent": {key: value for key, value in raw_dict["intent"].items() if key != "pipeline"}}
     execution = raw_dict.get("execution")
     if (
         raw_dict.get("schema_version") == 2 and isinstance(execution, dict)
