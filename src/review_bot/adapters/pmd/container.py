@@ -436,6 +436,8 @@ class RootlessPmdAnalyzer(StaticAnalyzer):
                 (tool_data["exit_code"] is None or type(tool_data["exit_code"]) is int)
                 and type(execution["exit_code"]) is type(tool_data["exit_code"])
             )
+            _require(report["content_hash"] == execution["report_hash"])
+            _require(report["tool_version"] in (None, execution["tool_version"]))
             _require(isinstance(execution["command"], list) and all(isinstance(arg, str) for arg in execution["command"]))
             report_path = run_dir / f"{tool}.xml"
             if not source_files:
@@ -494,6 +496,12 @@ class RootlessPmdAnalyzer(StaticAnalyzer):
                 tool_run,
                 execution=executions[tool],
                 errors=_errors(data[tool]["errors"]),
-                report=replace(tool_run.report, errors=_errors(data[tool]["report"]["errors"]), duplications=duplications),
+                report=replace(
+                    tool_run.report,
+                    content_hash=data[tool]["report"]["content_hash"],
+                    tool_version=data[tool]["report"]["tool_version"],
+                    errors=_errors(data[tool]["report"]["errors"]),
+                    duplications=duplications,
+                ),
             )
         return replace(run, **hydrated_tools, errors=errors, limitations=tuple(data["limitations"]))
