@@ -8,6 +8,7 @@ from review_bot.adapters.llamacpp_macbook import MACBOOK_SELECTOR_MODEL, MacBook
 class LlamaCppIntentSelectionClient(LlamaCppModelClient):
     _role_model = SELECTOR_MODEL
     _role_context_tokens = 131072
+    _role_max_output_tokens = 4096
 
     def __init__(self, model: str = SELECTOR_MODEL, *, api_url: str,
         timeout_seconds: int = 60, max_output_bytes: int = 512, max_attempts: int = 1):
