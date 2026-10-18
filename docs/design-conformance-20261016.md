@@ -142,3 +142,13 @@ me707 사전 점검은 온라인 peer 확인 이후에도 리뷰 서버의 생�
 실제 첫 선택 호출에서 Tev1은 JSON을 반환했으나 요구한 choice 필드와 달라 기존 검증이 거부했다. 같은 원문·질문·선택지·스키마에 OpenAI의 `response_format.json_schema` 형식을 적용한 대조 호출은 유효한 choice와 정확한 native 사용량을 반환했다. 이 근거로 공통 통신의 요청 형식을 보정하고 MacBook에 중복된 변환을 제거했다. 응답을 재작성하거나 검증을 완화하지 않았으며 초기 실패와 사용량 불명 기록도 보존한다. 최종 회귀와 실PR 결과는 milestones의 이번 후속 기록을 따른다.
 
 최종 전체 회귀는 **3002 passed, 1 warning in 241.87s**, exit 0이다. 실제 PR #5에서 Tev1 선택 8회는 모두 통과했지만 Bonsai 첫 리뷰 호출이 240초 제한에서 종료돼 CLI는 `failed/usage_unavailable`, exit 1이다. 최종 리뷰와 의미적 품질 개선은 미완료다. 실패 결과·사용량 불명·공유 admission의 uncertain 1건을 보존했으며, 두 모델의 슬롯이 유휴라는 표본만으로 불확실 기록을 해제하지 않았다. 앞선 1슬롯 제약은 이번 사용자 정정으로 교체됐고 R-04는 여전히 후순위다.
+
+## 후속 구현: 상시 API·워커와 컨테이너 (2026-10-18)
+
+사용자 승인으로 `perspectives-v1`을 기존 서명 웹훅 워커에 연결하고, 같은 SQLite 대기열에 고정 입력을 접수하는 인증 API를 추가했다. [API·운영 안내](intent-api-deployment.md), [FastAPI 접수·조회](../src/review_bot/runtime/intent_api.py), [워커](../src/review_bot/runtime/worker.py), [Compose 구성](../compose.yaml)을 따른다. API는 접수 후 202를 반환하고 리뷰는 워커가 처리한다. 컨테이너가 CLI 하위 프로세스로 리뷰를 실행하지 않는다. 새 관점 리뷰는 비공개 산출물만 허용하며 기존 A·declared-v1·code-first-v2의 게시 계약은 유지한다.
+
+기능 커밋은 `28a1b1a359f8356a44ce413bf0b171c022e58422`다. 이번 전체 자동 회귀는 **3016 passed, 6 warnings in 77.93s**, exit 0이다. 6개 테스트 프로세스에서 기존 Starlette deprecation이 각각 보고됐다. 서명 수신·새 리뷰 연결, API 인증·입력·재시작 후 영속 전달·결과 조회·실패 보존, 기존 lease·generation fence를 확인했으며 테스트 삭제·검증 완화는 없다. 실모델 API·배포 결과는 [milestones](../milestones.md)의 이번 직접 증거와 구분해 기록한다. API와 컨테이너 추가로 감사의 품질·보안·최신성 결함을 해결했다고 표시하지 않는다.
+
+실제 컨테이너 기동에서 드러난 tmpfs YAML 옵션 분리와 root/0600 네트워크 파일의 비특권 읽기 실패를 `169d16b`·`ba6c2d1`에서 보정했다. 최종 회귀는 **3023 passed, 6 warnings in 68.17s**, exit 0이다. me707의 web/worker는 비특권 UID·읽기 전용 루트로 실행되고 Mac의 health·작업·결과 조회가 모두 HTTP 200이다. 이미지에 설치된 Python 파일 62개가 기능 worktree와 일치한다.
+
+실PR #5는 한 번 접수됐고 재구성 중 대기열에 보존된 뒤 attempts=1로 실행됐다. Tev1 선택 8회는 통과했지만 Bonsai 첫 리뷰가 `model_error`로 끝나 전체 결과는 `failed/usage_unavailable`이다. 서버의 동일 task는 4096토큰을 342.91초에 처리했으며, 완성된 최종 리뷰는 없다. 응답 원문의 finish_reason과 중간 추론 필드는 이번 실패 자료에 보존되지 않아 거부된 정확한 응답 필드는 확정하지 않는다. 기존 어댑터는 비정상 종료 및 중간 추론 응답을 거부한다. 이 연결 계약과 출력 예산은 별도 후속 대상으로 남기고 검증을 완화해 성공으로 바꾸지 않았다. 최종 admission은 0건이고 두 서버의 각 2슬롯은 유휴다. R-04와 기존 리뷰 품질·검증·보안 결함의 상태는 그대로다.

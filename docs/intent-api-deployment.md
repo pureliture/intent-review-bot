@@ -43,7 +43,7 @@ Linux/me707에서 같은 이미지의 `web`과 `worker`를 별도 컨테이너�
 
 ```sh
 rtk proxy python3 deploy/prepare-network.py \
-  --directory /private/path/network --model-address <live-me707-address>
+  --directory /private/path/network --model-address 'LIVE_ME707_IP'
 rtk proxy docker compose --env-file /private/path/compose.env config --quiet
 rtk proxy docker compose --env-file /private/path/compose.env build web
 rtk proxy docker compose --env-file /private/path/compose.env up -d --no-build
@@ -51,7 +51,9 @@ rtk proxy docker compose --env-file /private/path/compose.env up -d --no-build
 
 `web`과 `worker`는 같은 state/admission bind mount를 사용한다. 읽을 수 있는 비밀 없는 hosts/resolver 파일을 명시적인 읽기 전용 bind mount로 제공한다. me707에서 관측된 Docker 생성 파일의 root/0600 권한으로 비특권 프로세스의 이름 해석이 실패하는 문제를 피하며, 호스트의 DNS·방화벽 설정은 변경하지 않는다. 이미지에는 명시적으로 허용한 package·lock 파일만 복사한다. 소스 checkout, `.git`, `.junie`, `.idea`, 키, 모델, 테스트 입력과 생성 결과는 build context에서 제외한다. 컨테이너는 비특권 UID·읽기 전용 루트로 실행한다.
 
-초기 설정의 호출 제한은 360초, 전체 리뷰 작업 제한은 900초다. 짧은 Bonsai 표본의 생성 속도에서 4096 출력 토큰만으로 약 260초가 걸릴 수 있어 여유를 둔 운영 예제이며, 장문 처리 속도나 과거 240초 실패 원인을 확정한 값은 아니다. 모델·출력 토큰·프롬프트·검증 한도는 그대로다.
+`LIVE_ME707_IP`는 실제 주소로 바꾼다. 네트워크 파일을 다시 생성한 뒤 기존 컨테이너에 반영하려면 진행 중인 리뷰를 마친 후 `up -d --no-build --force-recreate`를 사용한다. 파일은 atomic replace로 갱신하므로 기존 bind mount의 inode는 자동 교체되지 않는다.
+
+초기 설정의 호출 제한은 360초, 전체 리뷰 작업 제한은 900초다. 이번 실제 PR #5의 Bonsai 서버 처리는 342.91초였으며 최종 응답 검증은 실패했다. 이 단일 표본은 다른 입력·동시 실행의 처리 속도나 과거 240초 실패 원인을 확정하지 않는다. 모델·출력 토큰·프롬프트·검증 한도는 그대로다.
 
 ## 서명 웹훅 운영
 
@@ -67,3 +69,5 @@ rtk proxy docker compose --env-file /private/path/compose.env \
 ## API 검증
 
 컨테이너 기동 → `/health` → 인증 거부 → 유효한 고정 입력 POST의 202와 작업 ID → 상태 조회 → 결과 조회를 구분해 확인한다. 성공 판정에는 `status=completed`, 원문과 일치하는 hash·SHA, 실제 모델 ID와 사용량, 비공개 결과 파일, 외부 게시 미시도를 함께 확인한다. 모의 모델 회귀와 실모델 결과를 분리해 [milestones](../milestones.md)에 기록한다.
+
+2026-10-18 me707의 web/worker 기동과 Mac에서의 health·상태·결과 GET 200을 확인했다. 실제 PR #5는 단일 POST로 접수돼 컨테이너 재구성 후에도 보존됐고, 실제 Tev1 선택 8회 후 Bonsai 단계에서 `failed/usage_unavailable`로 끝났다. 서버는 4096토큰을 생성했지만 최종 리뷰는 없으며, 이 테스트를 리뷰 성공으로 표시하지 않는다. 현재 어댑터의 정상 종료·중간 추론 응답 거부·출력 한도와 Bonsai 기본 추론의 정합성은 후속 과제다. 외부 게시 설정은 활성화하지 않았다.
