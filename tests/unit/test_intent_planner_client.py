@@ -303,7 +303,7 @@ def test_plan_output_keeps_strict_json_and_schema_fields(role: Any, mock_http: A
 
 @pytest.mark.parametrize("path,value", [
     (("model",), "wrong-role"), (("choices", 0, "finish_reason"), "length"),
-    (("choices", 0, "message", "reasoning_content"), "secret"), (("choices", 0, "message", "tool_calls"), []),
+    (("choices", 0, "message", "reasoning_content"), 42), (("choices", 0, "message", "tool_calls"), []),
     (("usage",), None), (("usage", "prompt_tokens"), 41), (("usage", "completion_tokens"), True),
     (("usage", "completion_tokens"), 1025), (("usage", "total_tokens"), 171),
     (("tokens_evaluated",), 41), (("truncated",), True),

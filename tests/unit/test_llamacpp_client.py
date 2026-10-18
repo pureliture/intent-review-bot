@@ -327,6 +327,21 @@ def test_complete_rechecks_count_and_posts_original_messages_and_schema(
     assert 0 < requests[-1].extensions["timeout"]["read"] <= 10
 
 
+def test_reasoning_content_is_ignored_and_not_returned(
+    adapter: Any, mock_http: Any, main_request: ModelRequest,
+) -> None:
+    payload = chat_response()
+    payload["choices"][0]["message"]["reasoning_content"] = "internal reasoning stays out of the review result"
+    mock_http(lambda request: httpx.Response(200, json=payload)
+              if request.url.path == "/v1/chat/completions" else None)
+
+    response = adapter.LlamaCppModelClient(api_url=API_URL).complete(main_request)
+
+    assert response.text == '{"ok":true}'
+    assert response.usage == {"input_tokens": 42, "output_tokens": 5}
+    assert "internal reasoning" not in response.text
+
+
 def test_review_a_uses_large_transport_cap_and_native_token_gate(
     adapter: Any, mock_http: Any, worker_review_inputs: Any,
 ) -> None:
@@ -526,7 +541,7 @@ def test_unsupported_template_response_fails_before_tokenization(
 
 @pytest.mark.parametrize("fault", [
     "wrong_model", "no_choices", "two_choices", "wrong_index", "boolean_index", "role", "nontext", "length",
-    "tool_calls", "function_call", "reasoning", "missing_usage", "missing_prompt", "boolean_prompt", "negative_output",
+    "tool_calls", "function_call", "reasoning_type", "missing_usage", "missing_prompt", "boolean_prompt", "negative_output",
     "float_output", "wrong_total", "prompt_mismatch", "too_many_output", "truncated", "timings_mismatch",
 ])
 def test_invalid_or_truncated_completion_is_rejected(
@@ -548,8 +563,10 @@ def test_invalid_or_truncated_completion_is_rejected(
         choice["message"]["content"] = None
     elif fault == "length":
         choice["finish_reason"] = "length"
-    elif fault in ("tool_calls", "function_call", "reasoning"):
-        choice["message"][{"reasoning": "reasoning_content"}.get(fault, fault)] = "hidden output"
+    elif fault in ("tool_calls", "function_call"):
+        choice["message"][fault] = "hidden output"
+    elif fault == "reasoning_type":
+        choice["message"]["reasoning_content"] = 42
     elif fault == "missing_usage":
         del payload["usage"]
     elif fault == "missing_prompt":

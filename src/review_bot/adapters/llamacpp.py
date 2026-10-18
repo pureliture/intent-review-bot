@@ -350,9 +350,13 @@ class _LlamaCppClient:
         if (
             not isinstance(message, dict) or message.get("role") != "assistant"
             or set(message) - {"role", "content", "reasoning_content", "refusal"}
-            or message.get("reasoning_content") not in (None, "") or message.get("refusal") is not None
+            or message.get("refusal") is not None
         ):
-            raise PermanentModelError("Invalid llama.cpp assistant output; tools and hidden reasoning are forbidden")
+            raise PermanentModelError("Invalid llama.cpp assistant output; tools and refusals are forbidden")
+        reasoning = message.get("reasoning_content")
+        if reasoning is not None and not isinstance(reasoning, str):
+            raise PermanentModelError("Invalid llama.cpp reasoning metadata")
+        # Reasoning metadata is intentionally discarded; application output comes only from content.
         text = message.get("content")
         if not isinstance(text, str):
             raise PermanentModelError("Invalid llama.cpp model output text")
