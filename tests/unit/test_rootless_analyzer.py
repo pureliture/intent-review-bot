@@ -118,6 +118,8 @@ def _write_result(source: Path, output: Path, sha: str) -> dict:
             path=f"{container_dir}/{tool}.xml" if files else "",
             exists=bool(files),
             parse_status="valid" if files else "missing",
+            content_hash=execution.report_hash,
+            tool_version=execution.tool_version if files else None,
         )
         tools[tool] = ToolAnalysis(
             tool=tool,
@@ -289,6 +291,26 @@ def test_command_contract_and_host_paths(docker, source, tmp_path):
     name = next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--name="))
     assert name.startswith("review-bot-pmd-")
     assert docker.calls[-1][0] == ["docker", "rm", "--force", name]
+
+
+@pytest.mark.parametrize("tool", ["pmd", "cpd"])
+def test_verified_report_metadata_survives_deserialization(docker, source, tmp_path, tool):
+    run = _analyzer(tmp_path).run_analysis(SHA, source, "pmd/ruleset.xml")
+    result = getattr(run, tool)
+    assert result.report.content_hash == hashlib.sha256(Path(result.report.path).read_bytes()).hexdigest()
+    assert result.report.content_hash == result.execution.report_hash
+    assert result.report.tool_version == result.execution.tool_version == "7.3.0"
+
+
+@pytest.mark.parametrize("tool", ["pmd", "cpd"])
+@pytest.mark.parametrize("content_hash", [None, "e" * 64])
+def test_report_hash_must_agree_with_verified_execution(docker, source, tmp_path, tool, content_hash):
+    def change(data, output):
+        data[tool]["report"]["content_hash"] = content_hash
+
+    docker.mutate = change
+    with pytest.raises(AnalysisSetupError):
+        _analyzer(tmp_path).run_analysis(SHA, source, "pmd/ruleset.xml")
 
 
 def test_only_java_is_exported_not_scripts_config_or_credentials(docker, source, tmp_path):
