@@ -38,7 +38,7 @@ from review_bot.domain.intent_perspectives import PERSPECTIVES
 from review_bot.domain.models_v1 import ModelRequest, Snapshot, TaskInput
 from review_bot.domain.partition_review import PartitionReviewLimits, PartitionReviewResult
 
-PROMPT_VERSION = "partitioned-review/v11-global-semantic-review"
+PROMPT_VERSION = "partitioned-review/v12-fixed-context-repair"
 MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
 MAX_MODEL_CITATIONS = 32
@@ -330,6 +330,8 @@ def _global_spec(data, mode, *, full, previous):
         for key, paths in data["meta"]["target_paths"].items()}
     schema = _final_schema(tuple(refs), mode, data["meta"]["targets"], data["contexts"],
         target_refs, tuple(data["originals"]))
+    schema["properties"]["context_updates"]["required"] = [key for key in data["contexts"]
+        if key.startswith("G") and data["prior"].get(key, {}).get("update", {}).get("state") == "unresolved"]
     schema = global_review.extend_schema(schema, {**data, "references": refs},
         _obj, _text, _array, _citation_schema)
     return global_review.payload(data, full=full, previous=previous), schema, refs
@@ -1269,13 +1271,38 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                 else:
                     attempt["final"] = deepcopy(accepted)
                     budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
-                    if not accepted["source_requests"] or correction == limits.max_rechecks:
+                    requests = accepted["source_requests"]
+                    source_plan = None
+                    if not requests and accepted["missing_context"] and correction < limits.max_rechecks:
+                        # A named gap is a source-planning task even when the
+                        # reviewer omitted source_requests. No text/path guessing.
+                        source_plan = {"version": 1, "parent_plan_id": partitions["integration_plan_id"],
+                            "reason": "required_context_from_existing_frozen_originals",
+                            "prior_response_hash": hash_json(raw), "gaps": deepcopy(accepted["missing_context"]),
+                            "complete": False, "decision_ids": []}
+                        attempt["source_plan"] = source_plan
+                        by_decision = {row["decision_id"]: row for row in decisions}
+                        global_review.seal_source_plan(source_plan, by_decision)
+                        for spec in global_review.source_specs(partitions["original_inventory"], raw,
+                                source_plan["parent_plan_id"], source_plan["gaps"]):
+                            _, key = choose("plan_fixed_sources", spec["state"], spec["options"], spec["question"],
+                                observed=[row["observation_id"] for row in data["rows"]])
+                            source_plan["decision_ids"].append(key)
+                            by_decision[key] = decisions[-1]
+                            global_review.seal_source_plan(source_plan, by_decision)
+                        source_plan["complete"] = True
+                        global_review.seal_source_plan(source_plan, by_decision)
+                        requests = source_plan["requests"]
+                    if not requests or correction == limits.max_rechecks:
                         final = accepted
                         adjudication["status"] = "validated"
                         break
-                    previous = deepcopy(raw)
+                    previous = (global_review.source_recheck(raw, source_plan, by_decision)
+                        if source_plan is not None else deepcopy(raw))
                 # Retain every exact citation used by an earlier global response
                 # as well as the original page references for the correction.
+                if "final" in attempt:
+                    global_review.inherit_global_context(data, raw, accepted, correction)
                 data["references"].update({ref: refs[ref] for ref in global_review._refs(raw) if ref in refs})
         partitions["final"] = final
         partitions["final_covered_unit_ids"] = sorted({u for row in review_notes for u in row["covered_unit_ids"]})
@@ -1465,6 +1492,19 @@ def _validate_closed_trace(result, known_units):
         if actual != plan["pages"] or selected["pages"] != actual:
             raise PartitionError("stored_integration_delivery_changed")
         used.append(decision["decision_id"])
+    for number, attempt in enumerate(partition.get("global_review", {}).get("attempts", [])):
+        if "source_plan" not in attempt:
+            continue
+        final = attempt.get("final", {})
+        if not final.get("missing_context") or final.get("source_requests") or number >= partition["identity"]["limits"]["max_rechecks"]:
+            raise PartitionError("stored_unnecessary_fixed_source_plan")
+        ids = global_review.validate_source_plan(attempt["source_plan"], partition["original_inventory"],
+            attempt["response"], partition["integration_plan_id"], records, final["missing_context"],
+            allow_incomplete=result.status in ("failed", "not_run"))
+        expected_pages = ["PAGE-" + str(i + 1) for i in range(len(partition["integration_pages"]))]
+        if any(records[key]["input_observation_ids"] != expected_pages for key in ids):
+            raise PartitionError("stored_fixed_source_observations_changed")
+        used.extend(ids)
     if sorted(used) != sorted(records):
         raise PartitionError("unreferenced_closed_decision")
 
@@ -1783,9 +1823,25 @@ def _validate_global_review(result, originals, meta):
             if "validation_error" in attempt or attempt.get("final") != clean:
                 raise PartitionError("stored_global_conclusion_changed")
             accepted = clean
-            if not clean["source_requests"] and number != len(attempts) - 1:
+            plan = attempt.get("source_plan")
+            if plan is not None:
+                if clean["source_requests"] or not clean["missing_context"] or number >= limit - 1:
+                    raise PartitionError("stored_unnecessary_fixed_source_plan")
+                inventory = [{"evidence_id": o.evidence_id, "kind": o.kind, "path": o.path,
+                    "version": o.version, "sha": o.sha, "bytes": len(o.raw)} for o in originals]
+                decisions = {row["decision_id"]: row for row in partition["decisions"]}
+                global_review.validate_source_plan(plan, inventory, raw, partition["integration_plan_id"],
+                    decisions, clean["missing_context"], allow_incomplete=result.status in ("failed", "not_run"))
+                previous = global_review.source_recheck(raw, plan, decisions)
+                requests = plan["requests"] if plan["complete"] else []
+            else:
+                previous = deepcopy(raw)
+                requests = clean["source_requests"]
+            if not requests and number != len(attempts) - 1:
                 raise PartitionError("stored_global_unnecessary_correction")
-            previous = deepcopy(raw)
+            if requests and number < limit - 1 and number == len(attempts) - 1 and record["status"] == "validated":
+                raise PartitionError("stored_global_source_recheck_omitted")
+            global_review.inherit_global_context(data, raw, clean, number)
         data["references"].update({ref: refs[ref] for ref in global_review._refs(raw) if ref in refs})
     if record["status"] == "validated":
         if accepted is None or partition.get("final") != accepted:
@@ -1796,7 +1852,7 @@ def _validate_global_review(result, originals, meta):
 
 def validate_partition_result(result: PartitionReviewResult, task) -> None:
     """Recheck immutable originals, coverage and extracted quotes before output."""
-    if type(result) is not PartitionReviewResult or result.schema_version != 10 or result.review_type not in ("A", "B", "PLAN"):
+    if type(result) is not PartitionReviewResult or result.schema_version != 11 or result.review_type not in ("A", "B", "PLAN"):
         raise PartitionError("invalid_partition_result")
     if result.status not in ("planned", "measured", "completed", "partial_review", "failed", "not_run"):
         raise PartitionError("invalid_partition_result_status")

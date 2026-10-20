@@ -17,7 +17,9 @@ from tests.fixtures.intent_perspectives import make_task
 from tests.fixtures.partition_review import PartitionModelClient
 
 
-def test_fixed_api_worker_runs_partition_trial_and_returns_existing_result_endpoint(tmp_path, valid_config_yaml, monkeypatch):
+@pytest.mark.parametrize("repair_gap", [False, True])
+def test_fixed_api_worker_runs_partition_trial_and_returns_existing_result_endpoint(tmp_path, valid_config_yaml, monkeypatch, repair_gap):
+    from dataclasses import replace
     monkeypatch.setenv("REVIEW_BOT_API_TOKEN", "synthetic-partition-token")
     raw = yaml.safe_load(valid_config_yaml)
     raw["execution"].update(mode="offline", available_modes=["intent"], selector_uses_model=False)
@@ -30,7 +32,26 @@ def test_fixed_api_worker_runs_partition_trial_and_returns_existing_result_endpo
     root.mkdir(mode=0o700)
     previous = os.umask(0o077)
     store = SQLiteJobStore(root / "jobs.sqlite")
-    review, tev = PartitionModelClient(), PartitionModelClient(name="tev", group_all=True)
+    def review_gap(payload, body):
+        if payload["stage"] == "global_review":
+            body["missing_context"] = [] if "recheck" in payload else ["Need src/value.py head implementation."]
+            if "recheck" in payload:
+                cite = payload["requested_originals"][0]["blocks"][0]["reference_id"]
+                body["context_updates"] = {key: {"state": "resolved", "reason": "Synthetic explicit source-backed resolution.",
+                    "citations": [{"reference_id": cite}]} for key in payload["context_items"] if key.startswith("G")}
+        return body
+    def select_source(payload, body):
+        if payload["stage"] == "plan_fixed_sources":
+            found = next((row["evidence_id"] for row in payload["state"]["candidate_inventory"]
+                if row["path"] == "src/value.py" and row["version"] == "head"), None)
+            key = "source:" + found if found else "no_suitable_source"
+            body["choice"] = next(row["label"] for row in payload["options"] if row["key"] == key)
+        return body
+    review = PartitionModelClient(transform=review_gap if repair_gap else None)
+    tev = PartitionModelClient(name="tev", group_all=not repair_gap, transform=select_source if repair_gap else None)
+    if repair_gap:
+        review.profile = replace(review.profile, max_input_tokens=350)
+        review.counter = lambda r: 200 + 100 * len(json.loads(r.user_content)["observations"]) if json.loads(r.user_content)["stage"] == "final_review" else 100
 
     def forbidden(*args):
         raise AssertionError("fixed trial must not collect GitHub, run PMD, publish, or execute a target")
@@ -50,12 +71,19 @@ def test_fixed_api_worker_runs_partition_trial_and_returns_existing_result_endpo
             response = client.get(urls["result_url"], headers=headers)
             assert response.status_code == 200
             result = response.json()
-            assert result["schema_version"] == 10 and result["status"] == "completed"
+            assert result["schema_version"] == 11 and result["status"] == "completed"
             assert len(result["perspectives"]) == 8
             assert result["partition"]["scope_selection"]["decision"] == "apply"
             assert result["origin"]["publication"] == "not_attempted"
             assert review.requests and tev.requests
             assert all(json.loads(r.user_content)["stage"] != "draft_review" for r in review.requests)
+            if repair_gap:
+                attempts = result["partition"]["global_review"]["attempts"]
+                assert len(attempts) == 2 and attempts[0]["source_plan"]["complete"]
+                assert attempts[0]["response"]["source_requests"] == [] and attempts[0]["response"]["missing_context"]
+                assert attempts[1]["previous"]["prior_response"] == attempts[0]["response"]
+                assert any(d["stage"] == "plan_fixed_sources" for d in result["partition"]["decisions"])
+                assert all(row["state"] == "resolved" for key, row in result["partition"]["final"]["context_updates"].items() if key.startswith("G"))
         saved = root / "artifacts/fixed" / urls["review_id"] / "attempt-1"
         manifest = json.loads((saved / "manifest.json").read_text())
         assert manifest["status"] == "succeeded"
@@ -163,7 +191,7 @@ def test_cli_partition_option_reaches_same_executor_and_private_artifacts(tmp_pa
         "--max-total-tokens", "524288", "--max-calls", "64"]) == 0
     assert "completed/validated" in capsys.readouterr().out
     result = json.loads((output / "B/result.json").read_text())
-    assert result["schema_version"] == 10 and len(result["perspectives"]) == 8
+    assert result["schema_version"] == 11 and len(result["perspectives"]) == 8
     assert result["origin"]["publication"] == "not_attempted"
     assert tev.requests and review.requests
 
@@ -213,7 +241,7 @@ def test_github_worker_connects_architecture_analysis_to_partition_executor(tmp_
         results = list((root / "artifacts").rglob("A/result.json"))
         assert len(results) == 1
         result = json.loads(results[0].read_text())
-        assert result["schema_version"] == 10 and result["review_type"] == "A"
+        assert result["schema_version"] == 11 and result["review_type"] == "A"
         assert result["status"] == "completed", result["reason"]
         assert worker_pipeline_ports["analyzer"].run_analysis.call_count == 2
         worker_pipeline_ports["repo_reader"].collect_code_snapshot.assert_not_called()

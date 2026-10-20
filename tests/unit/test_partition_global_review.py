@@ -14,7 +14,7 @@ from tests.fixtures.intent_perspectives import make_task
 from tests.fixtures.partition_review import PartitionModelClient
 
 
-def _run(*, transform=None, full_fits=False, focused_fits=True, max_calls=128, output_cap=512):
+def _run(*, transform=None, planning_transform=None, full_fits=False, focused_fits=True, max_calls=128, output_cap=512):
     def count(request):
         payload = json.loads(request.user_content)
         if payload["stage"] == "final_review":
@@ -26,9 +26,162 @@ def _run(*, transform=None, full_fits=False, focused_fits=True, max_calls=128, o
     client.profile = replace(client.profile, max_input_tokens=350, max_output_tokens=output_cap)
     client.supports_bounded_reasoning = output_cap > 8192
     task = make_task()
-    result = run_partition_review(task, "intent", client, PartitionModelClient(),
+    result = run_partition_review(task, "intent", client, PartitionModelClient(transform=planning_transform),
         limits=PartitionReviewLimits(max_calls=max_calls, max_total_tokens=1000000))
     return task, result, client
+
+
+def _select_fixed_value_source(payload, body):
+    if payload["stage"] == "plan_fixed_sources":
+        candidates = payload["state"]["candidate_inventory"]
+        selected = next((row["evidence_id"] for row in candidates
+            if row["path"] == "src/value.py" and row["version"] == "head"), None)
+        body["choice"] = next(row["label"] for row in payload["options"]
+            if row["key"] == ("source:" + selected if selected else "no_suitable_source"))
+    return body
+
+
+def _resolve_fixed_gap(payload, body):
+    if "recheck" in payload:
+        cite = payload["requested_originals"][0]["blocks"][0]["reference_id"]
+        body["context_updates"] = {key: {"state": "resolved", "reason": "Synthetic explicit resolution from the full requested original.",
+            "citations": [{"reference_id": cite}]} for key in payload["context_items"] if key.startswith("G")}
+    return body
+
+
+def test_bare_global_gap_gets_closed_tev_source_plan_and_original_preserving_recheck():
+    calls = []
+    def transform(payload, body):
+        if payload["stage"] == "global_review":
+            calls.append(deepcopy(payload))
+            body["missing_context"] = [] if "recheck" in payload else ["Need src/value.py head return contract."]
+            _resolve_fixed_gap(payload, body)
+        return body
+    task, result, _ = _run(transform=transform, planning_transform=_select_fixed_value_source)
+    assert result.status == "completed", result.reason
+    assert len(calls) == 2
+    attempts = result.partition["global_review"]["attempts"]
+    plan = attempts[0]["source_plan"]
+    assert plan["complete"] and len(plan["requests"]) == 1
+    original = next(o for o in prepare_originals(task, "intent")[0]
+        if o.path == "src/value.py" and o.version == "head")
+    assert plan["requests"][0]["evidence_id"] == original.evidence_id
+    assert calls[1]["recheck"]["prior_response"] == attempts[0]["response"]
+    assert attempts[0]["response"]["source_requests"] == []
+    assert "".join(b["text"] for b in calls[1]["requested_originals"][0]["blocks"]) == original.text
+    assert all("state" not in receipt for receipt in calls[1]["recheck"]["source_delivery_plan"]["decision_receipts"])
+    assert any(d["stage"] == "plan_fixed_sources" for d in result.partition["decisions"])
+    validate_partition_result(result, task)
+
+
+def test_no_suitable_fixed_source_keeps_a_genuine_gap_without_forcing_a_positive_review():
+    def missing(payload, body):
+        if payload["stage"] == "global_review":
+            body["missing_context"] = ["A necessary external fact is genuinely unavailable."]
+        return body
+    def no_source(payload, body):
+        if payload["stage"] == "plan_fixed_sources":
+            body["choice"] = next(row["label"] for row in payload["options"] if row["key"] == "no_suitable_source")
+        return body
+    task, result, client = _run(transform=missing, planning_transform=no_source)
+    assert result.status == "partial_review" and result.partition["final"]["missing_context"]
+    assert len([r for r in client.requests if json.loads(r.user_content)["stage"] == "global_review"]) == 1
+    plan = result.partition["global_review"]["attempts"][0]["source_plan"]
+    assert plan["complete"] and plan["requests"] == []
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("field", ["requests", "gaps", "parent_plan_id", "complete", "plan_id"])
+def test_fixed_source_plan_tampering_is_rejected(field):
+    def missing(payload, body):
+        if payload["stage"] == "global_review":
+            body["missing_context"] = [] if "recheck" in payload else ["Need src/value.py head return contract."]
+            _resolve_fixed_gap(payload, body)
+        return body
+    task, result, _ = _run(transform=missing, planning_transform=_select_fixed_value_source)
+    assert result.status == "completed", result.reason
+    changed = deepcopy(result)
+    plan = changed.partition["global_review"]["attempts"][0]["source_plan"]
+    if field in ("requests", "gaps"):
+        plan[field].clear()
+    elif field == "complete":
+        plan[field] = False
+    else:
+        plan[field] = "changed"
+    with pytest.raises(PartitionError, match="stored_fixed_source_"):
+        validate_partition_result(changed, task)
+
+
+def test_fixed_source_planning_cannot_exceed_shared_call_budget_and_preserves_prefix():
+    _, baseline, _ = _run()
+    def missing(payload, body):
+        if payload["stage"] == "global_review":
+            body["missing_context"] = ["Need src/value.py head return contract."]
+        return body
+    task, result, _ = _run(transform=missing, planning_transform=_select_fixed_value_source,
+        max_calls=baseline.usage["calls"])
+    assert result.status == "failed" and result.reason == "call_limit_exceeded"
+    attempt = result.partition["global_review"]["attempts"][0]
+    assert attempt["response"]["missing_context"]
+    assert not attempt["source_plan"]["complete"] and not attempt["source_plan"]["decision_ids"]
+    assert "final" not in result.partition
+    validate_partition_result(result, task)
+
+
+def test_fixed_source_candidates_cover_entire_inventory_with_bounded_closed_options():
+    from review_bot.application import partition_global_review as global_review
+    inventory = [{"evidence_id": "S" + str(i), "path": "src/a" + str(i) + ".py", "kind": "source",
+        "version": "head", "sha": "h" * 40, "bytes": 100} for i in range(60)]
+    raw = {"missing_context": ["Need source A.", "Need source B."]}
+    specs = list(global_review.source_specs(inventory, raw, "parent"))
+    assert len(specs) == 6
+    for gap in raw["missing_context"]:
+        pages = [s for s in specs if s["state"]["gap"] == gap]
+        assert [o["evidence_id"] for spec in pages for o in spec["options"] if o["evidence_id"]] == [r["evidence_id"] for r in inventory]
+        assert all(len(s["options"]) <= 24 and s["options"][-1]["key"] == "no_suitable_source" for s in pages)
+        assert all(s["state"]["prior_global_response"] == raw for s in pages)
+
+
+def test_source_recheck_inherits_an_evidenced_negative_global_context_state():
+    calls = []
+    def flow(payload, body):
+        if payload["stage"] == "review_partition":
+            body["missing_context"] = ["Need fixed head implementation."]
+        if payload["stage"] == "global_review":
+            calls.append(deepcopy(payload))
+            if len(calls) == 1:
+                key = next(iter(payload["context_items"]))
+                cite = next(c for c in payload["citation_catalog"] if c["version"] == "head")
+                body["context_updates"][key] = {"state": "unresolved",
+                    "reason": "Synthetic new evidence retracts the earlier resolution.",
+                    "citations": [{"reference_id": cite["ranges"][0]["reference_id"]}]}
+                body["source_requests"] = [{"evidence_id": cite["evidence_id"], "reason": "Synthetic further source check."}]
+        return body
+    task, result, _ = _run(transform=flow)
+    assert len(calls) == 2
+    assert result.status == "partial_review" and result.partition["final"]["missing_context"]
+    assert any(row["update"]["state"] == "unresolved" and row.get("global_attempt") == 0
+        for row in calls[1]["prior_context_updates"].values())
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("explicit_unresolved", [False, True])
+def test_empty_missing_list_never_silently_resolves_a_registered_global_gap(explicit_unresolved):
+    def flow(payload, body):
+        if payload["stage"] == "global_review":
+            body["missing_context"] = [] if "recheck" in payload else ["Need src/value.py head return contract."]
+            if "recheck" in payload and explicit_unresolved:
+                body["context_updates"] = {key: {"state": "unresolved", "reason": "Synthetic necessary external relation is still unknown.",
+                    "citations": []} for key in payload["context_items"] if key.startswith("G")}
+        return body
+    task, result, _ = _run(transform=flow, planning_transform=_select_fixed_value_source)
+    if explicit_unresolved:
+        assert result.status == "partial_review" and result.partition["final"]["missing_context"]
+        assert all(v["state"] == "unresolved" for k, v in result.partition["final"]["context_updates"].items() if k.startswith("G"))
+    else:
+        assert result.status == "failed" and result.reason == "global_context_accounting_incomplete"
+        assert "final" not in result.partition
+    validate_partition_result(result, task)
 
 
 def test_all_original_page_responses_and_every_nested_cited_byte_reach_global_model():
