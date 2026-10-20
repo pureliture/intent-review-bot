@@ -89,6 +89,22 @@ def combine_final_pages(pages):
     return result
 
 
+def _context_update_applies(previous, update):
+    return not (update["state"] == "unresolved" and previous["state"] != "unresolved" and not update["citations"])
+
+
+def prior_context_updates(pages):
+    """Copy accepted state and its complete original evidence, without a summary."""
+    states = {}
+    for index, page in enumerate(pages):
+        for key, update in page["final"]["context_updates"].items():
+            previous = states.get(key, {}).get("update", {"state": "unresolved"})
+            if _context_update_applies(previous, update):
+                states[key] = {"page_index": index, "response_hash": hash_json(page["response"]),
+                    "update": deepcopy(update)}
+    return states
+
+
 def reconcile_final_context(rows, pages, final):
     """Replay explicit, source-backed context transitions across all pages.
 
@@ -104,7 +120,7 @@ def reconcile_final_context(rows, pages, final):
             if key not in states:
                 raise PartitionError("unknown_context_update")
             previous = deepcopy(states[key])
-            applied = not (update["state"] == "unresolved" and previous["state"] != "unresolved" and not update["citations"])
+            applied = _context_update_applies(previous, update)
             if applied:
                 states[key] = {"description": previous["description"], **deepcopy(update)}
             history.append({"page": index, "context_id": key, "previous": previous,

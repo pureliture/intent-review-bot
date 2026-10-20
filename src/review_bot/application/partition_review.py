@@ -18,7 +18,7 @@ from typing import Callable
 
 from review_bot.application.architecture_review import ModelProfile
 from review_bot.application import partition_choices as choices
-from review_bot.application.partition_integration import native_integration_pages, combine_final_pages, reconcile_final_context, has_insufficient_judgement
+from review_bot.application.partition_integration import native_integration_pages, combine_final_pages, reconcile_final_context, has_insufficient_judgement, prior_context_updates
 from review_bot.application.source_citations import citation_spans, citation_catalog, source_blocks, signal_context_spans, referenced_source_spans
 from review_bot.application.review_output_contract import render_output_contract
 from review_bot.application.code_first_intent_review import _original_text, _originals
@@ -37,7 +37,7 @@ from review_bot.domain.intent_perspectives import PERSPECTIVES
 from review_bot.domain.models_v1 import ModelRequest, Snapshot, TaskInput
 from review_bot.domain.partition_review import PartitionReviewLimits, PartitionReviewResult
 
-PROMPT_VERSION = "partitioned-review/v9-page-target-contract"
+PROMPT_VERSION = "partitioned-review/v10-shared-context-state"
 MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
 MAX_MODEL_CITATIONS = 32
@@ -125,8 +125,12 @@ missing source facts. Recheck them against the fixed originals and explain each
 correction in that observation's disposition. Preserve a genuinely insufficient
 final judgement only with its concrete missing_context or fixed-source request.
 Use context_updates for the known context_items you can judge from this page:
-unresolved, resolved, or not_required. Unaddressed items remain unresolved; omitting
-them never resolves them. Resolve or reclassify a provisional gap only with a reason
+unresolved, resolved, or not_required. When prior_context_updates is supplied,
+unaddressed items keep that earlier accepted state. Otherwise they remain unresolved;
+omission never resolves an initial gap. Keep unchanged earlier decisions by omitting
+their update keys. A source absent from this page does not contradict its earlier
+delivery or resolution. Revise an earlier decision only with supplied contradictory
+evidence and an explanation of the correction. Resolve a provisional gap only with a reason
 and supplied original evidence. Missing from another planned page is not missing
 from the fixed PR corpus. Do not require target test execution for static review.
 For each target_reviews key, record whether that target was reviewed, not applicable,
@@ -324,6 +328,10 @@ def _context_items(rows):
         "observation_id": row["observation_id"], "description": gap}
         for row in rows for gap in row["missing_context"]}
 
+
+def _unresolved_context_descriptions(contexts, updates, prior):
+    return {item["description"] for key, item in contexts.items()
+        if updates.get(key, prior.get(key, {}).get("update", {"state": "unresolved"}))["state"] == "unresolved"}
 
 
 
@@ -716,6 +724,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         paths = {span.path for span in supplied if span.path}
         targets = [key for key in meta["targets"] if paths.intersection(meta["target_paths"][key])]
         contexts = _context_items(partitions.get("review_observations", rows))
+        prior_context = prior_context_updates(partitions.get("integration_pages", []))
         references = {key: tuple(ref for ref, span in quote_choices(supplied, retained).items()
             if span.path in meta["target_paths"][key]) for key in targets}
         schema = _final_schema(tuple(quote_choices(supplied, retained)), mode, targets, contexts, references,
@@ -731,6 +740,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             "fixed_original_inventory": [{"evidence_id": o.evidence_id, "path": o.path,
                 "version": o.version, "source_hash": o.digest, "bytes": len(o.raw)} for o in originals],
             "context_items": contexts,
+            **({"prior_context_updates": prior_context,
+                "prior_context_policy": "These are earlier accepted decisions for the SAME fixed context IDs, copied with their complete reasons, original quoted evidence and source-response hashes. Keep an unchanged prior state by omitting that context_updates key. A source absent from this page was not absent from an earlier page that delivered it. Emit a new update only when supplied evidence changes the earlier decision, and explain that evidence and correction. Never reopen a resolved item solely because this page lacks that source. Earlier quotes here document the existing decision; they do not add review targets or new citation IDs."} if prior_context else {}),
             "initial_perspective_selection": partitions.get("scope_selection", {}).get("perspectives", []),
             "perspective_policy": "review_all_eight_from_fixed_catalog" if mode == "intent" else "not_applicable",
             "perspective_catalog": [asdict(p) for p in PERSPECTIVES] if mode == "intent" or mode == "planning" and "intent" in available_modes else []},
@@ -1103,8 +1114,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                         raise PartitionError("cpd_concern_without_partner_originals")
                 findings.append(clean)
             missing = sorted({bounded_text(x) for x in bounded_array(body["missing_context"], maximum=32)} |
-                {item["description"] for key, item in context_items.items() if key not in context_updates} |
-                {context_items[key]["description"] for key, update in context_updates.items() if update["state"] == "unresolved"} |
+                _unresolved_context_descriptions(context_items, context_updates,
+                    prior_context_updates(partitions["integration_pages"])) |
                 {"target_unresolved:" + key for key, review in target_reviews.items() if review["state"] == "insufficient_context"} |
                 {"source_recheck_pending:" + row["evidence_id"] for row in source_requests})
             if not missing and has_insufficient_judgement([*perspectives, *findings]):
@@ -1197,6 +1208,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
             final_pages.append(page_final)
             partitions["integration_pages"].append({"inputs": deepcopy(working),
+                "prior_context_updates": prior_context_updates(partitions["integration_pages"]),
                 "planned_sources": span_payload(final_spans(batch["inputs"], batch["sources"])),
                 "retained_citations": span_payload(accepted_retained),
                 "response": deepcopy(raw), "final": deepcopy(page_final), "stage_index": index - first_record})
@@ -1518,6 +1530,8 @@ def _validate_observation_tracking(partition, known_units, originals, *, plannin
         return restored
 
     for page_index, page in enumerate(pages):
+        if page.get("prior_context_updates") != prior_context_updates(pages[:page_index]):
+            raise PartitionError("stored_prior_context_inputs_changed")
         histories = [row for row in partition.get("source_recheck_requests", [])
             if row.get("page_index") == page_index and row.get("admitted")
             and row["stage_index"] != page["stage_index"]]
@@ -1542,6 +1556,7 @@ def _validate_observation_tracking(partition, known_units, originals, *, plannin
                 raise PartitionError("stored_source_recheck_request_changed")
             delivered_sources.extend(history["final"]["supplied_quotes"])
             native_deliveries.append({"inputs": page["inputs"], "response": history["response"],
+                "prior_context_updates": page["prior_context_updates"],
                 "final": history["final"], "retained_citations": history["retained_citations"],
                 "planned_sources": [], "delivery_sources": history["final"]["supplied_quotes"]})
         if page.get("retained_citations", []) != retained:
@@ -1624,9 +1639,7 @@ def _validate_observation_tracking(partition, known_units, originals, *, plannin
                 update["state"] != "unresolved" and not update["citations"]):
                 raise PartitionError("stored_context_update_invalid")
         expected["missing_context"] = sorted(set(expected["missing_context"]) |
-            {item["description"] for key, item in contexts.items() if key not in expected["context_updates"]} |
-            {contexts[key]["description"] for key, update in expected["context_updates"].items()
-                if update["state"] == "unresolved"} |
+            _unresolved_context_descriptions(contexts, expected["context_updates"], page["prior_context_updates"]) |
             {"target_unresolved:" + key for key, review in expected["target_reviews"].items()
                 if review["state"] == "insufficient_context"} |
             {"source_recheck_pending:" + row["evidence_id"] for row in expected["source_requests"]})
@@ -1646,7 +1659,7 @@ def _validate_observation_tracking(partition, known_units, originals, *, plannin
 
 def validate_partition_result(result: PartitionReviewResult, task) -> None:
     """Recheck immutable originals, coverage and extracted quotes before output."""
-    if type(result) is not PartitionReviewResult or result.schema_version != 8 or result.review_type not in ("A", "B", "PLAN"):
+    if type(result) is not PartitionReviewResult or result.schema_version != 9 or result.review_type not in ("A", "B", "PLAN"):
         raise PartitionError("invalid_partition_result")
     if result.status not in ("planned", "measured", "completed", "partial_review", "failed", "not_run"):
         raise PartitionError("invalid_partition_result_status")

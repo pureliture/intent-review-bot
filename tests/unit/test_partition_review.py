@@ -1188,3 +1188,87 @@ def test_a_later_page_can_resolve_an_earlier_gap_and_uncited_uncertainty_cannot_
     assert any(not event["applied"] for event in history)
     assert all(update["state"] == "resolved" for update in result.partition["final"]["context_updates"].values())
     validate_partition_result(result, task)
+
+
+def _cross_page_context_case(*, retract=False):
+    def flow(payload, body):
+        if payload["stage"] == "review_partition":
+            body["missing_context"] = ["Need the fixed baseline class body."]
+        if payload["stage"] == "final_review":
+            prior = payload.get("prior_context_updates", {})
+            source = next((c for c in payload["citation_catalog"]
+                if c["path"] == "src/A.java" and c["version"] == "base"), None)
+            resolved = prior and all(row["update"]["state"] == "resolved" for row in prior.values())
+            if resolved and not retract:
+                body["context_updates"] = {}
+            else:
+                cite = source or payload["citation_catalog"][0]
+                for row in body["context_updates"].values():
+                    row.update(state="resolved" if source and not resolved else "unresolved",
+                        reason="The fixed baseline body is supplied." if source and not resolved else
+                            "A new evidenced judgement retracts the earlier state." if retract else
+                            "This page does not supply the baseline body.",
+                        citations=[{"reference_id": cite["ranges"][0]["reference_id"]}])
+        return body
+    def count(request):
+        payload = json.loads(request.user_content)
+        return 200 + 100 * len(payload["observations"]) if payload["stage"] == "final_review" else 100
+    review = PartitionModelClient(counter=count, transform=flow)
+    review.profile = replace(review.profile, max_input_tokens=350)
+    task = _pmd_partition_task()
+    result = run_partition_review(task, "architecture", review, PartitionModelClient(), limits=limits())
+    return task, result, review
+
+
+def test_later_pages_receive_the_unchanged_prior_source_backed_decision():
+    from review_bot.application.context import hash_json
+    task, result, review = _cross_page_context_case()
+    assert result.status == "completed", result.reason
+    pages = result.partition["integration_pages"]
+    requests = [json.loads(r.user_content) for r in review.requests
+        if json.loads(r.user_content)["stage"] == "final_review"]
+    assert len(requests) == len(pages) > 1
+    inherited_without_original_body = False
+    for payload, page in zip(requests, pages):
+        prior = payload.get("prior_context_updates", {})
+        assert prior == page["prior_context_updates"]
+        for key, row in prior.items():
+            origin = pages[row["page_index"]]
+            assert row["response_hash"] == hash_json(origin["response"])
+            assert row["update"] == origin["final"]["context_updates"][key]
+            assert row["update"]["reason"] and row["update"]["citations"]
+            assert all(c["quote"] for c in row["update"]["citations"])
+        if prior and all(r["update"]["state"] == "resolved" for r in prior.values()) and not any(
+            c["path"] == "src/A.java" and c["version"] == "base" for c in payload["citation_catalog"]):
+            inherited_without_original_body = True
+            assert page["response"]["context_updates"] == {}
+            assert page["final"]["missing_context"] == []
+    assert inherited_without_original_body
+    assert not result.partition["final"]["missing_context"]
+    validate_partition_result(result, task)
+
+
+def test_prior_context_delivery_cannot_be_changed_in_the_stored_result():
+    from copy import deepcopy
+    task, result, _ = _cross_page_context_case()
+    assert result.status == "completed", result.reason
+    for field in ("reason", "quote", "response_hash"):
+        changed = deepcopy(result)
+        page = next(p for p in changed.partition["integration_pages"] if p["prior_context_updates"])
+        row = next(iter(page["prior_context_updates"].values()))
+        if field == "response_hash":
+            row[field] = "0" * 64
+        elif field == "quote":
+            row["update"]["citations"][0][field] += "changed"
+        else:
+            row["update"][field] += "changed"
+        with pytest.raises(PartitionError, match="stored_prior_context_inputs_changed"):
+            validate_partition_result(changed, task)
+
+
+def test_prior_context_delivery_does_not_force_the_model_to_keep_a_positive_state():
+    task, result, review = _cross_page_context_case(retract=True)
+    assert any(json.loads(r.user_content).get("prior_context_updates") for r in review.requests)
+    assert result.status == "partial_review" and result.reason == "unresolved_context"
+    assert result.partition["final"]["missing_context"]
+    validate_partition_result(result, task)
