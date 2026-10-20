@@ -249,5 +249,3 @@ class ModelExecutionBudget:
             if not retry or number == profile.max_attempts:
                 return None, index
         return None, index
-
-

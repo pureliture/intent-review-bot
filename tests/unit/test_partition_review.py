@@ -292,14 +292,68 @@ def test_architecture_draft_can_recommend_structural_improvement_without_inventi
     validate_partition_result(result, task)
 
 
-def test_draft_insufficient_judgement_cannot_hide_its_gap_from_context_tracking():
+def test_untracked_provisional_insufficiency_is_preserved_for_final_source_correction():
     def missing(payload, body):
         if payload["stage"] == "review_partition":
             body["draft_assessments"]["problem_success"]["verdict"] = "insufficient_context"
+        elif payload["stage"] == "final_review":
+            for disposition in body["observation_dispositions"].values():
+                disposition["reason"] = "Rechecked the fixed originals and corrected the provisional insufficiency; evidence exists in the planned corpus."
         return body
-    result = run_partition_review(make_task(), "intent", PartitionModelClient(transform=missing),
+    task = make_task()
+    client = PartitionModelClient(transform=missing)
+    result = run_partition_review(task, "intent", client,
         PartitionModelClient(group_all=True), limits=limits())
-    assert result.status == "failed" and result.reason == "draft_insufficient_judgement_without_missing_context"
+    assert result.status == "completed", result.reason
+    rows = result.partition["review_observations"]
+    assert rows and all(row["raw_response"]["draft_assessments"]["problem_success"]["verdict"] == "insufficient_context" for row in rows)
+    expected = [{"draft_key": "problem_success", "reason": "draft_insufficient_judgement_without_missing_context"}]
+    assert all(row["draft_validation_issues"] == expected for row in rows)
+    final = next(json.loads(request.user_content) for request in client.requests
+        if json.loads(request.user_content)["stage"] == "final_review")
+    assert all(row["draft_validation_issues"] == expected for row in final["observations"])
+    assert [row["raw_response"] for row in final["observations"]] == [row["raw_response"] for row in rows]
+    assert not result.partition["final"]["missing_context"]
+    validate_partition_result(result, task)
+    rows[0]["draft_validation_issues"] = []
+    with pytest.raises(PartitionError, match="stored_draft_validation_issues_changed"):
+        validate_partition_result(result, task)
+
+
+def test_final_insufficiency_without_a_gap_still_fails_after_provisional_recovery():
+    def insufficient(payload, body):
+        if payload["stage"] == "review_partition":
+            body["draft_assessments"]["problem_success"]["verdict"] = "insufficient_context"
+        elif payload["stage"] == "final_review":
+            body["perspectives"][0]["verdict"] = "insufficient_context"
+        return body
+    task = make_task()
+    result = run_partition_review(task, "intent", PartitionModelClient(transform=insufficient),
+        PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "failed" and result.reason == "insufficient_judgement_without_missing_context"
+    assert result.partition["review_observations"]
+    assert len(result.partition["rejected_final_attempts"]) == 2
+    validate_partition_result(result, task)
+
+
+def test_later_invalid_group_preserves_prior_raw_outputs_and_the_rejected_reply():
+    seen = []
+    def break_third(payload, body):
+        if payload["stage"] == "review_partition":
+            seen.append(body)
+            if len(seen) == 3:
+                body["citations"] = [{"reference_id": "not-supplied"}]
+        return body
+    task = make_task()
+    result = run_partition_review(task, "intent", PartitionModelClient(transform=break_third),
+        PartitionModelClient(), limits=limits())
+    assert result.status == "failed"
+    kept = result.partition["review_observations"]
+    assert len(kept) == 2 and [row["raw_response"] for row in kept] == seen[:2]
+    rejected = result.partition["rejected_review_attempts"]
+    assert len(rejected) == 1 and rejected[0]["response"] == seen[2]
+    assert rejected[0]["reason"] == "citation_reference_not_supplied"
+    validate_partition_result(result, task)
 
 
 def test_bonsai_limit_refines_units_and_only_safe_candidates_are_offered():

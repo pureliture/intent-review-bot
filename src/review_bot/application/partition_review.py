@@ -37,7 +37,7 @@ from review_bot.domain.intent_perspectives import PERSPECTIVES
 from review_bot.domain.models_v1 import ModelRequest, Snapshot, TaskInput
 from review_bot.domain.partition_review import PartitionReviewLimits, PartitionReviewResult
 
-PROMPT_VERSION = "partitioned-review/v7-evidence-compatible-drafts"
+PROMPT_VERSION = "partitioned-review/v8-preserved-provisional-issues"
 MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
 MAX_MODEL_CITATIONS = 32
@@ -116,6 +116,10 @@ source-backed reason. The original result remains in the audit trail. An explain
 correction is not by itself missing review evidence. Do not silently omit observations.
 Compare the original draft_assessments with the fixed evidence. Explain changed or
 discarded interpretations in the observation disposition reason and final reasoning.
+Program draft_validation_issues identify inconsistent PROVISIONAL judgements, not
+missing source facts. Recheck them against the fixed originals and explain each
+correction in that observation's disposition. Preserve a genuinely insufficient
+final judgement only with its concrete missing_context or fixed-source request.
 Use context_updates for the known context_items you can judge from this page:
 unresolved, resolved, or not_required. Unaddressed items remain unresolved; omitting
 them never resolves them. Resolve or reclassify a provisional gap only with a reason
@@ -180,8 +184,6 @@ def _note_references(raw, draft_keys, *, architecture=False):
             bounded_object(row, {"verdict", "statement", "reasoning", "failure_condition", "citations"})
             if row["verdict"] not in _draft_verdicts(architecture):
                 raise PartitionError("invalid_draft_verdict")
-            if row["verdict"] == "insufficient_context" and not body["missing_context"]:
-                raise PartitionError("draft_insufficient_judgement_without_missing_context")
             for field in ("statement", "reasoning", "failure_condition"):
                 bounded_text(row[field], empty=field == "failure_condition")
         refs = bounded_array(row["citations"], maximum=MAX_MODEL_CITATIONS)
@@ -193,6 +195,32 @@ def _note_references(raw, draft_keys, *, architecture=False):
                 references.append(ref)
                 seen.add(identifier)
     return body, references
+
+
+def _draft_validation_issues(raw):
+    return [{"draft_key": key, "reason": "draft_insufficient_judgement_without_missing_context"}
+        for key, draft in raw["draft_assessments"].items()
+        if draft["verdict"] == "insufficient_context" and not raw["missing_context"]]
+
+
+def _check_stored_note_response(row, sources, originals, draft_keys, *, architecture=False):
+    raw, refs = _note_references(row["raw_response"], draft_keys, architecture=architecture)
+    if row.get("raw_response_hash") != hash_json(raw) or (
+        row["statement"], row["missing_context"]) != (raw["statement"], raw["missing_context"]):
+        raise PartitionError("stored_original_result_changed")
+    if row.get("draft_validation_issues", []) != _draft_validation_issues(raw):
+        raise PartitionError("stored_draft_validation_issues_changed")
+    choices_by_id = citation_spans(sources, originals)
+    expected = []
+    for ref in refs:
+        span = choices_by_id.get(ref["reference_id"])
+        if span is None:
+            raise PartitionError("stored_original_result_citation_invalid")
+        expected.append({"evidence_id": span.evidence_id, "start_byte": span.start_byte, "end_byte": span.end_byte,
+            "sha": span.sha, "path": span.path, "version": span.version, "begin_line": span.begin_line,
+            "end_line": span.end_line, "quote": span.text})
+    if row["citations"] != expected:
+        raise PartitionError("stored_original_result_citation_changed")
 
 
 def _review_group_sources(group, originals):
@@ -614,6 +642,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             "statement": bounded_text(body["statement"]),
             "citations": citations(refs, supplied, maximum=MAX_MODEL_CITATIONS * (1 + len(keys))),
             "missing_context": [bounded_text(x) for x in bounded_array(body["missing_context"], maximum=16)],
+            "draft_validation_issues": _draft_validation_issues(body),
             "covered_unit_ids": sorted(covered), "raw_response": deepcopy(raw), "raw_response_hash": hash_json(raw)}
 
     def cited_spans(rows):
@@ -641,7 +670,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         # These are the original accepted results, including their exact raw
         # responses. They are not regenerated summaries or citation projections.
         return [{"observation_id": row["observation_id"], "covered_unit_ids": list(row["covered_unit_ids"]),
-            "raw_response": deepcopy(row["raw_response"]), "raw_response_hash": row["raw_response_hash"]} for row in rows]
+            "raw_response": deepcopy(row["raw_response"]), "raw_response_hash": row["raw_response_hash"],
+            "draft_validation_issues": deepcopy(row.get("draft_validation_issues", []))} for row in rows]
 
     def final_spans(rows, source_override=None):
         if source_override is None:
@@ -941,12 +971,19 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         # Review code in Bonsai as well: TEV observations are interpretations,
         # never a replacement for a Bonsai read of every actual original unit.
         review_notes = []
+        partitions["review_observations"] = review_notes
         for i, group in enumerate(groups):
             req = observation_request(group, profile, "review_partition")
             raw, index = execute(req, review_client, profile, f"review_partition:G{i + 1}")
-            review_notes.append(accept_note(raw, _review_group_sources(group, originals), [u.unit_id for u in group], "review_partition"))
+            try:
+                note = accept_note(raw, _review_group_sources(group, originals), [u.unit_id for u in group], "review_partition")
+            except (PartitionError, ValueError) as error:
+                partitions.setdefault("rejected_review_attempts", []).append({"response": deepcopy(raw),
+                    "response_hash": hash_json(raw), "reason": str(error) if isinstance(error, PartitionError) else "invalid_review_response",
+                    "stage_index": index - first_record, "covered_unit_ids": sorted(u.unit_id for u in group)})
+                raise
+            review_notes.append(note)
             budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
-        partitions["review_observations"] = review_notes
         partitions["final_observations"] = deepcopy(review_notes)
         def refine_integration_source(span, fits):
             original = next(o for o in originals if o.evidence_id == span.evidence_id)
@@ -1354,22 +1391,8 @@ def _validate_observation_tracking(partition, known_units, originals, *, plannin
         for gap in row["missing_context"]:
             bounded_text(gap)
         if stage == "review_partition":
-            raw, refs = _note_references(row["raw_response"], draft_keys,
+            _check_stored_note_response(row, sources, originals, draft_keys,
                 architecture=partition["operator_selected_mode"] == "architecture")
-            if row.get("raw_response_hash") != hash_json(raw) or (
-                row["statement"], row["missing_context"]) != (raw["statement"], raw["missing_context"]):
-                raise PartitionError("stored_original_result_changed")
-            choices_by_id = citation_spans(sources, originals)
-            expected = []
-            for ref in refs:
-                span = choices_by_id.get(ref["reference_id"])
-                if span is None:
-                    raise PartitionError("stored_original_result_citation_invalid")
-                expected.append({"evidence_id": span.evidence_id, "start_byte": span.start_byte, "end_byte": span.end_byte,
-                    "sha": span.sha, "path": span.path, "version": span.version, "begin_line": span.begin_line,
-                    "end_line": span.end_line, "quote": span.text})
-            if row["citations"] != expected:
-                raise PartitionError("stored_original_result_citation_changed")
 
     groups = partition.get("groups", [])
     assigned = [u for group in groups for u in group["unit_ids"]]
@@ -1616,6 +1639,13 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
         delivered = [known_units[u] for u in row.get("covered_unit_ids", []) if u in known_units]
         if row.get("observation_id") in review_observation_ids:
             delivered = _review_group_sources(delivered, originals)
+            if result.status in ("failed", "not_run"):
+                covered = row["covered_unit_ids"]
+                if (covered not in [sorted(group["unit_ids"]) for group in result.partition.get("groups", [])]
+                    or row["observation_id"] != _observation_id("review_partition", covered)):
+                    raise PartitionError("stored_observation_identity_mismatch")
+                draft_keys = PERSPECTIVE_IDS if mode == "intent" else [d["target_id"] for d in _relevant_targets(delivered, meta)]
+                _check_stored_note_response(row, delivered, originals_by_id, draft_keys, architecture=mode == "architecture")
         if not delivered:
             delivered = [SourceSpan(**{**s, "boundary": "citation"}) for s in
                 result.partition.get("final", {}).get("supplied_quotes", [])]
