@@ -152,6 +152,8 @@ The shared flow is:
 4. The review model reads every fixed source unit with the same PR purpose. Intent groups produce eight actual provisional assessments; architecture groups assess the program-linked PMD/CPD targets. Exact source blocks carry their reference IDs beside the code. These blocks present all supplied bytes in one request; they do not create extra model calls.
 
 Provisional insufficiency without a named gap is retained unchanged with a program validation issue for final source-based correction. Final insufficiency still requires concrete missing evidence. If a later group fails structural or citation validation, the private result retains earlier raw group responses and the rejected reply.
+
+Architecture integration pages without code-bound targets preserve and account for their observations with no findings. A necessary fixed-source request can add actual code before a target-bound judgement; findings cannot use a target absent from that page.
 5. Final review receives the original group responses unchanged, their evidence anchors and fixed source. It may correct the drafts with source-backed reasons. Context gaps require explicit evidence to resolve; an explained correction alone is not a missing-evidence state. PMD targets require explicit review accounting.
 6. Measure the complete final request first. Only actual overflow triggers lossless source delivery across integration pages. Preserve the original assessments of every page; a composite result does not invent one global majority verdict. A necessary fixed-original recheck can use at most one additional call within the same budget. Requests outside the frozen inventory are rejected; unresolved or unfittable rechecks remain partial.
 

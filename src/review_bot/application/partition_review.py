@@ -37,7 +37,7 @@ from review_bot.domain.intent_perspectives import PERSPECTIVES
 from review_bot.domain.models_v1 import ModelRequest, Snapshot, TaskInput
 from review_bot.domain.partition_review import PartitionReviewLimits, PartitionReviewResult
 
-PROMPT_VERSION = "partitioned-review/v8-preserved-provisional-issues"
+PROMPT_VERSION = "partitioned-review/v9-page-target-contract"
 MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
 MAX_MODEL_CITATIONS = 32
@@ -93,6 +93,10 @@ relevant target_ids for each finding, not every target ID. CPD counts alone cann
 a structural concern or common extraction. A CPD concern requires code citations from BOTH
 partner paths in review_target_details. If a required partner is not supplied, use
 insufficient_context rather than a concern. Never invent numeric measurements.
+Only use the review_targets available on this page for findings. An architecture
+page with no review_targets is context-only: keep findings and target_reviews empty
+and account for its original observations. Request a necessary frozen code original
+through source_requests before making a new code-bound judgement.
 For concern/conditional_risk identify a concrete failure condition and actual head code evidence.
 Use insufficient_context only for genuinely unavailable evidence required by this
 specific judgement. A visible contradiction or unmet requirement is a concern, not
@@ -296,7 +300,8 @@ def _final_schema(ids, mode, targets, contexts=(), target_references=None, origi
     reviews = _obj({key: _obj({"state": {"type": "string", "enum": ["reviewed", "not_apply", "insufficient_context"]},
         "reason": _text(), "citations": {**_array(_citation_schema(
             target_references[key] if target_references is not None else ids), MAX_MODEL_CITATIONS), "minItems": 1}}) for key in targets})
-    return _obj({"summary": _text(), "findings": _array(finding, 20), "questions": _array(_text(), 20),
+    context_only = mode == "architecture" and not targets
+    return _obj({"summary": _text(), "findings": _array(_obj({}) if context_only else finding, 0 if context_only else 20), "questions": _array(_text(), 20),
         "perspectives": {**_array(judgement, 8 if mode == "intent" else 0), "minItems": 8 if mode == "intent" else 0},
         "missing_context": _array(_text(), 32), "context_updates": updates, "target_reviews": reviews,
         "source_requests": _array(_obj({"evidence_id": {"type": "string", "enum": list(original_ids)},
@@ -1075,9 +1080,11 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                 if row["basis"] not in ("criterion", "observed_structure", "analysis_signal"):
                     raise PartitionError("invalid_finding_basis")
                 targets = bounded_array(row["target_ids"], maximum=32)
-                if any(t not in meta["targets"] for t in targets):
+                if any(t not in page_targets for t in targets):
                     raise PartitionError("invalid_finding_target")
-                if mode == "architecture" and (not targets or row["verdict"] == "concern" and
+                if mode == "architecture" and not targets:
+                    raise PartitionError("missing_finding_target")
+                if mode == "architecture" and row["verdict"] == "concern" and (
                     row["basis"] == "analysis_signal" and any(t.startswith("cpd-") for t in targets)):
                     raise PartitionError("cpd_count_only_concern")
                 clean = {**row, "citations": citations(row["citations"], supplied)}
@@ -1511,6 +1518,11 @@ def _validate_observation_tracking(partition, known_units, originals, *, plannin
             expected_targets = {key for key, source_paths in target_paths.items() if paths.intersection(source_paths)}
             if set(expected["target_reviews"]) != expected_targets:
                 raise PartitionError("stored_target_review_missing")
+            for finding in expected["findings"]:
+                if any(target not in expected_targets for target in finding["target_ids"]):
+                    raise PartitionError("stored_finding_target_outside_page")
+                if partition["operator_selected_mode"] == "architecture" and not finding["target_ids"]:
+                    raise PartitionError("stored_missing_finding_target")
             for key, review in expected["target_reviews"].items():
                 if review["state"] not in ("reviewed", "not_apply", "insufficient_context") or not review["citations"] or any(
                     citation["path"] not in target_paths[key] for citation in review["citations"]):

@@ -356,6 +356,98 @@ def test_later_invalid_group_preserves_prior_raw_outputs_and_the_rejected_reply(
     validate_partition_result(result, task)
 
 
+def _pmd_partition_task():
+    from tests.unit.test_context_and_architecture_review import _make_snapshot
+    from review_bot.application.context import build_task_input
+    from review_bot.application.delta import compute_delta
+    from review_bot.domain.models_v1 import Classification
+    snapshot = _make_snapshot({"src/A.java": "class A {}\n"}, {"src/A.java": "class A { void run() {} }\n"})
+    delta = compute_delta(base_findings=[], head_findings=[{"rule": "CognitiveComplexity", "path": "src/A.java", "metric": 20, "method": "run"}],
+        base_sha=snapshot.base.sha, head_sha=snapshot.head.sha)
+    return build_task_input(snapshot, delta, Classification("general"))
+
+
+def test_architecture_context_only_page_has_a_satisfiable_empty_findings_contract():
+    def count(request):
+        payload = json.loads(request.user_content)
+        return 200 + 100 * len(payload["observations"]) if payload["stage"] == "final_review" else 100
+    task = _pmd_partition_task()
+    review = PartitionModelClient(counter=count)
+    review.profile = replace(review.profile, max_input_tokens=350)
+    result = run_partition_review(task, "architecture", review, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    context_pages = [request for request in review.requests if json.loads(request.user_content)["stage"] == "final_review"
+        and not json.loads(request.user_content)["review_targets"]]
+    assert context_pages
+    assert all(request.response_schema["properties"]["findings"]["maxItems"] == 0 for request in context_pages)
+    assert all(json.loads(request.user_content)["observations"] for request in context_pages)
+    validate_partition_result(result, task)
+
+
+def test_global_target_cannot_escape_the_current_integration_pages_target_scope():
+    task = _pmd_partition_task()
+    identifier = next(signal.signal.signal_id for signal in task.signals if signal.role == "review")
+    def count(request):
+        payload = json.loads(request.user_content)
+        return 200 + 100 * len(payload["observations"]) if payload["stage"] == "final_review" else 100
+    def escape(payload, body):
+        if payload["stage"] == "final_review" and not payload["review_targets"]:
+            body["findings"] = [{"statement": "A report-only suggestion.", "reasoning": "This reply has no code-bound target on this page.",
+                "failure_condition": "", "verdict": "improvement", "basis": "analysis_signal", "target_ids": [identifier],
+                "citations": [{"reference_id": payload["citation_catalog"][0]["ranges"][0]["reference_id"]}]}]
+        return body
+    review = PartitionModelClient(counter=count, transform=escape)
+    review.profile = replace(review.profile, max_input_tokens=350)
+    result = run_partition_review(task, "architecture", review, PartitionModelClient(), limits=limits())
+    assert result.status == "failed" and result.reason == "invalid_finding_target"
+    assert result.partition["review_observations"]
+    validate_partition_result(result, task)
+
+
+def test_context_only_architecture_page_can_request_code_then_make_a_bound_finding():
+    def count(request):
+        payload = json.loads(request.user_content)
+        return 200 + 100 * len(payload["observations"]) if payload["stage"] == "final_review" else 100
+    def request_code(payload, body):
+        if payload["stage"] == "final_review":
+            if not payload["review_targets"]:
+                original = next(item for item in payload["fixed_original_inventory"]
+                    if item["path"] == "src/A.java" and item["version"] == "head")
+                body["source_requests"] = [{"evidence_id": original["evidence_id"],
+                    "reason": "Read actual head code before judging this analysis signal."}]
+            elif "source_recheck" in payload:
+                source = next(item for item in payload["citation_catalog"]
+                    if item["path"] == "src/A.java" and item["version"] == "head")
+                body["findings"] = [{"statement": "A synthetic source-bound structural assessment.",
+                    "reasoning": "The fixed head is now delivered for this target, instead of report-only evidence.",
+                    "failure_condition": "", "verdict": "improvement", "basis": "observed_structure",
+                    "target_ids": payload["review_targets"],
+                    "citations": [{"reference_id": source["ranges"][0]["reference_id"]}]}]
+        return body
+    task = _pmd_partition_task()
+    review = PartitionModelClient(counter=count, transform=request_code)
+    review.profile = replace(review.profile, max_input_tokens=350)
+    result = run_partition_review(task, "architecture", review, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    assert result.findings and result.findings[0]["target_ids"]
+    assert len(result.partition["source_recheck_requests"]) == 1
+    assert result.partition["source_recheck_requests"][0]["admitted"] is True
+    assert not result.partition["final"]["source_requests"]
+    validate_partition_result(result, task)
+
+
+def test_missing_architecture_target_is_not_misreported_as_a_cpd_count_concern():
+    def missing(payload, body):
+        if payload["stage"] == "final_review":
+            body["findings"] = [{"statement": "An unbound structural suggestion.", "reasoning": "The reply omitted its target binding.",
+                "failure_condition": "", "verdict": "improvement", "basis": "observed_structure", "target_ids": [],
+                "citations": [{"reference_id": payload["citation_catalog"][0]["ranges"][0]["reference_id"]}]}]
+        return body
+    result = run_partition_review(_pmd_partition_task(), "architecture", PartitionModelClient(transform=missing),
+        PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "failed" and result.reason == "missing_finding_target"
+
+
 def test_bonsai_limit_refines_units_and_only_safe_candidates_are_offered():
     from review_bot.application.intent_context import build_intent_task_input
     from tests.fixtures.intent_review import digest
