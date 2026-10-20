@@ -18,6 +18,7 @@ from typing import Callable
 
 from review_bot.application.architecture_review import ModelProfile
 from review_bot.application import partition_choices as choices
+from review_bot.application import partition_global_review as global_review
 from review_bot.application.partition_integration import native_integration_pages, combine_final_pages, reconcile_final_context, has_insufficient_judgement, prior_context_updates
 from review_bot.application.source_citations import citation_spans, citation_catalog, source_blocks, signal_context_spans, referenced_source_spans
 from review_bot.application.review_output_contract import render_output_contract
@@ -37,7 +38,7 @@ from review_bot.domain.intent_perspectives import PERSPECTIVES
 from review_bot.domain.models_v1 import ModelRequest, Snapshot, TaskInput
 from review_bot.domain.partition_review import PartitionReviewLimits, PartitionReviewResult
 
-PROMPT_VERSION = "partitioned-review/v10-shared-context-state"
+PROMPT_VERSION = "partitioned-review/v11-global-semantic-review"
 MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
 MAX_MODEL_CITATIONS = 32
@@ -323,6 +324,17 @@ def _source_requests(values, originals):
     return result
 
 
+def _global_spec(data, mode, *, full, previous):
+    refs = dict(sorted(global_review.delivery_references(data, full=full, previous=previous).items()))
+    target_refs = {key: [ref for ref, span in refs.items() if span.path in paths]
+        for key, paths in data["meta"]["target_paths"].items()}
+    schema = _final_schema(tuple(refs), mode, data["meta"]["targets"], data["contexts"],
+        target_refs, tuple(data["originals"]))
+    schema = global_review.extend_schema(schema, {**data, "references": refs},
+        _obj, _text, _array, _citation_schema)
+    return global_review.payload(data, full=full, previous=previous), schema, refs
+
+
 def _context_items(rows):
     return {"M" + hash_json((row["observation_id"], gap))[:24]: {
         "observation_id": row["observation_id"], "description": gap}
@@ -500,11 +512,12 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
 
     def request(stage, payload, schema, current):
         output = current.max_output_tokens
-        if stage != "final_review" and limits.observation_output_tokens is not None:
+        if stage == "review_partition" and limits.observation_output_tokens is not None:
             output = min(output, limits.observation_output_tokens)
-        if stage not in ("final_review", "review_partition"):
+        if stage not in ("final_review", "review_partition", "global_review"):
             raise PartitionError("free_form_tev_request_forbidden")
-        prompt = prompts["final" if stage == "final_review" else "observe"]
+        prompt = (global_review.PROMPT + (PMD_METRIC_REFERENCE if mode == "architecture" else "")
+            if stage == "global_review" else prompts["final" if stage == "final_review" else "observe"])
         prompt += render_output_contract(schema)
         prompt += "\nWrite every prose value in Korean." if language == "ko" else "\nWrite every prose value in English."
         return ModelRequest(1, current.model, prompt,
@@ -1212,10 +1225,58 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                 "planned_sources": span_payload(final_spans(batch["inputs"], batch["sources"])),
                 "retained_citations": span_payload(accepted_retained),
                 "response": deepcopy(raw), "final": deepcopy(page_final), "stage_index": index - first_record})
-        final = reconcile_final_context(review_notes, final_pages, combine_final_pages(final_pages))
+        integration_final = reconcile_final_context(review_notes, final_pages, combine_final_pages(final_pages))
+        partitions["integration_final"] = deepcopy(integration_final)
         reviewed_targets = {key for page in final_pages for key in page["target_reviews"]}
         if reviewed_targets != set(meta["targets"]):
             raise PartitionError("unreviewed_targets")
+        if len(final_pages) == 1:
+            final = integration_final
+        else:
+            # No program vote or concatenated page-local concern becomes the
+            # global conclusion. Every accepted page and its cited bytes survive.
+            final = None
+            data = global_review.prepare(partitions["integration_pages"], originals,
+                integration_final, _context_items(review_notes), meta)
+            adjudication = {"version": 1, "status": "preparing", "attempts": []}
+            partitions["global_review"] = adjudication
+            previous = None
+            for correction in range(limits.max_rechecks + 1):
+                attempt = {"previous": deepcopy(previous), "measurement_stages": []}
+                adjudication["attempts"].append(attempt)
+                full = True
+                for delivery in ("complete_originals", "all_results_and_cited_originals"):
+                    payload, schema, refs = _global_spec(data, mode, full=full, previous=previous)
+                    req = request("global_review", payload, schema, profile)
+                    attempt["measurement_stages"].append(len(budget.records) - first_record)
+                    if measure(req, review_client, profile, "global_review:" + delivery + ":admission", for_generation=True):
+                        break
+                    if not full:
+                        raise Stop("global_original_results_exceed_context")
+                    full = False
+                attempt.update(delivery=delivery, payload_hash=hash_json(payload), schema_hash=hash_json(schema))
+                raw, index = execute(req, review_client, profile, "global_review")
+                attempt.update(response=deepcopy(raw), response_hash=hash_json(raw), stage_index=index - first_record)
+                try:
+                    accepted = global_review.normalize(raw, data, mode, references=refs)
+                except (PartitionError, ValueError) as error:
+                    reason = str(error) if isinstance(error, PartitionError) else "invalid_global_response"
+                    attempt["validation_error"] = reason
+                    budget.records[index] = replace(budget.records[index], status="failed", reason=reason)
+                    if correction == limits.max_rechecks:
+                        raise
+                    previous = {"rejected_response": deepcopy(raw), "validation_error": reason}
+                else:
+                    attempt["final"] = deepcopy(accepted)
+                    budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
+                    if not accepted["source_requests"] or correction == limits.max_rechecks:
+                        final = accepted
+                        adjudication["status"] = "validated"
+                        break
+                    previous = deepcopy(raw)
+                # Retain every exact citation used by an earlier global response
+                # as well as the original page references for the correction.
+                data["references"].update({ref: refs[ref] for ref in global_review._refs(raw) if ref in refs})
         partitions["final"] = final
         partitions["final_covered_unit_ids"] = sorted({u for row in review_notes for u in row["covered_unit_ids"]})
         status = "partial_review" if final["missing_context"] or has_insufficient_judgement(
@@ -1248,13 +1309,14 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     common = _make_result(None, status, reason, local_records, active_profile, limits)
     hashes = {"observe": hash_json(prompts["observe"]),
         "plan": hash_json({"system": choices.SYSTEM, "contract": choices.VERSION}),
-        "select": hash_json(choices.SYSTEM), "final": hash_json(prompts["final"])}
+        "select": hash_json(choices.SYSTEM), "final": hash_json(prompts["final"]),
+        "global": hash_json(global_review.PROMPT + (PMD_METRIC_REFERENCE if mode == "architecture" else ""))}
     identity = {"shared_plan_id": partitions.get("shared_plan_id"), "mode": mode, "language": language,
         "input_hash": meta.get("input_hash", ""), "limits": asdict(limits),
         "prompts": hashes, "models": {"review": asdict(profile) if profile else None,
         "planner": asdict(planner) if planner else None}}
     identity["implementation"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-        for name in ("partition_review.py", "source_partition.py", "model_execution.py", "partition_choices.py", "source_citations.py", "partition_integration.py", "review_output_contract.py")}
+        for name in ("partition_review.py", "source_partition.py", "model_execution.py", "partition_choices.py", "source_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py")}
     identity["implementation"].update({"adapters/" + name: hashlib.sha256(
         (Path(__file__).parents[1] / "adapters" / name).read_bytes()).hexdigest()
         for name in ("llamacpp.py", "llamacpp_macbook.py", "intent_planner.py")})
@@ -1649,7 +1711,7 @@ def _validate_observation_tracking(partition, known_units, originals, *, plannin
         for item in (*output["findings"], *output["perspectives"]):
             check_citations(item["citations"], supplied)
     finals = [page["final"] for page in pages]
-    if partition.get("final") != reconcile_final_context(roots, finals, combine_final_pages(finals)):
+    if partition.get("integration_final") != reconcile_final_context(roots, finals, combine_final_pages(finals)):
         raise PartitionError("stored_integration_assembly_mismatch")
     if target_paths is not None and {key for page in pages for key in page["final"]["target_reviews"]} != set(target_paths):
         raise PartitionError("stored_target_coverage_incomplete")
@@ -1657,9 +1719,84 @@ def _validate_observation_tracking(partition, known_units, originals, *, plannin
         raise PartitionError("stored_observation_exclusions_mismatch")
 
 
+def _validate_global_review(result, originals, meta):
+    partition = result.partition
+    pages = partition["integration_pages"]
+    if len(pages) == 1:
+        if "global_review" in partition or partition.get("final") != partition["integration_final"]:
+            raise PartitionError("stored_single_page_conclusion_changed")
+        return
+    mode = partition["operator_selected_mode"]
+    data = global_review.prepare(pages, originals, partition["integration_final"],
+        _context_items(partition["review_observations"]), meta)
+    record = partition.get("global_review", {})
+    attempts = record.get("attempts", [])
+    if record.get("version") != 1 or record.get("status") not in ("preparing", "validated"):
+        raise PartitionError("stored_global_review_missing")
+    limit = partition["identity"]["limits"]["max_rechecks"] + 1
+    if not 1 <= len(attempts) <= limit:
+        raise PartitionError("stored_global_attempt_limit")
+    previous, accepted = None, None
+    for number, attempt in enumerate(attempts):
+        if attempt.get("previous") != previous:
+            raise PartitionError("stored_global_previous_changed")
+        measurements = attempt.get("measurement_stages", [])
+        if not 1 <= len(measurements) <= 2 or measurements != sorted(set(measurements)):
+            raise PartitionError("stored_global_measurements_changed")
+        for position, index in enumerate(measurements):
+            if type(index) is not int or not 0 <= index < len(result.stages):
+                raise PartitionError("stored_global_stage_invalid")
+            stage = result.stages[index]
+            full = position == 0
+            payload, schema, refs = _global_spec(data, mode, full=full, previous=previous)
+            delivery = "complete_originals" if full else "all_results_and_cited_originals"
+            prompt = global_review.PROMPT + (PMD_METRIC_REFERENCE if mode == "architecture" else "")
+            prompt += render_output_contract(schema)
+            prompt += "\nWrite every prose value in Korean." if result.language == "ko" else "\nWrite every prose value in English."
+            if stage.stage != "global_review:" + delivery + ":admission" or stage.prompt_hash != hash_json({"system": prompt, "schema": schema}):
+                raise PartitionError("stored_global_request_changed")
+            if position < len(measurements) - 1 and stage.reason != "input_limit_exceeded":
+                raise PartitionError("stored_global_unnecessary_focus")
+        if "response" not in attempt:
+            if number != len(attempts) - 1 or record["status"] == "validated":
+                raise PartitionError("stored_global_response_missing")
+            break
+        if (attempt.get("delivery") != delivery or attempt.get("payload_hash") != hash_json(payload)
+                or attempt.get("schema_hash") != hash_json(schema)
+                or attempt.get("response_hash") != hash_json(attempt["response"])):
+            raise PartitionError("stored_global_input_or_response_changed")
+        index = attempt.get("stage_index")
+        if type(index) is not int or not measurements[-1] < index < len(result.stages) or (
+            result.stages[index].stage not in ("global_review", "global_review:output_recovery")
+            or not result.stages[index].attempts or result.stages[index].prompt_hash != hash_json({"system": prompt, "schema": schema})):
+            raise PartitionError("stored_global_generation_missing")
+        raw = attempt["response"]
+        try:
+            clean = global_review.normalize(raw, data, mode, references=refs)
+        except (PartitionError, ValueError) as error:
+            reason = str(error) if isinstance(error, PartitionError) else "invalid_global_response"
+            if attempt.get("validation_error") != reason or "final" in attempt:
+                raise PartitionError("stored_global_rejection_changed")
+            previous = {"rejected_response": deepcopy(raw), "validation_error": reason}
+            accepted = None
+        else:
+            if "validation_error" in attempt or attempt.get("final") != clean:
+                raise PartitionError("stored_global_conclusion_changed")
+            accepted = clean
+            if not clean["source_requests"] and number != len(attempts) - 1:
+                raise PartitionError("stored_global_unnecessary_correction")
+            previous = deepcopy(raw)
+        data["references"].update({ref: refs[ref] for ref in global_review._refs(raw) if ref in refs})
+    if record["status"] == "validated":
+        if accepted is None or partition.get("final") != accepted:
+            raise PartitionError("stored_global_final_changed")
+    elif result.status in ("completed", "partial_review") or "final" in partition:
+        raise PartitionError("stored_unvalidated_global_conclusion")
+
+
 def validate_partition_result(result: PartitionReviewResult, task) -> None:
     """Recheck immutable originals, coverage and extracted quotes before output."""
-    if type(result) is not PartitionReviewResult or result.schema_version != 9 or result.review_type not in ("A", "B", "PLAN"):
+    if type(result) is not PartitionReviewResult or result.schema_version != 10 or result.review_type not in ("A", "B", "PLAN"):
         raise PartitionError("invalid_partition_result")
     if result.status not in ("planned", "measured", "completed", "partial_review", "failed", "not_run"):
         raise PartitionError("invalid_partition_result_status")
@@ -1757,6 +1894,7 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
         _validate_closed_trace(result, known_units)
         _validate_observation_tracking(result.partition, known_units, by_id,
             signal_spans=signal_context_spans(originals, meta.get("target_details", [])), target_paths=meta["target_paths"], review_meta=meta)
+        _validate_global_review(result, originals, meta)
         final = result.partition.get("final", {})
         if not result.partition.get("units_prepared") or result.partition.get("final_covered_unit_ids") != sorted(known_units):
             raise PartitionError("incomplete_partition_coverage")
@@ -1774,6 +1912,11 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
         if mode == "intent" and {p["perspective_id"] for p in result.perspectives} != set(PERSPECTIVE_IDS):
             raise PartitionError("incomplete_partition_perspectives")
     originals_by_id = {o.evidence_id: o for o in originals}
+    if result.status in ("failed", "not_run") and "global_review" in result.partition:
+        _validate_closed_trace(result, known_units)
+        _validate_observation_tracking(result.partition, known_units, by_id,
+            signal_spans=signal_context_spans(originals, meta.get("target_details", [])), target_paths=meta["target_paths"], review_meta=meta)
+        _validate_global_review(result, originals, meta)
     review_observation_ids = {row["observation_id"] for row in result.partition.get("review_observations", [])}
     for row in (*result.partition.get("observations", []), *result.partition.get("review_observations", []),
         *result.perspectives, *result.findings):

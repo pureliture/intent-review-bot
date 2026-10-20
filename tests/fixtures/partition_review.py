@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 
 from review_bot.application.architecture_review import ModelProfile
 from review_bot.domain.intent_perspectives import PERSPECTIVES
@@ -26,6 +27,36 @@ class PartitionModelClient:
             options = payload["options"]
             option = options[-1] if stage == "plan_partitions" and not self.group_all else options[0]
             body = {"choice": option["label"]}
+        elif stage == "global_review":
+            pages = payload["observations"]
+            previous = payload.get("recheck", {})
+            findings = [deepcopy(f) for page in pages for f in page["raw_response"]["findings"]]
+            perspectives = []
+            for perspective in PERSPECTIVES if payload["mode"] == "intent" else ():
+                candidates = [p for page in pages for p in page["raw_response"]["perspectives"]
+                    if p["perspective_id"] == perspective.id]
+                perspectives.append(deepcopy(next((p for p in candidates if p["verdict"] in
+                    ("concern", "conditional_risk", "insufficient_context")), candidates[-1])))
+            body = {"summary": "Synthetic global adjudication, not native quality evidence.",
+                "findings": findings, "questions": [q for page in pages for q in page["raw_response"]["questions"]][:20],
+                "perspectives": perspectives, "missing_context": payload["provisional_missing_context"],
+                "context_updates": {}, "pending_target_reviews": {},
+                "source_requests": [deepcopy(r) for page in pages for r in page["raw_response"]["source_requests"]],
+                "correction_reason": "Synthetic fixture retains the supplied judgments and original evidence.",
+                "correction_citations": [], "observation_dispositions": {}, "finding_dispositions": {}}
+            for page in pages:
+                key = page["observation_id"]
+                ref = request.response_schema["properties"]["observation_dispositions"]["properties"][key]["properties"]["citations"]["items"]["properties"]["reference_id"]["enum"][0]
+                body["observation_dispositions"][key] = {"disposition": "merged",
+                    "reason": "Synthetic fixture accounts for the original page.", "citations": [{"reference_id": ref}]}
+            for index, finding in enumerate(payload["finding_catalog"]):
+                body["finding_dispositions"][finding["finding_id"]] = {"disposition": "retained",
+                    "reason": "Synthetic fixture preserves this original finding.", "citations": findings[index]["citations"],
+                    "result_indices": [index]}
+            if self.transform:
+                body = self.transform(payload, body)
+            return body if isinstance(body, ModelResponse) else ModelResponse(json.dumps(body, ensure_ascii=False),
+                {"input_tokens": self.count_input_tokens(request), "output_tokens": 10})
         else:
             spans = [*payload.get("originals", payload.get("original_quotes", [])), *payload.get("pr_purpose", [])]
             spans = [{**s, "text": "".join(b["text"] for b in s["blocks"])} if "blocks" in s else s for s in spans]

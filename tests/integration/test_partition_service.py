@@ -50,7 +50,7 @@ def test_fixed_api_worker_runs_partition_trial_and_returns_existing_result_endpo
             response = client.get(urls["result_url"], headers=headers)
             assert response.status_code == 200
             result = response.json()
-            assert result["schema_version"] == 9 and result["status"] == "completed"
+            assert result["schema_version"] == 10 and result["status"] == "completed"
             assert len(result["perspectives"]) == 8
             assert result["partition"]["scope_selection"]["decision"] == "apply"
             assert result["origin"]["publication"] == "not_attempted"
@@ -83,7 +83,9 @@ def test_partition_trial_requires_private_mode_and_explicit_resource_budgets(val
         load_review_config_from_str(yaml.safe_dump(raw))
 
 
-def test_failed_source_recheck_is_persisted_and_readable_through_the_authenticated_result_api(tmp_path, valid_config_yaml, monkeypatch):
+@pytest.mark.parametrize("failure_stage", ["source_recheck", "global_review"])
+def test_failed_source_recheck_is_persisted_and_readable_through_the_authenticated_result_api(tmp_path, valid_config_yaml, monkeypatch, failure_stage):
+    from dataclasses import replace
     from review_bot.application.architecture_review import PermanentModelError
 
     monkeypatch.setenv("REVIEW_BOT_API_TOKEN", "synthetic-failed-partition")
@@ -99,6 +101,10 @@ def test_failed_source_recheck_is_persisted_and_readable_through_the_authenticat
     store = SQLiteJobStore(root / "jobs.sqlite")
 
     def fail_recheck(payload, body):
+        if failure_stage == "global_review":
+            if payload["stage"] == "global_review":
+                next(iter(body["observation_dispositions"].values()))["citations"] = [{}]
+            return body
         if payload["stage"] == "final_review":
             if "source_recheck" in payload:
                 error = PermanentModelError("Invalid or truncated model output")
@@ -110,6 +116,9 @@ def test_failed_source_recheck_is_persisted_and_readable_through_the_authenticat
         return body
 
     review = PartitionModelClient(transform=fail_recheck)
+    if failure_stage == "global_review":
+        review.profile = replace(review.profile, max_input_tokens=350)
+        review.counter = lambda r: 200 + 100 * len(json.loads(r.user_content)["observations"]) if json.loads(r.user_content)["stage"] == "final_review" else 100
     headers = {"Authorization": "Bearer synthetic-failed-partition"}
     try:
         with TestClient(create_intent_app(config, store, root / "artifacts")) as api:
@@ -117,17 +126,22 @@ def test_failed_source_recheck_is_persisted_and_readable_through_the_authenticat
             assert submitted.status_code == 202
             urls = submitted.json()
             worker = WorkerLoop(config, store, model_client=review,
-                planning_client=PartitionModelClient(name="tev", group_all=True), artifact_root=root / "artifacts")
+                planning_client=PartitionModelClient(name="tev", group_all=failure_stage != "global_review"), artifact_root=root / "artifacts")
             assert worker.run_once() is False
             status = api.get(urls["status_url"], headers=headers).json()
-            assert status["status"] == "failed" and status["error"] == "model_error"
+            expected_reason = "invalid_global_response" if failure_stage == "global_review" else "model_error"
+            assert status["status"] == "failed" and status["error"] == expected_reason
             response = api.get(urls["result_url"], headers=headers)
             assert response.status_code == 200
             result = response.json()
-            assert result["status"] == "failed" and result["reason"] == "model_error"
+            assert result["status"] == "failed" and result["reason"] == expected_reason
             assert not result["summary"] and not result["perspectives"] and not result["findings"]
             assert result["partition"]["review_observations"]
-            assert result["partition"]["source_recheck_requests"][0]["response"]
+            if failure_stage == "global_review":
+                assert result["partition"]["global_review"]["attempts"][0]["response"]
+                assert result["partition"]["integration_final"] and "final" not in result["partition"]
+            else:
+                assert result["partition"]["source_recheck_requests"][0]["response"]
             assert result["usage"]["usage_complete"] and result["usage"]["unknown_usage_attempts"] == 0
     finally:
         store.close()
@@ -149,7 +163,7 @@ def test_cli_partition_option_reaches_same_executor_and_private_artifacts(tmp_pa
         "--max-total-tokens", "524288", "--max-calls", "64"]) == 0
     assert "completed/validated" in capsys.readouterr().out
     result = json.loads((output / "B/result.json").read_text())
-    assert result["schema_version"] == 9 and len(result["perspectives"]) == 8
+    assert result["schema_version"] == 10 and len(result["perspectives"]) == 8
     assert result["origin"]["publication"] == "not_attempted"
     assert tev.requests and review.requests
 
@@ -199,7 +213,7 @@ def test_github_worker_connects_architecture_analysis_to_partition_executor(tmp_
         results = list((root / "artifacts").rglob("A/result.json"))
         assert len(results) == 1
         result = json.loads(results[0].read_text())
-        assert result["schema_version"] == 9 and result["review_type"] == "A"
+        assert result["schema_version"] == 10 and result["review_type"] == "A"
         assert result["status"] == "completed", result["reason"]
         assert worker_pipeline_ports["analyzer"].run_analysis.call_count == 2
         worker_pipeline_ports["repo_reader"].collect_code_snapshot.assert_not_called()

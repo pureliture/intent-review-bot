@@ -19,7 +19,7 @@ def _intent_artifact_values(task_input: Any, result: Any) -> dict[str, Any]:
         "usage.json": {"total": result.usage, "stages": [asdict(stage) for stage in result.stages]},
         "validation.json": {"status": result.status, "reason": result.reason, "errors": result.validation_errors,
             "stages": [{"stage": stage.stage, "status": stage.status, "reason": stage.reason} for stage in result.stages]}}
-    if result.schema_version == 9:
+    if result.schema_version == 10:
         values.update({"partition.json": result.partition, "perspectives.json": result.perspectives})
     elif result.schema_version == 3:
         from review_bot.domain.intent_perspectives import PERSPECTIVES
@@ -125,7 +125,7 @@ class RunArtifacts:
         self.write_json("A/scope.json", result.scope)
         self.write_json("A/result.json", result)
         self.write_json("A/usage.json", result.usage)
-        if result.schema_version == 9:
+        if result.schema_version == 10:
             self.write_json("A/partition.json", result.partition)
         self.write_json("A/validation.json", {"status": result.status, "reason": result.reason})
         self._write("A/comment.md", markdown)
@@ -141,7 +141,7 @@ class RunArtifacts:
             "input_fingerprint": result.run_key, "prompt_version": result.prompt_version,
             "prompt_hash": result.prompt_hash, "status": result.status, "reason": result.reason,
             "publication": None}
-        if result.schema_version in (2, 3, 9):
+        if result.schema_version in (2, 3, 10):
             self.manifest["modes"]["intent"]["result_schema_version"] = result.schema_version
         self.write_json("manifest.json", self.manifest)
 
@@ -273,11 +273,11 @@ class IntentArtifacts:
             "modes": {self.mode: {"input_hash": task_input.input_hash, "input_fingerprint": result.run_key,
                 "prompt_version": result.prompt_version, "prompt_hash": result.prompt_hash,
                 "status": result.status, "reason": result.reason, "publication": publication}}}
-        if result.schema_version in (3, 9):
+        if result.schema_version in (3, 10):
             manifest["status"] = "succeeded" if result.status == "completed" or (
-                result.schema_version == 9 and result.status == "measured") else "failed"
+                result.schema_version == 10 and result.status == "measured") else "failed"
             if result.reason == "mode_not_selected_in_shared_plan":
                 manifest["status"] = "skipped"
-        if result.schema_version in (2, 3, 9):
+        if result.schema_version in (2, 3, 10):
             manifest["modes"][self.mode]["result_schema_version"] = result.schema_version
         self._write(self.root, "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n")

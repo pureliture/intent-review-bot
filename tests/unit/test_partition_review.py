@@ -237,7 +237,8 @@ def test_actual_aggregate_overflow_preserves_results_in_separate_final_pages():
     assert len(result.partition["integration_pages"]) > 1
     assert not any(json.loads(r.user_content)["stage"] == "reduce_observations" for r in review.requests)
     assert [row for page in result.partition["integration_pages"] for row in page["inputs"]] == result.partition["review_observations"]
-    assert all(row["assessments"] for row in result.perspectives)
+    assert all(row["assessments"] for row in result.partition["integration_final"]["perspectives"])
+    assert all(row["verdict"] == "aligned" for row in result.perspectives)
     assert result.partition["final_covered_unit_ids"] == sorted(u["unit_id"] for u in result.partition["units"])
     validate_partition_result(result, task)
 
@@ -281,7 +282,7 @@ def test_outside_span_citation_and_stored_quote_tampering_are_rejected():
     assert any(r.reason == "invalid_model_response" for r in bad.stages)
     result = run_partition_review(task, "intent", PartitionModelClient(), PartitionModelClient(), limits=limits())
     result.perspectives[0]["citations"][0]["quote"] = "fabricated"
-    with pytest.raises(PartitionError, match="quote_mismatch|assembly_mismatch"):
+    with pytest.raises(PartitionError, match="quote_mismatch|assembly_mismatch|single_page_conclusion_changed"):
         validate_partition_result(result, task)
 
 
@@ -1184,7 +1185,7 @@ def test_a_later_page_can_resolve_an_earlier_gap_and_uncited_uncertainty_cannot_
     assert result.status == "completed", result.reason
     assert final_calls > 2
     assert not result.partition["final"]["missing_context"]
-    history = result.partition["final"]["context_update_history"]
+    history = result.partition["integration_final"]["context_update_history"]
     assert any(not event["applied"] for event in history)
     assert all(update["state"] == "resolved" for update in result.partition["final"]["context_updates"].values())
     validate_partition_result(result, task)

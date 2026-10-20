@@ -22,6 +22,10 @@ MEANINGS = {
     "questions": "Concrete remaining questions for the author, if necessary. Do not copy the perspective catalog questions.",
     "context_updates": "Optional updates keyed by known context_items IDs. Omission preserves the open state. Resolve/reclassify only with a reason and original source evidence.",
     "target_reviews": "An entry for EVERY supplied review_targets ID. Reviewed means this specific target was statically examined, including when no defect is found. Its citations must belong to that target's file(s).",
+    "pending_target_reviews": "Only the exact pending_review_targets keys. All earlier actual target-review records are inherited unchanged; do not regenerate them.",
+    "finding_dispositions": "An entry for EVERY finding_catalog finding_id. Retain, revise, or exclude the original finding with a concrete source-backed reason. Its original page/raw finding remains in the audit trail.",
+    "result_indices": "Zero-based indices in this response's findings array. Excluded original findings have an empty array; retained/revised findings must point to their resulting findings.",
+    "correction_citations": "Original references supporting cross-page corrections. Empty only when no correction needs evidence.",
     "source_requests": "Normally empty. Request a necessary recheck by exact fixed_original_inventory evidence_id and concrete reason. No new paths, external retrieval or target execution is allowed; unresolved requests keep the review partial.",
     "observation_dispositions": "An entry for EVERY supplied observation_id: retained, merged, or explicitly excluded with a reason and an original evidence anchor from that observation.",
     "correction_reason": "Explain how the source recheck corrects the earlier rejected interpretation or grounding. Do not invent evidence merely to retain an old verdict.",
@@ -30,6 +34,8 @@ MEANINGS = {
 MAP_KEYS = {
     "draft_assessments": "exact keys from draft_assessment_keys",
     "target_reviews": "exact keys from review_targets",
+    "pending_target_reviews": "exact keys from pending_review_targets",
+    "finding_dispositions": "exact finding_id keys from finding_catalog",
     "observation_dispositions": "exact observation_id keys from observations",
     "context_updates": "optional known IDs from context_items",
 }
