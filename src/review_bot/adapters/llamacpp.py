@@ -13,11 +13,12 @@ from urllib.parse import urlsplit
 import httpx
 
 from review_bot.adapters.model_http import mark_model_request_sent, model_request_slot
-from review_bot.application.architecture_review import ModelProfile, PermanentModelError, TransientModelError
+from review_bot.application.architecture_review import ModelProfile, PermanentModelError, TransientModelError, ModelOutputLimitError
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 
 LLAMACPP_PROFILE = "me707-llamacpp"
 REVIEW_MODEL = "bonsai2-27b"
+OUTPUT_RECOVERY_MESSAGE = "The reasoning budget is exhausted. Finish the complete schema JSON now using the supplied originals and citations."
 SELECTOR_MODEL = "tev1-4b-q8_0"
 _REVIEW_CONTEXT_TOKENS = 131072
 _SELECTOR_CONTEXT_TOKENS = 131072
@@ -166,6 +167,10 @@ class _LlamaCppClient:
         return _endpoint(api_url)
 
     @property
+    def supports_bounded_reasoning(self) -> bool:
+        return False
+
+    @property
     def model(self) -> str:
         return self._model
 
@@ -302,6 +307,12 @@ class _LlamaCppClient:
             "stream": False, "temperature": 0, "seed": 0, "n": 1, "max_tokens": maximum,
             "stop": [], "cache_prompt": False, "n_keep": -1,
         }
+        if request.reasoning_budget_tokens is not None:
+            budget = request.reasoning_budget_tokens
+            if not self.supports_bounded_reasoning or type(budget) is not int or not 0 < budget < maximum:
+                raise PermanentModelError("Invalid or unsupported reasoning output budget")
+            payload["reasoning_budget_tokens"] = budget
+            payload["reasoning_budget_message"] = OUTPUT_RECOVERY_MESSAGE
         encoded = _encode(payload)
         if len(encoded) > _MAX_INPUT_BYTES:
             raise PermanentModelError("llama.cpp input exceeds transport byte limit")
@@ -343,7 +354,7 @@ class _LlamaCppClient:
         choice = choices[0]
         if (
             not isinstance(choice, dict) or type(choice.get("index")) is not int or choice["index"] != 0
-            or choice.get("finish_reason") != "stop"
+            or choice.get("finish_reason") not in ("stop", "length")
         ):
             raise PermanentModelError("Invalid or truncated llama.cpp model output")
         message = choice.get("message")
@@ -358,14 +369,18 @@ class _LlamaCppClient:
             raise PermanentModelError("Invalid llama.cpp reasoning metadata")
         # Reasoning metadata is intentionally discarded; application output comes only from content.
         text = message.get("content")
-        if not isinstance(text, str):
+        if not isinstance(text, str) and not (choice["finish_reason"] == "length" and text is None):
             raise PermanentModelError("Invalid llama.cpp model output text")
         try:
-            text_bytes = len(text.encode("utf-8"))
+            text_bytes = len(text.encode("utf-8")) if isinstance(text, str) else 0
         except UnicodeError:
             raise PermanentModelError("Invalid llama.cpp model output encoding") from None
         if text_bytes > self._max_output_bytes:
             raise PermanentModelError("llama.cpp model output exceeds byte limit")
+        if choice["finish_reason"] == "length":
+            error = ModelOutputLimitError("Invalid or truncated llama.cpp model output")
+            error.rejected_output = {"finish_reason": "length", "content": text, "reasoning_content": reasoning}
+            raise error
         value = _json_object(text)
         self._check_output(value, payload)
         return ModelResponse(text, self._validated_usage(data, payload, measured))
@@ -433,6 +448,10 @@ class LlamaCppModelClient(_LlamaCppClient):
     _role_model = REVIEW_MODEL
     _role_context_tokens = _REVIEW_CONTEXT_TOKENS
     _role_max_output_tokens = _REVIEW_OUTPUT_TOKENS
+
+    @property
+    def supports_bounded_reasoning(self) -> bool:
+        return self.model == REVIEW_MODEL
 
     def __init__(
         self, model: str = REVIEW_MODEL, *, api_url: str, timeout_seconds: int = 60,

@@ -38,6 +38,10 @@ class PermanentModelError(RuntimeError):
     """Raised when model invocation cannot succeed and should not be retried."""
 
 
+class ModelOutputLimitError(PermanentModelError):
+    """The provider returned an incomplete completion at its output limit."""
+
+
 class ResponseValidationError(ValueError):
     """Raised when model response fails schema, echo, grounding, or architectural contracts."""
 

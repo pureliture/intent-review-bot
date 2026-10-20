@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import time
+from copy import deepcopy
 from asyncio import CancelledError as AsyncCancelledError
 from collections.abc import Callable
 from concurrent.futures import CancelledError
@@ -14,7 +15,7 @@ from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from review_bot.application.architecture_review import ModelProfile, TransientModelError
+from review_bot.application.architecture_review import ModelProfile, TransientModelError, ModelOutputLimitError
 from review_bot.application.context import hash_json
 from review_bot.application.intent_context import MAX_INPUT_BYTES, IntentInputError, strict_json_loads
 from review_bot.domain.intent_models import IntentModelAttempt, IntentStageRecord
@@ -23,6 +24,8 @@ from review_bot.ports import ModelClient
 
 MAX_OUTPUT_BYTES = 65536
 MAX_ATTEMPTS = 3
+MAX_REJECTED_OUTPUT_BYTES = 1024 * 1024
+OUTPUT_RECOVERY_FINAL_RESERVE = 8192
 
 
 class ModelLimits(Protocol):
@@ -105,6 +108,35 @@ class ModelExecutionBudget:
     def __init__(self, limits: ExecutionLimits, deadline: float, fence: Callable[[], bool] | None):
         self.limits, self.deadline, self.fence = limits, deadline, fence
         self.records: list[IntentStageRecord] = []
+        self.rejected_outputs: dict[int, list[dict]] = {}
+        self.output_recoveries: list[dict] = []
+
+    def execute_bounded_output(self, request: ModelRequest, client: ModelClient, profile: ModelProfile, *,
+        label: str, reserve_calls: int, reserve_tokens: int,
+    ) -> tuple[Any | None, int]:
+        """One known-limit recovery, keeping all input and the total output cap."""
+        body, index = self.execute(request, client, profile, label=label,
+            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens)
+        if (body is not None or self.records[index].reason != "model_output_limit"
+                or not self.rejected_outputs.get(index)
+                or getattr(client, "supports_bounded_reasoning", False) is not True
+                or request.reasoning_budget_tokens is not None
+                or request.max_output_tokens != profile.max_output_tokens
+                or request.max_output_tokens <= OUTPUT_RECOVERY_FINAL_RESERVE):
+            return body, index
+        bounded = replace(request,
+            reasoning_budget_tokens=request.max_output_tokens - OUTPUT_RECOVERY_FINAL_RESERVE)
+        recovered, next_index = self.execute(bounded, client, profile, label=label + ":output_recovery",
+            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens)
+        self.output_recoveries.append({"failed_stage_index": index, "recovery_stage_index": next_index,
+            "reason": "known_native_output_limit", "output_limit": request.max_output_tokens,
+            "reasoning_budget_tokens": bounded.reasoning_budget_tokens,
+            "target_final_output_reserve": OUTPUT_RECOVERY_FINAL_RESERVE,
+            "source_input_unchanged": (request.system_prompt, request.user_content, request.response_schema) ==
+                (bounded.system_prompt, bounded.user_content, bounded.response_schema),
+            "source_input_hash": hash_json({"system": request.system_prompt,
+                "user": request.user_content, "schema": request.response_schema})})
+        return recovered, next_index
 
     def totals(self) -> tuple[int, int, bool]:
         attempts = [attempt for record in self.records for attempt in record.attempts]
@@ -221,6 +253,19 @@ class ModelExecutionBudget:
                     delivery, usage = "not_sent", {"input_tokens": 0, "output_tokens": 0}
                 elif receipt_delivery == "sent" and receipt_usage is not None:
                     delivery, usage = "sent", receipt_usage
+                if (isinstance(error, ModelOutputLimitError) and delivery == "sent" and usage is not None
+                        and usage["output_tokens"] == actual.max_output_tokens):
+                    reason = "model_output_limit"
+                    output = getattr(error, "rejected_output", None)
+                    if (isinstance(output, dict) and set(output) == {"finish_reason", "content", "reasoning_content"}
+                            and output["finish_reason"] == "length"
+                            and (output["content"] is None or isinstance(output["content"], str))
+                            and (output["reasoning_content"] is None or isinstance(output["reasoning_content"], str))
+                            and len(json.dumps(output, ensure_ascii=False).encode("utf-8")) <= MAX_REJECTED_OUTPUT_BYTES):
+                        self.rejected_outputs.setdefault(index, []).append({"attempt": number,
+                            "request_hash": hash_json(asdict(actual)), "usage": deepcopy(usage),
+                            "output_limit": actual.max_output_tokens,
+                            "output": deepcopy(output), "output_hash": hash_json(output)})
                 retry = isinstance(error, (TimeoutError, TransientModelError)) and usage is not None and delivery != "unknown"
             if reason == "received" and usage is None:
                 reason = "usage_unavailable"

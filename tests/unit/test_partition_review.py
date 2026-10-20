@@ -18,6 +18,112 @@ def limits(**kwargs):
     return PartitionReviewLimits(max_total_tokens=1000000, max_calls=128, **kwargs)
 
 
+def _output_limited_review_client(*, known_usage=True, repeated_limit=False):
+    from review_bot.application.architecture_review import ModelOutputLimitError
+    review = PartitionModelClient()
+    review.profile = replace(review.profile, max_output_tokens=32678)
+    review.supports_bounded_reasoning = True
+
+    def limit_output(payload, body):
+        request = review.requests[-1]
+        if payload["stage"] == "final_review" and (request.reasoning_budget_tokens is None or repeated_limit):
+            error = ModelOutputLimitError("Truncated completion")
+            if known_usage:
+                error.delivery = "sent"
+                error.usage = {"input_tokens": 100, "output_tokens": request.max_output_tokens}
+            error.rejected_output = {"finish_reason": "length", "content": '{"partial":',
+                "reasoning_content": "Original provider output retained without rewriting."}
+            raise error
+        return body
+
+    review.transform = limit_output
+    return review
+
+
+def test_known_output_limit_gets_one_bounded_reasoning_recovery_with_identical_input():
+    from copy import deepcopy
+    task = make_task()
+    review = _output_limited_review_client()
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed", result.reason
+    finals = [r for r in review.requests if json.loads(r.user_content)["stage"] == "final_review"]
+    assert len(finals) == 2
+    assert (finals[0].system_prompt, finals[0].user_content, finals[0].response_schema) == (
+        finals[1].system_prompt, finals[1].user_content, finals[1].response_schema)
+    assert finals[0].max_output_tokens == finals[1].max_output_tokens == 32678
+    assert finals[0].reasoning_budget_tokens is None and finals[1].reasoning_budget_tokens == 24486
+    assert result.partition["rejected_model_outputs"][0]["output"]["content"] == '{"partial":'
+    assert result.partition["rejected_model_outputs"][0]["output"]["reasoning_content"]
+    assert len(result.partition["output_recoveries"]) == 1
+    assert result.usage["usage_complete"] and result.usage["calls"] == 15
+    validate_partition_result(result, task)
+    altered = deepcopy(result)
+    altered.partition["rejected_model_outputs"][0]["output"]["content"] += "changed"
+    with pytest.raises(PartitionError, match="stored_rejected_output_changed"):
+        validate_partition_result(altered, task)
+    altered = deepcopy(result)
+    altered.partition["output_recoveries"][0]["target_final_output_reserve"] += 1
+    with pytest.raises(PartitionError, match="stored_output_recovery_changed"):
+        validate_partition_result(altered, task)
+
+
+def test_unknown_output_limit_usage_never_triggers_a_recovery():
+    task = make_task()
+    review = _output_limited_review_client(known_usage=False)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "failed" and result.reason == "usage_unavailable"
+    assert len([r for r in review.requests if json.loads(r.user_content)["stage"] == "final_review"]) == 1
+    assert not result.partition["output_recoveries"] and not result.partition["rejected_model_outputs"]
+    validate_partition_result(result, task)
+
+
+def test_repeated_output_limit_is_bounded_and_both_original_outputs_are_retained():
+    task = make_task()
+    review = _output_limited_review_client(repeated_limit=True)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "failed" and result.reason == "model_output_limit"
+    assert len([r for r in review.requests if json.loads(r.user_content)["stage"] == "final_review"]) == 2
+    assert len(result.partition["rejected_model_outputs"]) == 2
+    assert len(result.partition["output_recoveries"]) == 1
+    assert result.usage["usage_complete"]
+    validate_partition_result(result, task)
+
+
+def test_output_recovery_cannot_exceed_the_shared_call_budget():
+    task = make_task()
+    review = _output_limited_review_client()
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True),
+        limits=PartitionReviewLimits(max_total_tokens=1000000, max_calls=14))
+    assert result.status == "failed" and result.reason == "call_limit_exceeded"
+    assert result.usage["calls"] == 14 and result.usage["usage_complete"]
+    assert len([r for r in review.requests if json.loads(r.user_content)["stage"] == "final_review"]) == 1
+    assert len(result.partition["rejected_model_outputs"]) == 1
+    validate_partition_result(result, task)
+
+
+def test_output_recovery_after_a_source_recheck_preserves_both_kinds_of_history():
+    task = make_task()
+    review = _output_limited_review_client()
+    limit_output = review.transform
+
+    def request_then_limit(payload, body):
+        if payload["stage"] == "final_review" and "source_recheck" not in payload:
+            original = next(row for row in payload["fixed_original_inventory"] if row["version"] == "head")
+            body["source_requests"] = [{"evidence_id": original["evidence_id"], "reason": "Recheck the fixed source."}]
+            return body
+        return limit_output(payload, body)
+
+    review.transform = request_then_limit
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed", result.reason
+    assert len(result.partition["source_recheck_requests"]) == 1
+    assert len(result.partition["rejected_model_outputs"]) == 1
+    assert len(result.partition["output_recoveries"]) == 1
+    assert result.partition["source_recheck_requests"][0]["admitted"]
+    assert result.usage["calls"] == 16 and result.usage["usage_complete"]
+    validate_partition_result(result, task)
+
+
 def test_native_measured_plan_observation_selection_and_review_reach_eight_perspectives():
     task = make_task()
     review, tev = PartitionModelClient(), PartitionModelClient(name="tev", group_all=True)
@@ -768,6 +874,63 @@ def test_model_can_request_one_frozen_original_recheck_and_preserve_the_initial_
     assert not result.partition["final"]["source_requests"]
     assert result.partition["final"]["correction_reason"]
     validate_partition_result(result, task)
+
+
+def test_fatal_source_recheck_preserves_prefix_without_promoting_a_page_to_global_conclusion():
+    from review_bot.application.architecture_review import PermanentModelError
+
+    def fail_recheck(payload, body):
+        if payload["stage"] == "final_review":
+            if "source_recheck" in payload:
+                error = PermanentModelError("Invalid or truncated model output")
+                error.delivery = "sent"
+                error.usage = {"input_tokens": 100, "output_tokens": 512}
+                raise error
+            original = next(row for row in payload["fixed_original_inventory"] if row["version"] == "head")
+            body["source_requests"] = [{"evidence_id": original["evidence_id"], "reason": "Compare the frozen implementation."}]
+        return body
+
+    task = make_task()
+    result = run_partition_review(task, "intent", PartitionModelClient(transform=fail_recheck),
+        PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "failed" and result.reason == "model_error"
+    assert result.summary == "" and not result.perspectives and not result.findings
+    assert len(result.partition["review_observations"]) == 1
+    assert result.partition["source_recheck_requests"][0]["response"]["summary"]
+    assert result.usage["usage_complete"] and result.usage["unknown_usage_attempts"] == 0
+    validate_partition_result(result, task)
+    assert "failed" in format_partition_review_markdown(result, task)
+
+
+def test_fatal_later_integration_page_keeps_completed_pages_without_a_global_conclusion():
+    from review_bot.application.architecture_review import PermanentModelError
+    final_calls = 0
+
+    def fail_second_page(payload, body):
+        nonlocal final_calls
+        if payload["stage"] == "final_review":
+            final_calls += 1
+            if final_calls == 2:
+                error = PermanentModelError("Rejected native output")
+                error.delivery = "sent"
+                error.usage = {"input_tokens": 300, "output_tokens": 512}
+                raise error
+        return body
+
+    def measured(request):
+        payload = json.loads(request.user_content)
+        return 200 + 100 * len(payload["observations"]) if payload["stage"] == "final_review" else 100
+
+    task = make_task()
+    review = PartitionModelClient(counter=measured, transform=fail_second_page)
+    review.profile = replace(review.profile, max_input_tokens=350)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(), limits=limits())
+    assert result.status == "failed" and result.reason == "model_error"
+    assert len(result.partition["integration_pages"]) == 1
+    assert result.partition["integration_pages"][0]["response"]["summary"]
+    assert not result.summary and not result.perspectives and not result.partition.get("final")
+    validate_partition_result(result, task)
+    assert "failed" in format_partition_review_markdown(result, task)
 
 
 def test_overflowing_recheck_delivers_requested_originals_and_every_prior_reply_reference_without_summary():

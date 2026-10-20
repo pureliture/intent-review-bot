@@ -22,7 +22,7 @@ from review_bot.application.partition_integration import native_integration_page
 from review_bot.application.source_citations import citation_spans, citation_catalog, source_blocks, signal_context_spans, referenced_source_spans
 from review_bot.application.review_output_contract import render_output_contract
 from review_bot.application.code_first_intent_review import _original_text, _originals
-from review_bot.application.model_execution import ModelExecutionBudget, model_profile
+from review_bot.application.model_execution import ModelExecutionBudget, model_profile, OUTPUT_RECOVERY_FINAL_RESERVE
 from review_bot.application.context import build_task_input, hash_json
 from review_bot.application.declared_intent_review import _make_result
 from review_bot.application.intent_context import (
@@ -598,7 +598,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     def execute(req, client, current, label):
         if not measure(req, client, current, label + ":admission"):
             raise Stop("native_request_exceeds_model_limits")
-        raw, index = budget.execute(req, client, current, label=label,
+        raw, index = budget.execute_bounded_output(req, client, current, label=label,
             reserve_calls=0, reserve_tokens=0)
         if raw is None:
             raise Stop(budget.records[index].reason)
@@ -1120,6 +1120,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
 
         for batch in batches:
             working, source_spans = batch["inputs"], batch["sources"]
+            page_final = None
             previous, retained, accepted_retained = None, [], []
             available_rechecks = limits.max_rechecks
             for recheck in range(available_rechecks + 1):
@@ -1137,11 +1138,11 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     break
                 before_exclusions = len(exclusions)
                 try:
-                    final = accept_final_response(raw, working, final_spans(working, [*source_spans, *retained]), previous is not None, retained)
+                    page_final = accept_final_response(raw, working, final_spans(working, [*source_spans, *retained]), previous is not None, retained)
                     accepted_retained = list(retained)
-                    if final["source_requests"] and recheck < available_rechecks:
+                    if page_final["source_requests"] and recheck < available_rechecks:
                         requested_sources = [make_span(o, 0, len(o.raw), "requested_original")
-                            for o in originals if o.evidence_id in {row["evidence_id"] for row in final["source_requests"]}]
+                            for o in originals if o.evidence_id in {row["evidence_id"] for row in page_final["source_requests"]}]
                         supplied = final_spans(working, [*source_spans, *retained])
                         roots = [c for row in review_notes for c in row["citations"]]
                         prior_sources = referenced_source_spans(raw, supplied, {o.evidence_id: o for o in originals},
@@ -1171,12 +1172,12 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                                 raise
                             fits = False
                         partitions.setdefault("source_recheck_requests", []).append({"response": deepcopy(raw),
-                            "final": deepcopy(final), "response_hash": hash_json(raw), "page_index": len(final_pages),
+                            "final": deepcopy(page_final), "response_hash": hash_json(raw), "page_index": len(final_pages),
                             "retained_citations": span_payload(retained),
                             "retained_reply_citations": span_payload(next_retained),
                             "delivery": delivery, "candidate_measurement_stages": measurements,
                             "parent_integration_plan_id": partitions.get("integration_plan_id"),
-                            "stage_index": index - first_record, "requests": deepcopy(final["source_requests"]),
+                            "stage_index": index - first_record, "requests": deepcopy(page_final["source_requests"]),
                             "admitted": fits, **({"reason": unavailable} if not fits else {})})
                         if fits:
                             budget.records[index] = replace(budget.records[index], status="completed", reason="source_recheck_requested")
@@ -1194,11 +1195,11 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                         raise
                     previous = {"rejected_response": deepcopy(raw), "validation_error": reason}
             budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
-            final_pages.append(final)
+            final_pages.append(page_final)
             partitions["integration_pages"].append({"inputs": deepcopy(working),
                 "planned_sources": span_payload(final_spans(batch["inputs"], batch["sources"])),
                 "retained_citations": span_payload(accepted_retained),
-                "response": deepcopy(raw), "final": deepcopy(final), "stage_index": index - first_record})
+                "response": deepcopy(raw), "final": deepcopy(page_final), "stage_index": index - first_record})
         final = reconcile_final_context(review_notes, final_pages, combine_final_pages(final_pages))
         reviewed_targets = {key for page in final_pages for key in page["target_reviews"]}
         if reviewed_targets != set(meta["targets"]):
@@ -1226,6 +1227,12 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         if budget.records and budget.records[-1].attempts and budget.records[-1].reason != "validated":
             budget.records[-1] = replace(budget.records[-1], status="failed", reason="invalid_model_response")
     local_records = budget.records[first_record:]
+    partitions["rejected_model_outputs"] = [{"stage_index": index - first_record, **deepcopy(item)}
+        for index, items in budget.rejected_outputs.items() if index >= first_record for item in items]
+    partitions["output_recoveries"] = [{**deepcopy(item),
+        "failed_stage_index": item["failed_stage_index"] - first_record,
+        "recovery_stage_index": item["recovery_stage_index"] - first_record}
+        for item in budget.output_recoveries if item["failed_stage_index"] >= first_record]
     common = _make_result(None, status, reason, local_records, active_profile, limits)
     hashes = {"observe": hash_json(prompts["observe"]),
         "plan": hash_json({"system": choices.SYSTEM, "contract": choices.VERSION}),
@@ -1239,6 +1246,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     identity["implementation"].update({"adapters/" + name: hashlib.sha256(
         (Path(__file__).parents[1] / "adapters" / name).read_bytes()).hexdigest()
         for name in ("llamacpp.py", "llamacpp_macbook.py", "intent_planner.py")})
+    identity["implementation"]["domain/models_v1.py"] = hashlib.sha256(
+        (Path(__file__).parents[1] / "domain/models_v1.py").read_bytes()).hexdigest()
     partitions["identity"] = identity
     exclusions.sort(key=hash_json)
     return PartitionReviewResult("PLAN" if mode == "planning" else "B" if mode == "intent" else "A", status, reason,
@@ -1637,7 +1646,7 @@ def _validate_observation_tracking(partition, known_units, originals, *, plannin
 
 def validate_partition_result(result: PartitionReviewResult, task) -> None:
     """Recheck immutable originals, coverage and extracted quotes before output."""
-    if type(result) is not PartitionReviewResult or result.schema_version != 7 or result.review_type not in ("A", "B", "PLAN"):
+    if type(result) is not PartitionReviewResult or result.schema_version != 8 or result.review_type not in ("A", "B", "PLAN"):
         raise PartitionError("invalid_partition_result")
     if result.status not in ("planned", "measured", "completed", "partial_review", "failed", "not_run"):
         raise PartitionError("invalid_partition_result_status")
@@ -1652,6 +1661,38 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
         raise PartitionError("partition_result_identity_mismatch")
     if result.origin != {"execution": "partitioned_mode_evaluation", "publication": "not_attempted"}:
         raise PartitionError("partition_result_origin_mismatch")
+    rejected_indices = set()
+    for rejected in result.partition.get("rejected_model_outputs", []):
+        index = rejected["stage_index"]
+        if type(index) is not int or not 0 <= index < len(result.stages):
+            raise PartitionError("stored_rejected_output_stage_mismatch")
+        attempts = result.stages[index].attempts
+        number = rejected["attempt"]
+        if type(number) is not int or not 1 <= number <= len(attempts):
+            raise PartitionError("stored_rejected_output_attempt_mismatch")
+        attempt = attempts[number - 1]
+        output = rejected["output"]
+        if (not isinstance(output, dict) or set(output) != {"finish_reason", "content", "reasoning_content"}
+                or output["finish_reason"] != "length"
+                or (output["content"] is not None and not isinstance(output["content"], str))
+                or (output["reasoning_content"] is not None and not isinstance(output["reasoning_content"], str))):
+            raise PartitionError("stored_rejected_output_shape_mismatch")
+        if (attempt.reason != "model_output_limit" or attempt.delivery != "sent" or attempt.usage is None
+                or type(rejected["output_limit"]) is not int or rejected["output_limit"] <= 0
+                or attempt.usage["output_tokens"] != rejected["output_limit"]
+                or rejected["request_hash"] != attempt.request_hash or rejected["usage"] != attempt.usage
+                or rejected["output_hash"] != hash_json(rejected["output"])):
+            raise PartitionError("stored_rejected_output_changed")
+        rejected_indices.add(index)
+    for recovery in result.partition.get("output_recoveries", []):
+        first, next_index = recovery["failed_stage_index"], recovery["recovery_stage_index"]
+        if (first not in rejected_indices or type(next_index) is not int or not first < next_index < len(result.stages)
+                or result.stages[next_index].stage != result.stages[first].stage + ":output_recovery"
+                or recovery["reason"] != "known_native_output_limit"
+                or recovery["target_final_output_reserve"] != OUTPUT_RECOVERY_FINAL_RESERVE
+                or recovery["reasoning_budget_tokens"] != recovery["output_limit"] - OUTPUT_RECOVERY_FINAL_RESERVE
+                or recovery["source_input_unchanged"] is not True):
+            raise PartitionError("stored_output_recovery_changed")
     expected = {o.evidence_id: o.digest for o in originals}
     if result.scope.get("source_hashes") != expected or result.scope.get("repository_wide") is not False:
         raise PartitionError("partition_result_scope_mismatch")

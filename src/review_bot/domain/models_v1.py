@@ -363,6 +363,7 @@ class ModelRequest:
     timeout_seconds: int
     max_output_tokens: int | None
     response_schema: dict[str, object]
+    reasoning_budget_tokens: int | None = None
 
 
 @dataclass(frozen=True)

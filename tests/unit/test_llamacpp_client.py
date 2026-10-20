@@ -65,6 +65,49 @@ def test_invalid_native_usage_is_not_promoted_to_a_known_receipt(adapter, main_r
     assert getattr(captured.value, "usage", None) is None
 
 
+def test_bounded_reasoning_only_changes_sampler_options_not_native_prompt_or_total_output(adapter, main_request, mock_http):
+    requests = mock_http()
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    bounded = replace(main_request, reasoning_budget_tokens=16)
+    assert client.supports_bounded_reasoning
+    assert client.count_input_tokens(main_request) == client.count_input_tokens(bounded) == 42
+    client.complete(bounded)
+    body = json.loads(next(r for r in requests if r.url.path == "/v1/chat/completions").content)
+    normal = client._chat_payload(main_request)
+    assert body["messages"] == normal["messages"] and body["response_format"] == normal["response_format"]
+    assert body["max_tokens"] == normal["max_tokens"] == 32
+    assert body["reasoning_budget_tokens"] == 16 and body["reasoning_budget_message"]
+    assert "reasoning_budget_tokens" not in normal
+    assert all("reasoning_budget_tokens" not in json.loads(r.content) for r in requests if r.url.path == "/apply-template")
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "16", 32, 33])
+def test_invalid_reasoning_budget_is_rejected_before_http(adapter, main_request, mock_http, value):
+    requests = mock_http()
+    with pytest.raises(PermanentModelError):
+        adapter.LlamaCppModelClient(api_url=API_URL).complete(replace(main_request, reasoning_budget_tokens=value))
+    assert not requests
+
+
+@pytest.mark.parametrize("content", ['{"partial":', None])
+def test_truncated_output_has_a_typed_rejection_and_preserves_both_output_channels(adapter, main_request, mock_http, content):
+    from review_bot.application.architecture_review import ModelOutputLimitError
+
+    def truncated(request):
+        if request.url.path == "/v1/chat/completions":
+            body = chat_response(content, output_tokens=32)
+            body["choices"][0]["finish_reason"] = "length"
+            body["choices"][0]["message"]["reasoning_content"] = "Unmodified provider reasoning"
+            return httpx.Response(200, json=body)
+
+    mock_http(truncated)
+    with pytest.raises(ModelOutputLimitError) as captured:
+        adapter.LlamaCppModelClient(api_url=API_URL).complete(main_request)
+    assert captured.value.usage == {"input_tokens": 42, "output_tokens": 32}
+    assert captured.value.rejected_output == {"finish_reason": "length", "content": content,
+        "reasoning_content": "Unmodified provider reasoning"}
+
+
 @pytest.fixture
 def adapter() -> Any:
     return importlib.import_module("review_bot.adapters.llamacpp")

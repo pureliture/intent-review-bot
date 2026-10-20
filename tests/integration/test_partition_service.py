@@ -50,7 +50,7 @@ def test_fixed_api_worker_runs_partition_trial_and_returns_existing_result_endpo
             response = client.get(urls["result_url"], headers=headers)
             assert response.status_code == 200
             result = response.json()
-            assert result["schema_version"] == 7 and result["status"] == "completed"
+            assert result["schema_version"] == 8 and result["status"] == "completed"
             assert len(result["perspectives"]) == 8
             assert result["partition"]["scope_selection"]["decision"] == "apply"
             assert result["origin"]["publication"] == "not_attempted"
@@ -76,10 +76,62 @@ def test_partition_trial_requires_private_mode_and_explicit_resource_budgets(val
     import pytest
     with pytest.raises(ValueError, match="max_total_tokens"):
         load_review_config_from_str(yaml.safe_dump(raw))
+
     raw["partition_evaluation"].update(max_total_tokens=524288, max_calls=64)
     raw["publish"].update(mode="comment", b_comments_enabled=True)
     with pytest.raises(ValueError, match="artifact_only"):
         load_review_config_from_str(yaml.safe_dump(raw))
+
+
+def test_failed_source_recheck_is_persisted_and_readable_through_the_authenticated_result_api(tmp_path, valid_config_yaml, monkeypatch):
+    from review_bot.application.architecture_review import PermanentModelError
+
+    monkeypatch.setenv("REVIEW_BOT_API_TOKEN", "synthetic-failed-partition")
+    raw = yaml.safe_load(valid_config_yaml)
+    raw["execution"].update(mode="offline", available_modes=["intent"], selector_uses_model=False)
+    raw["intent"] = {"pipeline": "perspectives-v1"}
+    raw["publish"].update(mode="artifact_only", b_comments_enabled=False)
+    raw["partition_evaluation"] = {"enabled": True, "max_total_tokens": 524288, "max_calls": 64}
+    config, _ = load_review_config_from_str(yaml.safe_dump(raw))
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    previous = os.umask(0o077)
+    store = SQLiteJobStore(root / "jobs.sqlite")
+
+    def fail_recheck(payload, body):
+        if payload["stage"] == "final_review":
+            if "source_recheck" in payload:
+                error = PermanentModelError("Invalid or truncated model output")
+                error.delivery = "sent"
+                error.usage = {"input_tokens": 100, "output_tokens": 512}
+                raise error
+            original = next(row for row in payload["fixed_original_inventory"] if row["version"] == "head")
+            body["source_requests"] = [{"evidence_id": original["evidence_id"], "reason": "Compare this original."}]
+        return body
+
+    review = PartitionModelClient(transform=fail_recheck)
+    headers = {"Authorization": "Bearer synthetic-failed-partition"}
+    try:
+        with TestClient(create_intent_app(config, store, root / "artifacts")) as api:
+            submitted = api.post("/reviews/intent", json=asdict(make_task()), headers=headers)
+            assert submitted.status_code == 202
+            urls = submitted.json()
+            worker = WorkerLoop(config, store, model_client=review,
+                planning_client=PartitionModelClient(name="tev", group_all=True), artifact_root=root / "artifacts")
+            assert worker.run_once() is False
+            status = api.get(urls["status_url"], headers=headers).json()
+            assert status["status"] == "failed" and status["error"] == "model_error"
+            response = api.get(urls["result_url"], headers=headers)
+            assert response.status_code == 200
+            result = response.json()
+            assert result["status"] == "failed" and result["reason"] == "model_error"
+            assert not result["summary"] and not result["perspectives"] and not result["findings"]
+            assert result["partition"]["review_observations"]
+            assert result["partition"]["source_recheck_requests"][0]["response"]
+            assert result["usage"]["usage_complete"] and result["usage"]["unknown_usage_attempts"] == 0
+    finally:
+        store.close()
+        os.umask(previous)
 
 
 def test_cli_partition_option_reaches_same_executor_and_private_artifacts(tmp_path, monkeypatch, capsys):
@@ -97,7 +149,7 @@ def test_cli_partition_option_reaches_same_executor_and_private_artifacts(tmp_pa
         "--max-total-tokens", "524288", "--max-calls", "64"]) == 0
     assert "completed/validated" in capsys.readouterr().out
     result = json.loads((output / "B/result.json").read_text())
-    assert result["schema_version"] == 7 and len(result["perspectives"]) == 8
+    assert result["schema_version"] == 8 and len(result["perspectives"]) == 8
     assert result["origin"]["publication"] == "not_attempted"
     assert tev.requests and review.requests
 
@@ -147,7 +199,7 @@ def test_github_worker_connects_architecture_analysis_to_partition_executor(tmp_
         results = list((root / "artifacts").rglob("A/result.json"))
         assert len(results) == 1
         result = json.loads(results[0].read_text())
-        assert result["schema_version"] == 7 and result["review_type"] == "A"
+        assert result["schema_version"] == 8 and result["review_type"] == "A"
         assert result["status"] == "completed", result["reason"]
         assert worker_pipeline_ports["analyzer"].run_analysis.call_count == 2
         worker_pipeline_ports["repo_reader"].collect_code_snapshot.assert_not_called()

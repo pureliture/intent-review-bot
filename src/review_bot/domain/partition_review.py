@@ -34,7 +34,7 @@ class PartitionReviewResult:
     usage: dict
     model_delivery: dict
     stages: tuple[IntentStageRecord, ...]
-    schema_version: int = 7
+    schema_version: int = 8
     language: str = "ko"
     summary: str = ""
     findings: tuple[dict, ...] = ()
