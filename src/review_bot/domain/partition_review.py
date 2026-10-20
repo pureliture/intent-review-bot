@@ -12,6 +12,7 @@ class PartitionReviewLimits(IntentReviewLimits):
     input_target_tokens: int | None = None
     observation_output_tokens: int | None = None
     measure_only: bool = False
+    # Each integration page has one bounded correction; run budgets remain shared.
     max_rechecks: int = 1
 
 
@@ -33,7 +34,7 @@ class PartitionReviewResult:
     usage: dict
     model_delivery: dict
     stages: tuple[IntentStageRecord, ...]
-    schema_version: int = 6
+    schema_version: int = 7
     language: str = "ko"
     summary: str = ""
     findings: tuple[dict, ...] = ()

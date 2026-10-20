@@ -73,6 +73,28 @@ def citation_catalog(spans, originals, anchors=()):
         "sha": originals[key].sha, "ranges": rows} for key, rows in grouped.items()]
 
 
+def referenced_source_spans(response, spans, originals, anchors=()):
+    """Keep every nested reference of an unchanged prior reply as exact bytes."""
+    choices = citation_spans(spans, originals, anchors)
+    result = {}
+
+    def visit(value):
+        if isinstance(value, dict):
+            if set(value) == {"reference_id"}:
+                key = value["reference_id"]
+                if key not in choices:
+                    raise PartitionError("prior_citation_reference_not_supplied")
+                result[key] = choices[key]
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(response)
+    return list(result.values())
+
+
 def source_blocks(spans, originals):
     """Put reference IDs beside their exact source, without repeating source bytes.
 

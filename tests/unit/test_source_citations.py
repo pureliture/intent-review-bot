@@ -60,3 +60,20 @@ def test_cpd_partner_anchors_use_only_fixed_originals_and_exact_report_locations
     assert all(s.text.encode() in originals[i].raw for i, s in enumerate(spans))
     with pytest.raises(PartitionError, match="original_unavailable"):
         signal_context_spans(originals[:1], [target])
+
+
+def test_retained_reply_sources_walk_all_nested_references_and_reject_unknown_ids():
+    import pytest
+    from review_bot.application.source_citations import referenced_source_spans
+    from review_bot.application.source_partition import PartitionError
+    original = SourceOriginal("S1", "".join(f"line {i}\n" for i in range(30)), "source")
+    span = make_span(original, 0, len(original.raw), "whole_original")
+    known = {"S1": original}
+    choices = citation_spans([span], known)
+    ids = list(choices)
+    reply = {"citations": [{"reference_id": ids[0]}], "perspectives": [{"citations": [{"reference_id": ids[-1]}]}]}
+    retained = referenced_source_spans(reply, [span], known)
+    assert retained == [choices[ids[0]], choices[ids[-1]]]
+    assert all(s.text.encode() == original.raw[s.start_byte:s.end_byte] for s in retained)
+    with pytest.raises(PartitionError, match="prior_citation_reference_not_supplied"):
+        referenced_source_spans({"nested": [[{"reference_id": "unknown"}]]}, [span], known)

@@ -770,6 +770,73 @@ def test_model_can_request_one_frozen_original_recheck_and_preserve_the_initial_
     validate_partition_result(result, task)
 
 
+def test_overflowing_recheck_delivers_requested_originals_and_every_prior_reply_reference_without_summary():
+    from copy import deepcopy
+    from tests.fixtures.intent_review import digest
+    from review_bot.application.intent_context import build_intent_task_input
+    task = make_task()
+    text = "".join(f"value_{i} = {i}\n" for i in range(600))
+
+    def extend(code):
+        files = tuple(replace(f, content=text, content_hash=digest(text)) if f.path == "src/value.py" else f for f in code.files)
+        inventory = digest(":".join(f"{f.path}:{f.content_hash}" for f in sorted(files, key=lambda f: f.path)))
+        return replace(code, files=files, inventory_hash=inventory)
+
+    task = build_intent_task_input(task.snapshot, extend(task.base), extend(task.head), related_paths=task.reviewed_paths)
+    prior_ref = None
+
+    def request_and_correct(payload, body):
+        nonlocal prior_ref
+        if payload["stage"] == "final_review":
+            if "source_recheck" not in payload:
+                original = next(row for row in payload["fixed_original_inventory"]
+                    if row["path"] == "src/value.py" and row["version"] == "head")
+                body["source_requests"] = [{"evidence_id": original["evidence_id"], "reason": "Compare frozen head with this original interpretation."}]
+                base = next(row for row in payload["citation_catalog"] if row["path"] == "src/value.py" and row["version"] == "base")
+                prior_ref = base["ranges"][-1]["reference_id"]
+            # This quote was NOT in the initial group's citations. Its exact
+            # range must survive coalescing and the focused recheck too.
+            body["perspectives"][0]["citations"] = [{"reference_id": prior_ref}]
+        return body
+
+    def measured(request):
+        payload = json.loads(request.user_content)
+        if "source_recheck" in payload and any(row["path"] == "src/value.py" and row["version"] == "base"
+                and row["end_byte"] - row["start_byte"] > 1024 for row in payload["original_quotes"]):
+            return 100000
+        return 100
+
+    review = PartitionModelClient(counter=measured, transform=request_and_correct)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed", result.reason
+    validate_partition_result(result, task)
+    finals = [json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "final_review"]
+    assert len(finals) == 2 and finals[1]["observations"] == finals[0]["observations"]
+    history = result.partition["source_recheck_requests"][0]
+    assert history["admitted"] and history["delivery"] == "requested_originals_with_retained_citations"
+    assert finals[1]["source_recheck"]["prior_response"] == history["response"]
+    assert prior_ref in {row["reference_id"] for entry in finals[1]["citation_catalog"] for row in entry["ranges"]}
+    assert any(row["path"] == "src/value.py" and row["version"] == "head" and row["start_byte"] == 0
+        and row["end_byte"] == len(text.encode()) for row in finals[1]["original_quotes"])
+    assert any(row["path"] == "src/value.py" and row["version"] == "base" and row["end_byte"] == len(text.encode())
+        for row in history["final"]["supplied_quotes"])
+    assert not result.partition["reductions"] and not result.partition["final"]["source_requests"]
+    assert len(history["candidate_measurement_stages"]) == 2
+    altered = deepcopy(result)
+    altered.partition["source_recheck_requests"][0]["response"]["summary"] += " modified"
+    with pytest.raises(PartitionError, match="stored_recheck_response_changed"):
+        validate_partition_result(altered, task)
+    altered = deepcopy(result)
+    altered.partition["source_recheck_requests"][0]["retained_reply_citations"] = []
+    with pytest.raises(PartitionError, match="nested_prior_citation_omitted"):
+        validate_partition_result(altered, task)
+    altered = deepcopy(result)
+    prior = altered.partition["source_recheck_requests"][0]["final"]["supplied_quotes"]
+    prior[:] = [row for row in prior if not (row["path"] == "src/value.py" and row["version"] == "base")]
+    with pytest.raises(PartitionError):
+        validate_partition_result(altered, task)
+
+
 @pytest.mark.parametrize("allowance,fit,expected_calls", [(1, True, 2), (0, True, 1), (1, False, 1)])
 def test_unresolved_or_unfittable_source_recheck_is_partial_not_a_silent_success(allowance, fit, expected_calls):
     def always_request(payload, body):
@@ -862,6 +929,35 @@ def test_paginated_source_recheck_retains_the_original_delivery_plan_and_added_f
     assert len(result.partition["integration_pages"]) > 1
     assert result.partition["source_recheck_requests"][0]["admitted"]
     assert result.partition["integration_plan_id"]
+    validate_partition_result(result, task)
+
+
+def test_each_integration_page_has_one_bounded_source_correction_under_the_same_run_budget():
+    requested_pages = 0
+
+    def request_on_two_pages(payload, body):
+        nonlocal requested_pages
+        if payload["stage"] == "final_review" and "source_recheck" not in payload and requested_pages < 2:
+            original = next(row for row in payload["fixed_original_inventory"] if row["version"] == "head")
+            body["source_requests"] = [{"evidence_id": original["evidence_id"], "reason": "Resolve this page against the fixed implementation."}]
+            requested_pages += 1
+        return body
+
+    def count(request):
+        payload = json.loads(request.user_content)
+        return 200 + 100 * len(payload["observations"]) if payload["stage"] == "final_review" else 100
+
+    task = make_task()
+    review = PartitionModelClient(counter=count, transform=request_on_two_pages)
+    review.profile = replace(review.profile, max_input_tokens=350)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    history = result.partition["source_recheck_requests"]
+    assert len(history) == 2 and all(row["admitted"] for row in history)
+    assert len({row["page_index"] for row in history}) == 2
+    finals = [json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "final_review"]
+    assert len(finals) == len(result.partition["integration_pages"]) + 2
+    assert result.usage["usage_complete"] and result.usage["calls"] <= limits().max_calls
     validate_partition_result(result, task)
 
 
