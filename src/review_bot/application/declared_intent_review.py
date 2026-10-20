@@ -42,14 +42,16 @@ from review_bot.domain.intent_models import (
     IntentTaskInput,
     ReviewBResult,
 )
+from review_bot.application.model_execution import (
+    MAX_OUTPUT_BYTES, valid_profile as _valid_profile,
+    stage_gate as _gate, response_usage as _usage, measurement_receipt as _measurement_receipt,
+)
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 from review_bot.ports import ModelClient
 
 PROMPT_VERSION = "review-b/v1"
 STAGES = ("extract_goals", "observe_changes", "assess")
 ASSESSMENTS = ("consistent_with_evidence", "evidence_conflict", "insufficient_context")
-MAX_OUTPUT_BYTES = 65536
-MAX_ATTEMPTS = 3
 MIN_QUOTE_NONSPACE_CHARS = 12
 _COMMON_PROMPT = """You review the relationship between a PR's declared problem, implementation strategy,
 assumptions, and behavior supported by supplied evidence. Perform only the input stage.
@@ -329,56 +331,6 @@ def validate_intent_assessment(body: Any, task: IntentTaskInput, goals: IntentGo
         questions.append(IntentQuestion(identifier, bounded_text(row["question"]), related, evidence_refs,
             bounded_text(row["why_needed"]), bounded_text(row["how_answer_changes_assessment"])))
     return IntentAssessment(summary, tuple(findings), tuple(questions))
-
-
-def _valid_profile(profile: Any, limits: IntentReviewLimits) -> bool:
-    return isinstance(profile, ModelProfile) and all(
-        type(value) is int and value > 0 for value in (profile.max_input_bytes, profile.max_output_bytes,
-            profile.timeout_seconds, profile.max_attempts, profile.max_output_tokens,
-            limits.max_input_tokens, limits.max_total_tokens, limits.task_timeout_seconds)
-    ) and profile.max_attempts <= MAX_ATTEMPTS and (
-        profile.max_input_tokens is None or type(profile.max_input_tokens) is int and profile.max_input_tokens > 0
-    ) and isinstance(profile.provider, str) and 0 < len(profile.provider) <= 128 and profile.provider.isprintable() and isinstance(profile.model, str) and 0 < len(profile.model) <= 256 and profile.model.isprintable() and type(profile.is_mock) is bool
-
-
-def _gate(before_stage: Callable[[], bool] | None, deadline: float) -> str | None:
-    if time.monotonic() >= deadline:
-        return "task_deadline_exceeded"
-    if before_stage is not None:
-        try:
-            if before_stage() is not True:
-                return "stage_gate_rejected"
-        except Exception:
-            return "stage_gate_rejected"
-    return None
-
-
-def _usage(response: ModelResponse) -> dict[str, int] | None:
-    value = response.usage
-    if not isinstance(value, dict) or not {"input_tokens", "output_tokens"} <= set(value) or set(value) - {"input_tokens", "output_tokens", "total_tokens"}:
-        return None
-    if not all(type(item) is int and 0 <= item <= 10**9 for item in value.values()):
-        return None
-    if "total_tokens" in value and value["total_tokens"] != value["input_tokens"] + value["output_tokens"]:
-        return None
-    return {"input_tokens": value["input_tokens"], "output_tokens": value["output_tokens"]}
-
-
-def _measurement_receipt(record: IntentStageRecord, client: ModelClient, profile: ModelProfile) -> IntentStageRecord:
-    try:
-        receipt = getattr(client, "token_count_receipt", None)
-    except Exception:
-        receipt = None
-    if receipt is None and profile.is_mock:
-        return replace(record, token_measurement_delivery="not_attempted", token_measurement_model_calls=0,
-            token_measurement_usage={"input_tokens": 0, "output_tokens": 0})
-    if isinstance(receipt, dict) and set(receipt) == {"delivery", "model_calls", "usage"}:
-        usage = _usage(ModelResponse("", receipt["usage"]))
-        if receipt["delivery"] in ("not_sent", "sent") and type(receipt["model_calls"]) is int and receipt["model_calls"] == 0 and usage == {"input_tokens": 0, "output_tokens": 0}:
-            return replace(record, token_measurement_delivery=receipt["delivery"], token_measurement_model_calls=0, token_measurement_usage=usage)
-        if receipt["delivery"] == "sent" and type(receipt["model_calls"]) is int and receipt["model_calls"] == 1 and usage is not None and usage["output_tokens"] <= 1:
-            return replace(record, token_measurement_delivery="sent", token_measurement_model_calls=1, token_measurement_usage=usage)
-    return replace(record, token_measurement_delivery="unknown", token_measurement_model_calls=None, token_measurement_usage=None)
 
 
 def _execute_stage(

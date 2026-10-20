@@ -344,6 +344,14 @@ class SQLiteModelAdmission:
                 if suffix:
                     continue
                 raise
+            # A concurrent SQLite connection may unlink a sidecar after pathname
+            # lookup but before stat finishes (observed on macOS as nlink=0).
+            # Recheck that pathname; never relax checks on a live file or the DB.
+            if suffix and metadata.st_nlink == 0:
+                try:
+                    metadata = os.stat(self.db_path.name + suffix, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
             _private_file_metadata(metadata)
 
     def _open_database(self, directory: int, *, create: bool) -> int:

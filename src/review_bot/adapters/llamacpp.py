@@ -368,6 +368,13 @@ class _LlamaCppClient:
             raise PermanentModelError("llama.cpp model output exceeds byte limit")
         value = _json_object(text)
         self._check_output(value, payload)
+        return ModelResponse(text, self._validated_usage(data, payload, measured))
+
+    def _validated_usage(self, data, payload, measured):
+        choices = data.get("choices")
+        if data.get("model") != self.model or not isinstance(choices, list) or len(choices) != 1 or (
+            not isinstance(choices[0], dict) or type(choices[0].get("index")) is not int or choices[0]["index"] != 0):
+            raise PermanentModelError("Invalid llama.cpp usage envelope")
         usage = data.get("usage")
         if not isinstance(usage, dict):
             raise PermanentModelError("Missing llama.cpp model usage")
@@ -392,7 +399,7 @@ class _LlamaCppClient:
                 or _count(timings.get("predicted_n")) != output_tokens
             ):
                 raise PermanentModelError("llama.cpp timings do not match model usage")
-        return ModelResponse(text, {"input_tokens": input_tokens, "output_tokens": output_tokens})
+        return {"input_tokens": input_tokens, "output_tokens": output_tokens}
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         deadline = self._deadline(request)
@@ -402,9 +409,22 @@ class _LlamaCppClient:
         if measured > self._max_input_tokens:
             raise PermanentModelError("llama.cpp input exceeds native token budget; truncation is forbidden")
         data = self._request("POST", "/v1/chat/completions", deadline, payload)
-        response = self._response(data, payload, measured)
-        self._remaining(deadline)
-        return response
+        try:
+            response = self._response(data, payload, measured)
+            self._remaining(deadline)
+            return response
+        except (PermanentModelError, TimeoutError) as error:
+            # A rejected/truncated answer is still rejected. Preserve a separately
+            # validated resource receipt when HTTP completed, instead of turning
+            # known consumption into an unknown-delivery event.
+            try:
+                usage = self._validated_usage(data, payload, measured)
+            except PermanentModelError:
+                pass
+            else:
+                error.delivery = "sent"
+                error.usage = usage
+            raise
 
 
 class LlamaCppModelClient(_LlamaCppClient):

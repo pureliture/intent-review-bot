@@ -128,7 +128,7 @@ rtk proxy uv run --locked review-bot intent --input /path/to/private/fixed-B-inp
   --output /path/to/private/evaluation-001
 ```
 
-Without `--model-profile`, the result is `not_run/model_profile_unset`, with zero review or metering calls. Ambient model opt-in does not enable this command. Explicit profiles are `ollama-local-128k`, `me707-llamacpp` and `macbook-llamacpp`; model preparation is the operator's responsibility, with no model download or provider fallback.
+Without `--model-profile`, the result is `not_run/model_profile_unset`, with zero review or metering calls. Ambient model opt-in does not enable this command. Explicit profiles are `ollama-local-128k`, `me707-llamacpp`, `macbook-llamacpp` and `macbook-granite-llamacpp`; model preparation is the operator's responsibility, with no model download or provider fallback.
 
 Each default v1 evaluation stores `B/{input,goals,observations,result,scope,usage,validation}.json`, `B/comment.md` and a mode-specific `manifest.json` with `publication=not_attempted/artifact_only`. Unattempted or invalid stage data is JSON `null`; earlier validated stages and actual call usage survive later failures. For v1, exit `0` means artifacts were saved for a completed or explicitly `not_run` outcome, **not** that a real review completed. V2 instead exits `0` only for `completed`; `partial_review`, `not_run` and failure exit `1` while preserving their files. Invalid input, unsafe paths or storage failure exits `1`; no source or raw exception value is printed.
 
@@ -139,6 +139,23 @@ Goal/constraint quotes must be literal contiguous spans present in every referen
 `usage.calls` counts completion attempts, including v2 planning. The **Ollama** token counter makes a one-output-token preflight; B includes its separate delivery/usage in total tokens and `model_calls` (normally three v1 review calls plus three generating preflights). The **llama.cpp** native template/tokenizer generates no answer and records zero generation calls/tokens for measurement. Metadata/template/tokenizer HTTP requests still share admission. Unknown transport/usage remains `null` with known subtotals, not zero. Supplied `test_run` records are integrity-checked and version/path-bound, **not independently attested**; reading test source never creates a run record. Drafts show scope, unexecuted tests, missing context, and uncertainty, and construct links only from verified evidence.
 
 Synthetic Python/JavaScript/Java fixtures and CLI tests exercise the real B pipeline using mock models/HTTP. They establish integration and validation, not model quality or completion of the live PR #36 evaluation. A v1 records, commands, `A/` artifacts and marker remain unchanged.
+
+### Private shared partition evaluation
+
+Trusted configuration can enable `partition_evaluation.enabled: true` with explicit `max_calls`, `max_total_tokens` and task deadlines. The existing fixed-input API and Worker then use the shared planner before choosing PR-wide modes. Keep `publish.mode: artifact_only`; this evaluation path rejects comment publication. For a fixed B input, the CLI exposes `--partition-evaluation` with `--max-calls`, `--max-total-tokens` and `--task-timeout-seconds`. The separate `--input-target-tokens` option is an experimental measurement target; it does not impose a smaller live context or authorize shortening source.
+
+The shared flow is:
+
+1. Freeze the declared PR source scope, base/head versions, supplied tests, PR purpose and exact derived diffs. Use deterministic AST boundaries and explicit line fallback where needed. Measure complete requests with each actual model's native tokenizer, including prompts, schema instructions and output reservation.
+2. The program supplies complete, admissible grouping candidates. Tev1 chooses a closed option, observes each bounded group and chooses modes for the whole PR. Java changes must belong to a Gradle module for PMD/CPD review; Maven modules are excluded. Intent eligibility is independent. Tev1 also selects the initial applicability of the eight fixed perspectives.
+3. Reuse the initial plan in both modes. New analysis evidence or a changed request fit can amend affected groups; preserve the parent plan, exact reasons and amended identity.
+4. The review model reads every fixed source unit with the same PR purpose. Intent groups produce eight actual provisional assessments; architecture groups assess the program-linked PMD/CPD targets. Exact source blocks carry their reference IDs beside the code. These blocks present all supplied bytes in one request; they do not create extra model calls.
+5. Final review receives the original group responses unchanged, their evidence anchors and fixed source. It may correct the drafts with source-backed reasons. Context gaps require explicit evidence to resolve; an explained correction alone is not a missing-evidence state. PMD targets require explicit review accounting.
+6. Measure the complete final request first. Only actual overflow triggers lossless source delivery across integration pages. Preserve the original assessments of every page; a composite result does not invent one global majority verdict. A necessary fixed-original recheck can use at most one additional call within the same budget. Requests outside the frozen inventory are rejected; unresolved or unfittable rechecks remain partial.
+
+The evaluation result is schema 6. Private artifacts preserve the plan, source hashes, full original model results, delivered ranges, corrections and actual usage. Truncated output and unknown usage are not accepted as successful reviews. Structural validation and regression tests establish these execution contracts; they do not establish semantic review quality. Older private evaluation artifacts retain their original versions and evidence.
+
+With this option disabled, existing `declared-v1`, `code-first-v2` and `perspectives-v1` behavior remains selected through `intent.pipeline`. Model profiles select the actual prepared serving environment separately from these pipeline versions.
 
 ### Code-first B and Tev1 planning (v2, explicit opt-in)
 
@@ -299,6 +316,12 @@ This does **not** implement automatic uncertain-ticket reconciliation, durable i
 | Review | `lfm2.5-2.6b-q8_0` | `MACBOOK_LFM_BASE_URL` | 32768 | 4096 tokens |
 | Existing mode selector | `tev1-0.8b-q8_0` | `MACBOOK_TEV1_BASE_URL` | 32768 | 64 tokens |
 | Separate code-first B planning | `tev1-0.8b-q8_0` | `MACBOOK_TEV1_BASE_URL` | 32768 | 4096 tokens |
+
+For an explicit MacBook evaluation, `MACBOOK_REVIEW_MAX_OUTPUT_TOKENS=8192` gives the review role an 8,192-token output allowance and derives a 24,576-token input allowance inside the same 32K context. This setting is optional, preserves the default above, and does not change Tev1 or the production Bonsai profile. It is useful when a complete structured response exceeds 4,096 tokens; it does not authorize shortening source or accepting truncated responses.
+
+`macbook-granite-llamacpp` explicitly selects a prepared `granite4.2` review server through `MACBOOK_GRANITE_BASE_URL`. It requires one generation slot and a 65,536-token context, reserves 16,384 output tokens and admits at most 49,152 input tokens. It uses the same local Tev1 endpoint and private admission group as above. Set `model.max_output_bytes: 65536` for structured evaluations; byte and token ceilings are separate. The LFM output override does not apply to Granite. Neither local profile automatically switches models when a request fails.
+
+The local recovery evaluation uses an existing Granite4.2 8.8B Q4_K_M GGUF and a server reasoning budget of 2,048 tokens. The server's reasoning budget consumes part of its output allowance. Local results establish behavior for those actual weights and settings; they do not establish Bonsai quality or Linux analyzer isolation.
 
 Keep model files in a private ignored directory. This session prepared the author's [LFM2.5 Q8_0 GGUF](https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF) and the unchanged Q8_0 model layer from official [Ollama `tev1:0.8b`](https://ollama.com/library/tev1); no Ollama server, converted replacement or external inference provider is used. Exact revisions, file sizes and verified SHA-256 hashes are in `milestones.md`.
 

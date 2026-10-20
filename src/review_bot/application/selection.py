@@ -252,6 +252,13 @@ def constrain_architecture_to_java_gradle(
         f"{selection.policy_version}:{policy}")
 
 
+def record_planned_modes(snapshot, available_modes, selected_modes, plan_id):
+    """Record one PR-wide decision made after bounded observations."""
+    if len(set(selected_modes)) != len(selected_modes) or any(m not in available_modes for m in selected_modes):
+        raise ValueError("invalid_planned_modes")
+    return _selection_record(snapshot, available_modes, selected_modes, "partitioned-plan/v4-closed:" + plan_id)
+
+
 class LightweightModeSelector:
     """Conservative local prefilter: skip known docs/assets, keep sources and uncertainty."""
 

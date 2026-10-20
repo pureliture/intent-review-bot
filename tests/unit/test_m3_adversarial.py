@@ -483,13 +483,15 @@ time.sleep(100)
 
         assert not is_alive, f"Grandchild process {grandchild_pid} was orphaned and survived!"
 
-    def test_sigterm_ignored_escalates_to_sigkill(self, tmp_path: Path) -> None:
+    def test_sigterm_ignored_escalates_to_sigkill(self, tmp_path: Path, monkeypatch) -> None:
         """Processes ignoring SIGTERM must be killed by escalated SIGKILL."""
         script = """
-import signal, time
+import signal, time, sys
+from pathlib import Path
 
-# Explicitly ignore SIGTERM
+# Establish the actual test precondition before starting the timeout budget.
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(sys.argv[1]).write_text("ready")
 
 while True:
     time.sleep(0.1)
@@ -497,10 +499,24 @@ while True:
         script_file = tmp_path / "ignore_sigterm.py"
         script_file.write_text(script, encoding="utf-8")
 
+        ready_file = tmp_path / "sigterm-handler-ready"
+        from review_bot.adapters.pmd import runner as runner_module
+        original_popen = runner_module.subprocess.Popen
+        def start_ready(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            deadline = time.monotonic() + 10
+            while not ready_file.exists():
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    process.kill()
+                    process.wait()
+                    pytest.fail("Synthetic child did not install its SIGTERM handler")
+                time.sleep(0.01)
+            return process
+        monkeypatch.setattr(runner_module.subprocess, "Popen", start_ready)
         clean_env = sanitize_environment()
         with pytest.raises(AnalysisTimeoutError) as exc_info:
             execute_java_process(
-                (sys.executable, str(script_file)),
+                (sys.executable, str(script_file), str(ready_file)),
                 cwd=tmp_path,
                 env=clean_env,
                 timeout_seconds=1,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from review_bot.adapters.llamacpp import SELECTOR_MODEL, LlamaCppModelClient
 from review_bot.adapters.llamacpp_macbook import MACBOOK_SELECTOR_MODEL, MacBookLlamaCppModelClient
+from review_bot.domain.models_v1 import ModelRequest
 
 
 class LlamaCppPlanClient(LlamaCppModelClient):
@@ -18,6 +19,15 @@ class LlamaCppPlanClient(LlamaCppModelClient):
     ) -> None:
         super().__init__(model, api_url=api_url, timeout_seconds=timeout_seconds,
                          max_output_bytes=max_output_bytes, max_attempts=max_attempts)
+
+    def _chat_payload(self, request: ModelRequest) -> dict:
+        payload = super()._chat_payload(request)
+        properties = request.response_schema.get("properties")
+        if isinstance(properties, dict) and set(properties) == {"choice"}:
+            # The closed label allowance must not be spent on hidden reasoning.
+            # _measure forwards these same kwargs to native /apply-template.
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        return payload
 
 
 class MacBookLlamaCppPlanClient(MacBookLlamaCppModelClient):

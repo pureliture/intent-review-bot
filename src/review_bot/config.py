@@ -276,6 +276,22 @@ class ComparisonConfig(BaseModel):
     ambiguous_base_action: Literal["incomparable"] = "incomparable"
 
 
+class PartitionEvaluationConfig(BaseModel):
+    """Operator-only private trial; resource budgets require an explicit choice."""
+    model_config = ConfigDict(strict=True, extra="forbid")
+    enabled: bool = False
+    input_target_tokens: int | None = Field(default=None, gt=0)
+    max_total_tokens: int | None = Field(default=None, gt=0)
+    max_calls: int | None = Field(default=None, gt=0, le=512)
+    observation_output_tokens: int | None = Field(default=None, gt=0, le=32678)
+
+    @model_validator(mode="after")
+    def require_trial_budgets(self):
+        if self.enabled and (self.max_total_tokens is None or self.max_calls is None):
+            raise ValueError("partition evaluation requires explicit max_total_tokens and max_calls")
+        return self
+
+
 class CodeInputConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
     versions: list[str] = Field(default_factory=lambda: ["comparison_base", "head"])
@@ -322,6 +338,7 @@ class ReviewBotConfig(BaseModel):
     model: ModelConfig
     architecture: ArchitectureConfig = Field(default_factory=ArchitectureConfig)
     intent: IntentConfig = Field(default_factory=IntentConfig)
+    partition_evaluation: PartitionEvaluationConfig = Field(default_factory=PartitionEvaluationConfig)
     repository_settings: RepositorySettingsConfig
     comparison: ComparisonConfig
     code_input: CodeInputConfig
@@ -337,6 +354,10 @@ class ReviewBotConfig(BaseModel):
             raise ValueError("architecture configuration is required for A-only execution")
         if self.execution.mode == "github_app" and "mode" not in self.publish.model_fields_set:
             self.publish.mode = "comment"
+        if self.partition_evaluation.enabled and self.publish.mode != "artifact_only":
+            raise ValueError("partition evaluation requires artifact_only publication")
+        if self.partition_evaluation.enabled and "intent" in self.execution.available_modes and self.intent.pipeline != "perspectives-v1":
+            raise ValueError("partition intent evaluation requires perspectives-v1")
         if self.intent.pipeline == "perspectives-v1":
             private_output = self.publish.mode == "artifact_only" and not self.publish.b_comments_enabled
             app_comments = (
@@ -372,6 +393,8 @@ class TargetRepositoryConfig(BaseModel):
 def compute_config_hash(data: dict[str, Any] | BaseModel) -> str:
     """Computes a deterministic SHA-256 digest over normalized canonical JSON."""
     raw_dict = data.model_dump(mode="json") if isinstance(data, BaseModel) else data
+    if isinstance(raw_dict.get("partition_evaluation"), dict) and not raw_dict["partition_evaluation"].get("enabled"):
+        raw_dict = {key: value for key, value in raw_dict.items() if key != "partition_evaluation"}
     if isinstance(raw_dict.get("intent"), dict) and raw_dict["intent"].get("pipeline") == "declared-v1":
         raw_dict = {**raw_dict, "intent": {key: value for key, value in raw_dict["intent"].items() if key != "pipeline"}}
     execution = raw_dict.get("execution")

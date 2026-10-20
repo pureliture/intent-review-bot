@@ -236,6 +236,25 @@ def test_plan_generation_allows_more_than_64_tokens_and_preserves_native_wire(ro
     assert all(0 < item.extensions["timeout"]["read"] <= 10 for item in requests)
 
 
+def test_closed_choice_disables_thinking_for_both_native_measurement_and_generation(role: Any, mock_http: Any) -> None:
+    def reply(request):
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, json=chat_response(model=role.model, output_tokens=6, content='{"choice":"A"}'))
+        return None
+    requests = mock_http(role, reply)
+    schema = {"type": "object", "properties": {"choice": {"type": "string", "enum": ["A", "B"]}},
+        "required": ["choice"], "additionalProperties": False}
+    request = replace(plan_request(role.model), max_output_tokens=16, response_schema=schema)
+    response = role.client_type(api_url=role.api_url).complete(request)
+    template = next(json.loads(item.content) for item in requests if item.url.path == "/apply-template")
+    payload = next(json.loads(item.content) for item in requests if item.url.path == "/v1/chat/completions")
+    assert template["chat_template_kwargs"] == payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert payload["max_tokens"] == 16
+    assert payload["response_format"]["json_schema"]["schema"] == schema
+    assert json.loads(response.text) == {"choice": "A"}
+    assert response.usage == {"input_tokens": 42, "output_tokens": 6}
+
+
 def test_warmup_and_uncached_native_counts_never_generate(role: Any, mock_http: Any) -> None:
     counts = iter((137, 138))
     requests = mock_http(role, lambda request: httpx.Response(200, json={"tokens": [7] * next(counts)})

@@ -15,6 +15,8 @@ MACBOOK_LLAMACPP_PROFILE = "macbook-llamacpp"
 MACBOOK_REVIEW_MODEL = "lfm2.5-2.6b-q8_0"
 MACBOOK_SELECTOR_MODEL = "tev1-0.8b-q8_0"
 MACBOOK_CONTEXT_TOKENS = 32768
+MACBOOK_GRANITE_PROFILE = "macbook-granite-llamacpp"
+MACBOOK_GRANITE_MODEL = "granite4.2"
 
 
 def macbook_model_admission(max_concurrency: int = 2) -> SQLiteModelAdmission:
@@ -72,6 +74,15 @@ class MacBookLlamaCppModelClient(_MacBookLlamaCppClient, LlamaCppModelClient):
         self, model: str = MACBOOK_REVIEW_MODEL, *, api_url: str, timeout_seconds: int = 60,
         max_output_bytes: int = 32768, max_attempts: int = 1,
     ) -> None:
+        configured_output = os.environ.get("MACBOOK_REVIEW_MAX_OUTPUT_TOKENS") if self._role_model == MACBOOK_REVIEW_MODEL else None
+        if configured_output is not None:
+            if not configured_output.isascii() or not configured_output.isdecimal() or not (
+                1 <= int(configured_output) <= MACBOOK_CONTEXT_TOKENS - 4096):
+                raise ValueError("MACBOOK_REVIEW_MAX_OUTPUT_TOKENS must leave at least 4096 input tokens within local32k")
+            # This explicit local evaluation setting is reflected in both the
+            # profile and the transport's input/output admission. Defaults and
+            # the production Bonsai role remain unchanged.
+            self._role_max_output_tokens = int(configured_output)
         super().__init__(model, api_url=api_url, timeout_seconds=timeout_seconds,
                          max_output_bytes=max_output_bytes, max_attempts=max_attempts)
         self.request_admission = macbook_model_admission()
@@ -86,3 +97,18 @@ class MacBookLlamaCppDecisionClient(_MacBookLlamaCppClient, LlamaCppDecisionClie
     def __init__(self, model: str = MACBOOK_SELECTOR_MODEL, *, api_url: str, timeout_seconds: int = 60) -> None:
         super().__init__(model, api_url=api_url, timeout_seconds=timeout_seconds)
         self.request_admission = macbook_model_admission()
+
+
+class MacBookGraniteLlamaCppModelClient(MacBookLlamaCppModelClient):
+    """Explicit cached Granite4.2 role; never an automatic model fallback."""
+
+    _role_model = MACBOOK_GRANITE_MODEL
+    _role_context_tokens = 65536
+    _role_max_output_tokens = 16384
+    _chat_payload = LlamaCppModelClient._chat_payload
+
+    def __init__(self, model: str = MACBOOK_GRANITE_MODEL, *, api_url: str,
+        timeout_seconds: int = 60, max_output_bytes: int = 65536, max_attempts: int = 1,
+    ) -> None:
+        super().__init__(model, api_url=api_url, timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes, max_attempts=max_attempts)

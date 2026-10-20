@@ -39,6 +39,32 @@ def chat_response(
     }
 
 
+def test_truncated_answer_is_rejected_but_its_valid_native_usage_is_preserved(adapter, main_request, mock_http):
+    def truncated(request):
+        if request.url.path == "/v1/chat/completions":
+            body = chat_response('{"ok":', output_tokens=32)
+            body["choices"][0]["finish_reason"] = "length"
+            return httpx.Response(200, json=body)
+    mock_http(truncated)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    with pytest.raises(PermanentModelError, match="truncated") as captured:
+        client.complete(main_request)
+    assert captured.value.delivery == "sent"
+    assert captured.value.usage == {"input_tokens": 42, "output_tokens": 32}
+
+
+def test_invalid_native_usage_is_not_promoted_to_a_known_receipt(adapter, main_request, mock_http):
+    def invalid(request):
+        if request.url.path == "/v1/chat/completions":
+            body = chat_response('{"ok":', input_tokens=41, output_tokens=32)
+            body["choices"][0]["finish_reason"] = "length"
+            return httpx.Response(200, json=body)
+    mock_http(invalid)
+    with pytest.raises(PermanentModelError) as captured:
+        adapter.LlamaCppModelClient(api_url=API_URL).complete(main_request)
+    assert getattr(captured.value, "usage", None) is None
+
+
 @pytest.fixture
 def adapter() -> Any:
     return importlib.import_module("review_bot.adapters.llamacpp")

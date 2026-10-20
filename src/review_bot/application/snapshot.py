@@ -50,6 +50,7 @@ def collect_snapshot_material(
     evidence: Sequence[EnvelopeEvidence] = (), unavailable_sources: Sequence[UnavailableSource] = (),
     related_paths: tuple[str, ...] = (), captured_at: str | None = None, as_of: str | None = None,
     before_read: Callable[[], bool] | None = None,
+    include_java_build_manifests: bool = False,
 ) -> SnapshotMaterial:
     """Freeze B originals and complete scoped Git files before making any selection."""
     def gate() -> None:
@@ -69,6 +70,9 @@ def collect_snapshot_material(
         renames = repo_reader.get_rename_map(merge_base.comparison_base_sha, head_sha)
         paths = tuple(sorted(set(related_paths) | {path for item in changed
             for path in (item.path, item.previous_path) if path}))
+        if include_java_build_manifests:
+            from review_bot.application.partition_review import _architecture_source_paths
+            paths = tuple(sorted(_architecture_source_paths(paths, ())))
         gate()
         base = collect_intent_code_snapshot(repo_reader, merge_base.comparison_base_sha, paths)
         gate()

@@ -115,6 +115,7 @@ class WorkerLoop:
         if (
             mode_selector is None and profile is not None
             and getattr(getattr(config, "execution", None), "selector_uses_model", False)
+            and not config.partition_evaluation.enabled
         ):
             self._ollama_selector_client = build_selector_client(profile, model_settings)
             mode_selector = ModelModeSelector(self._ollama_selector_client, model=self._ollama_selector_client.model)
@@ -138,6 +139,9 @@ class WorkerLoop:
             self.planning_client.request_cancelled = self._stop_event.is_set
         self._lease_lost = False
         self._current_run_id: str | None = None
+        self._partition_budget_key = None
+        self._partition_budget = None
+        self._partition_plan = self._partition_task = self._partition_planning_result = None
         self._setup_signals()
 
     def _setup_signals(self) -> None:
@@ -165,7 +169,11 @@ class WorkerLoop:
             self.model_client.warmup()
         if self._ollama_selector_client is not None:
             self._ollama_selector_client.warmup()
-        if getattr(getattr(self.config, "intent", None), "pipeline", None) == "perspectives-v1":
+        if self.config.partition_evaluation.enabled:
+            self._prepare_partition_planner()
+            if isinstance(self.planning_client, LlamaCppModelClient):
+                self.planning_client.warmup()
+        elif getattr(getattr(self.config, "intent", None), "pipeline", None) == "perspectives-v1":
             self._prepare_intent_selector()
             if isinstance(self.intent_selection_client, LlamaCppModelClient):
                 self.intent_selection_client.warmup()
@@ -177,10 +185,49 @@ class WorkerLoop:
             if isinstance(self.intent_selection_client, LlamaCppModelClient):
                 self.intent_selection_client.request_cancelled = self._stop_event.is_set
 
+    def _prepare_partition_planner(self) -> None:
+        if self.planning_client is None:
+            self.planning_client = build_planning_client(self.config.model.profile, self.config.model)
+            if isinstance(self.planning_client, LlamaCppModelClient):
+                self.planning_client.request_cancelled = self._stop_event.is_set
+
+    def _review_partitioned(self, task_input, mode, run, deadline, language, *, available_modes=()):
+        from review_bot.application.partition_review import run_partition_review
+        from review_bot.application.model_execution import ModelExecutionBudget
+        from review_bot.domain.partition_review import PartitionReviewLimits
+
+        self._prepare_partition_planner()
+        trial = self.config.partition_evaluation
+        limits = PartitionReviewLimits(max_total_tokens=trial.max_total_tokens,
+            max_calls=trial.max_calls, input_target_tokens=trial.input_target_tokens,
+            observation_output_tokens=trial.observation_output_tokens,
+            task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
+        key = (run.run_id, run.generation, run.attempts)
+        if self._partition_budget_key != key:
+            self._partition_budget_key = key
+            self._partition_budget = ModelExecutionBudget(limits, deadline, lambda: self._active(run, deadline))
+        return run_partition_review(task_input, mode, self.model_client, self.planning_client,
+            limits=limits, language=language, before_stage=lambda: self._active(run, deadline),
+            shared_budget=self._partition_budget, available_modes=available_modes,
+            prepared_plan=getattr(self, "_partition_plan", None) if mode != "planning" else None)
+
+    def _plan_partitioned(self, task_input, available_modes, run, deadline):
+        from review_bot.application.partition_review import validate_partition_result
+        plan = self._review_partitioned(task_input, "planning", run, deadline,
+            self.config.output.language, available_modes=tuple(available_modes))
+        validate_partition_result(plan, task_input)
+        self._partition_planning_result = plan
+        if plan.status != "planned":
+            raise _CommonFailure("partition_planning_failed:" + plan.reason)
+        self._partition_plan, self._partition_task = plan, task_input
+        return plan
+
     def _review_perspectives(self, task_input, run, deadline, language):
         from review_bot.application.intent_perspective_review import run_intent_perspective_review
         from review_bot.domain.intent_perspectives import IntentPerspectiveLimits
 
+        if self.config.partition_evaluation.enabled:
+            return self._review_partitioned(task_input, "intent", run, deadline, language)
         self._prepare_intent_selector()
         limits = IntentPerspectiveLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
         return run_intent_perspective_review(task_input, self.model_client,
@@ -272,6 +319,7 @@ class WorkerLoop:
         run_id = run.run_id
         self._current_run_id = run_id
         self._lease_lost = False
+        self._partition_plan = self._partition_task = self._partition_planning_result = None
 
         previous_github_client = self.github_client
         previous_repo_reader = self.repo_reader
@@ -343,7 +391,8 @@ class WorkerLoop:
                 available_modes = tuple(
                     getattr(execution_cfg, "available_modes", ("architecture",))
                 )
-                if "intent" in available_modes:
+                partition_flow = self.config.partition_evaluation.enabled
+                if "intent" in available_modes or partition_flow:
                     if not pr_data:
                         raise RuntimeError("intent_pr_source_unavailable")
                     sources = collect_intent_sources(self.github_client, repo_name, run.pr_number, pr_data,
@@ -352,7 +401,8 @@ class WorkerLoop:
                     material = collect_snapshot_material(self.repo_reader, target_base_sha, head_sha,
                         evidence=sources.evidence, unavailable_sources=sources.unavailable_sources,
                         related_paths=tuple(self.config.intent.context_paths), captured_at=sources.captured_at,
-                        as_of=sources.as_of, before_read=lambda: self._active(run, deadline))
+                        as_of=sources.as_of, before_read=lambda: self._active(run, deadline),
+                        include_java_build_manifests=partition_flow)
                 self._require_active(run, deadline)
                 review_snap, pr_snap, classification, mode_sel = assemble_snapshot_bundle(
                     repo_reader=self.repo_reader,
@@ -367,9 +417,9 @@ class WorkerLoop:
                     title=title,
                     body=body,
                     available_modes=available_modes,
-                    selector_policy=getattr(execution_cfg, "selector_policy", "all_available"),
-                    selector_uses_model=getattr(execution_cfg, "selector_uses_model", False),
-                    mode_selector=self.mode_selector,
+                    selector_policy="all_available" if partition_flow else getattr(execution_cfg, "selector_policy", "all_available"),
+                    selector_uses_model=False if partition_flow else getattr(execution_cfg, "selector_uses_model", False),
+                    mode_selector=None if partition_flow else self.mode_selector,
                     **({"material": material} if material is not None else {}),
                 )
                 self._require_active(run, deadline)
@@ -384,7 +434,26 @@ class WorkerLoop:
                     self._update_run(run, RunStatus.FAILED, RunStage.SELECT, error=error)
                     return False
 
+                if partition_flow and mode_sel.selected_modes and review_snap.comparison_status == "comparable":
+                    from review_bot.application.selection import record_planned_modes
+                    if self.artifact_root is None or material is None:
+                        raise _CommonFailure("partition_planning_artifacts_or_material_unavailable")
+                    artifacts = RunArtifacts(self.artifact_root, run)
+                    artifacts.save_common(snapshot=review_snap, selection=mode_sel, config_hash=self.config.config_hash)
+                    paths = tuple(sorted({f.path for c in (material.base, material.head) for f in c.files}))
+                    planning_task = build_intent_task_input(review_snap, material.base, material.head, related_paths=paths)
+                    artifacts.write_json("planning-input.json", planning_task)
+                    try:
+                        plan = self._plan_partitioned(planning_task, mode_sel.selected_modes, run, deadline)
+                    finally:
+                        if self._partition_planning_result is not None:
+                            artifacts.save_execution_plan(self._partition_planning_result)
+                    mode_sel = record_planned_modes(review_snap, available_modes,
+                        plan.partition["selected_modes"], plan.partition["plan_id"])
+                    artifacts.save_common(snapshot=review_snap, selection=mode_sel, config_hash=self.config.config_hash)
                 if not mode_sel.selected_modes:
+                    if artifacts is not None:
+                        artifacts.finish("skipped")
                     logger.info(
                         "No applicable modes for run %s; skipping downstream execution", run_id,
                     )
@@ -398,6 +467,7 @@ class WorkerLoop:
                     "selected_modes": mode_sel.selected_modes,
                     "perspective": classification.review_mode,
                     "config_hash": self.config.config_hash,
+                    **({"plan_id": self._partition_plan.partition["plan_id"]} if self._partition_plan is not None else {}),
                 }
                 fingerprint = hashlib.sha256(json.dumps(semantic_input, sort_keys=True).encode()).hexdigest()
                 run = replace(run, fingerprint=fingerprint)
@@ -409,7 +479,7 @@ class WorkerLoop:
                 raise _ModeFailure("review_result_unavailable")
             self._require_active(run, deadline)
             if self.artifact_root is not None:
-                artifacts = RunArtifacts(self.artifact_root, run)
+                artifacts = artifacts or RunArtifacts(self.artifact_root, run)
                 artifacts.save_common(snapshot=review_snap, selection=mode_sel, config_hash=self.config.config_hash)
             for mode in mode_sel.selected_modes:
                 self._require_active(run, deadline)
@@ -459,6 +529,11 @@ class WorkerLoop:
             reason = "unchanged_input" if all_reused and not failed else publication.reason if not failed and publication is not None and publication.status == "not_attempted" else None
             self._require_active(run, deadline)
             if artifacts is not None:
+                if self.config.partition_evaluation.enabled and self._partition_budget is not None:
+                    calls, tokens, unknown = self._partition_budget.totals()
+                    artifacts.write_json("usage.json", {"calls": calls, "known_total_tokens": tokens,
+                        "usage_complete": not unknown, "planning": self._partition_plan.usage if self._partition_plan else None,
+                        "modes": {mode: receipt.usage for mode, receipt in receipts.items()}})
                 artifacts.finish(terminal_status.value, publication)
             stage = RunStage.PUBLISH if not failed or any(receipt.publication for receipt in failed) else None
             applied = self._update_run(run, terminal_status, stage, error=error, reason=reason)
@@ -663,17 +738,26 @@ class WorkerLoop:
         task_input = None
         if self.repo_reader and delta:
             try:
-                base_code = self.repo_reader.collect_code_snapshot(effective_base_sha)
-                self._require_active(run, deadline)
-                head_code = self.repo_reader.collect_code_snapshot(head_sha)
+                if self.config.partition_evaluation.enabled:
+                    from review_bot.application.partition_review import prepare_partition_architecture_task
+                    task_input = prepare_partition_architecture_task(self.repo_reader, pr_snap, delta, classification,
+                        before_read=lambda: self._require_active(run, deadline))
+                else:
+                    base_code = self.repo_reader.collect_code_snapshot(effective_base_sha)
+                    self._require_active(run, deadline)
+                    head_code = self.repo_reader.collect_code_snapshot(head_sha)
             except _RunAborted:
                 raise
             except Exception as exc:
                 raise _CommonFailure(f"worker_pipeline_error:{type(exc).__name__}") from None
             self._require_active(run, deadline)
-            task_input = build_task_input(Snapshot(pr=pr_snap, base=base_code, head=head_code), delta, classification)
+            if task_input is None:
+                task_input = build_task_input(Snapshot(pr=pr_snap, base=base_code, head=head_code), delta, classification)
         self._stage(run, RunStage.REVIEW, deadline)
-        result = run_review_a_pipeline(task_input, self.model_client) if task_input is not None else None
+        if task_input is not None and self.config.partition_evaluation.enabled:
+            result = self._review_partitioned(task_input, "architecture", run, deadline, self.config.output.language)
+        else:
+            result = run_review_a_pipeline(task_input, self.model_client) if task_input is not None else None
         self._stage(run, RunStage.VALIDATE, deadline)
         self._stage(run, RunStage.PUBLISH, deadline)
         writes_comment = self.config.publish.mode == "comment" and not (draft and not self.config.publish.draft_comments)
@@ -685,6 +769,8 @@ class WorkerLoop:
             raise _ModeFailure("artifact_root_required")
         analysis_failed = any(getattr(value, "status", None) in ("failed", "missing_report") for value in (base_run, head_run))
         status = "failed" if analysis_failed or result.status == "failed" else result.status
+        if self.config.partition_evaluation.enabled and result.status == "partial_review":
+            status = "failed"
         core_receipt = ExecutionReceipt(2, "architecture", mode_sel.selection_id, review_snap.snapshot_id,
             run.generation, result.run_key, status, a_result=result, usage=result.usage,
             coverage=result.scope, limitations=tuple(task_input.limitations),
@@ -692,7 +778,11 @@ class WorkerLoop:
             error_code="analysis_failed" if analysis_failed else result.reason if status == "failed" else None,
             input_fingerprint=input_fingerprint)
         try:
-            markdown = format_review_markdown(result, task_input, marker=marker,
+            formatter = format_review_markdown
+            if self.config.partition_evaluation.enabled:
+                from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
+                formatter = format_partition_review_markdown
+            markdown = formatter(result, task_input, marker=marker,
                 max_length=self.config.output.max_comment_characters,
                 artifact_notice="전체 A 자료는 비공개 서비스 결과 파일에 보존됩니다." if artifacts is not None else None)
             self._require_active(run, deadline)
@@ -755,19 +845,28 @@ class WorkerLoop:
         if stored is None:
             raise _ModeFailure("fixed_intent_input_unavailable")
         task_input = decode_intent_task_input(stored[0])
+        if self.config.partition_evaluation.enabled:
+            self._plan_partitioned(task_input, ("intent",), run, deadline)
         self._stage(run, RunStage.REVIEW, deadline)
         result = self._review_perspectives(task_input, run, deadline, stored[1])
         self._stage(run, RunStage.VALIDATE, deadline)
-        markdown = format_intent_perspective_markdown(result, task_input)
+        if self.config.partition_evaluation.enabled:
+            from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
+            markdown = format_partition_review_markdown(result, task_input)
+        else:
+            markdown = format_intent_perspective_markdown(result, task_input)
         output = self.artifact_root / "fixed" / run.run_id / f"attempt-{run.attempts}"
         artifacts = IntentArtifacts(output)
+        if self.config.partition_evaluation.enabled:
+            artifacts.save_execution_plan(task_input, self._partition_plan)
         artifacts.save(task_input, result, markdown)
         self._require_active(run, deadline)
         complete = result.status == "completed"
-        applied = self._update_run(run, RunStatus.SUCCEEDED if complete else RunStatus.FAILED,
-            RunStage.VALIDATE, reason=result.reason, error=None if complete else result.reason,
+        nonselection = result.reason == "mode_not_selected_in_shared_plan"
+        applied = self._update_run(run, RunStatus.SKIPPED if nonselection else RunStatus.SUCCEEDED if complete else RunStatus.FAILED,
+            RunStage.VALIDATE, reason=result.reason, error=None if complete or nonselection else result.reason,
             fingerprint=result.run_key)
-        return applied and complete
+        return applied and (complete or nonselection)
 
     def _execute_intent(
         self, run: RunRecord, review_snap: Any, mode_sel: Any, material: Any,
@@ -778,15 +877,20 @@ class WorkerLoop:
             raise _ModeFailure("intent_material_unavailable")
         if artifacts is None:
             raise _ModeFailure("artifact_root_required")
-        task_input = build_intent_task_input(review_snap, material.base, material.head,
-            related_paths=tuple(self.config.intent.context_paths))
+        task_input = self._partition_task if self.config.partition_evaluation.enabled else build_intent_task_input(
+            review_snap, material.base, material.head, related_paths=tuple(self.config.intent.context_paths))
+        if task_input is None:
+            raise _ModeFailure("partition_plan_input_unavailable")
         marker = self.config.publish.b_marker
         code_first = self.config.intent.pipeline == "code-first-v2"
         perspectives = self.config.intent.pipeline == "perspectives-v1"
         if perspectives:
-            self._prepare_intent_selector()
+            if self.config.partition_evaluation.enabled:
+                self._prepare_partition_planner()
+            else:
+                self._prepare_intent_selector()
             input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client,
-                selection_client=self.intent_selection_client)
+                selection_client=self.intent_selection_client, planning_client=self.planning_client)
         elif code_first:
             if self.planning_client is None and self.model_client is not None:
                 self.planning_client = build_planning_client(self.config.model.profile, self.config.model)
@@ -813,6 +917,9 @@ class WorkerLoop:
             from review_bot.adapters.markdown.intent_perspective_formatter import format_intent_perspective_markdown
             result = self._review_perspectives(task_input, run, deadline, self.config.output.language)
             formatter = format_intent_perspective_markdown
+            if self.config.partition_evaluation.enabled:
+                from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
+                formatter = format_partition_review_markdown
         elif code_first:
             from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
             from review_bot.application.code_first_intent_review import run_code_first_review

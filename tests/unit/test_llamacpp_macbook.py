@@ -157,6 +157,23 @@ def test_public_contracts_and_constructors_are_offline(tmp_path: Path) -> None:
     assert not (tmp_path / "macbook-admission").exists()
 
 
+def test_explicit_local_review_output_allowance_reduces_input_and_does_not_change_tev(monkeypatch):
+    from review_bot.adapters.intent_planner import MacBookLlamaCppPlanClient
+    monkeypatch.setenv("MACBOOK_REVIEW_MAX_OUTPUT_TOKENS", "8192")
+    review = adapter.MacBookLlamaCppModelClient(api_url=API_URL)
+    planner = MacBookLlamaCppPlanClient(api_url=API_URL)
+    assert (review.profile.max_input_tokens, review.profile.max_output_tokens) == (24576, 8192)
+    assert (review._max_input_tokens, review._max_output_tokens) == (24576, 8192)
+    assert (planner.profile.max_input_tokens, planner.profile.max_output_tokens) == (28672, 4096)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "32768", "28673", "٨١٩٢", "8192.0"])
+def test_invalid_local_output_override_is_rejected(monkeypatch, value):
+    monkeypatch.setenv("MACBOOK_REVIEW_MAX_OUTPUT_TOKENS", value)
+    with pytest.raises(ValueError, match="must leave"):
+        adapter.MacBookLlamaCppModelClient(api_url=API_URL)
+
+
 @pytest.mark.parametrize("api_url", [
     "http://LOCALHOST:8080/v1/", "http://127.0.0.1:8080/v1", "http://127.12.34.56/v1/", "http://[::1]:8080/v1",
 ])

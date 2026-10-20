@@ -834,3 +834,34 @@ def test_directory_instead_of_database_is_rejected_without_sqlite_io(db_path, mo
     with pytest.raises(ModelAdmissionError):
         with SQLiteModelAdmission(db_path).request(deadline=_deadline(), generates=True):
             pytest.fail("directory admitted as database")
+
+@pytest.mark.parametrize("replacement_mode", [None, 0o600, 0o660])
+def test_disappearing_sidecar_is_rechecked_without_accepting_unsafe_replacement(db_path, monkeypatch, replacement_mode):
+    admission = SQLiteModelAdmission(db_path)
+    with admission.request(deadline=_deadline(), generates=False):
+        pass
+    journal = Path(str(db_path) + "-journal")
+    journal.write_bytes(b"synthetic journal")
+    journal.chmod(0o600)
+    original_stat = os.stat
+    intercepted = []
+    def disappearing(path, *args, **kwargs):
+        metadata = original_stat(path, *args, **kwargs)
+        if path == journal.name and kwargs.get("dir_fd") is not None and not intercepted:
+            intercepted.append(True)
+            journal.unlink()
+            if replacement_mode is not None:
+                journal.write_bytes(b"synthetic replacement")
+                journal.chmod(replacement_mode)
+            fields = list(metadata)
+            fields[3] = 0  # inode unlinked between path lookup and stat completion.
+            return os.stat_result(fields)
+        return metadata
+    monkeypatch.setattr(os, "stat", disappearing)
+    with admission._private_directory(create=False) as directory:
+        if replacement_mode == 0o660:
+            with pytest.raises(ModelAdmissionError, match="private, owned and not linked"):
+                admission._check_files(directory)
+        else:
+            admission._check_files(directory)
+    assert intercepted

@@ -43,6 +43,21 @@ def test_macbook_profile_has_distinct_local_roles_and_limits():
     assert selector.timeout_seconds == 17
 
 
+def test_explicit_granite_profile_keeps_local_admission_and_existing_tev(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACBOOK_GRANITE_BASE_URL", "http://127.0.0.1:18139/v1")
+    review = model_clients.build_review_client("macbook-granite-llamacpp", ModelConfig(max_output_bytes=65536))
+    planning = model_clients.build_planning_client("macbook-granite-llamacpp")
+    assert review.model == "granite4.2"
+    assert (review.profile.max_input_tokens, review.profile.max_output_tokens) == (49152, 16384)
+    assert review._context_tokens == 65536 and review._server_generation_slots == 1
+    assert review.request_admission.db_path == tmp_path / "mac-admission/requests.sqlite"
+    assert planning.model == "tev1-0.8b-q8_0"
+    assert planning.profile.max_input_tokens == 28672
+    monkeypatch.delenv("MACBOOK_GRANITE_BASE_URL")
+    with pytest.raises(ValueError, match="MACBOOK_GRANITE_BASE_URL"):
+        model_clients.build_review_client("macbook-granite-llamacpp")
+
+
 @pytest.mark.parametrize("role,variable", [
     ("review", "MACBOOK_LFM_BASE_URL"), ("selector", "MACBOOK_TEV1_BASE_URL"),
 ])

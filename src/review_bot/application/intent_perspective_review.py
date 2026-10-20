@@ -15,8 +15,9 @@ from review_bot.application.intent_context import (
     decode_intent_task_input, intent_scope, safe_relative_path,
 )
 from review_bot.application.code_first_intent_review import (
-    _Budget, _citations, _identity, _originals, _plan_material, _profile,
+    _citations, _identity, _originals, _plan_material,
 )
+from review_bot.application.model_execution import ModelExecutionBudget as _Budget, model_profile as _profile
 from review_bot.application.declared_intent_review import _make_result
 from review_bot.domain.intent_models import IntentStageRecord, IntentTaskInput
 from review_bot.domain.intent_perspectives import (
