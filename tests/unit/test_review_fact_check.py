@@ -267,9 +267,11 @@ def test_invalid_checker_reference_is_retained_in_readable_partial_result():
     validate_partition_result(result, task)
 
 
-def test_worker_mode_fingerprints_include_factual_checker_implementation(valid_config_yaml, tmp_path, monkeypatch):
+@pytest.mark.parametrize("component", ["facts", "eligibility"])
+def test_worker_mode_fingerprints_include_verification_and_eligibility_implementations(valid_config_yaml, tmp_path, monkeypatch, component):
     from review_bot.config import load_review_config_from_str
     from review_bot.runtime.mode_fingerprints import architecture_input_fingerprint, intent_input_fingerprint
+    from review_bot.application import selection
     config, _ = load_review_config_from_str(valid_config_yaml)
     config = config.model_copy(update={"partition_evaluation": config.partition_evaluation.model_copy(update={"enabled": True})})
     task = make_task()
@@ -282,6 +284,6 @@ def test_worker_mode_fingerprints_include_factual_checker_implementation(valid_c
     assert all(before)
     changed = tmp_path / "changed_fact_check.py"
     changed.write_text("# a different factual verification implementation\n")
-    monkeypatch.setattr(facts, "__file__", str(changed))
+    monkeypatch.setattr(facts if component == "facts" else selection, "__file__", str(changed))
     after = fingerprints()
     assert all(after) and all(left != right for left, right in zip(before, after))

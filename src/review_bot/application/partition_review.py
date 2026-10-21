@@ -20,6 +20,7 @@ from review_bot.application.architecture_review import ModelProfile
 from review_bot.application import partition_choices as choices
 from review_bot.application import partition_global_review as global_review
 from review_bot.application import review_fact_check as fact_check
+from review_bot.application.selection import is_gradle_java_path
 from review_bot.application.partition_integration import native_integration_pages, combine_final_pages, reconcile_final_context, has_insufficient_judgement, prior_context_updates
 from review_bot.application.source_citations import citation_spans, citation_catalog, source_blocks, signal_context_spans, referenced_source_spans
 from review_bot.application.review_output_contract import render_output_contract
@@ -355,8 +356,6 @@ def prepare_partition_architecture_task(reader, pr, delta, classification, *, be
     changed = set(pr.changed_files) | set(pr.rename_map) | set(pr.rename_map.values())
     selected = tuple(s for s in delta.signals if changed.intersection(s.paths))
     skipped = len(delta.signals) - len(selected)
-    scoped_delta = replace(delta, signals=selected, limitations=(*delta.limitations,
-        *((f"partition_evaluation_excludes_unrelated_analysis_signals:{skipped}",) if skipped else ())))
     paths = tuple(sorted(_architecture_source_paths(changed, selected)))
     if before_read:
         before_read()
@@ -366,6 +365,17 @@ def prepare_partition_architecture_task(reader, pr, delta, classification, *, be
     head = collect_intent_code_snapshot(reader, pr.head_sha, paths)
     if before_read:
         before_read()
+    base_paths, head_paths = ({f.path for f in code.files} for code in (base, head))
+    # PR-wide eligibility can be enabled by another Gradle module. Each actual
+    # A target must still satisfy the same condition, including CPD partners.
+    # Preserve collected originals and raw analysis; filter review signals only.
+    eligible = tuple(signal for signal in selected if all(
+        is_gradle_java_path(path, head_paths if path in head_paths else base_paths)
+        for path in signal.paths))
+    unsupported = len(selected) - len(eligible)
+    scoped_delta = replace(delta, signals=eligible, limitations=(*delta.limitations,
+        *((f"partition_evaluation_excludes_unrelated_analysis_signals:{skipped}",) if skipped else ()),
+        *((f"partition_evaluation_excludes_non_gradle_analysis_signals:{unsupported}",) if unsupported else ())))
     return build_task_input(Snapshot(pr, base, head), scoped_delta, classification)
 
 
@@ -1404,7 +1414,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         "prompts": hashes, "models": {"review": asdict(profile) if profile else None,
         "planner": asdict(planner) if planner else None}}
     identity["implementation"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-        for name in ("partition_review.py", "source_partition.py", "model_execution.py", "partition_choices.py", "source_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py", "review_fact_check.py")}
+        for name in ("partition_review.py", "source_partition.py", "model_execution.py", "partition_choices.py", "source_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py", "review_fact_check.py", "selection.py")}
     identity["implementation"].update({"adapters/" + name: hashlib.sha256(
         (Path(__file__).parents[1] / "adapters" / name).read_bytes()).hexdigest()
         for name in ("llamacpp.py", "llamacpp_macbook.py", "intent_planner.py")})
