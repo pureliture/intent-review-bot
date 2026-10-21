@@ -40,7 +40,7 @@ from review_bot.domain.intent_perspectives import PERSPECTIVES
 from review_bot.domain.models_v1 import ModelRequest, Snapshot, TaskInput
 from review_bot.domain.partition_review import PartitionReviewLimits, PartitionReviewResult
 
-PROMPT_VERSION = "partitioned-review/v15-fixed-factual-context"
+PROMPT_VERSION = "partitioned-review/v16-explicit-finding-dispositions"
 MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
 MAX_MODEL_CITATIONS = 32

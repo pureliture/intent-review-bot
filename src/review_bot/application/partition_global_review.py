@@ -25,6 +25,12 @@ Do not invent measurements. Static test source is not evidence that tests ran.
 Review the full PR purpose and declared limits. Account for EVERY PAGE observation_id
 and EVERY finding_id. Explain retained/revised/excluded findings; excluded findings
 have no result_indices, retained/revised findings identify their resulting findings.
+Use retained only when EVERY linked result keeps the original verdict and EXACT
+target_ids set. Adding/removing a target or changing verdict requires revised,
+even when the underlying concern is the same. Prose and citations may change.
+For global_retained_finding_changed, compare each retained finding's original
+verdict and target_ids with ALL its linked results; correct the disposition or
+the result against the source, never invent a different substantive judgement.
 Preserve genuine concerns, but correct unsupported earlier findings with actual sources.
 Unchanged target-review records are inherited; explicitly review only pending_review_targets.
 For intent, give one judgement for each of the eight perspective IDs; architecture has none.

@@ -56,4 +56,6 @@ flowchart TD
 
 항목별 재작성 횟수는 기존 `max_rechecks`를 사용한다. 별도의 무제한 예산을 만들지 않는다. 기존 작업 마감, 호출·토큰 예산, 취소 fence와 모델 admission을 공유한다. 검사가 끝나기 전 예산·취소·모델·스키마 오류가 발생하면 마지막으로 받아들인 결과를 보존하고 `partial_review / factual_verification_incomplete`로 남긴다. 확인하지 않은 수정본을 최종 결과로 승격하지 않는다.
 
-결과 schema 13와 prompt `partitioned-review/v15-fixed-factual-context`는 원본 통합 결과, 항목별 전체 후보·검사·재작성·재검사, 원문 범위, 실제 사용량을 보존한다. 저장 결과 검증기는 항목과 필드의 전수 대응, 지표 선택과 정의 비교, native 초과 후 전달 변경, 원본과 수정본의 결합을 다시 확인한다. A/B 비공개 산출물의 `fact-verification.json`과 `partition.json`에서 확인할 수 있다. 공개 댓글은 이 평가 경로에서 허용하지 않는다.
+결과 schema 13와 prompt `partitioned-review/v16-explicit-finding-dispositions`는 원본 통합 결과, 항목별 전체 후보·검사·재작성·재검사, 원문 범위, 실제 사용량을 보존한다. 저장 결과 검증기는 항목과 필드의 전수 대응, 지표 선택과 정의 비교, native 초과 후 전달 변경, 원본과 수정본의 결합을 다시 확인한다. A/B 비공개 산출물의 `fact-verification.json`과 `partition.json`에서 확인할 수 있다. 공개 댓글은 이 평가 경로에서 허용하지 않는다.
+
+전체 통합의 `retained`는 연결한 모든 결과가 원래 판정과 PMD/CPD 대상 집합을 유지할 때 사용한다. 판정이나 대상 집합을 바꾸면 같은 우려를 유지하더라도 `revised`로 기록한다. 문장과 인용 자체는 바꿀 수 있다. 모델 요청에도 프로그램 검증기와 같은 규칙을 명시하며, 이를 위반한 응답은 원본을 보존하고 제한된 정정 절차로 처리한다.

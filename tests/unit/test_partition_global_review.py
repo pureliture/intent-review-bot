@@ -266,6 +266,60 @@ def test_global_fixture_preserves_a_negative_finding_without_forced_positive_res
     validate_partition_result(result, task)
 
 
+@pytest.mark.parametrize("change", ["target_ids", "verdict"])
+def test_changed_finding_requires_revised_disposition_without_changing_its_original(change):
+    from review_bot.application import partition_global_review as g
+    from review_bot.application.source_citations import citation_spans
+    from review_bot.application.source_partition import SourceOriginal, make_span
+
+    original = SourceOriginal("Sfixture", "class Example {}\n", "code", "src/Example.java", "head", "h" * 40)
+    span = make_span(original, 0, len(original.raw), "fixture")
+    refs = citation_spans([span], {original.evidence_id: original})
+    cite = {"reference_id": next(iter(refs))}
+    finding = {"statement": "Synthetic structural observation.", "reasoning": "Synthetic source comparison.",
+        "failure_condition": "", "verdict": "improvement", "basis": "observed_structure",
+        "target_ids": ["pmd-one"], "citations": [cite]}
+    page = {"response": {"findings": [finding]}, "final": {"context_updates": {},
+        "supplied_quotes": [{"evidence_id": original.evidence_id, "start_byte": 0,
+            "end_byte": len(original.raw), "quote": original.text}]}}
+    inherited = {"target_reviews": {key: {"state": "reviewed"} for key in ("pmd-one", "pmd-two")},
+        "missing_context": [], "observation_dispositions": []}
+    data = g.prepare([page], [original], inherited, {}, {"targets": ["pmd-one", "pmd-two"],
+        "target_paths": {key: [original.path] for key in ("pmd-one", "pmd-two")}})
+    identifier = data["findings"][0]["finding_id"]
+    changed = deepcopy(finding)
+    if change == "target_ids":
+        changed[change].append("pmd-two")
+    else:
+        changed[change] = "concern"
+        changed["failure_condition"] = "Synthetic remaining failure condition."
+    body = {"summary": "Synthetic integration.", "findings": [changed], "questions": [],
+        "perspectives": [], "missing_context": [], "context_updates": {}, "source_requests": [],
+        "pending_target_reviews": {}, "observation_dispositions": {"PAGE-1": {"disposition": "retained",
+            "reason": "Synthetic page accounting.", "citations": [cite]}},
+        "finding_dispositions": {identifier: {"disposition": "retained", "reason": "Synthetic source-backed revision.",
+            "citations": [cite], "result_indices": [0]}},
+        "correction_reason": "Synthetic revision.", "correction_citations": [cite]}
+    with pytest.raises(PartitionError, match="global_retained_finding_changed"):
+        g.normalize(body, data, "architecture", references=refs)
+    body["finding_dispositions"][identifier]["disposition"] = "revised"
+    accepted = g.normalize(body, data, "architecture", references=refs)
+    assert accepted["findings"][0][change] == changed[change]
+    assert data["findings"][0]["raw_finding"] == finding
+    assert page["response"]["findings"] == [finding]
+
+
+def test_actual_global_request_explains_the_retained_target_and_verdict_invariant():
+    _, result, client = _run(transform=_finding)
+    assert result.status == "completed", result.reason
+    request = next(r for r in client.requests if json.loads(r.user_content)["stage"] == "global_review")
+    assert "EXACT\ntarget_ids set" in request.system_prompt
+    assert "Adding/removing a target or changing verdict requires revised" in request.system_prompt
+    assert "global_retained_finding_changed" in request.system_prompt
+    assert "Prose and citations may change" in request.system_prompt
+    assert "every linked result preserves the original verdict and exact target_ids set" in request.system_prompt
+
+
 @pytest.mark.parametrize("field", ["response", "payload_hash", "schema_hash", "stage_index", "delivery", "final"])
 def test_stored_global_tampering_is_rejected(field):
     task, result, _ = _run(transform=_finding)

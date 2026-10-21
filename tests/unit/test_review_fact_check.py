@@ -312,7 +312,7 @@ def test_checker_receives_literal_prose_and_exact_claim_rules_without_repairing_
     assert "check EACH named component" in request.system_prompt
     assert "necessary conditions, sufficient conditions" in request.system_prompt
     assert result.partition["identity"]["prompts"]["fact_check"] == hash_json(facts.CHECK_PROMPT)
-    assert result.prompt_version == "partitioned-review/v15-fixed-factual-context"
+    assert result.prompt_version == "partitioned-review/v16-explicit-finding-dispositions"
     assert result.model["is_mock"] is True  # no semantic accuracy claim from this fixture
 
 
