@@ -1109,3 +1109,79 @@ def test_korean_tcc_metric_extraction_matches_three_recorded_native_controls():
             if spec["state"]["target_metric"] != "TCC":
                 assert spec["options"] == facts.CATEGORY_OPTIONS[spec["state"]["target_metric"]]
                 assert spec["question"] == facts.CATEGORY_QUESTION
+
+
+
+@pytest.mark.parametrize("finding_kind", ["method_pmd", "class_pmd", "cpd"])
+def test_prepared_analysis_finding_owners_and_raw_details_reach_fact_requests(finding_kind):
+    from dataclasses import asdict
+    from review_bot.application.delta import build_delta
+    from review_bot.application.partition_review import prepare_originals
+    from review_bot.application.source_partition import make_span
+    from review_bot.domain.models_v1 import CpdDuplication, CpdOccurrence, PmdViolation
+    from tests.unit.test_context_and_architecture_review import _make_snapshot
+    from tests.unit.test_delta_adversarial import make_test_run
+    path = "src/main/java/demo/RagDocumentContentSupport.java"
+    partner = "src/main/java/demo/RagDocumentReader.java"
+    fragment = 'String listDocumentsByKeyword(String keyword) {\n    return keyword == null ? "" : keyword.trim();\n}\n'
+    neighbor = 'boolean matchesContentHashFragment(String value) { return value != null; }\n'
+    source = "package demo;\nclass RagDocumentContentSupport {\n" + "// unchanged context\n" * 125 + fragment + neighbor + "}\n"
+    files = {path: source, partner: source.replace("RagDocumentContentSupport", "RagDocumentReader"), "build.gradle": "plugins { id 'java' }\n"}
+    snapshot = _make_snapshot(files, files)
+    base_pmd = head_pmd = base_cpd = head_cpd = ()
+    if finding_kind != "cpd":
+        method = "listDocumentsByKeyword" if finding_kind == "method_pmd" else None
+        rule = "CognitiveComplexity" if method else "GodClass"
+        message = ("The method 'listDocumentsByKeyword(String)' has a cognitive complexity of 17, current threshold is 15."
+            if method else "Possible God Class (WMC=80, ATFD=9, TCC=0.070)")
+        finding = PmdViolation(path=path, raw_path="/workspace/" + path, begin_line=128 if method else 2,
+            end_line=130 if method else 132, begin_column=5, end_column=71, rule=rule, ruleset="Design", priority=3,
+            klass="RagDocumentContentSupport", method=method, package="demo", message=message,
+            code_fragment=fragment if method else source)
+        prior_message = message.replace("complexity of 17", "complexity of 16") if method else "Possible God Class (WMC=50, ATFD=5, TCC=0.070)"
+        base_pmd, head_pmd = (replace(finding, message=prior_message),), (finding,)
+    else:
+        finding = CpdDuplication(lines=3, tokens=120, occurrences=tuple(CpdOccurrence(path=value,
+            raw_path="/workspace/" + value, begin_line=128, end_line=130, begin_column=5, end_column=71,
+            end_line_inferred=False, code_fragment=fragment) for value in (path, partner)), code_fragment=fragment)
+        head_cpd = (finding,)
+    delta = build_delta(make_test_run(snapshot.base.sha, source_files=(path, partner), pmd_violations=base_pmd, cpd_duplications=base_cpd),
+        make_test_run(snapshot.head.sha, source_files=(path, partner), pmd_violations=head_pmd, cpd_duplications=head_cpd))
+    task = build_task_input(snapshot, delta, Classification("general"))
+    originals, meta = prepare_originals(task, "architecture")
+    selected = next(signal.signal for signal in task.signals if signal.role == "review")
+    target = next(detail for detail in meta["target_details"] if detail["target_id"] == selected.signal_id)
+    assert target["base_findings"] == [asdict(value) for value in selected.base_findings]
+    assert target["head_findings"] == [asdict(value) for value in selected.head_findings]
+    assert target["head_findings"] == [asdict(finding)]
+    head = next(original for original in originals if original.path == path and original.version == "head")
+    span = make_span(head, 0, len(head.raw), "test")
+    quote = {"evidence_id": span.evidence_id, "start_byte": span.start_byte, "end_byte": span.end_byte, "quote": span.text}
+    item = {"statement": "Inspect the reported analysis observation.", "reasoning": "Keep its reported owner, message and exact source fragment available.",
+        "failure_condition": "", "verdict": "improvement", "basis": "analysis_signal", "target_ids": [selected.signal_id], "citations": [quote]}
+    final = {"summary": "Static analysis review.", "findings": [item], "perspectives": [], "questions": []}
+    row = facts.items(final)[1]
+    for stage in ("fact_check", "fact_rewrite"):
+        payload, _, _, _ = facts.request_spec(stage, [row], final, originals, meta, kind="complete_originals")
+        forwarded = next(detail for detail in payload["canonical_facts"]["analysis_targets"] if detail["target_id"] == selected.signal_id)
+        assert forwarded == target
+        # JSON arrays/null are the actual model wire, not only Python metadata.
+        actual = json.loads(json.dumps(forwarded, ensure_ascii=False))
+        assert actual["base_findings"] == json.loads(json.dumps([asdict(value) for value in selected.base_findings]))
+        assert actual["head_findings"] == json.loads(json.dumps([asdict(finding)]))
+        evidence = actual["head_findings"][0]
+        assert evidence["code_fragment"] == finding.code_fragment
+        if finding_kind == "cpd":
+            assert [occurrence["path"] for occurrence in evidence["occurrences"]] == [path, partner]
+            assert all(occurrence["begin_column"] == 5 and occurrence["end_column"] == 71 and
+                occurrence["code_fragment"] == fragment for occurrence in evidence["occurrences"])
+        else:
+            assert evidence["method"] == finding.method
+            assert evidence["message"] == finding.message and evidence["rule"] == finding.rule
+            assert evidence["klass"] == "RagDocumentContentSupport" and evidence["ruleset"] == "Design"
+            assert evidence["begin_column"] == 5 and evidence["end_column"] == 71
+            if finding_kind == "method_pmd":
+                assert evidence["method"] == "listDocumentsByKeyword" and "complexity of 17" in evidence["message"]
+                assert "matchesContentHashFragment" not in evidence["message"]
+            else:
+                assert evidence["method"] is None

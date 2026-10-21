@@ -435,6 +435,8 @@ def prepare_originals(task, mode):
                             "begin_line": location.begin_line, "end_line": location.end_line})
             details.append({"target_id": signal.signal_id, "tool": getattr(signal.tool, "value", signal.tool),
                 "change": getattr(signal.change, "value", signal.change), "paths": list(signal.paths), "locations": locations,
+                "base_findings": [asdict(finding) for finding in signal.base_findings],
+                "head_findings": [asdict(finding) for finding in signal.head_findings],
                 "measurements": [asdict(value) for value in signal.measurements]})
         meta = {"input_hash": task.input_hash, "snapshot_id": hash_json(asdict(task.snapshot.pr)),
             "base_sha": task.snapshot.base.sha, "head_sha": task.snapshot.head.sha,

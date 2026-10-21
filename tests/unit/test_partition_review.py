@@ -322,6 +322,71 @@ def test_architecture_uses_same_executor_and_keeps_analysis_as_evidence():
     validate_partition_result(result, task)
 
 
+def test_raw_pmd_member_and_class_findings_survive_observation_final_and_global_requests():
+    from tests.unit.test_context_and_architecture_review import _make_snapshot
+    from review_bot.application.context import build_task_input
+    from review_bot.application.partition_review import prepare_originals
+    from review_bot.domain.changes import Measurement
+    from review_bot.domain.models_v1 import AnalysisDelta, Classification, DeltaSignal, PmdViolation
+
+    path = "src/Gateway.java"
+    snapshot = _make_snapshot({path: "class LegacyGateway {\n  boolean matchesContentHashFragment() { return false; }\n}\n"},
+        {path: "class Gateway {\n  boolean matchesContentHashFragment() { return false; }\n  boolean listDocumentsByKeyword() { return true; }\n}\n"})
+    before = PmdViolation(path, path, 2, 2, 1, 70, "CognitiveComplexity", "design", 3,
+        "LegacyGateway", "matchesContentHashFragment", "", "The method 'matchesContentHashFragment()' has a cognitive complexity of 16.",
+        snapshot.base.files[0].content.splitlines()[1])
+    after = replace(before, begin_line=3, end_line=3, klass="Gateway", method="listDocumentsByKeyword",
+        message="The method 'listDocumentsByKeyword()' has a cognitive complexity of 17, current threshold is 15",
+        code_fragment=snapshot.head.files[0].content.splitlines()[2])
+    class_before = replace(before, begin_line=1, end_line=3, rule="CyclomaticComplexity", method="",
+        message="The class 'LegacyGateway' has a total cyclomatic complexity of 70 (highest 10).", code_fragment=None)
+    class_after = replace(class_before, end_line=4, klass="Gateway",
+        message="The class 'Gateway' has a total cyclomatic complexity of 84 (highest 15).")
+    signals = (
+        DeltaSignal("pmd-" + "a" * 64, "pmd", "worsened", (before,), (after,), (path,), "fixture_version_pair",
+            (Measurement("cognitive_complexity", 16, 17),)),
+        DeltaSignal("pmd-" + "b" * 64, "pmd", "worsened", (class_before,), (class_after,), (path,), "fixture_version_pair",
+            (Measurement("cyclomatic_complexity", 70, 84),)),
+    )
+    task = build_task_input(snapshot, AnalysisDelta(1, snapshot.base.sha, snapshot.head.sha, "recipe", True, signals),
+        Classification("general"))
+    original_task = asdict(task)
+    expected = {signal.signal_id: {"base_findings": [asdict(f) for f in signal.base_findings],
+        "head_findings": [asdict(f) for f in signal.head_findings]} for signal in signals}
+    _, meta = prepare_originals(task, "architecture")
+    for detail in meta["target_details"]:
+        assert {key: detail[key] for key in expected[detail["target_id"]]} == expected[detail["target_id"]]
+
+    def count(request):
+        payload = json.loads(request.user_content)
+        return 200 + 100 * len(payload["observations"]) if payload["stage"] == "final_review" else 100
+
+    review = PartitionModelClient(counter=count)
+    review.profile = replace(review.profile, max_input_tokens=350)
+    result = run_partition_review(task, "architecture", review, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    stages = set()
+    seen = set()
+    for request in review.requests:
+        payload = json.loads(request.user_content)
+        if payload["stage"] not in ("review_partition", "final_review", "global_review"):
+            continue
+        stages.add(payload["stage"])
+        for detail in payload["review_target_details"]:
+            seen.add(detail["target_id"])
+            for version in ("base_findings", "head_findings"):
+                assert detail[version] == expected[detail["target_id"]][version]
+        if payload["stage"] in ("final_review", "global_review"):
+            assert {d["target_id"] for d in payload["review_target_details"]} == set(expected)
+    assert stages == {"review_partition", "final_review", "global_review"} and seen == set(expected)
+    assert expected[signals[0].signal_id]["base_findings"][0]["method"] == "matchesContentHashFragment"
+    assert expected[signals[0].signal_id]["head_findings"][0]["method"] == "listDocumentsByKeyword"
+    assert expected[signals[1].signal_id]["head_findings"][0]["method"] == ""
+    assert expected[signals[1].signal_id]["head_findings"][0]["code_fragment"] is None
+    assert asdict(task) == original_task
+    validate_partition_result(result, task)
+
+
 def test_report_only_group_cannot_request_a_head_concern_but_head_code_still_can():
     from tests.unit.test_context_and_architecture_review import _make_snapshot
     from review_bot.application.context import build_task_input

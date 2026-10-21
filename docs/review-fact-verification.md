@@ -120,3 +120,10 @@ PR 설명에서 범위 밖이라고 적힌 기능도 실제 제공 코드에는 
 조건 없는 `improvement`를 조건 없는 `concern`으로 바꾼 응답은 기존 검증기가 거부한다.
 한국어 TCC 의미 추출은 실제 문장에 서술된 응집도와 결합도를 한국어 질문·닫힌 선택지로 구분한다.
 영문 지표 선택과 다른 지표의 추출 계약은 유지한다.
+
+
+각 분석 대상의 `base_findings`와 `head_findings`는 원래 PMD/CPD dataclass를 전체 복사한다.
+PMD의 rule·ruleset·class·method·message·행·열·fragment, CPD의 token 수·occurrences·fragment를 유지한다.
+집계 수치와 위치만 전달하고 메서드 소유자를 모델이 다시 추정하게 하지 않는다.
+이 고정 메타데이터는 묶음 생성·최종 통합·사실 검사·재작성에서 공통으로 사용하며, 원래 signal evidence도 함께 보존한다.
+클래스 수준 신호의 빈 method는 채우지 않고, 원래 메시지와 소유 범위가 없는 값은 추정하지 않는다.
