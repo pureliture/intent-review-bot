@@ -516,7 +516,7 @@ def accept_check(raw, rows, refs, source_ids=()):
                 or not isinstance(request["reason"], str) or not request["reason"].strip() or len(request["reason"]) > 4000):
             raise PartitionError("fact_source_request_invalid")
         seen.add(request["evidence_id"])
-    if requests and not any(v["state"] == "unverifiable" for item in raw["items"].values() for v in item.values()):
+    if requests and not any(v["state"] in ("contradicted", "unverifiable") for item in raw["items"].values() for v in item.values()):
         raise PartitionError("fact_source_request_without_gap")
     return deepcopy(raw["items"])
 
@@ -771,8 +771,16 @@ def planned_source_requests(record):
 
 
 def source_gaps(record):
-    return [issue["field"] + ": " + issue["reason"] for issue in record["issues"]
+    gaps = [issue["field"] + ": " + issue["reason"] for issue in record["issues"]
         if issue["kind"] == "source_assertion" and issue["state"] == "unverifiable"]
+    requests = record["check"]["response"]["source_requests"]
+    if gaps or not requests:
+        return gaps
+    # Batch requests are correction context for existing negative rows only;
+    # do not reinterpret the contradiction or infer a semantic association.
+    if any(issue["kind"] == "source_assertion" and issue["state"] == "contradicted" for issue in record["issues"]):
+        return [request["reason"] for request in requests]
+    return []
 
 
 def unread_inventory(originals, spans):
@@ -922,6 +930,7 @@ def validate(result, originals, meta):
             or ledger.get("status") not in ("unverified", "model_supported")):
         raise PartitionError("stored_fact_verification_missing")
     interrupted = "interruption_reason" in ledger
+    last_generation = max((index for index, event in enumerate(result.stages) if event.attempts), default=-1)
     expected_rows = items(original)
     entries = ledger.get("items", [])
     if len(entries) > len(expected_rows) or (not interrupted and len(entries) != len(expected_rows)):
@@ -996,6 +1005,7 @@ def validate(result, originals, meta):
                     raise PartitionError("stored_fact_capacity_wire_changed")
             if position < len(measurements) - 1 and event.reason != "input_limit_exceeded":
                 raise PartitionError("stored_fact_unnecessary_focus")
+        historical_rejection = False
         children = record.get("children")
         if children is not None:
             if not 1 <= len(children) <= 2:
@@ -1133,11 +1143,27 @@ def validate(result, originals, meta):
                 if not interrupted or ledger["interruption_reason"] != str(error) or record.get("validation_error") != str(error):
                     raise
                 return None, refs, spans
+            if "validation_error" in record:
+                # Older runs rejected a contradicted compound field's explicit
+                # request unless another field was unverifiable. Replay that
+                # exact terminal witness as failure, never as a new acceptance.
+                states = ([value["state"] for item in record["response"]["items"].values() for value in item.values()]
+                    if stage == "fact_check" else [])
+                historical_rejection = (stage == "fact_check" and interrupted and ledger["status"] == "unverified"
+                    and event_index == last_generation
+                    and ledger["interruption_reason"] == record["validation_error"] == "fact_source_request_without_gap"
+                    and bool(record["response"]["source_requests"])
+                    and "contradicted" in states and "unverifiable" not in states
+                    and event.status == "completed" and event.reason == "input_measured")
+                if not historical_rejection:
+                    raise PartitionError("stored_fact_validation_error_changed")
         if record.get("delivered_ranges") != [{"evidence_id": span.evidence_id,
                 "start_byte": span.start_byte, "end_byte": span.end_byte} for span in spans]:
             raise PartitionError("stored_fact_delivered_ranges_changed")
         if record.get("cited_evidence") != cites:
             raise PartitionError("stored_fact_checker_evidence_changed")
+        if historical_rejection:
+            return None, refs, spans
         return record["response"], refs, spans
 
     for ordinal, (row, entry) in enumerate(zip(expected_rows, entries)):

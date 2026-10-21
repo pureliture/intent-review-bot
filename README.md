@@ -144,7 +144,7 @@ Synthetic Python/JavaScript/Java fixtures and CLI tests exercise the real B pipe
 
 ### Private shared partition evaluation
 
-Trusted configuration can enable `partition_evaluation.enabled: true` with explicit `max_calls`, `max_total_tokens` and task deadlines. The existing fixed-input API and Worker then use the shared planner before choosing PR-wide modes. Keep `publish.mode: artifact_only`; this evaluation path rejects comment publication. For a fixed B input, the CLI exposes `--partition-evaluation` with `--max-calls`, `--max-total-tokens` and `--task-timeout-seconds`. The separate `--input-target-tokens` option is an experimental measurement target; it does not impose a smaller live context or authorize shortening source.
+Trusted configuration can enable `partition_evaluation.enabled: true` with explicit `max_calls`, `max_total_tokens` and task deadlines. The existing fixed-input API and Worker then use the shared planner before choosing PR-wide modes. CLI and fixed-input evaluation require `publish.mode: artifact_only` and reject comment publication. Normal signed GitHub App jobs use the shared partition flow and may publish comments under the existing authorization, freshness, lease and publication gates. For a fixed B input, the CLI exposes `--partition-evaluation` with `--max-calls`, `--max-total-tokens` and `--task-timeout-seconds`. The separate `--input-target-tokens` option is an experimental measurement target; it does not impose a smaller live context or authorize shortening source. An unspecified partition input ceiling uses the validated native role profiles (with the legacy conservative ceiling for an unknown role cap); an explicit operator or shared-budget ceiling remains binding.
 
 The shared flow is:
 

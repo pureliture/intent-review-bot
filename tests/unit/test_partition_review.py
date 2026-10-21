@@ -310,6 +310,104 @@ def test_modes_share_one_call_budget_without_double_counting_usage():
     assert len(review.requests) + len(tev.requests) == 15
 
 
+def _native_role_clients(*, review_input=1048576 - 32678, planner_input=126976,
+        review_count=100, planner_count=100):
+    review = PartitionModelClient(group_all=True, counter=lambda request: review_count)
+    planner = PartitionModelClient(group_all=True, counter=lambda request: planner_count)
+    review.profile = replace(review.profile, max_input_tokens=review_input, max_output_tokens=32678)
+    planner.profile = replace(planner.profile, max_input_tokens=planner_input, max_output_tokens=4096)
+    return review, planner
+
+
+@pytest.mark.parametrize("planner_count", [126976, 126977])
+def test_unspecified_partition_input_uses_native_roles_without_inheriting_131k(planner_count):
+    task = make_task()
+    review, planner = _native_role_clients(review_count=727026, planner_count=planner_count)
+    configured = replace(limits(), max_total_tokens=50000000)
+    assert configured.max_input_tokens is None
+    result = run_partition_review(task, "intent", review, planner, limits=configured)
+    assert result.partition["identity"]["limits"]["max_input_tokens"] == 1048576 - 32678
+    assert review.profile.max_output_tokens == 32678
+    assert planner.profile.max_input_tokens + planner.profile.max_output_tokens == 131072
+    if planner_count == 126976:
+        assert result.status == "completed", result.reason
+        assert review.requests and all(request.max_output_tokens == 32678 for request in review.requests)
+        validate_partition_result(result, task)
+    else:
+        assert result.status in ("not_run", "failed") and not planner.requests
+        assert any(record.reason == "input_limit_exceeded" for record in result.stages)
+    assert configured.max_input_tokens is None
+
+
+@pytest.mark.parametrize("local_input,shared_input", [(None, None), (None, 131072), (131072, None)])
+def test_partition_input_resolution_preserves_explicit_caps_and_other_shared_budget_state(local_input, shared_input):
+    import time
+    from review_bot.application.model_execution import ModelExecutionBudget
+    configured = replace(limits(), max_input_tokens=local_input)
+    shared_limits = replace(configured, max_input_tokens=shared_input, max_calls=127, max_total_tokens=900000)
+    fence = lambda: True
+    deadline = time.monotonic() + 123
+    shared = ModelExecutionBudget(shared_limits, deadline, fence)
+    records = shared.records
+    review, planner = _native_role_clients()
+    result = run_partition_review(make_task(), "intent", review, planner, limits=configured, shared_budget=shared)
+    expected = 1048576 - 32678 if local_input is None and shared_input is None else 131072
+    assert result.status == "completed", result.reason
+    assert result.partition["identity"]["limits"]["max_input_tokens"] == expected
+    assert shared.limits.max_input_tokens == expected
+    assert {key: value for key, value in asdict(shared.limits).items() if key != "max_input_tokens"} == {
+        key: value for key, value in asdict(shared_limits).items() if key != "max_input_tokens"}
+    assert shared.deadline == deadline and shared.fence is fence and shared.records is records
+    validate_partition_result(result, make_task())
+
+
+def test_partition_explicit_input_cap_is_not_expanded_and_conflicting_shared_cap_is_rejected():
+    import time
+    from review_bot.application.model_execution import ModelExecutionBudget
+    review, planner = _native_role_clients(review_count=727026)
+    configured = replace(limits(), max_input_tokens=131072, max_total_tokens=50000000)
+    result = run_partition_review(make_task(), "intent", review, planner, limits=configured)
+    assert result.status in ("failed", "not_run") and not review.requests
+    assert result.partition["identity"]["limits"]["max_input_tokens"] == 131072
+    assert any(record.reason == "input_limit_exceeded" for record in result.stages)
+    shared = ModelExecutionBudget(replace(configured, max_input_tokens=262144), time.monotonic() + 120, None)
+    previous = shared.limits
+    review, planner = _native_role_clients()
+    result = run_partition_review(make_task(), "intent", review, planner, limits=configured, shared_budget=shared)
+    assert result.status == "not_run" and result.reason == "partition_shared_input_limit_conflict"
+    assert shared.limits is previous and result.partition["identity"]["limits"]["max_input_tokens"] == 131072
+    assert not review.count_requests and not planner.count_requests and not shared.records
+
+
+@pytest.mark.parametrize("review_input,planner_input", [(None, 126976), (1048576 - 32678, None), (None, None)])
+def test_unknown_native_role_input_keeps_conservative_fallback(review_input, planner_input):
+    review, planner = _native_role_clients(review_input=review_input, planner_input=planner_input)
+    task = make_task()
+    result = run_partition_review(task, "intent", review, planner, limits=limits())
+    assert result.status == "completed", result.reason
+    assert result.partition["identity"]["limits"]["max_input_tokens"] == 131072
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("invalid", [None, "invalid"])
+def test_unspecified_input_does_not_make_missing_or_invalid_profile_usable(invalid):
+    review, planner = _native_role_clients()
+    review.profile = invalid
+    result = run_partition_review(make_task(), "intent", review, planner, limits=limits())
+    assert result.status == "not_run" and result.reason == "partition_model_profile_unset"
+    assert type(result.partition["identity"]["limits"]["max_input_tokens"]) is int
+    assert not review.count_requests and not planner.count_requests
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, 1.5, "131072"])
+def test_explicit_invalid_partition_input_limit_never_reaches_measurement(invalid):
+    review, planner = _native_role_clients()
+    result = run_partition_review(make_task(), "intent", review, planner,
+        limits=replace(limits(), max_input_tokens=invalid))
+    assert result.status == "not_run" and result.reason == "invalid_partition_options"
+    assert not review.count_requests and not planner.count_requests
+
+
 def test_architecture_uses_same_executor_and_keeps_analysis_as_evidence():
     from tests.unit.test_context_and_architecture_review import _make_snapshot
     from review_bot.application.context import build_task_input
@@ -541,7 +639,7 @@ def test_draft_validation_recheck_cannot_bypass_recheck_budget_or_active_guard(g
         def exhaust_after_first(payload, body):
             body = invalid(payload, body)
             if payload["stage"] == "review_partition":
-                budget.limits = replace(configured, max_calls=budget.totals()[0])
+                budget.limits = replace(budget.limits, max_calls=budget.totals()[0])
             return body
         review.transform = exhaust_after_first
     budget = ModelExecutionBudget(configured, time.monotonic() + 120, lambda: active)

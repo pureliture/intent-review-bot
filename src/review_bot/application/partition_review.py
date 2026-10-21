@@ -35,7 +35,7 @@ from review_bot.application.intent_context import (
 from review_bot.application.source_partition import (
     PartitionError, SourceOriginal, SourceSpan, make_span, partition_original, verify_partition,
 )
-from review_bot.domain.intent_models import IntentTaskInput
+from review_bot.domain.intent_models import IntentReviewLimits, IntentTaskInput
 from review_bot.domain.intent_perspectives import PERSPECTIVES
 from review_bot.domain.models_v1 import ModelRequest, Snapshot, TaskInput
 from review_bot.domain.partition_review import PartitionReviewLimits, PartitionReviewResult
@@ -594,9 +594,22 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     review_instructions: str = "",
 ) -> PartitionReviewResult:
     """Native measurements and every generation share one finite, fenced budget."""
+    fallback_input = IntentReviewLimits().max_input_tokens
+    probe_limits = replace(limits, max_input_tokens=fallback_input) if limits.max_input_tokens is None else limits
+    profile, planner = model_profile(review_client, probe_limits), model_profile(planning_client, probe_limits)
+    shared_input = shared_budget.limits.max_input_tokens if shared_budget is not None else None
+    input_conflict = (limits.max_input_tokens is not None and shared_input is not None
+        and limits.max_input_tokens != shared_input)
+    if limits.max_input_tokens is None:
+        # An unknown role cap keeps the conservative legacy input ceiling.
+        native_input = (max(profile.max_input_tokens, planner.max_input_tokens)
+            if profile is not None and planner is not None
+            and profile.max_input_tokens is not None and planner.max_input_tokens is not None else fallback_input)
+        limits = replace(limits, max_input_tokens=shared_input if shared_input is not None else native_input)
+    if shared_budget is not None and shared_input is None:
+        shared_budget.limits = replace(shared_budget.limits, max_input_tokens=limits.max_input_tokens)
     budget = shared_budget or ModelExecutionBudget(limits, time.monotonic() + limits.task_timeout_seconds, before_stage)
     first_record = len(budget.records)
-    profile, planner = model_profile(review_client, limits), model_profile(planning_client, limits)
     originals, meta, units, notes, reductions = [], {}, [], [], []
     unit_measurements = {}
     signal_spans = []
@@ -945,6 +958,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
 
     status, reason = "failed", "invalid_partition_options"
     try:
+        if input_conflict:
+            raise Stop("partition_shared_input_limit_conflict")
         if type(limits) is not PartitionReviewLimits or mode not in ("intent", "architecture", "planning") or language not in ("ko", "en") or any(
             type(x) is not int or x <= 0 for x in (limits.max_calls, limits.max_total_tokens,
                 limits.max_input_tokens, limits.task_timeout_seconds)) or (
@@ -1648,6 +1663,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                         fact_check.accept_rewrites(raw, packet_rows, refs, mode, meta)
                 except PartitionError as error:
                     packet["validation_error"] = str(error)
+                    budget.records[index] = replace(budget.records[index], status="failed", reason=str(error))
                     raise
                 budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
                 return raw, refs, spans, index

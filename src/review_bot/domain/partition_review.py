@@ -8,6 +8,7 @@ from .intent_models import IntentReviewLimits, IntentStageRecord
 
 @dataclass(frozen=True)
 class PartitionReviewLimits(IntentReviewLimits):
+    max_input_tokens: int | None = None
     max_calls: int = 0
     input_target_tokens: int | None = None
     observation_output_tokens: int | None = None

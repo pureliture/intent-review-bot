@@ -493,6 +493,7 @@ def test_invalid_checker_reference_is_retained_in_readable_partial_result():
     assert result.status == "partial_review" and result.reason == "factual_verification_incomplete"
     ledger = result.partition["fact_verification"]
     assert ledger["interruption_reason"] == "fact_check_unknown_reference"
+    assert result.stages[-1].status == "failed" and result.stages[-1].reason == "fact_check_unknown_reference"
     assert ledger["items"][0]["attempts"][0]["check"]["response"]["items"]
     assert result.partition["final"] == result.partition["pre_verification_final"]
     validate_partition_result(result, task)
@@ -556,7 +557,7 @@ def test_checker_receives_literal_prose_and_exact_claim_rules_without_repairing_
     assert result.model["is_mock"] is True  # no semantic accuracy claim from this fixture
 
 
-def _fixed_test_repair(*, no_suitable=False, cap=128, corrupt_request=None):
+def _fixed_test_repair(*, no_suitable=False, cap=128, corrupt_request=None, assessment_state="unverifiable", extra_row=False):
     from review_bot.domain.models_v1 import CodeFile, Snapshot
     task = _metric_task()
     path = "tests/ACheckTest.java"
@@ -576,9 +577,15 @@ def _fixed_test_repair(*, no_suitable=False, cap=128, corrupt_request=None):
         stage = payload["stage"]
         if stage == "final_review":
             body["summary"] = literal
+            if extra_row:
+                head = next(s for s in payload["original_quotes"] if s["version"] == "head" and s["path"] == "src/A.java")
+                body["findings"] = [{"verdict": "improvement", "basis": "observed_structure",
+                    "statement": "An independent supported statement.", "reasoning": "The exact supplied source supports this statement.",
+                    "failure_condition": "", "target_ids": list(payload["review_targets"]),
+                    "citations": [{"reference_id": head["blocks"][0]["reference_id"]}]}]
         elif stage == "fact_check" and payload["items"][0]["item_id"] == "summary":
             if not any(s["path"] == path and s["version"] == "head" for s in payload["originals"]):
-                body["items"]["summary"]["text"].update(state="unverifiable",
+                body["items"]["summary"]["text"].update(state=assessment_state,
                     reason="Need the actual frozen HEAD tests/ACheckTest.java assertion, not a reported test result.")
                 source = next((s for s in payload["fixed_original_inventory"] if s["path"] == path and s["version"] == "head"), None)
                 if source and not no_suitable:
@@ -622,6 +629,93 @@ def test_unverifiable_fact_reads_existing_test_original_and_rechecks_same_item_w
     rewritten = next(json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "fact_rewrite")
     assert rewritten["recheck"]["original_check_response"] == first["check"]["response"]
     assert rewritten["recheck"]["source_delivery_plan"]["parent_plan_id"] == first["source_plan"]["parent_plan_id"]
+
+
+def test_contradicted_compound_fact_carries_explicit_source_through_rewrite_and_recheck():
+    task, result, review, path, _ = _fixed_test_repair(assessment_state="contradicted", extra_row=True)
+    assert result.status == "completed", result.reason
+    first, second = result.partition["fact_verification"]["items"][0]["attempts"]
+    assert first["assessments"]["text"]["state"] == "contradicted"
+    assert first["issues"][0]["state"] == "contradicted"
+    assert first["source_plan"]["gaps"] == [request["reason"] for request in first["check"]["response"]["source_requests"]]
+    assert second["input_source_requests"] == first["check"]["response"]["source_requests"]
+    rewrite = next(json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "fact_rewrite")
+    assert rewrite["recheck"]["original_check_response"] == first["check"]["response"]
+    assert any(source["path"] == path for source in rewrite["originals"])
+    assert result.summary == result.partition["fact_verification"]["items"][0]["original"]
+    assert [row["item_id"] for row in rewrite["items"]] == ["summary"]
+    supported = result.partition["fact_verification"]["items"][1]
+    assert supported["item_id"] == "findings:0" and supported["status"] == "model_supported"
+    assert len(supported["attempts"]) == 1 and "source_plan" not in supported["attempts"][0]
+    assert supported["accepted"] == supported["original"]
+    assert set(first["check"]["response"]["items"]) == {"summary", "findings:0"}
+    validate_partition_result(result, task)
+
+
+def test_fact_source_gaps_preserve_unverifiable_priority_and_require_explicit_requests_for_contradictions():
+    issue = lambda state: {"kind": "source_assertion", "field": state, "state": state, "reason": state + " reason"}
+    record = {"issues": [issue("contradicted"), issue("unverifiable")],
+        "check": {"response": {"source_requests": [{"evidence_id": "S1", "reason": "Read."}]}}}
+    assert facts.source_gaps(record) == ["unverifiable: unverifiable reason"]
+    record["issues"].pop()
+    assert facts.source_gaps(record) == ["Read."]
+    record["check"]["response"]["source_requests"] = []
+    assert facts.source_gaps(record) == []
+
+
+@pytest.mark.parametrize("state", ["supported", "non_factual"])
+def test_fact_source_request_without_any_factual_gap_still_rejects(state):
+    row = {"id": "summary", "kind": "summary", "item": ""}
+    response = {"items": {"summary": {"text": {"state": state, "reason": "No missing factual premise.", "citations": []}}},
+        "source_requests": [{"evidence_id": "S1", "reason": "Read."}]}
+    with pytest.raises(PartitionError, match="^fact_source_request_without_gap$"):
+        facts.accept_check(response, [row], {}, ["S1"])
+
+
+@pytest.mark.parametrize("mutation", [None, "validation_error", "unknown_reference", "delivered_ranges", "later_generation"])
+def test_historical_contradicted_source_request_replays_only_exact_terminal_failure(monkeypatch, mutation):
+    current_accept = facts.accept_check
+    def old_accept(raw, rows, refs, source_ids=()):
+        accepted = current_accept(raw, rows, refs, source_ids)
+        if raw["source_requests"] and not any(v["state"] == "unverifiable" for item in raw["items"].values() for v in item.values()):
+            raise PartitionError("fact_source_request_without_gap")
+        return accepted
+    with monkeypatch.context() as patch:
+        patch.setattr(facts, "accept_check", old_accept)
+        task, result, _, _, _ = _fixed_test_repair(assessment_state="contradicted")
+    ledger = result.partition["fact_verification"]
+    assert result.status == "partial_review" and ledger["interruption_reason"] == "fact_source_request_without_gap"
+    record = ledger["items"][0]["attempts"][0]["check"]
+    stage_index = record["stage_index"]
+    assert result.stages[stage_index].status == "failed"
+    assert result.stages[stage_index].reason == record["validation_error"]
+    # Reproduce the old stage accounting exactly, without promoting this run.
+    result = replace(result, stages=tuple(replace(stage, status="completed", reason="input_measured")
+        if index == stage_index else stage for index, stage in enumerate(result.stages)))
+    if mutation == "validation_error":
+        record["validation_error"] = "another_failure"
+    elif mutation == "unknown_reference":
+        record["response"]["items"]["summary"]["text"]["citations"] = [{"reference_id": "Q-forged"}]
+        record["response_hash"] = hash_json(record["response"])
+    elif mutation == "delivered_ranges":
+        record["delivered_ranges"] = []
+    elif mutation == "later_generation":
+        result = replace(result, stages=(*result.stages, result.stages[stage_index]))
+        from review_bot.application import partition_review
+        originals, meta = partition_review.prepare_originals(task, "architecture")
+        if "shared_plan" in result.partition:
+            originals = partition_review._attach_common_context(originals, result.partition["shared_plan"])
+        with pytest.raises(PartitionError, match="stored_fact_validation_error_changed"):
+            facts.validate(result, originals, meta)
+        return
+    if mutation:
+        with pytest.raises(PartitionError):
+            validate_partition_result(result, task)
+    else:
+        snapshot = deepcopy(result)
+        validate_partition_result(result, task)
+        assert result == snapshot
+        assert ledger["status"] == "unverified" and result.status == "partial_review"
 
 
 def test_no_suitable_fixed_source_does_not_invent_evidence_or_force_a_positive_fact_state():
