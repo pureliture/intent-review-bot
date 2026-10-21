@@ -742,7 +742,8 @@ def callable_delivery_issues(row, assessments, originals, delivered_ranges):
     result = []
     for field, text in fields(row).items():
         missing = sorted(name for name in tokens(text) & known.keys() if not any(map(covered, known[name])))
-        if assessments[field]["state"] != "supported" or not missing:
+        # Required input delivery is independent of the model's provisional verdict.
+        if assessments[field]["state"] == "non_factual" or not missing:
             continue
         reason = "No complete fixed HEAD implementation is delivered for the named callables: " + ", ".join(missing) + ". Read the exact definitions before supporting this field; name presence or a call site is insufficient and this does not determine whether the claimed route is true."
         result.append({"kind": "source_assertion", "field": field, "state": "unverifiable", "reason": reason,

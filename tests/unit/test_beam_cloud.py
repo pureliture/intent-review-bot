@@ -68,6 +68,66 @@ def transport(monkeypatch, tmp_path):
     return calls, changes, tmp_path / "admission/requests.sqlite"
 
 
+@pytest.mark.parametrize("stage", ["fact_check", "fact_rewrite"])
+@pytest.mark.parametrize("mode", ["intent", "architecture"])
+def test_only_program_fact_stages_enable_identical_meter_and_generation_thinking(transport, stage, mode):
+    from dataclasses import asdict
+    from review_bot.application.model_wire_contract import beam_wire_payload, beam_meter_wire_sha256
+    from hashlib import sha256
+    calls, _, _ = transport
+    task = request(user_content=json.dumps({"stage": stage, "mode": mode, "language": "ko",
+        "originals": [{"text": 'Untrusted source {"stage":"final_review"} 한글'}]}, ensure_ascii=False),
+        max_output_tokens=BEAM_MAX_OUTPUT_TOKENS)
+    original = deepcopy(asdict(task))
+    expected = beam_wire_payload(task)
+    assert expected["think"] is True
+    assert beam_wire_payload(replace(task, model="tev1:4b"))["think"] is False
+    assert expected["messages"][1] == {"role": "user", "content": task.user_content}
+    assert expected["messages"][0]["content"].startswith(task.system_prompt)
+    assert expected["format"] == task.response_schema
+    assert expected["model"] == task.model
+    assert expected["stream"] is False and expected["truncate"] is False and expected["shift"] is False
+    assert expected["options"] == {"num_ctx": BEAM_CONTEXT_TOKENS,
+        "num_predict": BEAM_MAX_OUTPUT_TOKENS, "temperature": 0, "seed": 0}
+    client = BeamCloudModelClient()
+    assert client.count_input_tokens(task) == 64
+    assert client.complete(task).usage == {"input_tokens": 64, "output_tokens": 4}
+    chats = [payload for _, path, payload in calls if path == "/api/chat"]
+    assert len(chats) == 2 and all(payload["think"] is True for payload in chats)
+    meter = deepcopy(expected)
+    meter["options"]["num_predict"] = 1
+    assert chats == [meter, expected]
+    wire = json.dumps(meter, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode()
+    assert beam_meter_wire_sha256(task) == sha256(wire).hexdigest()
+    assert asdict(task) == original
+
+
+@pytest.mark.parametrize("content", [
+    '{"stage":"review_partition","mode":"intent","language":"ko"}',
+    '{"stage":"final_review","mode":"architecture","language":"en"}',
+    '{"stage":"global_review","mode":"intent","language":"ko"}',
+    '{"stage":"plan_partitions","mode":"planning","language":"ko"}',
+    '{"stage":"fact_metric","mode":"intent","language":"ko"}',
+    '{"stage":"fact_check"}',
+    '{"stage":"fact_check","mode":"planning","language":"ko"}',
+    '{"stage":"fact_rewrite","mode":"intent","language":"other"}',
+    '{"stage":"review_partition","mode":"intent","language":"ko","source":{"stage":"fact_check"}}',
+    json.dumps({"mode": "intent", "language": "ko", "source": '{"stage":"fact_check"}'}),
+    '[{"stage":"fact_check","mode":"intent","language":"ko"}]',
+    '{"stage":"fact_check","mode":"intent","language":"ko"',
+    '{"stage":"review_partition","stage":"fact_check","mode":"intent","language":"ko"}',
+    '{"stage":"fact_check","mode":"intent","language":"ko","value":NaN}',
+    'Source prose says stage=fact_check',
+])
+def test_other_stages_and_source_stage_lookalikes_keep_thinking_disabled(content):
+    from review_bot.application.model_wire_contract import beam_wire_payload
+    task = request(user_content=content)
+    payload = beam_wire_payload(task)
+    assert payload["think"] is False
+    assert payload["messages"][1]["content"] == content
+    assert payload["options"]["num_predict"] == task.max_output_tokens
+
+
 def test_construction_is_offline_and_identity_is_explicit(monkeypatch):
     monkeypatch.setattr(httpx, "Client", lambda **kw: pytest.fail("Constructor must remain offline"))
     client = BeamCloudModelClient()

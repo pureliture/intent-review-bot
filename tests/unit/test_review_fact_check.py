@@ -49,13 +49,14 @@ def test_callable_delivery_guard_uses_only_production_head_code_without_changing
 
 
 @pytest.mark.parametrize("delivery,expected_gap", [("callsite_and_base", True), ("one_byte_gap", True), ("adjacent_complete", False)])
-def test_callable_delivery_requires_same_head_complete_definition_extent(delivery, expected_gap):
+@pytest.mark.parametrize("state", ["supported", "contradicted", "unverifiable"])
+def test_callable_delivery_requires_same_head_complete_definition_extent(delivery, expected_gap, state):
     from review_bot.application.source_partition import SourceOriginal
     text = 'def trace(func):\n    return func\n\n@trace\nasync def hidden_guard():\n    return "한글"\n\ndef caller():\n    return hidden_guard()\n'
     head = SourceOriginal("head", text, "source", "src/service.py", "head", "a" * 40)
     base = SourceOriginal("base", text, "source", "src/service.py", "base", "b" * 40)
     row = {"id": "summary", "kind": "summary", "item": "The caller uses hidden_guard."}
-    raw = {"text": {"state": "supported", "reason": "Original raw judgement.", "citations": []}}
+    raw = {"text": {"state": state, "reason": "Original raw judgement.", "citations": []}}
     bounds = lambda key, start, end: {"evidence_id": key, "start_byte": start, "end_byte": end}
     if delivery == "callsite_and_base":
         ranges = [bounds("head", head.raw.index(b"def caller"), len(head.raw)), bounds("base", 0, len(base.raw))]
@@ -67,7 +68,7 @@ def test_callable_delivery_requires_same_head_complete_definition_extent(deliver
         ranges = [bounds("head", 0, cut), bounds("head", cut, len(head.raw))]
     result = facts.callable_delivery_issues(row, raw, [head, base], ranges)
     assert bool(result) is expected_gap
-    assert raw["text"]["state"] == "supported"
+    assert raw["text"]["state"] == state
     if result:
         definition = result[0]["missing_callable_definitions"][0]
         assert definition["evidence_id"] == "head"
@@ -497,11 +498,12 @@ def test_invalid_checker_reference_is_retained_in_readable_partial_result():
     validate_partition_result(result, task)
 
 
-@pytest.mark.parametrize("component", ["facts", "eligibility"])
+@pytest.mark.parametrize("component", ["facts", "eligibility", "wire"])
 def test_worker_mode_fingerprints_include_verification_and_eligibility_implementations(valid_config_yaml, tmp_path, monkeypatch, component):
     from review_bot.config import load_review_config_from_str
     from review_bot.runtime.mode_fingerprints import architecture_input_fingerprint, intent_input_fingerprint
     from review_bot.application import selection
+    from review_bot.application import model_wire_contract
     config, _ = load_review_config_from_str(valid_config_yaml)
     config = config.model_copy(update={"partition_evaluation": config.partition_evaluation.model_copy(update={"enabled": True})})
     task = make_task()
@@ -514,7 +516,7 @@ def test_worker_mode_fingerprints_include_verification_and_eligibility_implement
     assert all(before)
     changed = tmp_path / "changed_fact_check.py"
     changed.write_text("# a different factual verification implementation\n")
-    monkeypatch.setattr(facts if component == "facts" else selection, "__file__", str(changed))
+    monkeypatch.setattr({"facts": facts, "eligibility": selection, "wire": model_wire_contract}[component], "__file__", str(changed))
     after = fingerprints()
     assert all(after) and all(left != right for left, right in zip(before, after))
 
