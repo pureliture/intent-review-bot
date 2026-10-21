@@ -19,13 +19,16 @@ import httpx
 from review_bot.adapters.llamacpp import _check_output_fields, _json_object
 from review_bot.adapters.model_http import mark_model_request_sent, model_request_slot
 from review_bot.application.architecture_review import (
-    ModelOutputLimitError, ModelProfile, PermanentModelError, TransientModelError,
+    ModelInputCapacityError, ModelOutputLimitError, ModelProfile, PermanentModelError, TransientModelError,
+)
+from review_bot.application.model_execution import native_capacity_count, capacity_input_hash
+from review_bot.application.context import hash_json
+from review_bot.application.model_wire_contract import (
+    BEAM_CLOUD_MODEL, BEAM_CONTEXT_TOKENS, BEAM_MAX_OUTPUT_TOKENS,
+    compact_schema as _compact_schema, beam_wire_payload,
 )
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 
-BEAM_CLOUD_MODEL = "beam:cloud"
-BEAM_CONTEXT_TOKENS = 1048576
-BEAM_MAX_OUTPUT_TOKENS = 32678
 _TRANSPORT_BYTES = 16 * 1024 * 1024
 _METADATA_SECONDS = 60
 _ZERO_USAGE = {"input_tokens": 0, "output_tokens": 0}
@@ -154,6 +157,18 @@ class BeamCloudModelClient:
                                 body.extend(chunk)
                             self._remaining(deadline)
                             if response.status_code != 200:
+                                if measurement and path == "/api/chat" and response.status_code == 400:
+                                    raw_body = bytes(body).decode("utf-8", errors="replace")
+                                    count = native_capacity_count(raw_body, BEAM_CONTEXT_TOKENS)
+                                    if count is not None:
+                                        evidence = {"provider": "ollama-cloud", "model": self.model,
+                                            "status": 400, "response_body": raw_body,
+                                            "response_sha256": sha256(bytes(body)).hexdigest(),
+                                            "wire_sha256": sha256(content).hexdigest(),
+                                            "input_tokens": count, "context_tokens": BEAM_CONTEXT_TOKENS,
+                                            "output_tokens_reserved": 1, "completed": True}
+                                        ticket.finish()
+                                        raise ModelInputCapacityError("Beam cloud HTTP 400", evidence)
                                 if response.status_code == 429:
                                     try:
                                         rejected = _object(bytes(body)) == {"error": "too many concurrent requests"}
@@ -223,13 +238,10 @@ class BeamCloudModelClient:
         maximum = request.max_output_tokens if request.max_output_tokens is not None else BEAM_MAX_OUTPUT_TOKENS
         if not _positive(maximum) or maximum > BEAM_MAX_OUTPUT_TOKENS:
             raise PermanentModelError("Invalid beam cloud output reservation")
-        schema = _encode(request.response_schema).decode("utf-8")
-        contract = "\n\nReturn exactly one JSON object matching this entire response schema. Do not add prose or fields.\n" + schema
-        payload = {"model": self.model, "messages": [
-                {"role": "system", "content": request.system_prompt + contract},
-                {"role": "user", "content": request.user_content}],
-            "format": request.response_schema, "stream": False, "think": False, "truncate": False, "shift": False,
-            "options": {"num_ctx": BEAM_CONTEXT_TOKENS, "num_predict": maximum, "temperature": 0, "seed": 0}}
+        try:
+            payload = beam_wire_payload(request)
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            raise PermanentModelError("Invalid beam cloud JSON") from None
         if len(_encode(payload)) > _TRANSPORT_BYTES:
             raise PermanentModelError("Beam cloud input exceeds transport byte limit")
         return payload
@@ -255,7 +267,14 @@ class BeamCloudModelClient:
 
     def count_input_tokens(self, request):
         self._receipt("not_sent")
-        return self._measure(self._payload(request), self._deadline(request))
+        try:
+            return self._measure(self._payload(request), self._deadline(request))
+        except ModelInputCapacityError as error:
+            from dataclasses import asdict
+            error.capacity_rejection["request_hash"] = hash_json(asdict(request))
+            error.capacity_rejection["source_input_hash"] = capacity_input_hash(request.system_prompt,
+                request.user_content, request.response_schema, request.model, request.max_output_tokens)
+            raise
 
     def complete(self, request):
         deadline = self._deadline(request)

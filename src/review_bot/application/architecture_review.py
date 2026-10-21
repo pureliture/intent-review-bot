@@ -42,6 +42,14 @@ class ModelOutputLimitError(PermanentModelError):
     """The provider returned an incomplete completion at its output limit."""
 
 
+class ModelInputCapacityError(PermanentModelError):
+    """A completed native measurement rejection; actual usage remains unknown."""
+
+    def __init__(self, message, capacity_rejection):
+        super().__init__(message)
+        self.capacity_rejection = capacity_rejection
+
+
 class ResponseValidationError(ValueError):
     """Raised when model response fails schema, echo, grounding, or architectural contracts."""
 

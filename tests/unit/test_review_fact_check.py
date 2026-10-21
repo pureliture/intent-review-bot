@@ -21,6 +21,136 @@ def limits(**kwargs):
     return PartitionReviewLimits(max_calls=128, max_total_tokens=1000000, **kwargs)
 
 
+def _capacity_review_client():
+    from dataclasses import asdict
+    from hashlib import sha256
+    from review_bot.adapters.beam_cloud import BeamCloudModelClient
+    from review_bot.application.architecture_review import ModelInputCapacityError
+    from review_bot.application.model_execution import capacity_input_hash
+
+    class CapacityClient(PartitionModelClient):
+        supports_native_input_measurement = True
+
+        def count_input_tokens(self, request):
+            payload = json.loads(request.user_content)
+            if payload["stage"] == "fact_check" and len(payload["items"]) > 4:
+                self.token_count_receipt = {"delivery": "unknown", "model_calls": None, "usage": None}
+                body = json.dumps({"error": "The prompt is too long: 1524758, model maximum context length: 1048576 (ref: d7fc51b7-fe86-4bfa-99c6-b70cf9701bb1)"})
+                wire = BeamCloudModelClient()._payload(request)
+                wire["options"]["num_predict"] = 1
+                proof = {"provider": "ollama-cloud", "model": "beam:cloud", "status": 400,
+                    "response_body": body, "response_sha256": sha256(body.encode()).hexdigest(),
+                    "wire_sha256": sha256(json.dumps(wire, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":")).encode()).hexdigest(),
+                    "input_tokens": 1524758, "context_tokens": 1048576, "output_tokens_reserved": 1,
+                    "completed": True, "request_hash": hash_json(asdict(request)),
+                    "source_input_hash": capacity_input_hash(request.system_prompt, request.user_content,
+                        request.response_schema, request.model, request.max_output_tokens)}
+                raise ModelInputCapacityError("Beam cloud HTTP 400", proof)
+            count = super().count_input_tokens(request)
+            self.token_count_receipt = {"delivery": "sent", "model_calls": 1,
+                "usage": {"input_tokens": count, "output_tokens": 1}}
+            return count
+
+    client = CapacityClient(name="beam:cloud")
+    client.profile = replace(client.profile, provider="ollama-cloud", max_input_tokens=1048576 - 512, is_mock=False)
+    return client
+
+
+@pytest.mark.parametrize("fits", [True, False])
+def test_native_capacity_rejection_reserves_unknown_usage_before_lossless_batch_split(fits):
+    import time
+    from review_bot.application.model_execution import ModelExecutionBudget
+    task, client = make_task(), _capacity_review_client()
+    settings = PartitionReviewLimits(max_calls=256, max_total_tokens=24000000 if fits else 1000000)
+    budget = ModelExecutionBudget(settings, time.monotonic() + settings.task_timeout_seconds, None)
+    result = run_partition_review(task, "intent", client, PartitionModelClient(), limits=settings, shared_budget=budget)
+    rejected = result.partition["native_capacity_rejections"]
+    assert rejected and result.usage["usage_complete"] is False
+    assert result.usage["input_tokens"] is None and result.usage["output_tokens"] is None
+    assert result.usage["unknown_usage_attempts"] == len(rejected)
+    assert result.usage["reserved_model_calls"] == len(rejected)
+    assert result.usage["reserved_tokens"] == len(rejected) * 1524759
+    actual_calls, actual_tokens, actual_unknown = budget.totals()
+    effective_calls, effective_tokens, unbounded_unknown = budget.operational_totals()
+    assert actual_unknown is True and unbounded_unknown is False
+    assert effective_calls == actual_calls + result.usage["reserved_model_calls"]
+    assert effective_tokens == actual_tokens + result.usage["reserved_tokens"]
+    assert all(result.stages[item["stage_index"]].token_measurement_usage is None for item in rejected)
+    if fits:
+        assert result.status == "completed", result.reason
+        checks = [json.loads(req.user_content) for req in client.requests if json.loads(req.user_content)["stage"] == "fact_check"]
+        assert [row["item_id"] for call in checks for row in call["items"]] == [row["id"] for row in facts.items(result.partition["pre_verification_final"])]
+        assert all(len(call["items"]) <= 4 for call in checks)
+        for mutation in ("reservation", "body", "wire_hash", "missing", "source_input"):
+            changed = deepcopy(result)
+            item = changed.partition["native_capacity_rejections"][0]
+            if mutation == "reservation":
+                item["budget_reservation"]["total_tokens"] -= 1
+            elif mutation == "missing":
+                changed.partition.pop("native_capacity_rejections")
+            else:
+                key = {"body": "response_body", "wire_hash": "wire_sha256", "source_input": "source_input_hash"}[mutation]
+                item["capacity_rejection"][key] = "forged" if mutation == "body" else "0" * 64
+                item["witness_hash"] = hash_json(item["capacity_rejection"])
+            with pytest.raises(PartitionError):
+                validate_partition_result(changed, task)
+    else:
+        assert result.status == "partial_review"
+        assert result.partition["fact_verification"]["interruption_reason"] == "task_token_limit_exceeded"
+        assert not any(json.loads(req.user_content)["stage"] == "fact_check" for req in client.requests)
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("mode", ["architecture", "intent"])
+def test_wire_reference_definitions_preserve_complete_a_b_fact_response_contracts(mode):
+    from review_bot.application.model_wire_contract import compact_schema
+    if mode == "architecture":
+        task, result, client, _ = _metric_run()
+    else:
+        task, client = make_task(), PartitionModelClient()
+        result = run_partition_review(task, mode, client, PartitionModelClient(), limits=limits())
+    assert result.status == "completed"
+    packets = {packet["stage_index"]: packet for entry in result.partition["fact_verification"]["items"]
+        for attempt in entry["attempts"] for key in ("check", "rewrite") if (packet := attempt.get(key))}
+    for packet in packets.values():
+        request = next(req for req in client.requests if json.loads(req.user_content)["stage"] == packet["call_stage"]
+            and [row["item_id"] for row in json.loads(req.user_content)["items"]] == [row["id"] for row in packet["rows"]])
+        original = deepcopy(request.response_schema)
+        compact = compact_schema(original)
+        def expand(value):
+            if isinstance(value, dict):
+                if set(value) == {"$ref"}:
+                    return expand(compact["$defs"][value["$ref"][8:]])
+                return {key: expand(child) for key, child in value.items() if key != "$defs"}
+            return [expand(child) for child in value] if isinstance(value, list) else value
+        restored = expand(compact)
+        assert restored == original == request.response_schema
+        def reference_ids(value):
+            if isinstance(value, dict):
+                if set(value) == {"reference_id"}:
+                    yield value["reference_id"]
+                for child in value.values():
+                    yield from reference_ids(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from reference_ids(child)
+        def enums(value):
+            if isinstance(value, dict):
+                yield from value.get("enum", [])
+                for child in value.values():
+                    yield from enums(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from enums(child)
+        allowed = set(enums(restored))
+        assert set(reference_ids(packet["response"])) <= allowed
+        assert "__FOREIGN_REFERENCE__" not in allowed
+        # All per-item supported-only enums and conditional rules also survive
+        # exact expansion, including IDs that exist elsewhere in the catalog.
+    validate_partition_result(result, task)
+
+
 def _reference(payload, path=None):
     return next(block["reference_id"] for source in payload["originals"]
         if source["version"] == "head" and (path is None or source["path"] == path)

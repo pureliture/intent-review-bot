@@ -932,18 +932,20 @@ class WorkerLoop:
                 **self._presentation_options("architecture"))
             markdown = self._settings_notice(markdown)
             self._require_active(run, deadline)
-            if status == "completed" and cached is None:
-                self._save_cached_review(run, "architecture", task_input, result)
-            self._require_active(run, deadline)
             if artifacts is not None:
                 artifacts.save_review(snapshot=review_snap, selection=mode_sel, task_input=task_input,
                     base_run=base_run, head_run=head_run, result=result, markdown=markdown, config_hash=self.config.config_hash)
+            self._require_active(run, deadline)
+            if status == "completed" and cached is None:
+                self._save_cached_review(run, "architecture", task_input, result)
         except (_RunAborted, _CommonFailure, GitHubAuthorizationError):
             raise
         except Exception as exc:
             self._require_active(run, deadline)
             prefix = "worker" if mode_sel.selected_modes == ("architecture",) else "architecture"
-            return replace(core_receipt, execution_status="failed", error_code=f"{prefix}_pipeline_error:{type(exc).__name__}")
+            error_code = f"{prefix}_pipeline_error:{type(exc).__name__}"
+            return replace(core_receipt, execution_status="failed", error_code=error_code,
+                publication=self._publish_failure_notice(run, "architecture", review_snap, error_code, deadline, draft=draft))
         self._require_active(run, deadline)
         if not writes_comment:
             publication = PublicationReceipt(None, "not_attempted",
@@ -1107,15 +1109,17 @@ class WorkerLoop:
                 **self._presentation_options("intent"))
             markdown = self._settings_notice(markdown)
             self._require_active(run, deadline)
+            artifacts.save_intent(task_input, result, markdown)
+            self._require_active(run, deadline)
             if result.status == "completed" and cached is None:
                 self._save_cached_review(run, "intent", task_input, result)
-            self._require_active(run, deadline)
-            artifacts.save_intent(task_input, result, markdown)
         except (_RunAborted, _CommonFailure, GitHubAuthorizationError):
             raise
         except Exception as exc:
             self._require_active(run, deadline)
-            return replace(core_receipt, execution_status="failed", error_code=f"intent_artifact_error:{type(exc).__name__}")
+            error_code = f"intent_artifact_error:{type(exc).__name__}"
+            return replace(core_receipt, execution_status="failed", error_code=error_code,
+                publication=self._publish_failure_notice(run, "intent", review_snap, error_code, deadline, draft=draft))
         self._stage(run, RunStage.PUBLISH, deadline)
         if reason is not None:
             publication = PublicationReceipt(None, "not_attempted",

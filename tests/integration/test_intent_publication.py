@@ -227,6 +227,9 @@ def test_a_output_failure_preserves_called_core_and_usage_without_suppressing_b(
 @pytest.mark.parametrize("failure", ["format", "artifact"])
 def test_b_unexpected_output_failure_preserves_core_and_usage(intent_flow, monkeypatch, failure):
     flow = intent_flow
+    opt_in(flow)
+    cached = []
+    monkeypatch.setattr(flow.worker, "_save_cached_review", lambda *args: cached.append(args))
 
     def fail_output(*args, **kwargs):
         raise RuntimeError("synthetic-output-secret")
@@ -244,13 +247,83 @@ def test_b_unexpected_output_failure_preserves_core_and_usage(intent_flow, monke
     assert_preserved_core_usage(b, "intent")
     assert recorded["intent"]["usage"] == b["usage"]
     assert b["execution_status"] == "failed" and b["error_code"] == "intent_artifact_error:RuntimeError"
-    assert b["publication"] is None and writes(flow) == []
+    assert b["publication"]["status"] == "succeeded" and len(writes(flow)) == 1
+    assert_status_notice(flow.comments[0]["body"])
+    assert all(args[1] != "intent" for args in cached)
+    assert "synthetic-output-secret" not in flow.comments[0]["body"]
     assert "synthetic-output-secret" not in (root / "B/receipt.json").read_text()
     assert "synthetic-output-secret" not in (root / "manifest.json").read_text()
 
 
+def test_b_actual_replay_formatter_failure_preserves_raw_checkpoint_and_publishes_only_notice(intent_flow, monkeypatch):
+    flow = intent_flow
+    opt_in(flow)
+    original_review = flow.worker._review_partitioned
+    raw_result = []
+    cached = []
+
+    def invalid_checkpoint(*args, **kwargs):
+        result = original_review(*args, **kwargs)
+        if args[1] != "intent":
+            return result
+        page = result.partition["integration_pages"][0]
+        target = next(iter(page["response"]["target_reviews"]))
+        del page["response"]["target_reviews"][target]
+        result = replace(result, status="partial_review", reason="factual_verification_incomplete")
+        raw_result.append(deepcopy(result))
+        return result
+
+    monkeypatch.setattr(flow.worker, "_review_partitioned", invalid_checkpoint)
+    monkeypatch.setattr(flow.worker, "_save_cached_review", lambda *args: cached.append(args))
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
+    root, status, modes = receipts(flow)
+    receipt = json.loads((root / "B/receipt.json").read_text())
+    assert status == "failed" and receipt["error_code"] == "intent_artifact_error:PartitionError"
+    assert receipt["b_result"]["status"] == "partial_review"
+    assert receipt["b_result"]["reason"] == "factual_verification_incomplete"
+    assert receipt["b_result"]["partition"] == raw_result[0].partition
+    assert receipt["publication"]["status"] == "succeeded" and modes["intent"]["execution_status"] == "failed"
+    assert_status_notice(flow.comments[0]["body"])
+    assert len(writes(flow)) == 1 and all(args[1] != "intent" for args in cached)
+    assert not (root / "B/comment.md").exists()
+
+
+@pytest.mark.parametrize("method", ["find_marker_comment", "create_comment", "update_comment"])
+def test_b_formatter_failure_notice_preserves_authorization_fence(intent_flow, monkeypatch, method):
+    flow = intent_flow
+    opt_in(flow, ("intent", "architecture"))
+    if method == "update_comment":
+        flow.comments.append({"id": 700, "body": B_MARKER + "\nPrior review",
+            "user": {"login": "review-app[bot]", "type": "Bot"}})
+    original = getattr(flow.github, method)
+
+    def reject_intent(*args, **kwargs):
+        text = kwargs.get("body", kwargs.get("marker", args[-1] if args else ""))
+        if isinstance(text, str) and B_MARKER in text:
+            raise GitHubAppAuthError("synthetic-authorization-secret")
+        return original(*args, **kwargs)
+
+    def fail_output(*args, **kwargs):
+        raise RuntimeError("synthetic-output-secret")
+
+    monkeypatch.setattr(flow.github, method, reject_intent)
+    monkeypatch.setattr("review_bot.adapters.markdown.partition_formatter.format_partition_review_markdown", fail_output)
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
+    root, status, modes = receipts(flow)
+    receipt = json.loads((root / "B/receipt.json").read_text())
+    assert status == "failed" and receipt["b_result"]["status"] == "completed"
+    assert receipt["error_code"] == "intent_artifact_error:RuntimeError"
+    assert receipt["publication"]["reason"] == "publication_authorization_lost"
+    assert receipt["publication"]["input_fingerprint"] is None
+    assert "architecture" not in modes and flow.analyzer.run_analysis.call_count == 0
+    assert writes(flow) == []
+    assert "synthetic-authorization-secret" not in (root / "B/receipt.json").read_text()
+    assert "synthetic-output-secret" not in (root / "B/receipt.json").read_text()
+
+
 def test_b_output_failure_does_not_override_lease_loss(intent_flow, monkeypatch):
     flow = intent_flow
+    opt_in(flow)
 
     def lose_lease_and_fail(*args, **kwargs):
         flow.worker._lease_lost = True

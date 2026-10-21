@@ -11,7 +11,7 @@ from review_bot.adapters.beam_cloud import (
     BEAM_CONTEXT_TOKENS, BEAM_MAX_OUTPUT_TOKENS, BeamCloudModelClient,
 )
 from review_bot.adapters.model_http import reset_model_request_context, set_model_request_context
-from review_bot.application.architecture_review import ModelOutputLimitError, PermanentModelError, TransientModelError
+from review_bot.application.architecture_review import ModelInputCapacityError, ModelOutputLimitError, PermanentModelError, TransientModelError
 from review_bot.domain.models_v1 import ModelRequest
 
 HTTP_CLIENT = httpx.Client
@@ -270,3 +270,71 @@ def test_direct_or_expired_completion_never_hides_a_paid_measurement(transport):
     with pytest.raises(PermanentModelError, match="fresh exact native"):
         client.complete(request())
     assert calls == before
+
+
+def test_completed_exact_native_capacity_rejection_releases_only_capacity_and_keeps_unknown_usage(transport):
+    from dataclasses import asdict
+    from hashlib import sha256
+    from review_bot.application.context import hash_json
+    calls, changes, database = transport
+    body = {"error": "The prompt is too long: 1524758, model maximum context length: 1048576 (ref: d7fc51b7-fe86-4bfa-99c6-b70cf9701bb1)"}
+    changes["handler"] = lambda req, payload, data: httpx.Response(400, json=body) if req.url.path == "/api/chat" else data
+    client = BeamCloudModelClient()
+    task = request()
+    with pytest.raises(ModelInputCapacityError, match="^Beam cloud HTTP 400$") as caught:
+        client.count_input_tokens(task)
+    proof = caught.value.capacity_rejection
+    assert proof["input_tokens"] == 1524758 and proof["context_tokens"] == BEAM_CONTEXT_TOKENS
+    assert proof["request_hash"] == hash_json(asdict(task))
+    assert proof["response_sha256"] == sha256(proof["response_body"].encode()).hexdigest()
+    assert client.token_count_receipt == {"delivery": "unknown", "model_calls": None, "usage": None}
+    assert len([path for _, path, _ in calls if path == "/api/chat"]) == 1
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM model_admission").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("status,body", [
+    (400, {"error": "The prompt is too long: 1524758, model maximum context length: 131072 (ref: d7fc51b7-fe86-4bfa-99c6-b70cf9701bb1)"}),
+    (400, {"error": "The prompt is too long: 5, model maximum context length: 1048576 (ref: d7fc51b7-fe86-4bfa-99c6-b70cf9701bb1)"}),
+    (400, {"error": "The prompt is too long: 1524758, model maximum context length: 1048576 (ref: invalid)"}),
+    (400, {"error": "The prompt is too long: 1524758, model maximum context length: 1048576 (ref: d7fc51b7-fe86-4bfa-99c6-b70cf9701bb1)", "eval_count": 0}),
+    (502, {"error": "The prompt is too long: 1524758, model maximum context length: 1048576 (ref: d7fc51b7-fe86-4bfa-99c6-b70cf9701bb1)"}),
+])
+def test_other_capacity_like_errors_remain_unknown_and_uncertain(transport, status, body):
+    _, changes, database = transport
+    changes["handler"] = lambda req, payload, data: httpx.Response(status, json=body) if req.url.path == "/api/chat" else data
+    client = BeamCloudModelClient()
+    with pytest.raises((PermanentModelError, TransientModelError)) as caught:
+        client.count_input_tokens(request())
+    assert not isinstance(caught.value, ModelInputCapacityError)
+    assert client.token_count_receipt == {"delivery": "unknown", "model_calls": None, "usage": None}
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT state FROM model_admission").fetchall() == [("uncertain",)]
+
+
+def test_wire_schema_interning_is_lossless_and_meter_matches_completion(transport):
+    from review_bot.adapters.beam_cloud import _compact_schema
+    calls, _, _ = transport
+    enum = ["Q" + str(index) for index in range(200)]
+    citation = {"type": "object", "properties": {"reference_id": {"type": "string", "enum": enum}},
+        "required": ["reference_id"], "additionalProperties": False}
+    schema = {"type": "object", "properties": {"first": citation, "second": deepcopy(citation)},
+        "required": ["first", "second"], "additionalProperties": False}
+    compact = _compact_schema(schema)
+    def expand(node):
+        if isinstance(node, dict):
+            if set(node) == {"$ref"}:
+                return expand(compact["$defs"][node["$ref"][8:]])
+            return {key: expand(value) for key, value in node.items() if key != "$defs"}
+        return [expand(value) for value in node] if isinstance(node, list) else node
+    assert expand(compact) == schema and len(json.dumps(compact)) < len(json.dumps(schema))
+    assert _compact_schema({"$ref": "#/$defs/original", "$defs": {"original": schema}}) == {"$ref": "#/$defs/original", "$defs": {"original": schema}}
+    task = request(response_schema=schema)
+    client = BeamCloudModelClient()
+    client.count_input_tokens(task)
+    # Only transport is interned. The original inline extra-field guard remains.
+    with pytest.raises(PermanentModelError, match="Unexpected"):
+        client.complete(task)
+    chats = [payload for _, path, payload in calls if path == "/api/chat"]
+    assert chats[0]["messages"] == chats[1]["messages"] and chats[0]["format"] == chats[1]["format"] == compact
+    assert task.response_schema == schema and task.system_prompt == "Review the supplied source."

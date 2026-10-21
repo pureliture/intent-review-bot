@@ -25,7 +25,7 @@ from review_bot.application.partition_integration import native_integration_page
 from review_bot.application.source_citations import citation_spans, citation_catalog, source_blocks, signal_context_spans, referenced_source_spans
 from review_bot.application.review_output_contract import render_output_contract
 from review_bot.application.code_first_intent_review import _original_text, _originals
-from review_bot.application.model_execution import ModelExecutionBudget, model_profile, OUTPUT_RECOVERY_FINAL_RESERVE
+from review_bot.application.model_execution import ModelExecutionBudget, model_profile, capacity_reservation, OUTPUT_RECOVERY_FINAL_RESERVE
 from review_bot.application.context import build_task_input, hash_json
 from review_bot.application.declared_intent_review import _make_result
 from review_bot.application.intent_context import (
@@ -1162,9 +1162,13 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                 if review["state"] not in ("reviewed", "not_apply", "insufficient_context"):
                     raise PartitionError("invalid_target_review")
                 refs = final_citations(review["citations"], supplied)
-                if review["state"] == "reviewed" and not any(
-                    c["path"] in meta["target_paths"][key] for c in refs):
-                    raise PartitionError("target_review_without_source")
+                allowed_refs = {ref for ref, span in quote_choices(supplied, retained).items()
+                    if span.path in meta["target_paths"][key]}
+                for index, citation in enumerate(review["citations"]):
+                    if citation["reference_id"] not in allowed_refs:
+                        raise PartitionError("target_review_citation_outside_target:"
+                            f"json_path=$.target_reviews[{json.dumps(key)}].citations[{index}].reference_id;"
+                            f"target_id={key};reference_id={citation['reference_id']};expected=target_reference")
                 target_reviews[key] = {"state": review["state"], "reason": bounded_text(review["reason"]), "citations": refs}
             perspectives, seen = [], set()
             if mode == "architecture" and isinstance(body["perspectives"], list) and body["perspectives"]:
@@ -1501,7 +1505,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     event = budget.records[failed]
                     rejected = budget.rejected_outputs.get(failed, [])
                     known = (str(error) == "model_output_limit" and event.reason == "model_output_limit" and
-                        bool(event.attempts) and bool(rejected) and not budget.totals()[2] and
+                        bool(event.attempts) and bool(rejected) and not budget.operational_totals()[2] and
                         all(attempt.delivery == "sent" and attempt.usage is not None and
                             attempt.usage["output_tokens"] == req.max_output_tokens for attempt in event.attempts))
                     if len(packet_rows) < 2 or not known:
@@ -1589,11 +1593,18 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     local_records = budget.records[first_record:]
     partitions["rejected_model_outputs"] = [{"stage_index": index - first_record, **deepcopy(item)}
         for index, items in budget.rejected_outputs.items() if index >= first_record for item in items]
+    capacity = [{"stage_index": index - first_record, **deepcopy(item)}
+        for index, item in budget.capacity_rejections.items() if index >= first_record]
+    if capacity:
+        partitions["native_capacity_rejections"] = capacity
     partitions["output_recoveries"] = [{**deepcopy(item),
         "failed_stage_index": item["failed_stage_index"] - first_record,
         "recovery_stage_index": item["recovery_stage_index"] - first_record}
         for item in budget.output_recoveries if item["failed_stage_index"] >= first_record]
     common = _make_result(None, status, reason, local_records, active_profile, limits)
+    if capacity:
+        common.usage.update(reserved_model_calls=sum(item["budget_reservation"]["model_calls"] for item in capacity),
+            reserved_tokens=sum(item["budget_reservation"]["total_tokens"] for item in capacity))
     hashes = {"observe": hash_json(prompts["observe"]),
         "plan": hash_json({"system": choices.SYSTEM, "contract": choices.VERSION}),
         "select": hash_json(choices.SYSTEM), "final": hash_json(prompts["final"]),
@@ -1608,7 +1619,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         "prompts": hashes, "models": {"review": asdict(profile) if profile else None,
         "planner": asdict(planner) if planner else None}}
     identity["implementation"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-        for name in ("partition_review.py", "source_partition.py", "model_execution.py", "partition_choices.py", "source_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py", "review_fact_check.py", "selection.py")}
+        for name in ("partition_review.py", "source_partition.py", "model_execution.py", "model_wire_contract.py", "partition_choices.py", "source_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py", "review_fact_check.py", "selection.py")}
     identity["implementation"].update({"adapters/" + name: hashlib.sha256(
         (Path(__file__).parents[1] / "adapters" / name).read_bytes()).hexdigest()
         for name in ("llamacpp.py", "llamacpp_macbook.py", "intent_planner.py")})
@@ -2203,6 +2214,45 @@ def _validate_global_review(result, originals, meta):
         raise PartitionError("stored_unvalidated_global_conclusion")
 
 
+def _validate_capacity_rejections(result):
+    """Replay the separate conservative reservations, never actual zero usage."""
+    records = result.partition.get("native_capacity_rejections", [])
+    seen, reserved_calls, reserved_tokens = set(), 0, 0
+    try:
+        if not isinstance(records, list):
+            raise ValueError
+        profile = ModelProfile(**result.partition["identity"]["models"]["review"]) if records else None
+    except (KeyError, TypeError, ValueError):
+        raise PartitionError("stored_native_capacity_profile_changed") from None
+    for item in records:
+        try:
+            if not isinstance(item, dict) or set(item) != {"stage_index", "capacity_rejection", "budget_reservation", "witness_hash"}:
+                raise ValueError
+            index = item["stage_index"]
+            if type(index) is not int or index in seen or not 0 <= index < len(result.stages):
+                raise ValueError
+            seen.add(index)
+            event = result.stages[index]
+            reservation = capacity_reservation(event, {k: v for k, v in item.items() if k != "stage_index"}, profile)
+            if event.status != "not_run" or event.reason not in ("input_limit_exceeded", "call_limit_exceeded",
+                    "task_token_limit_exceeded", "task_deadline_exceeded", "stage_gate_rejected", "model_cancelled"):
+                raise ValueError
+            reserved_calls += reservation["model_calls"]
+            reserved_tokens += reservation["total_tokens"]
+        except (ValueError, TypeError, KeyError):
+            raise PartitionError("stored_native_capacity_rejection_changed") from None
+    for index, event in enumerate(result.stages):
+        if (event.reason == "input_limit_exceeded" and event.token_measurement == "measured"
+                and event.token_measurement_usage is None and index not in seen):
+            raise PartitionError("stored_native_capacity_rejection_missing")
+    if records:
+        if (result.usage.get("reserved_model_calls") != reserved_calls or result.usage.get("reserved_tokens") != reserved_tokens
+                or result.usage.get("usage_complete") is not False or result.usage.get("unknown_usage_attempts", 0) < len(seen)):
+            raise PartitionError("stored_native_capacity_reservation_changed")
+    elif "reserved_model_calls" in result.usage or "reserved_tokens" in result.usage:
+        raise PartitionError("stored_native_capacity_reservation_changed")
+
+
 def validate_partition_result(result: PartitionReviewResult, task) -> None:
     """Recheck immutable originals, coverage and extracted quotes before output."""
     if type(result) is not PartitionReviewResult or result.schema_version != 13 or result.review_type not in ("A", "B", "PLAN"):
@@ -2220,6 +2270,7 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
         raise PartitionError("partition_result_identity_mismatch")
     if result.origin != {"execution": "partitioned_mode_evaluation", "publication": "not_attempted"}:
         raise PartitionError("partition_result_origin_mismatch")
+    _validate_capacity_rejections(result)
     rejected_indices = set()
     for rejected in result.partition.get("rejected_model_outputs", []):
         index = rejected["stage_index"]

@@ -961,6 +961,78 @@ def test_rejected_grounding_is_rechecked_once_without_rewriting_the_rejected_res
     validate_partition_result(result, task)
 
 
+def test_reviewed_target_without_citations_is_rechecked_once_and_never_accepted_empty():
+    rejected_response = []
+
+    def empty_first(payload, body):
+        if payload["stage"] == "final_review" and "source_recheck" not in payload:
+            target = next(iter(body["target_reviews"]))
+            body["target_reviews"][target]["citations"] = []
+            from copy import deepcopy
+            rejected_response.append(deepcopy(body))
+        return body
+
+    task = make_task()
+    review = PartitionModelClient(group_all=True, transform=empty_first)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed", result.reason
+    finals = [json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "final_review"]
+    assert len(finals) == 2
+    rejected = result.partition["rejected_final_attempts"]
+    assert len(rejected) == 1 and rejected[0]["reason"] == "missing_partition_citation"
+    assert rejected[0]["response"] == rejected_response[0]
+    assert finals[1]["source_recheck"]["validation_error"] == "missing_partition_citation"
+    assert all(row["citations"] for row in result.partition["final"]["target_reviews"].values())
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("outside", ["pr", "other_file"])
+@pytest.mark.parametrize("state", ["reviewed", "not_apply", "insufficient_context"])
+def test_target_review_mixed_citations_get_one_exact_recheck_without_erasing_raw_refs(outside, state):
+    from copy import deepcopy
+    task = make_task()
+    original_task = deepcopy(asdict(task))
+    rejected_response = []
+    invalid_target = []
+    invalid_ref = []
+
+    def invalid_first(payload, body):
+        if payload["stage"] == "final_review" and "source_recheck" not in payload:
+            target = next(iter(body["target_reviews"]))
+            schema = review.requests[-1].response_schema["properties"]["target_reviews"]["properties"][target]
+            allowed = schema["properties"]["citations"]["items"]["properties"]["reference_id"]["enum"]
+            assert len(allowed) >= 2
+            source = next(row for row in payload["citation_catalog"]
+                if (not row["path"] if outside == "pr" else bool(row["path"]) and row["path"] != target))
+            ref = source["ranges"][0]["reference_id"]
+            assert ref not in allowed
+            body["target_reviews"][target].update(state=state,
+                citations=[{"reference_id": value} for value in [*allowed[:2], ref]])
+            invalid_target.append(target)
+            invalid_ref.append(ref)
+            rejected_response.append(deepcopy(body))
+        return body
+
+    review = PartitionModelClient(group_all=True, transform=invalid_first)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed", result.reason
+    finals = [json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "final_review"]
+    assert len(finals) == 2
+    target, ref = invalid_target[0], invalid_ref[0]
+    expected = ("target_review_citation_outside_target:"
+        f"json_path=$.target_reviews[{json.dumps(target)}].citations[2].reference_id;"
+        f"target_id={target};reference_id={ref};expected=target_reference")
+    rejected = result.partition["rejected_final_attempts"]
+    assert len(rejected) == 1 and rejected[0]["reason"] == expected
+    assert rejected[0]["response"] == rejected_response[0]
+    assert len(rejected[0]["response"]["target_reviews"][target]["citations"]) == 3
+    assert finals[1]["source_recheck"]["validation_error"] == expected
+    assert finals[1]["source_recheck"]["rejected_response"] == rejected_response[0]
+    assert finals[0]["original_quotes"] == finals[1]["original_quotes"]
+    assert asdict(task) == original_task
+    validate_partition_result(result, task)
+
+
 def test_two_allowed_disposition_citations_get_exact_feedback_in_the_existing_single_recheck():
     from copy import deepcopy
     task = make_task()
