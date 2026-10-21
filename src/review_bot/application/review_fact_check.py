@@ -221,6 +221,7 @@ def delivery(rows, final, originals, meta, *, kind, extra=None):
             "Citation existence, matching bytes, or the same file is insufficient; imports/header lines do not establish later test assertions, and an adjacent range does not establish an omitted assignment or storage operation. "
             "Check this original citation binding separately from whether the claim is true elsewhere in the full originals. If the prose is true elsewhere but the original citation set does not support it, return unverifiable and explain the exact binding gap; your checker citations may identify the actual supporting ranges for the existing complete-item rewrite. "
             "When the full originals support the existing prose, preserve those supported assertions and correct the replacement citation ranges rather than weakening the claim to match an unrelated quote. "
+            "For supported, select supporting checker references wholly contained in the ORIGINAL item's citation range union for the same evidence_id. If your supporting references extend outside that union, use unverifiable so the existing rewrite can correct the item's citation binding. "
             "Your own correct checker citations do not silently repair the unchanged original_item.citations or justify supported for that binding gap. Recheck the actual replacement citations after rewrite. "
             "This binding requirement does not apply to empty or non_factual fields; a summary without its own citations retains its existing source-check treatment. Preserve original fields, items, citation sets and all audit responses.")
     if any(row["kind"] == "perspectives" for row in rows):
@@ -563,9 +564,50 @@ def retain_sources(candidate, spans):
     candidate["supplied_quotes"] = list(existing.values())
 
 
-def issues(assessments, metric_checks):
+def citation_binding_issues(row, assessments, originals, cited_evidence):
+    """Conservative binding guard, not a semantic falsehood determination.
+
+    A correct checker may choose a broader useful context than the item cites.
+    That still requires explicit re-review; raw assessments and items stay intact.
+    Containment alone never proves that the cited bytes entail the prose.
+    """
+    item = row["item"]
+    if not isinstance(item, dict) or not item.get("citations"):
+        return []
+    by_id = {original.evidence_id: original for original in originals}
+    union = {}
+    for span in sorted(quote_spans(item["citations"], by_id),
+            key=lambda span: (span.evidence_id, span.start_byte, span.end_byte)):
+        ranges = union.setdefault(span.evidence_id, [])
+        if ranges and span.start_byte <= ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], span.end_byte))
+        else:
+            ranges.append((span.start_byte, span.end_byte))
+    references = {"Q" + hash_json((cite["evidence_id"], by_id[cite["evidence_id"]].digest,
+        cite["start_byte"], cite["end_byte"]))[:12]: cite for cite in cited_evidence}
+    result = []
+    for field, assessment in assessments.items():
+        if assessment["state"] != "supported" or not fields(row)[field].strip():
+            continue
+        outside = []
+        for reference in assessment["citations"]:
+            if reference["reference_id"] not in references:
+                raise PartitionError("fact_check_support_evidence_missing")
+            cite = references[reference["reference_id"]]
+            if not any(start <= cite["start_byte"] < cite["end_byte"] <= end
+                    for start, end in union.get(cite["evidence_id"], [])):
+                outside.append({key: cite[key] for key in ("evidence_id", "start_byte", "end_byte")})
+        if outside:
+            result.append({"kind": "source_assertion", "field": field, "state": "unverifiable",
+                "reason": "The checker's supporting ranges extend outside the original item's citation union, so its original binding has not been established. This conservatively requests re-review; it does not establish that the prose is false.",
+                "citations": deepcopy(assessment["citations"]), "binding_gap_ranges": outside})
+    return result
+
+
+def issues(assessments, metric_checks, *, row, originals, cited_evidence):
     return [dict(kind="source_assertion", field=key, **deepcopy(value)) for key, value in assessments.items()
-        if value["state"] in ("contradicted", "unverifiable")] + [deepcopy(c["issue"]) for c in metric_checks if c["issue"]]
+        if value["state"] in ("contradicted", "unverifiable")] + citation_binding_issues(
+            row, assessments, originals, cited_evidence) + [deepcopy(c["issue"]) for c in metric_checks if c["issue"]]
 
 
 def source_gaps(record):
@@ -679,7 +721,8 @@ def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources
                 record["metric_checks"].append({"decision_id": decision_id, "spec": deepcopy(spec),
                     "selected_key": selected["key"], "issue": metric_issue(spec, selected)})
             record["assessments"] = assessments[current["id"]]
-            record["issues"] = issues(record["assessments"], record["metric_checks"])
+            record["issues"] = issues(record["assessments"], record["metric_checks"], row=current,
+                originals=originals, cited_evidence=record["check"]["cited_evidence"])
             if not record["issues"] or number == max_rewrites:
                 entry.update(status="unverified" if record["issues"] else "model_supported", accepted=deepcopy(current["item"]))
                 apply_item(candidate, current, current["item"])
@@ -963,7 +1006,8 @@ def validate(result, originals, meta):
                 if not terminal or ledger["interruption_reason"] != str(error):
                     raise
                 break
-            expected_issues = issues(checked, checks)
+            expected_issues = issues(checked, checks, row=current,
+                originals=originals, cited_evidence=attempt["check"]["cited_evidence"])
             if attempt.get("assessments") != checked or attempt.get("issues") != expected_issues:
                 raise PartitionError("stored_fact_assessment_changed")
             if not expected_issues or number == limit - 1:

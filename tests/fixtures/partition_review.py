@@ -58,11 +58,28 @@ class PartitionModelClient:
             return body if isinstance(body, ModelResponse) else ModelResponse(json.dumps(body, ensure_ascii=False),
                 {"input_tokens": self.count_input_tokens(request), "output_tokens": 10})
         elif stage == "fact_check":
-            ref = next(block["reference_id"] for source in payload["originals"] for block in source["blocks"])
-            body = {"source_requests": [], "items": {row["item_id"]: {field: {"state": "supported" if value else "non_factual",
-                "reason": "Synthetic factual check; not evidence of native semantic quality.",
-                "citations": [{"reference_id": ref}] if value else []}
-                for field, value in row["fields"].items()} for row in payload["items"]}}
+            fallback = next(block["reference_id"] for source in payload["originals"] for block in source["blocks"])
+            def default_reference(row):
+                item = row["original_item"]
+                own = item.get("citations", []) if isinstance(item, dict) else []
+                if not own:
+                    return fallback
+                candidates = [(entry, citation) for source in payload["citation_catalog"] for entry in source["ranges"]
+                    for citation in own if source["evidence_id"] == citation["evidence_id"]]
+                for entry, citation in candidates:
+                    if (entry["start_byte"], entry["end_byte"]) == (citation["start_byte"], citation["end_byte"]):
+                        return entry["reference_id"]
+                for entry, citation in candidates:
+                    if citation["start_byte"] <= entry["start_byte"] < entry["end_byte"] <= citation["end_byte"]:
+                        return entry["reference_id"]
+                return None
+            body = {"source_requests": [], "items": {}}
+            for row in payload["items"]:
+                ref = default_reference(row)
+                body["items"][row["item_id"]] = {field: {"state": "non_factual" if not value else "supported" if ref else "unverifiable",
+                    "reason": "Synthetic factual check; not evidence of native semantic quality." if ref or not value else
+                        "This exact source page does not deliver the item's own cited range.",
+                    "citations": [{"reference_id": ref}] if value and ref else []} for field, value in row["fields"].items()}
         elif stage == "fact_rewrite":
             replacement = deepcopy(payload["items"][0]["original_item"])
             ref = next(block["reference_id"] for source in payload["originals"] for block in source["blocks"])

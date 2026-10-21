@@ -891,6 +891,14 @@ def test_true_test_claim_with_header_citation_uses_existing_rewrite_to_repair_bi
             assert "do not silently repair" in rule and "empty or non_factual fields" in rule
             for row in payload["items"]:
                 item = row["original_item"]
+                if isinstance(item, dict) and item.get("citations"):
+                    original_cite = item["citations"][0]
+                    own_reference = next(entry["reference_id"] for source in payload["citation_catalog"]
+                        if source["evidence_id"] == original_cite["evidence_id"] for entry in source["ranges"]
+                        if (entry["start_byte"], entry["end_byte"]) == (original_cite["start_byte"], original_cite["end_byte"]))
+                    for field, assessment in body["items"][row["item_id"]].items():
+                        if assessment["state"] == "supported" and row["fields"][field]:
+                            assessment["citations"] = [{"reference_id": own_reference}]
                 if isinstance(item, dict) and item.get("perspective_id") == "supporting_evidence":
                     assert item["failure_condition"] == "" and row["fields"]["failure_condition"] == ""
                     assert body["items"][row["item_id"]]["failure_condition"]["state"] == "non_factual"
@@ -898,8 +906,8 @@ def test_true_test_claim_with_header_citation_uses_existing_rewrite_to_repair_bi
                     checked_fields.append(original_binding_supported)
                     if not original_binding_supported:
                         for field in ("statement", "reasoning"):
-                            body["items"][row["item_id"]][field].update(state="unverifiable",
-                                reason="The claim is true in the full HEAD test, but this item's original citation contains only imports and omits the assertion.",
+                            body["items"][row["item_id"]][field].update(state="supported",
+                                reason="The claim is true in the full HEAD test; the checker selected the actual assertion range.",
                                 citations=[{"reference_id": reference(payload, assertion.strip())}])
         elif stage == "fact_rewrite":
             item = deepcopy(payload["items"][0]["original_item"])
@@ -920,9 +928,53 @@ def test_true_test_claim_with_header_citation_uses_existing_rewrite_to_repair_bi
     assert any(assertion.strip() in cite["quote"] and cite["begin_line"] == 9 for cite in accepted["citations"])
     entry = next(entry for entry in result.partition["fact_verification"]["items"] if entry["original"] == original)
     first, second = entry["attempts"]
-    assert first["assessments"]["statement"]["state"] == "unverifiable"
+    assert first["assessments"]["statement"]["state"] == "supported"
+    assert first["check"]["response"]["items"][entry["item_id"]]["statement"]["state"] == "supported"
+    gap = next(issue for issue in first["issues"] if issue["field"] == "statement")
+    assert gap["state"] == "unverifiable" and gap["binding_gap_ranges"]
     assert any(assertion.strip() in cite["quote"] for cite in first["check"]["cited_evidence"])
     assert second["assessments"]["statement"]["state"] == "supported"
     assert len([request for request in review.requests if json.loads(request.user_content)["stage"] == "fact_rewrite"]) == 1
     assert result.summary == result.partition["pre_verification_final"]["summary"]
     validate_partition_result(result, task)
+    changed = deepcopy(result)
+    changed_entry = next(value for value in changed.partition["fact_verification"]["items"] if value["item_id"] == entry["item_id"])
+    changed_entry["attempts"][0]["issues"][0]["binding_gap_ranges"] = []
+    with pytest.raises(PartitionError, match="stored_fact_assessment_changed"):
+        validate_partition_result(changed, task)
+
+
+
+def test_citation_binding_union_accepts_adjacent_ranges_and_skips_empty_nonfactual_and_summary():
+    from review_bot.application.source_partition import SourceOriginal
+    source = SourceOriginal("S-union", "abcdefghij", "source", "a.py", "head", "a" * 40)
+    def cite(start, end):
+        return {"evidence_id": source.evidence_id, "start_byte": start, "end_byte": end,
+            "quote": source.raw[start:end].decode()}
+    def reference(start, end):
+        return {"reference_id": "Q" + hash_json((source.evidence_id, source.digest, start, end))[:12]}
+    row = {"id": "findings:0", "kind": "findings", "item": {"statement": "A supported source assertion.",
+        "reasoning": "Could the author consider this alternative?", "failure_condition": "", "citations": [cite(0, 4), cite(4, 8)]}}
+    assessments = {"statement": {"state": "supported", "reason": "Exact proof.", "citations": [reference(0, 8)]},
+        "reasoning": {"state": "non_factual", "reason": "Pure question.", "citations": [reference(8, 10)]},
+        "failure_condition": {"state": "supported", "reason": "Empty field, ignored by binding guard.", "citations": [reference(8, 10)]}}
+    unchanged = deepcopy((row, assessments))
+    assert facts.citation_binding_issues(row, assessments, [source], [cite(0, 8), cite(8, 10)]) == []
+    assert (row, assessments) == unchanged
+    assert facts.citation_binding_issues({"id": "summary", "kind": "summary", "item": "No own citations."},
+        {"text": assessments["statement"]}, [source], [cite(8, 10)]) == []
+
+
+def test_citation_binding_distinct_evidence_identity_remains_a_conservative_gap():
+    from review_bot.application.source_partition import SourceOriginal
+    original = SourceOriginal("S-head", "same bytes", "source", "a.py", "head", "a" * 40)
+    other = SourceOriginal("S-base", "same bytes", "source", "a.py", "base", "b" * 40)
+    own = {"evidence_id": original.evidence_id, "start_byte": 0, "end_byte": len(original.raw), "quote": original.text}
+    witness = {"evidence_id": other.evidence_id, "start_byte": 0, "end_byte": len(other.raw), "quote": other.text}
+    reference = {"reference_id": "Q" + hash_json((other.evidence_id, other.digest, 0, len(other.raw)))[:12]}
+    row = {"id": "findings:0", "kind": "findings", "item": {"statement": "A source claim.", "reasoning": "", "failure_condition": "", "citations": [own]}}
+    assessment = {"statement": {"state": "supported", "reason": "Checker chose the other frozen identity.", "citations": [reference]}}
+    gap, = facts.citation_binding_issues(row, assessment, [original, other], [witness])
+    assert gap["kind"] == "source_assertion" and gap["state"] == "unverifiable"
+    assert gap["binding_gap_ranges"] == [{"evidence_id": other.evidence_id, "start_byte": 0, "end_byte": len(other.raw)}]
+    assert assessment["statement"]["state"] == "supported" and row["item"]["citations"] == [own]
