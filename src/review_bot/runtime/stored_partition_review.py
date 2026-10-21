@@ -82,6 +82,13 @@ def shared_review_generation_key(task, config, review_client, planning_client, b
     snapshot = value.get("snapshot", {})
     for key in ("captured_at", "as_of", "snapshot_id", "context_digest"):
         snapshot.pop(key, None)
+    if (snapshot.get("comparison_status") == "comparable"
+            and snapshot.get("comparison_base_sha") == value.get("base", {}).get("sha")
+            and snapshot.get("head_sha") == value.get("head", {}).get("sha")
+            and snapshot.get("comparison_base_sha") and snapshot.get("head_sha")):
+        # Publication still fences the current target ref. The review's actual
+        # comparison/head commits and complete material below remain in the key.
+        snapshot.pop("target_base_sha", None)
     for evidence in snapshot.get("evidence", []):
         locator = evidence.get("locator", {})
         locator.pop("retrieved_at", None)

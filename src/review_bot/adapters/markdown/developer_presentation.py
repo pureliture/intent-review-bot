@@ -246,15 +246,19 @@ def quotes(citations, task) -> str:
 
 def judgement_label(finding) -> str:
     verdict = finding.get("verdict", finding.get("judgement", ""))
+    if verdict in ("concern", "confirmed_issue"):
+        return "확인된 문제"
     if verdict in ("insufficient_context", "insufficient_evidence", "author_question"):
         return "작성자 확인 질문"
     if verdict == "improvement":
         return "구체적 개선 제안"
-    if verdict == "conditional_risk" or finding.get("failure_condition"):
+    if verdict == "conditional_risk":
+        return "조건부 위험"
+    if finding.get("failure_condition"):
         return "조건부 위험"
     if finding.get("basis") == "analysis_signal":
         return "구조 검토 의견"
-    return "확인된 문제" if verdict in ("concern", "confirmed_issue") else escape(verdict)
+    return escape(verdict)
 
 
 def findings_section(findings, questions, task, *, signals=(), target_reviews=None, presentation=None) -> str:

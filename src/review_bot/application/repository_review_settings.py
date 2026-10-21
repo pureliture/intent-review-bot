@@ -154,6 +154,8 @@ def parse_repository_review_settings(raw: bytes, source_sha: str) -> RepositoryR
         sections[section] = {}
         for key, text in supplied.items():
             text = _text(text, maximum, template=section == "comment_templates")
+            if section == "presentation" and len(text) > 1000:
+                raise RepositorySettingsError("text_size_limit")
             if section == "comment_templates":
                 for name in TEMPLATE_SECTIONS[key]:
                     token = "{{" + name + "}}"

@@ -218,6 +218,80 @@ def test_settings_presentation_update_reuses_original_plan_and_review_then_crite
         worker_pipeline_ports["analyzer"].run_analysis.assert_not_called()
 
 
+def test_real_default_branch_presentation_commit_reuses_review_with_current_base_fence(
+    tmp_path, valid_config_yaml, synthetic_repo,
+):
+    from unittest.mock import Mock
+    from review_bot.adapters.git import GitRepositoryReader
+    from review_bot.adapters.repository_review_settings import FileRepositoryReviewSettingsStore
+    from review_bot.application.repository_review_settings import (
+        RepositoryReviewSettingsResolver, SETTINGS_PATH,
+    )
+
+    path = "src/main/java/demo/Service.java"
+    synthetic_repo.write_file("build.gradle", "plugins { id 'java' }\n")
+    synthetic_repo.write_file(path, "package demo; class Service { int value() { return 0; } }\n")
+    synthetic_repo.write_file(SETTINGS_PATH, json.dumps({"schema_version": 1,
+        "presentation": {"title_b": "처음 팀 검토"}}, ensure_ascii=False))
+    base = synthetic_repo.commit("Initial code and review presentation")
+    synthetic_repo.create_branch("feature/cache", base)
+    synthetic_repo.checkout("feature/cache")
+    synthetic_repo.write_file(path, "package demo; class Service { int value() { return 1; } }\n")
+    head = synthetic_repo.commit("Change the reviewed method")
+    synthetic_repo.checkout("main")
+    reader = GitRepositoryReader(synthetic_repo.repo_dir)
+    resolver = RepositoryReviewSettingsResolver(FileRepositoryReviewSettingsStore(tmp_path / "settings-state"))
+
+    def settings_factory(run, pr_data, github, *, before_request):
+        assert before_request()
+        return resolver.resolve(run.installation_id, run.repository_id,
+            lambda: (reader.get_commit("refs/heads/main").sha, reader))
+
+    analyzer = Mock()
+    ports = {"repo_reader": reader, "analyzer": analyzer}
+    with _app_worker(tmp_path, valid_config_yaml, ports, "intent", comments=True,
+        settings_factory=settings_factory) as context:
+        _, worker, github, store, root, _, review, tev = context
+        github.pull_requests[7]["base"]["sha"] = base
+        github.pull_requests[7]["head"].update(sha=head, ref="feature/cache")
+        assert worker.run_once() is True
+        counts = (len(review.requests), len(tev.requests))
+        assert all(counts)
+        runs = root / "artifacts/runs/99/7"
+        first_run = next(runs.iterdir())
+        original_input = json.loads((first_run / "B/input.json").read_text())
+        original_result = json.loads((first_run / "B/result.json").read_text())
+        original_plan = json.loads((first_run / "execution-plan.json").read_text())
+        original_changes = reader.get_changed_files(base, head)
+        comment_id = github.posted_comments[0]["id"]
+
+        synthetic_repo.write_file(SETTINGS_PATH, json.dumps({"schema_version": 1,
+            "presentation": {"title_b": "변경된 팀 검토"},
+            "comment_templates": {"intent": "{{summary}}\n{{perspectives}}\n{{llm_review}}"}}, ensure_ascii=False))
+        advanced = synthetic_repo.commit("Update presentation on the default branch only")
+        assert advanced != base and reader.get_commit("feature/cache").sha == head
+        assert reader.resolve_merge_base(advanced, head).comparison_base_sha == base
+        assert reader.get_changed_files(base, head) == original_changes
+        github.pull_requests[7]["base"]["sha"] = advanced
+        store.enqueue_request(PrRequestRecord(44, 99, 7, 2))
+        assert worker.run_once() is True, store._get_connection().execute("SELECT status,error FROM runs").fetchall()
+        assert (len(review.requests), len(tev.requests)) == counts
+        assert len(github.posted_comments) == 1 and len(github.updated_comments) == 1
+        assert github.updated_comments[0]["id"] == comment_id
+        assert "변경된 팀 검토" in github.updated_comments[0]["body"]
+        second_run = next(directory for directory in runs.iterdir() if directory != first_run)
+        assert json.loads((second_run / "snapshot.json").read_text())["target_base_sha"] == advanced
+        receipt = json.loads((second_run / "B/receipt.json").read_text())
+        assert receipt["publication"]["status"] == "succeeded"
+        assert receipt["publication"]["comment_id"] == comment_id
+        assert receipt["usage"]["model_calls"] == 0
+        assert json.loads((second_run / "B/input.json").read_text()) == original_input
+        assert json.loads((second_run / "B/result.json").read_text()) == original_result
+        assert json.loads((second_run / "execution-plan.json").read_text()) == original_plan
+        assert json.loads((second_run / "repository-settings.json").read_text())["bundle"]["source_sha"] == advanced
+        analyzer.run_analysis.assert_not_called()
+
+
 def test_b_perspective_failure_preserves_selected_a_execution_and_posts_b_status(
     tmp_path, valid_config_yaml, worker_pipeline_ports,
 ):

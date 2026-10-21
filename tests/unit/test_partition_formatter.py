@@ -89,10 +89,14 @@ def test_partition_template_cannot_drop_required_completed_sections():
     assert markdown.index("#### LLM 리뷰") < markdown.index("#### 전체 판단")
 
 
-def test_partition_adopted_perspective_concern_is_actionable_in_main_review():
+@pytest.mark.parametrize("verdict,label,other_label", [
+    ("concern", "확인된 문제", "조건부 위험"),
+    ("conditional_risk", "조건부 위험", "확인된 문제"),
+])
+def test_partition_declared_verdict_keeps_its_label_and_failure_condition(verdict, label, other_label):
     def concern(payload, body):
         if payload["stage"] == "final_review":
-            body["perspectives"][0].update(verdict="conditional_risk", statement="Missing caller guard can expose stale values.",
+            body["perspectives"][0].update(verdict=verdict, statement="Missing caller guard can expose stale values.",
                 failure_condition="A caller bypasses the guard while the cache is stale.")
         return body
 
@@ -101,6 +105,16 @@ def test_partition_adopted_perspective_concern_is_actionable_in_main_review():
     assert result.status == "completed", result.reason
     markdown = format_partition_review_markdown(result, task, publication_mode="comment")
     main = markdown.split("<summary>8개 관점별 검토 근거</summary>")[0]
-    assert "조건부 위험" in main and "Missing caller guard" in main
+    assert label in main and other_label not in main and "Missing caller guard" in main
+    assert "성립 조건:" in main
     assert "A caller bypasses the guard" in main
     assert "추가로 조치할 발견사항은 없습니다" not in main
+
+
+def test_explicit_finding_verdict_precedes_its_condition_and_analysis_basis():
+    from review_bot.adapters.markdown.developer_presentation import judgement_label
+    for verdict, expected in (("concern", "확인된 문제"), ("confirmed_issue", "확인된 문제"),
+            ("conditional_risk", "조건부 위험"), ("improvement", "구체적 개선 제안"),
+            ("insufficient_evidence", "작성자 확인 질문"), ("author_question", "작성자 확인 질문")):
+        assert judgement_label({"verdict": verdict, "basis": "analysis_signal", "failure_condition": "A concrete condition."}) == expected
+    assert judgement_label({"judgement": "concern", "basis": "analysis_signal"}) == "확인된 문제"

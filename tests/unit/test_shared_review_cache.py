@@ -223,6 +223,40 @@ def test_architecture_cache_codec_restores_real_task_dataclass(tmp_path, worker_
     assert asdict(restored_result) == asdict(result)
 
 
+def test_generation_key_preserves_actual_comparison_head_sources_and_guidance(valid_config_yaml):
+    from dataclasses import replace
+    import yaml
+    from review_bot.application.repository_review_settings import RepositoryReviewSettings
+    from review_bot.config import load_review_config_from_str
+    from review_bot.runtime.stored_partition_review import shared_review_generation_key
+    from tests.fixtures.intent_perspectives import make_task
+    from tests.fixtures.partition_review import PartitionModelClient
+
+    raw = yaml.safe_load(valid_config_yaml)
+    raw["execution"]["available_modes"] = ["intent"]
+    config, _ = load_review_config_from_str(yaml.safe_dump(raw))
+    task = make_task()
+    review, tev = PartitionModelClient(), PartitionModelClient(group_all=True)
+    bundle = RepositoryReviewSettings()
+    key = lambda value, settings=bundle: shared_review_generation_key(value, config, review, tev, settings, "intent")
+    original = key(task)
+    assert key(replace(task, snapshot=replace(task.snapshot, target_base_sha="c" * 40))) == original
+    changed_base = replace(task, base=replace(task.base, sha="d" * 40),
+        snapshot=replace(task.snapshot, comparison_base_sha="d" * 40))
+    changed_head = replace(task, head=replace(task.head, sha="e" * 40),
+        snapshot=replace(task.snapshot, head_sha="e" * 40))
+    changed_file = replace(task.head.files[0], content=task.head.files[0].content + "\n# changed source\n")
+    changed_source = replace(task, head=replace(task.head, files=(changed_file, *task.head.files[1:])))
+    for changed in (changed_base, changed_head, changed_source):
+        assert key(changed) != original
+    assert key(task, RepositoryReviewSettings(review_instructions=(("intent", "new judgment guidance"),))) != original
+    # An incomparable or inconsistent material cannot normalize away target refs.
+    for snapshot in (replace(task.snapshot, comparison_status="incomparable"),
+        replace(task.snapshot, comparison_base_sha="f" * 40)):
+        value = replace(task, snapshot=snapshot)
+        assert key(value) != key(replace(value, snapshot=replace(snapshot, target_base_sha="c" * 40)))
+
+
 @pytest.mark.parametrize("changed", ["ruleset", "tools_lock"])
 def test_same_path_recipe_bytes_or_unavailable_recipe_cannot_reuse_previous_a_or_plan(tmp_path, valid_config_yaml, changed):
     from review_bot.application.repository_review_settings import RepositoryReviewSettings

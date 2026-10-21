@@ -121,6 +121,37 @@ def test_generation_and_presentation_hashes_have_independent_effects():
     assert first.effective_version == same_content_new_commit.effective_version
 
 
+def test_presentation_labels_match_renderer_character_and_utf8_byte_bounds():
+    from review_bot.adapters.markdown.developer_presentation import label
+
+    for text in ("x" * 1000, "가" * 341):
+        bundle = parse_repository_review_settings(manifest(presentation={"title_b": text}), SHA)
+        assert label(dict(bundle.presentation), "title_b", "fallback") == text
+    for text in ("x" * 1001, "가" * 342):
+        with pytest.raises(RepositorySettingsError, match="text_size_limit"):
+            parse_repository_review_settings(manifest(presentation={"title_b": text}), NEXT_SHA)
+
+
+def test_invalid_presentation_bundle_uses_fallback_without_replacing_last_valid(tmp_path):
+    store = FileRepositoryReviewSettingsStore(tmp_path)
+    current = RepositoryReviewSettingsResolver(store)
+    previous = current.resolve(44, 99, source(manifest(review_instructions={"intent": "trusted"},
+        presentation={"title_b": "x" * 1000}))[0])
+    assert not previous.used_fallback
+    for text in ("x" * 1001, "가" * 342):
+        invalid = source(manifest(review_instructions={"intent": "unaccepted"},
+            presentation={"title_b": text}), NEXT_SHA)[0]
+        resolution = current.resolve(44, 99, invalid)
+        assert resolution.used_fallback and resolution.diagnostic == "text_size_limit"
+        assert resolution.bundle == previous.bundle
+        assert resolution.attempted_sha == NEXT_SHA and resolution.bundle.source_sha == SHA
+        assert store.load(44, 99) == previous.bundle
+        no_history = current.resolve(44, 100, invalid)
+        assert no_history.used_fallback and no_history.bundle.is_builtin
+        assert no_history.diagnostic == "text_size_limit"
+        assert store.load(44, 100) is None
+
+
 @pytest.mark.parametrize("raw", [
     b"\xff", b'{"schema_version":1,"schema_version":1}',
     b'{"schema_version":true}', b'{"schema_version":1,"mode":"intent"}',
