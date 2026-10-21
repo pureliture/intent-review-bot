@@ -119,7 +119,8 @@ def test_code_first_failure_preserves_completed_a_files_and_mode_receipts(intent
     result = json.loads((root / "B/result.json").read_text())
     assert result["schema_version"] == 13 and result["status"] == "failed"
     assert result["usage"]["calls"] == len([r for r in review.requests
-        if json.loads(r.user_content)["mode"] == "intent"]) == 1
+        if json.loads(r.user_content)["mode"] == "intent"]) == 2
+    assert [row["response"] for row in result["partition"]["rejected_review_attempts"]] == [{}, {}]
     receipt = json.loads((root / "B/receipt.json").read_text())
     assert receipt["b_result"] == result
     assert (root / "A/receipt.json").exists()

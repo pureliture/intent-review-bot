@@ -280,7 +280,10 @@ def test_outside_span_citation_and_stored_quote_tampering_are_rejected():
     task = make_task()
     bad = run_partition_review(task, "intent", PartitionModelClient(transform=invalid), PartitionModelClient(), limits=limits())
     assert bad.status == "failed" and bad.reason == "citation_reference_not_supplied"
-    assert any(r.reason == "invalid_model_response" for r in bad.stages)
+    rejected = bad.partition["rejected_review_attempts"]
+    assert len(rejected) == 2 and all(row["reason"] == "citation_reference_not_supplied" for row in rejected)
+    assert all(bad.stages[row["stage_index"]].reason == row["reason"] for row in rejected)
+    validate_partition_result(bad, task)
     result = run_partition_review(task, "intent", PartitionModelClient(), PartitionModelClient(), limits=limits())
     result.perspectives[0]["citations"][0]["quote"] = "fabricated"
     with pytest.raises(PartitionError, match="quote_mismatch|assembly_mismatch|single_page_conclusion_changed|stored_fact_final_changed"):
@@ -440,8 +443,196 @@ def test_out_of_schema_non_head_concern_still_fails_instead_of_bypassing_groundi
         return body
     result = run_partition_review(make_task(), "intent", PartitionModelClient(transform=unsupported),
         PartitionModelClient(), limits=limits())
-    assert result.status == "failed" and result.reason == "draft_concern_without_head_failure_evidence"
+    assert result.status == "failed" and result.reason.startswith("draft_concern_without_head_failure_evidence:")
+    assert len(result.partition["rejected_review_attempts"]) == 2
     assert not result.partition.get("integration_pages")
+
+
+@pytest.mark.parametrize("missing", ["head_reference", "failure_condition"])
+def test_draft_grounding_gets_one_bounded_recheck_with_unchanged_sources_and_exact_feedback(missing):
+    from copy import deepcopy
+    task = make_task()
+    rejected_response = []
+    target_key = "assumptions_tradeoffs"
+
+    def invalid_first(payload, body):
+        if payload["stage"] == "review_partition":
+            catalog = payload["citation_catalog"]
+            head = next((row for row in catalog if row["path"] and row["version"] == "head"), None)
+            if head is None:
+                return body
+            prose = next(row for row in catalog if not row["path"])
+            retry = "source_recheck" in payload
+            draft = body["draft_assessments"][target_key]
+            draft.update(verdict="conditional_risk", failure_condition="An actual supplied HEAD call would fail.",
+                citations=[{"reference_id": (prose if not retry and missing == "head_reference" else head)["ranges"][0]["reference_id"]}])
+            if not retry and missing == "failure_condition":
+                draft["failure_condition"] = ""
+            if not retry:
+                rejected_response.append(deepcopy(body))
+        return body
+
+    review = PartitionModelClient(group_all=True, transform=invalid_first)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed", result.reason
+    requests = [r for r in review.requests if json.loads(r.user_content)["stage"] == "review_partition"]
+    assert len(requests) == 2 and requests[0].response_schema == requests[1].response_schema
+    first, retry = [json.loads(r.user_content) for r in requests]
+    previous = retry.pop("source_recheck")
+    assert first == retry
+    assert previous["rejected_response"] == rejected_response[0]
+    field = "citations" if missing == "head_reference" else "failure_condition"
+    assert previous["validation_error"].startswith("draft_concern_without_head_failure_evidence:"
+        f'json_path=$.draft_assessments["{target_key}"].{field};draft_key={target_key};')
+    allowed = [entry["reference_id"] for source in first["citation_catalog"]
+        if source["path"] and source["version"] == "head" for entry in source["ranges"]]
+    assert previous["validation_error"].endswith("allowed_HEAD_reference_ids=" + json.dumps(allowed))
+    for draft in requests[0].response_schema["properties"]["draft_assessments"]["properties"].values():
+        assert "nonempty" in draft["properties"]["failure_condition"]["description"]
+        assert "HEAD code reference" in draft["properties"]["citations"]["description"]
+    assert "Draft concern and conditional_risk require BOTH" in requests[0].system_prompt
+    rejected = result.partition["rejected_review_attempts"]
+    assert len(rejected) == 1 and rejected[0]["response"] == rejected_response[0]
+    assert rejected[0]["reason"] == previous["validation_error"]
+    assert result.stages[rejected[0]["stage_index"]].status == "failed"
+    accepted = result.partition["review_observations"][0]["raw_response"]["draft_assessments"]
+    assert accepted[target_key]["verdict"] == "conditional_risk" and accepted[target_key]["failure_condition"]
+    assert {key: value for key, value in accepted.items() if key != target_key} == {
+        key: value for key, value in rejected_response[0]["draft_assessments"].items() if key != target_key}
+    validate_partition_result(result, task)
+
+    altered = deepcopy(result)
+    row = altered.partition["review_observations"][0]
+    row["raw_response"]["draft_assessments"][target_key] = deepcopy(rejected_response[0]["draft_assessments"][target_key])
+    from review_bot.application.partition_review import hash_json
+    row["raw_response_hash"] = hash_json(row["raw_response"])
+    with pytest.raises(PartitionError, match="draft_concern_without_head_failure_evidence"):
+        validate_partition_result(altered, task)
+
+
+@pytest.mark.parametrize("gate", ["disabled", "call_limit", "lease", "input_limit"])
+def test_draft_validation_recheck_cannot_bypass_recheck_budget_or_active_guard(gate):
+    from review_bot.application.model_execution import ModelExecutionBudget
+    import time
+    task = make_task()
+    active = True
+    review = PartitionModelClient(group_all=True)
+
+    def invalid(payload, body):
+        nonlocal active
+        if payload["stage"] == "review_partition":
+            body["citations"] = [{"reference_id": "not-supplied"}]
+        return body
+
+    review.transform = invalid
+    def count(request):
+        nonlocal active
+        if "source_recheck" in json.loads(request.user_content):
+            if gate == "lease":
+                active = False
+            if gate == "input_limit":
+                return 100000
+        return 100
+    review.counter = count
+    configured = limits()
+    if gate == "disabled":
+        configured = replace(configured, max_rechecks=0)
+    if gate == "call_limit":
+        def exhaust_after_first(payload, body):
+            body = invalid(payload, body)
+            if payload["stage"] == "review_partition":
+                budget.limits = replace(configured, max_calls=budget.totals()[0])
+            return body
+        review.transform = exhaust_after_first
+    budget = ModelExecutionBudget(configured, time.monotonic() + 120, lambda: active)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True),
+        limits=configured, shared_budget=budget)
+    assert result.status == "failed"
+    assert len([r for r in review.requests if json.loads(r.user_content)["stage"] == "review_partition"]) == 1
+    assert len(result.partition["rejected_review_attempts"]) == 1
+    assert not result.partition.get("integration_pages")
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("tamper", ["delete", "duplicate", "alter_raw", "recheck_excess", "request_chain", "missing_attempt", "source_blocks", "citation_catalog"])
+def test_stored_note_recheck_binds_every_rejection_raw_stage_and_request_chain(tamper):
+    from copy import deepcopy
+    from review_bot.application.context import hash_json
+    task = make_task()
+
+    def invalid_first(payload, body):
+        if payload["stage"] == "review_partition" and "source_recheck" not in payload:
+            body["citations"] = [{"reference_id": "not-supplied"}]
+        return body
+
+    result = run_partition_review(task, "intent", PartitionModelClient(group_all=True, transform=invalid_first),
+        PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed", result.reason
+    validate_partition_result(result, task)
+    altered = deepcopy(result)
+    history = altered.partition["review_validation_attempts"]
+    rejected = altered.partition["rejected_review_attempts"]
+    if tamper == "delete":
+        rejected.clear()
+    elif tamper == "duplicate":
+        rejected.append(deepcopy(rejected[0]))
+    elif tamper == "alter_raw":
+        rejected[0]["response"]["statement"] += " changed"
+        rejected[0]["response_hash"] = hash_json(rejected[0]["response"])
+        history[0]["response_hash"] = rejected[0]["response_hash"]
+    elif tamper == "recheck_excess":
+        altered.partition["identity"]["limits"]["max_rechecks"] = 0
+        altered = replace(altered, run_key=hash_json(altered.partition["identity"]))
+    elif tamper == "request_chain":
+        packet = history[1]["request"]
+        payload = json.loads(packet["user_content"])
+        payload["source_recheck"]["validation_error"] = "different-error"
+        packet["user_content"] = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    elif tamper in ("source_blocks", "citation_catalog"):
+        events = list(altered.stages)
+        for item in history:
+            packet = item["request"]
+            payload = json.loads(packet["user_content"])
+            if tamper == "source_blocks":
+                payload["originals"][0]["blocks"][0]["text"] += " changed in both requests"
+            else:
+                payload["citation_catalog"][0]["ranges"][0]["reference_id"] = "changed-in-both-requests"
+            packet["user_content"] = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            index = item["stage_index"]
+            event = events[index]
+            events[index] = replace(event, request_hash=hash_json(packet), token_measurement_request_hash=hash_json(packet),
+                attempts=tuple(replace(attempt, request_hash=hash_json(packet)) for attempt in event.attempts))
+        altered = replace(altered, stages=tuple(events))
+    else:
+        history.pop(0)
+    with pytest.raises(PartitionError, match="stored_review_validation_history_changed"):
+        validate_partition_result(altered, task)
+
+
+def test_old_failed_note_artifact_keeps_generic_stage_without_becoming_a_completed_review():
+    from copy import deepcopy
+    from review_bot.application.context import hash_json
+    task = make_task()
+
+    def invalid(payload, body):
+        if payload["stage"] == "review_partition":
+            body["citations"] = [{"reference_id": "not-supplied"}]
+        return body
+
+    result = run_partition_review(task, "intent", PartitionModelClient(group_all=True, transform=invalid),
+        PartitionModelClient(group_all=True), limits=replace(limits(), max_rechecks=0))
+    assert result.status == "failed"
+    legacy = deepcopy(result)
+    legacy.partition.pop("review_validation_contract")
+    legacy.partition.pop("review_validation_attempts")
+    index = legacy.partition["rejected_review_attempts"][0]["stage_index"]
+    events = list(legacy.stages)
+    events[index] = replace(events[index], status="completed", reason="invalid_model_response")
+    legacy = replace(legacy, stages=tuple(events))
+    validate_partition_result(legacy, task)
+    promoted = replace(legacy, status="completed")
+    with pytest.raises(PartitionError):
+        validate_partition_result(promoted, task)
 
 
 def test_architecture_draft_can_recommend_structural_improvement_without_inventing_a_runtime_failure():
@@ -514,7 +705,7 @@ def test_later_invalid_group_preserves_prior_raw_outputs_and_the_rejected_reply(
     def break_third(payload, body):
         if payload["stage"] == "review_partition":
             seen.append(body)
-            if len(seen) == 3:
+            if len(seen) >= 3:
                 body["citations"] = [{"reference_id": "not-supplied"}]
         return body
     task = make_task()
@@ -524,8 +715,8 @@ def test_later_invalid_group_preserves_prior_raw_outputs_and_the_rejected_reply(
     kept = result.partition["review_observations"]
     assert len(kept) == 2 and [row["raw_response"] for row in kept] == seen[:2]
     rejected = result.partition["rejected_review_attempts"]
-    assert len(rejected) == 1 and rejected[0]["response"] == seen[2]
-    assert rejected[0]["reason"] == "citation_reference_not_supplied"
+    assert len(rejected) == 2 and [row["response"] for row in rejected] == seen[2:]
+    assert all(row["reason"] == "citation_reference_not_supplied" for row in rejected)
     validate_partition_result(result, task)
 
 

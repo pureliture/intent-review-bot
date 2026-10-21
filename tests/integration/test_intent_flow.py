@@ -324,7 +324,8 @@ def test_b_invalid_response_retains_called_stage_and_does_not_suppress_a(intent_
     flow = intent_flow
     use_modes(flow, ("intent", "architecture"))
     enable_a_fixture(flow)
-    failed_model = MockModelClient([ModelResponse("{}", {"input_tokens": 100, "output_tokens": 10})], input_tokens=100)
+    failed_model = MockModelClient([ModelResponse("{}", {"input_tokens": 100, "output_tokens": 10})] * 2,
+        input_tokens=100)
     flow.worker.model_client = failed_model
     assert send_event(flow).status_code == 202
     assert flow.worker.run_once() is False
@@ -332,8 +333,9 @@ def test_b_invalid_response_retains_called_stage_and_does_not_suppress_a(intent_
     b = json.loads((root / "B/result.json").read_text())
     manifest = json.loads((root / "manifest.json").read_text())
     assert status == "failed" and b["status"] == "failed"
-    assert b["usage"]["calls"] == len(failed_model.requests) == 1
-    assert b["usage"]["input_tokens"] == 100
+    assert b["usage"]["calls"] == len(failed_model.requests) == 2
+    assert b["usage"]["input_tokens"] == 200
+    assert [row["response"] for row in b["partition"]["rejected_review_attempts"]] == [{}, {}]
     assert b["stages"][1]["attempts"] == [] and b["stages"][2]["attempts"] == []
     assert (root / "A/result.json").is_file() and flow.analyzer.run_analysis.call_count == 2
     assert manifest["modes"]["intent"]["execution_status"] == "failed"

@@ -191,11 +191,15 @@ def _draft_verdicts(architecture=False):
         ["improvement"] if architecture else [])
 
 
-def _note_schema(ids, draft_keys, *, architecture=False, has_head_code=True):
+def _note_schema(ids, draft_keys, *, architecture=False, has_head_code=True, head_reference_ids=()):
     verdicts = [value for value in _draft_verdicts(architecture)
         if has_head_code or value not in ("concern", "conditional_risk")]
     judgement = _obj({"verdict": {"type": "string", "enum": verdicts}, "statement": _text(), "reasoning": _text(),
-        "failure_condition": _text(True), "citations": {**_array(_citation_schema(ids), MAX_MODEL_CITATIONS), "minItems": 1}})
+        "failure_condition": {**_text(True), "description":
+            "For concern or conditional_risk, a nonempty concrete failure condition is required."},
+        "citations": {**_array(_citation_schema(ids), MAX_MODEL_CITATIONS), "minItems": 1,
+            "description": "For concern or conditional_risk, include at least one supplied HEAD code reference: "
+                + json.dumps(list(head_reference_ids)) + ". PR prose and base-only references do not satisfy this requirement."}})
     return _obj({"statement": _text(), "citations": {**_array(_citation_schema(ids), MAX_MODEL_CITATIONS), "minItems": 1},
         "missing_context": _array(_text(), 16), "draft_assessments": _obj({key: judgement for key in draft_keys})})
 
@@ -228,6 +232,49 @@ def _draft_validation_issues(raw):
         if draft["verdict"] == "insufficient_context" and not raw["missing_context"]]
 
 
+def _validate_note_draft_grounding(raw, choices_by_id):
+    for key, draft in raw["draft_assessments"].items():
+        if draft["verdict"] not in ("concern", "conditional_risk"):
+            continue
+        has_condition = bool(draft["failure_condition"].strip())
+        has_head = any((span := choices_by_id.get(ref["reference_id"])) is not None
+            and span.path and span.version == "head" for ref in draft["citations"])
+        if not has_condition or not has_head:
+            field = "failure_condition" if not has_condition else "citations"
+            refs = [ref["reference_id"] for ref in draft["citations"]]
+            raise PartitionError("draft_concern_without_head_failure_evidence:"
+                f"json_path=$.draft_assessments[{json.dumps(key)}].{field};draft_key={key};"
+                f"verdict={draft['verdict']};expected=nonempty_failure_condition_and_HEAD_code_reference;"
+                f"actual_references={json.dumps(refs)};"
+                f"allowed_HEAD_reference_ids={json.dumps([ref for ref, span in choices_by_id.items() if span.path and span.version == 'head'])}")
+
+
+def _note_validation_reason(raw, draft_keys, sources, originals, *, architecture=False):
+    try:
+        body, refs = _note_references(raw, draft_keys, architecture=architecture)
+        choices_by_id = citation_spans(sources, originals)
+        _validate_note_draft_grounding(body, choices_by_id)
+        if any(ref["reference_id"] not in choices_by_id for ref in refs):
+            raise PartitionError("citation_reference_not_supplied")
+        bounded_text(body["statement"])
+        for gap in bounded_array(body["missing_context"], maximum=16):
+            bounded_text(gap)
+    except (PartitionError, ValueError) as error:
+        return str(error) if isinstance(error, PartitionError) else "invalid_review_response"
+    return None
+
+
+def _note_request_witness(request_value, event):
+    # The execution budget clamps only timeout before recording the actual hash.
+    # Keep the exact request and recover that finite timeout without model calls.
+    packet = asdict(request_value)
+    for timeout in range(packet["timeout_seconds"], 0, -1):
+        packet["timeout_seconds"] = timeout
+        if hash_json(packet) == event.request_hash:
+            return packet
+    raise PartitionError("note_request_witness_mismatch")
+
+
 def _check_stored_note_response(row, sources, originals, draft_keys, *, architecture=False):
     raw, refs = _note_references(row["raw_response"], draft_keys, architecture=architecture)
     if row.get("raw_response_hash") != hash_json(raw) or (
@@ -236,6 +283,7 @@ def _check_stored_note_response(row, sources, originals, draft_keys, *, architec
     if row.get("draft_validation_issues", []) != _draft_validation_issues(raw):
         raise PartitionError("stored_draft_validation_issues_changed")
     choices_by_id = citation_spans(sources, originals)
+    _validate_note_draft_grounding(raw, choices_by_id)
     expected = []
     for ref in refs:
         span = choices_by_id.get(ref["reference_id"])
@@ -560,6 +608,13 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         prompt = (fact_check.CHECK_PROMPT if stage == "fact_check" else fact_check.REWRITE_PROMPT if stage == "fact_rewrite" else
             global_review.PROMPT + (PMD_METRIC_REFERENCE if mode == "architecture" else "") + guidance
             if stage == "global_review" else prompts["final" if stage == "final_review" else "observe"])
+        if stage == "review_partition":
+            prompt += ("\nDraft concern and conditional_risk require BOTH a nonempty concrete failure_condition "
+                "and at least one citation to supplied HEAD code with a nonempty file path. PR prose, static reports "
+                "and base-only code cannot establish a HEAD failure. Keep every original and cite only supplied "
+                "references. On source_recheck, reconsider the unchanged original response against these same "
+                "sources and choices; explain the evidence faithfully without inventing support or automatically "
+                "downgrading a verdict to pass validation.")
         prompt += render_output_contract(schema)
         prompt += "\nWrite every prose value in Korean." if language == "ko" else "\nWrite every prose value in English."
         return ModelRequest(1, current.model, prompt,
@@ -629,7 +684,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             *[asdict(span) for span in retained]]
         return citation_catalog(spans, {o.evidence_id: o for o in originals}, anchors)
 
-    def observation_request(group, current, stage):
+    def observation_request(group, current, stage, previous=None):
         if stage == "observe_partition":
             return routing_request(group, "review_scope")
         relevant = _relevant_targets(group, meta)
@@ -642,9 +697,12 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             "review_target_details": relevant,
             "draft_assessment_keys": list(draft_keys),
             "original_byte_sizes": {o.evidence_id: len(o.raw) for o in originals if o.evidence_id in {u.evidence_id for u in supplied}},
-            "perspective_catalog": [asdict(p) for p in PERSPECTIVES] if mode == "intent" or mode == "planning" and "intent" in available_modes else []},
+            "perspective_catalog": [asdict(p) for p in PERSPECTIVES] if mode == "intent" or mode == "planning" and "intent" in available_modes else [],
+            **({"source_recheck": previous} if previous is not None else {})},
             _note_schema(tuple(quote_choices(supplied)), draft_keys, architecture=mode == "architecture",
-                has_head_code=any(s.path and s.version == "head" for s in supplied)), current)
+                has_head_code=any(s.path and s.version == "head" for s in supplied),
+                head_reference_ids=[ref for ref, span in quote_choices(supplied).items()
+                    if span.path and span.version == "head"]), current)
 
     def group_fits(group, label):
         if len(group) > choices.MAX_GROUP_UNITS:
@@ -715,10 +773,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     def accept_note(raw, supplied, covered, stage):
         keys = PERSPECTIVE_IDS if mode == "intent" else [d["target_id"] for d in _relevant_targets(supplied, meta)]
         body, refs = _note_references(raw, keys, architecture=mode == "architecture")
-        for draft in body["draft_assessments"].values():
-            if draft["verdict"] in ("concern", "conditional_risk") and (not draft["failure_condition"] or not any(
-                c["path"] and c["version"] == "head" for c in citations(draft["citations"], supplied))):
-                raise PartitionError("draft_concern_without_head_failure_evidence")
+        _validate_note_draft_grounding(body, quote_choices(supplied))
         return {"observation_id": _observation_id(stage, covered),
             "statement": bounded_text(body["statement"]),
             "citations": citations(refs, supplied, maximum=MAX_MODEL_CITATIONS * (1 + len(keys))),
@@ -1086,16 +1141,33 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         # never a replacement for a Bonsai read of every actual original unit.
         review_notes = []
         partitions["review_observations"] = review_notes
+        partitions["review_validation_contract"] = 1
+        partitions["review_validation_attempts"] = []
         for i, group in enumerate(groups):
-            req = observation_request(group, profile, "review_partition")
-            raw, index = execute(req, review_client, profile, f"review_partition:G{i + 1}")
-            try:
-                note = accept_note(raw, _review_group_sources(group, originals), [u.unit_id for u in group], "review_partition")
-            except (PartitionError, ValueError) as error:
-                partitions.setdefault("rejected_review_attempts", []).append({"response": deepcopy(raw),
-                    "response_hash": hash_json(raw), "reason": str(error) if isinstance(error, PartitionError) else "invalid_review_response",
-                    "stage_index": index - first_record, "covered_unit_ids": sorted(u.unit_id for u in group)})
-                raise
+            previous = None
+            for recheck in range(limits.max_rechecks + 1):
+                req = observation_request(group, profile, "review_partition", previous)
+                raw, index = execute(req, review_client, profile,
+                    f"review_partition:G{i + 1}" + (":validation_recheck" if previous is not None else ""))
+                recovery = next((item for item in budget.output_recoveries
+                    if item["recovery_stage_index"] == index), None)
+                actual_request = replace(req, reasoning_budget_tokens=recovery["reasoning_budget_tokens"]) if recovery else req
+                partitions["review_validation_attempts"].append({"stage_index": index - first_record,
+                    "group_index": i, "covered_unit_ids": sorted(u.unit_id for u in group),
+                    "response_hash": hash_json(raw), "request": _note_request_witness(actual_request, budget.records[index])})
+                try:
+                    note = accept_note(raw, _review_group_sources(group, originals), [u.unit_id for u in group], "review_partition")
+                    note["stage_index"] = index - first_record
+                    break
+                except (PartitionError, ValueError) as error:
+                    reason = str(error) if isinstance(error, PartitionError) else "invalid_review_response"
+                    budget.records[index] = replace(budget.records[index], status="failed", reason=reason)
+                    partitions.setdefault("rejected_review_attempts", []).append({"response": deepcopy(raw),
+                        "response_hash": hash_json(raw), "reason": reason,
+                        "stage_index": index - first_record, "covered_unit_ids": sorted(u.unit_id for u in group)})
+                    if recheck == limits.max_rechecks:
+                        raise
+                    previous = {"rejected_response": deepcopy(raw), "validation_error": reason}
             review_notes.append(note)
             budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
         partitions["final_observations"] = deepcopy(review_notes)
@@ -1584,11 +1656,15 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     except PartitionError as error:
         reason = str(error)
         status = "failed" if any(r.attempts for r in budget.records[first_record:]) else "not_run"
-        if budget.records and budget.records[-1].attempts and budget.records[-1].reason != "validated":
+        if (budget.records and budget.records[-1].attempts and budget.records[-1].reason != "validated"
+                and not any(row["stage_index"] == len(budget.records) - first_record - 1
+                    for row in partitions.get("rejected_review_attempts", []))):
             budget.records[-1] = replace(budget.records[-1], status="failed", reason="invalid_model_response")
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
         status, reason = "failed", "invalid_partition_response_or_input"
-        if budget.records and budget.records[-1].attempts and budget.records[-1].reason != "validated":
+        if (budget.records and budget.records[-1].attempts and budget.records[-1].reason != "validated"
+                and not any(row["stage_index"] == len(budget.records) - first_record - 1
+                    for row in partitions.get("rejected_review_attempts", []))):
             budget.records[-1] = replace(budget.records[-1], status="failed", reason="invalid_model_response")
     local_records = budget.records[first_record:]
     partitions["rejected_model_outputs"] = [{"stage_index": index - first_record, **deepcopy(item)}
@@ -2214,6 +2290,108 @@ def _validate_global_review(result, originals, meta):
         raise PartitionError("stored_unvalidated_global_conclusion")
 
 
+def _validate_review_validation_history(result, known_units, originals, meta):
+    partition = result.partition
+    rejected = partition.get("rejected_review_attempts", [])
+    semantic_failures = {i for i, event in enumerate(result.stages)
+        if event.stage.startswith("review_partition:G") and event.status == "failed"
+        and event.reason not in ("invalid_model_response", "model_error", "model_timeout", "model_output_limit",
+            "usage_unavailable", "model_cancelled")}
+    if partition.get("review_validation_contract") != 1:
+        # The old executor stopped at its first invalid note and retained a
+        # generic stage reason. Preserve those failed artifacts without ever
+        # admitting an unbound retry history as a completed result.
+        if result.status in ("completed", "partial_review") and (rejected or semantic_failures
+                or any(":validation_recheck" in event.stage for event in result.stages)):
+            raise PartitionError("stored_review_validation_history_missing")
+        return
+    attempts = partition.get("review_validation_attempts", [])
+    groups = partition.get("groups", [])
+    notes = partition.get("review_observations", [])
+    rejected_by_stage, notes_by_stage, seen, previous = {}, {}, set(), {}
+    try:
+        for row in rejected:
+            index = row["stage_index"]
+            if type(index) is not int or index in rejected_by_stage:
+                raise ValueError
+            rejected_by_stage[index] = row
+        if set(rejected_by_stage) != semantic_failures:
+            raise ValueError
+        for row in notes:
+            index = row["stage_index"]
+            if type(index) is not int or index in notes_by_stage:
+                raise ValueError
+            notes_by_stage[index] = row
+        if [item["stage_index"] for item in attempts] != sorted(item["stage_index"] for item in attempts):
+            raise ValueError
+        for item in attempts:
+            index, group_index = item["stage_index"], item["group_index"]
+            if (type(index) is not int or index in seen or not 0 <= index < len(result.stages)
+                    or type(group_index) is not int or not 0 <= group_index < len(groups)):
+                raise ValueError
+            seen.add(index)
+            event = result.stages[index]
+            prior = previous.get(group_index)
+            group_units = groups[group_index]["unit_ids"]
+            covered = sorted(group_units)
+            sources = _review_group_sources([known_units[key] for key in group_units], list(originals.values()))
+            keys = PERSPECTIVE_IDS if result.review_type == "B" else [d["target_id"] for d in _relevant_targets(sources, meta)]
+            request_packet = item["request"]
+            payload = json.loads(request_packet["user_content"])
+            anchors = [citation for row in notes if row["stage_index"] < index for citation in row["citations"]]
+            if (payload["originals"] != source_blocks([span for span in sources if span.kind != "pr_text"], originals)
+                    or payload["pr_purpose"] != source_blocks([span for span in sources if span.kind == "pr_text"], originals)
+                    or payload["citation_catalog"] != citation_catalog(sources, originals, anchors)):
+                raise ValueError
+            suffix = ":validation_recheck" if prior else ""
+            expected_stage = f"review_partition:G{group_index + 1}" + suffix
+            if (event.stage not in (expected_stage, expected_stage + ":output_recovery")
+                    or item["covered_unit_ids"] != covered or hash_json(request_packet) != event.request_hash
+                    or payload["stage"] != "review_partition" or payload["draft_assessment_keys"] != list(keys)):
+                raise ValueError
+            if prior:
+                old_item, old_payload = prior
+                rejection = rejected_by_stage.get(old_item["stage_index"])
+                if rejection is None or partition["identity"]["limits"]["max_rechecks"] < 1:
+                    raise ValueError
+                expected_previous = {"rejected_response": rejection["response"], "validation_error": rejection["reason"]}
+                restored = dict(payload)
+                if restored.pop("source_recheck", None) != expected_previous or restored != old_payload:
+                    raise ValueError
+                old_request = old_item["request"]
+                if any(request_packet[field] != old_request[field] for field in
+                        ("system_prompt", "response_schema", "model", "max_output_tokens")):
+                    raise ValueError
+                if "source_recheck" in old_payload:
+                    raise ValueError
+            elif "source_recheck" in payload:
+                raise ValueError
+            rejection, accepted = rejected_by_stage.get(index), notes_by_stage.get(index)
+            if (rejection is None) == (accepted is None):
+                raise ValueError
+            if rejection:
+                raw = rejection["response"]
+                if (rejection["covered_unit_ids"] != covered or rejection["response_hash"] != hash_json(raw)
+                        or rejection["reason"] != event.reason or event.status != "failed"
+                        or _note_validation_reason(raw, keys, sources, originals,
+                            architecture=result.review_type == "A") != rejection["reason"]):
+                    raise ValueError
+            else:
+                raw = accepted["raw_response"]
+                if (accepted["covered_unit_ids"] != covered or event.status != "completed" or event.reason != "validated"
+                        or prior and prior[0]["stage_index"] in notes_by_stage):
+                    raise ValueError
+            if item["response_hash"] != hash_json(raw):
+                raise ValueError
+            previous[group_index] = (item, payload)
+        if seen != set(rejected_by_stage) | set(notes_by_stage):
+            raise ValueError
+        if result.status in ("completed", "partial_review") and len(notes) != len(groups):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, PartitionError):
+        raise PartitionError("stored_review_validation_history_changed") from None
+
+
 def _validate_capacity_rejections(result):
     """Replay the separate conservative reservations, never actual zero usage."""
     records = result.partition.get("native_capacity_rejections", [])
@@ -2377,6 +2555,7 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
         if mode == "intent" and {p["perspective_id"] for p in result.perspectives} != set(PERSPECTIVE_IDS):
             raise PartitionError("incomplete_partition_perspectives")
     originals_by_id = {o.evidence_id: o for o in originals}
+    _validate_review_validation_history(result, known_units, originals_by_id, meta)
     if result.status in ("failed", "not_run") and "global_review" in result.partition:
         _validate_closed_trace(result, known_units)
         _validate_observation_tracking(result.partition, known_units, by_id,

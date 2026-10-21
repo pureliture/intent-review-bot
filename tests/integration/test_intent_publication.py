@@ -342,11 +342,14 @@ def test_b_output_failure_does_not_override_lease_loss(intent_flow, monkeypatch)
 def test_a_cache_does_not_hide_b_retry_after_invalid_model_response(intent_flow):
     flow = intent_flow
     opt_in(flow, ("architecture", "intent"))
-    bad = MockModelClient([ModelResponse("{}", {"input_tokens": 100, "output_tokens": 10})], profile=flow.model.profile, input_tokens=100)
+    bad = MockModelClient([ModelResponse("{}", {"input_tokens": 100, "output_tokens": 10})] * 2,
+        profile=flow.model.profile, input_tokens=100)
     flow.worker.model_client = bad
     assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
     first, status, modes = receipts(flow)
-    assert status == "failed" and modes["intent"]["usage"]["calls"] == 1
+    assert status == "failed" and modes["intent"]["usage"]["calls"] == 2
+    failed = json.loads((first / "B/result.json").read_text())
+    assert [row["response"] for row in failed["partition"]["rejected_review_attempts"]] == [{}, {}]
     assert modes["intent"]["publication"]["status"] == "succeeded"
     assert modes["intent"]["publication"]["input_fingerprint"] is None
     assert_status_notice(next(comment["body"] for comment in flow.comments if B_MARKER in comment["body"]))
