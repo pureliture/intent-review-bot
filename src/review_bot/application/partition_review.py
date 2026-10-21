@@ -40,7 +40,7 @@ from review_bot.domain.intent_perspectives import PERSPECTIVES
 from review_bot.domain.models_v1 import ModelRequest, Snapshot, TaskInput
 from review_bot.domain.partition_review import PartitionReviewLimits, PartitionReviewResult
 
-PROMPT_VERSION = "partitioned-review/v13-factual-recheck"
+PROMPT_VERSION = "partitioned-review/v15-fixed-factual-context"
 MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
 MAX_MODEL_CITATIONS = 32
@@ -1335,6 +1335,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             else:
                 raise Stop("fact_check_original_evidence_exceeds_context")
             call.update(delivery=kind, payload_hash=hash_json(payload), schema_hash=hash_json(schema))
+            call["delivered_ranges"] = [{"evidence_id": s.evidence_id,
+                "start_byte": s.start_byte, "end_byte": s.end_byte} for s in spans]
             raw, index = execute(req, review_client, profile, stage)
             call.update(response=deepcopy(raw), response_hash=hash_json(raw), stage_index=index - first_record)
             try:
@@ -1346,15 +1348,23 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             return raw, refs, spans, index
 
         def factual_check(rows, candidate, record):
-            raw, refs, _, index = fact_call("fact_check", rows, candidate, record)
-            accepted = fact_check.accept_check(raw, rows, refs)
+            raw, refs, spans, index = fact_call("fact_check", rows, candidate, record, fact_check.check_extra(record))
+            accepted = fact_check.accept_check(raw, rows, refs, [o["evidence_id"] for o in fact_check.unread_inventory(originals, spans)])
             budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
             return accepted
 
+        def factual_sources(row, candidate, record):
+            raw = record["check"]["response"]
+            parent = fact_check.source_parent(meta["input_hash"], verification["original_final_hash"], row, record)
+            plan = {"version": 1, "parent_plan_id": parent,
+                "reason": "required_context_from_existing_frozen_originals",
+                "prior_response_hash": hash_json(raw), "gaps": fact_check.source_gaps(record),
+                "complete": True, "requests": deepcopy(raw["source_requests"])}
+            plan["plan_id"] = hash_json(plan)
+            record["source_plan"] = plan
+
         def factual_rewrite(row, candidate, record):
-            extra = {"discrepancies": deepcopy(record["issues"]),
-                "original_check_response": deepcopy(record["check"]["response"]),
-                "check_cited_evidence": deepcopy(record["check"]["cited_evidence"])}
+            extra = fact_check.rewrite_extra(record)
             raw, refs, spans, index = fact_call("fact_rewrite", [row], candidate, record, extra)
             replacement = fact_check.accept_rewrite(raw, row, refs, mode, meta)
             record["rewrite"]["accepted"] = deepcopy(replacement)
@@ -1366,7 +1376,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
 
         try:
             final = fact_check.run(final, originals, meta, mode=mode, check=factual_check,
-                rewrite=factual_rewrite, choose=choose, max_rewrites=limits.max_rechecks, ledger=verification)
+                rewrite=factual_rewrite, choose=choose, resolve_sources=factual_sources,
+                max_rewrites=limits.max_rechecks, ledger=verification)
         except (Stop, PartitionError) as error:
             verification.update(status="unverified", interruption_reason=str(error))
             final = deepcopy(verification.get("accepted_final", final))
@@ -1927,7 +1938,7 @@ def _validate_global_review(result, originals, meta):
 
 def validate_partition_result(result: PartitionReviewResult, task) -> None:
     """Recheck immutable originals, coverage and extracted quotes before output."""
-    if type(result) is not PartitionReviewResult or result.schema_version != 12 or result.review_type not in ("A", "B", "PLAN"):
+    if type(result) is not PartitionReviewResult or result.schema_version != 13 or result.review_type not in ("A", "B", "PLAN"):
         raise PartitionError("invalid_partition_result")
     if result.status not in ("planned", "measured", "completed", "partial_review", "failed", "not_run"):
         raise PartitionError("invalid_partition_result_status")

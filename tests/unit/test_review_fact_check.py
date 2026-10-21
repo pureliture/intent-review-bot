@@ -2,6 +2,7 @@
 from copy import deepcopy
 from dataclasses import replace
 import json
+import hashlib
 
 import pytest
 
@@ -287,3 +288,168 @@ def test_worker_mode_fingerprints_include_verification_and_eligibility_implement
     monkeypatch.setattr(facts if component == "facts" else selection, "__file__", str(changed))
     after = fingerprints()
     assert all(after) and all(left != right for left, right in zip(before, after))
+
+
+@pytest.mark.parametrize("mode", ["architecture", "intent"])
+def test_checker_receives_literal_prose_and_exact_claim_rules_without_repairing_input(mode):
+    """Wire contract only; native paired controls establish the prompt evidence."""
+    literal = "Guard A OR guard B. A named method's property must not be attributed to both."
+    def transform(payload, body):
+        if payload["stage"] == "final_review":
+            body["summary"] = literal
+        return body
+    task = _metric_task() if mode == "architecture" else make_task()
+    client = PartitionModelClient(transform=transform)
+    result = run_partition_review(task, mode, client, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    validate_partition_result(result, task)
+    request = next(req for req in client.requests if json.loads(req.user_content)["stage"] == "fact_check")
+    payload = json.loads(request.user_content)
+    assert payload["items"][0]["original_item"] == literal
+    assert payload["items"][0]["fields"]["text"] == literal
+    assert result.partition["pre_verification_final"]["summary"] == literal
+    assert "not a weaker true paraphrase" in request.system_prompt
+    assert "check EACH named component" in request.system_prompt
+    assert "necessary conditions, sufficient conditions" in request.system_prompt
+    assert result.partition["identity"]["prompts"]["fact_check"] == hash_json(facts.CHECK_PROMPT)
+    assert result.prompt_version == "partitioned-review/v15-fixed-factual-context"
+    assert result.model["is_mock"] is True  # no semantic accuracy claim from this fixture
+
+
+def _fixed_test_repair(*, no_suitable=False, cap=128, corrupt_request=None):
+    from review_bot.domain.models_v1 import CodeFile, Snapshot
+    task = _metric_task()
+    path = "tests/ACheckTest.java"
+    content = "class ACheckTest { void check() { assert true; } }\n"
+    code = CodeFile(path, content, hashlib.sha256(content.encode()).hexdigest(), "test")
+    head = replace(task.snapshot.head, files=(*task.snapshot.head.files, code))
+    pr = replace(task.snapshot.pr, changed_files=(*task.snapshot.pr.changed_files, path))
+    task = build_task_input(Snapshot(pr, task.snapshot.base, head), task.delta, task.classification)
+    literal = "The frozen head includes a related test assertion."
+    def counter(request):
+        payload = json.loads(request.user_content)
+        if payload["stage"] in ("fact_check", "fact_rewrite") and not payload.get("recheck", {}).get("source_requests"):
+            if any(s["path"] == path for s in payload["originals"]):
+                return 1000
+        return 100
+    def transform(payload, body):
+        stage = payload["stage"]
+        if stage == "final_review":
+            body["summary"] = literal
+        elif stage == "fact_check" and payload["items"][0]["item_id"] == "summary":
+            if not any(s["path"] == path and s["version"] == "head" for s in payload["originals"]):
+                body["items"]["summary"]["text"].update(state="unverifiable",
+                    reason="Need the actual frozen HEAD tests/ACheckTest.java assertion, not a reported test result.")
+                source = next((s for s in payload["fixed_original_inventory"] if s["path"] == path and s["version"] == "head"), None)
+                if source and not no_suitable:
+                    body["source_requests"] = [{"evidence_id": source["evidence_id"], "reason": "Read the actual HEAD assertion."}]
+                    if corrupt_request == "outside":
+                        body["source_requests"][0]["evidence_id"] = "outside-corpus"
+                    elif corrupt_request == "already_delivered":
+                        body["source_requests"][0]["evidence_id"] = payload["originals"][0]["evidence_id"]
+                    elif corrupt_request == "duplicate":
+                        body["source_requests"] *= 2
+                    elif corrupt_request == "empty_reason":
+                        body["source_requests"][0]["reason"] = ""
+        elif stage == "fact_rewrite":
+            source = path if payload.get("recheck", {}).get("source_requests") else "src/A.java"
+            body = {"replacement": payload["items"][0]["original_item"],
+                "correction_reason": "Re-read the requested fixed original; keep the item when its premise is supported.",
+                "correction_citations": [{"reference_id": _reference(payload, source)}]}
+        return body
+    review = PartitionModelClient(counter=counter, transform=transform, group_all=True)
+    review.profile = replace(review.profile, max_input_tokens=500)
+    result = run_partition_review(task, "architecture", review,
+        PartitionModelClient(group_all=True),
+        limits=PartitionReviewLimits(max_calls=cap, max_total_tokens=1000000))
+    return task, result, review, path, content
+
+
+def test_unverifiable_fact_reads_existing_test_original_and_rechecks_same_item_without_erasing_it():
+    task, result, review, path, content = _fixed_test_repair()
+    assert result.status == "completed", result.reason
+    validate_partition_result(result, task)
+    entry = result.partition["fact_verification"]["items"][0]
+    first, second = entry["attempts"]
+    assert entry["accepted"] == entry["original"] == result.summary
+    assert first["assessments"]["text"]["state"] == "unverifiable"
+    assert first["source_plan"]["complete"] and first["source_plan"]["requests"]
+    assert second["input_source_requests"] == first["source_plan"]["requests"]
+    checks = [json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "fact_check"]
+    assert not any(s["path"] == path for s in checks[0]["originals"])
+    supplied = next(s for s in checks[1]["originals"] if s["path"] == path and s["version"] == "head")
+    assert "".join(b["text"] for b in supplied["blocks"]) == content
+    rewritten = next(json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "fact_rewrite")
+    assert rewritten["recheck"]["original_check_response"] == first["check"]["response"]
+    assert rewritten["recheck"]["source_delivery_plan"]["parent_plan_id"] == first["source_plan"]["parent_plan_id"]
+
+
+def test_no_suitable_fixed_source_does_not_invent_evidence_or_force_a_positive_fact_state():
+    task, result, _, _, _ = _fixed_test_repair(no_suitable=True)
+    assert result.status == "partial_review" and result.reason == "factual_verification_incomplete"
+    entry = result.partition["fact_verification"]["items"][0]
+    assert entry["attempts"][0]["source_plan"]["requests"] == []
+    assert entry["status"] == "unverified"
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("field", ["parent_plan_id", "requests", "delivered_ranges", "input_source_requests"])
+def test_fixed_fact_source_plan_and_delivered_context_tampering_are_rejected(field):
+    task, result, _, _, _ = _fixed_test_repair()
+    assert result.status == "completed"
+    result = deepcopy(result)
+    first, second = result.partition["fact_verification"]["items"][0]["attempts"]
+    if field == "parent_plan_id":
+        first["source_plan"][field] = "changed"
+    elif field == "requests":
+        first["source_plan"][field] = []
+    elif field == "delivered_ranges":
+        first["check"][field] = []
+    else:
+        second[field] = []
+    with pytest.raises(PartitionError):
+        validate_partition_result(result, task)
+
+
+def test_fact_source_acquisition_uses_existing_shared_budget_and_keeps_failed_prefix():
+    _, baseline, _, _, _ = _fixed_test_repair()
+    source_index = next(i for i, s in enumerate(baseline.stages) if s.stage == "fact_rewrite" and s.attempts)
+    calls_before = sum(len(s.attempts) for s in baseline.stages[:source_index])
+    task, result, _, _, _ = _fixed_test_repair(cap=calls_before)
+    assert result.status == "partial_review" and result.reason == "factual_verification_incomplete"
+    ledger = result.partition["fact_verification"]
+    assert ledger["interruption_reason"] == "call_limit_exceeded"
+    plan = ledger["items"][0]["attempts"][0]["source_plan"]
+    assert plan["complete"] is True and plan["requests"]
+    assert result.usage["calls"] == calls_before
+    validate_partition_result(result, task)
+
+
+def test_requested_fact_original_is_complete_even_in_focused_citation_delivery():
+    from review_bot.application.source_partition import SourceOriginal, make_span
+    code = SourceOriginal("S-code", "one\ntwo\nthree\nfour\n", "source", "src/A.py", "head", "a" * 40)
+    test = SourceOriginal("S-test", "def test_a():\n    assert True\n", "test_source", "tests/test_a.py", "head", "a" * 40)
+    purpose = SourceOriginal("S-purpose", "Frozen full purpose", "pr_text", "", "", "")
+    span = make_span(code, 4, 8, "test")
+    quote = {"evidence_id": span.evidence_id, "start_byte": span.start_byte, "end_byte": span.end_byte,
+        "sha": span.sha, "path": span.path, "version": span.version, "begin_line": span.begin_line,
+        "end_line": span.end_line, "quote": span.text}
+    final = {"summary": "Test premise.", "findings": [{"citations": [quote]}], "perspectives": [], "questions": []}
+    row = {"id": "summary", "kind": "summary", "item": final["summary"]}
+    extra = {"source_requests": [{"evidence_id": test.evidence_id, "reason": "Need the fixed assertion."}],
+        "check_cited_evidence": [quote]}
+    payload, _, _ = facts.delivery([row], final, [code, test, purpose], {}, kind="cited_ranges", extra=extra)
+    supplied = {s["evidence_id"]: "".join(b["text"] for b in s["blocks"]) for s in payload["originals"]}
+    assert supplied == {code.evidence_id: "two\n", test.evidence_id: test.text, purpose.evidence_id: purpose.text}
+    extra["source_requests"][0]["evidence_id"] = "outside"
+    with pytest.raises(PartitionError, match="outside_frozen_corpus"):
+        facts.delivery([row], final, [code, test, purpose], {}, kind="cited_ranges", extra=extra)
+
+
+@pytest.mark.parametrize("corrupt", ["outside", "already_delivered", "duplicate", "empty_reason"])
+def test_invalid_fact_source_request_is_a_readable_partial_without_source_expansion(corrupt):
+    task, result, review, _, _ = _fixed_test_repair(corrupt_request=corrupt)
+    assert result.status == "partial_review" and result.reason == "factual_verification_incomplete"
+    assert result.partition["fact_verification"]["interruption_reason"] == "fact_source_request_invalid"
+    assert not any(json.loads(req.user_content)["stage"] == "fact_rewrite" for req in review.requests)
+    validate_partition_result(result, task)

@@ -59,7 +59,7 @@ class PartitionModelClient:
                 {"input_tokens": self.count_input_tokens(request), "output_tokens": 10})
         elif stage == "fact_check":
             ref = next(block["reference_id"] for source in payload["originals"] for block in source["blocks"])
-            body = {"items": {row["item_id"]: {field: {"state": "supported" if value else "non_factual",
+            body = {"source_requests": [], "items": {row["item_id"]: {field: {"state": "supported" if value else "non_factual",
                 "reason": "Synthetic factual check; not evidence of native semantic quality.",
                 "citations": [{"reference_id": ref}] if value else []}
                 for field, value in row["fields"].items()} for row in payload["items"]}}

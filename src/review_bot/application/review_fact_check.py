@@ -15,7 +15,7 @@ from review_bot.application import partition_choices as choices
 from review_bot.application.source_partition import PartitionError, make_span
 from review_bot.application.source_citations import citation_spans, citation_catalog, source_blocks
 
-VERSION = "fact-review/v1-source-preserving"
+VERSION = "fact-review/v2-fixed-source-recheck"
 PMD_REFERENCE = "https://github.com/pmd/pmd/blob/pmd_releases/7.3.0/pmd-java/src/main/java/net/sourceforge/pmd/lang/java/metrics/JavaMetrics.java"
 METRICS = {
     "TCC": ("cohesion", "Tight Class Cohesion: related method pairs sharing direct attribute access. Low TCC means low cohesion (응집도), and does not establish low coupling (결합도)."),
@@ -69,6 +69,26 @@ independent human authentication from an audit actor label. For metric meanings
 and numeric values use the supplied canonical definitions and actual analysis facts.
 Select exact source reference IDs; never invent sources, quotes or offsets. Explain
 the actual mismatch or missing fact precisely. Return only schema JSON.
+
+Check the LITERAL assertion, not a weaker true paraphrase. Never approve a whole
+field by checking only its main theme or one true clause. Explicitly distinguish
+AND, OR, only-if, unless, necessary conditions, sufficient conditions, defaults,
+possibility and guaranteed behavior. Test a claimed OR against the case where
+only one condition is true; a guard requiring every condition contradicts OR.
+For claims about multiple named methods/components, check EACH named component.
+A property present in one method cannot be attributed to both. A shared loop
+does not establish shared filtering, validation or side effects. Differences
+must be stated even when the overall recommendation remains reasonable.
+When a field mixes true and false clauses, return contradicted and identify
+the exact incorrect clause and source guard/method. Do not repair the claim in
+your reason and then label the unchanged original supported. A false clause
+remains false when another field elsewhere in the item gives the correct rule.
+fixed_original_inventory lists actual frozen originals omitted from THIS packet.
+An original absent here is not absent from the PR. If an unverifiable factual
+premise needs one of those originals, request its exact evidence_id through
+source_requests with a precise reason. Prefer actual HEAD test/source assertions
+over author-reported claims. Do not invent paths or request execution/discovery.
+Use no requests when the supplied evidence suffices or no listed original helps.
 """
 REWRITE_PROMPT = """Correct only the supplied review item using its unchanged
 original text, explicit factual discrepancies, exact frozen sources and canonical
@@ -161,8 +181,11 @@ def delivery(rows, final, originals, meta, *, kind, extra=None):
     roots = final if any(row["kind"] in ("summary", "questions") for row in rows) else [row["item"] for row in rows]
     anchors = quote_spans([roots, extra or {}], by_id)
     selected = {s.evidence_id for s in anchors}
+    requested = {r["evidence_id"] for r in (extra or {}).get("source_requests", [])}
+    if not requested <= set(by_id):
+        raise PartitionError("fact_source_request_outside_frozen_corpus")
     paths = {s.path for s in anchors if s.path}
-    whole = [o for o in originals if kind == "complete_originals" or o.kind == "pr_text" or
+    whole = [o for o in originals if kind == "complete_originals" or o.kind == "pr_text" or o.evidence_id in requested or
         kind == "cited_originals" and (o.evidence_id in selected or o.path in paths)]
     spans = [make_span(o, 0, len(o.raw), "fact_original") for o in whole]
     delivered = {s.evidence_id for s in spans}
@@ -185,14 +208,18 @@ def request_spec(stage, rows, final, originals, meta, *, kind, extra=None):
     payload, refs, spans = delivery(rows, final, originals, meta, kind=kind, extra=extra)
     if extra:
         payload["recheck"] = deepcopy(extra)
-    schema = check_schema(rows, refs) if stage == "fact_check" else rewrite_schema(rows[0], refs)
+    inventory = unread_inventory(originals, spans)
+    payload["fixed_original_inventory"] = inventory
+    schema = check_schema(rows, refs, [o["evidence_id"] for o in inventory]) if stage == "fact_check" else rewrite_schema(rows[0], refs)
     return payload, schema, refs, spans
 
 
-def check_schema(rows, refs):
+def check_schema(rows, refs, source_ids=()):
     assessment = obj({"state": {"type": "string", "enum": ["supported", "contradicted", "unverifiable", "non_factual"]},
         "reason": text(), "citations": cite_schema(refs)})
-    return obj({"items": obj({row["id"]: obj({key: assessment for key in fields(row)}) for row in rows})})
+    request = obj({"evidence_id": {"type": "string", "enum": list(source_ids) or ["no_unread_original"]}, "reason": text()})
+    return obj({"items": obj({row["id"]: obj({key: assessment for key in fields(row)}) for row in rows}),
+        "source_requests": {"type": "array", "items": request, "maxItems": min(8, len(source_ids))}})
 
 
 def decode_citations(citations, refs):
@@ -209,8 +236,8 @@ def decode_citations(citations, refs):
     return result
 
 
-def accept_check(raw, rows, refs):
-    if not isinstance(raw, dict) or set(raw) != {"items"} or set(raw["items"]) != {r["id"] for r in rows}:
+def accept_check(raw, rows, refs, source_ids=()):
+    if not isinstance(raw, dict) or set(raw) != {"items", "source_requests"} or set(raw["items"]) != {r["id"] for r in rows}:
         raise PartitionError("fact_check_item_coverage_changed")
     for row in rows:
         assessments = raw["items"][row["id"]]
@@ -224,6 +251,18 @@ def accept_check(raw, rows, refs):
             decode_citations(item["citations"], refs)
             if item["state"] == "supported" and fields(row)[field].strip() and not item["citations"]:
                 raise PartitionError("fact_check_support_without_evidence")
+    requests = raw["source_requests"]
+    if not isinstance(requests, list) or len(requests) > min(8, len(source_ids)):
+        raise PartitionError("fact_source_request_invalid")
+    seen = set()
+    for request in requests:
+        if (not isinstance(request, dict) or set(request) != {"evidence_id", "reason"}
+                or request["evidence_id"] not in source_ids or request["evidence_id"] in seen
+                or not isinstance(request["reason"], str) or not request["reason"].strip() or len(request["reason"]) > 4000):
+            raise PartitionError("fact_source_request_invalid")
+        seen.add(request["evidence_id"])
+    if requests and not any(v["state"] == "unverifiable" for item in raw["items"].values() for v in item.values()):
+        raise PartitionError("fact_source_request_without_gap")
     return deepcopy(raw["items"])
 
 
@@ -308,7 +347,49 @@ def issues(assessments, metric_checks):
         if value["state"] in ("contradicted", "unverifiable")] + [deepcopy(c["issue"]) for c in metric_checks if c["issue"]]
 
 
-def run(final, originals, meta, *, mode, check, rewrite, choose, max_rewrites, ledger):
+def source_gaps(record):
+    return [issue["field"] + ": " + issue["reason"] for issue in record["issues"]
+        if issue["kind"] == "source_assertion" and issue["state"] == "unverifiable"]
+
+
+def unread_inventory(originals, spans):
+    """Closed candidate pool, independent of the reviewer's requested wording."""
+    return [{"evidence_id": o.evidence_id, "kind": o.kind, "path": o.path,
+        "version": o.version, "sha": o.sha, "bytes": len(o.raw)}
+        for o in originals if not any(
+            s.evidence_id == o.evidence_id and s.start_byte == 0 and s.end_byte == len(o.raw) for s in spans)]
+
+
+def source_parent(input_hash, original_hash, row, record):
+    return hash_json({"input_hash": input_hash, "original_final_hash": original_hash,
+        "item_id": row["id"], "item_hash": record["item_hash"],
+        "checker_response_hash": record["check"]["response_hash"]})
+
+
+def requested_sources(record):
+    result = {}
+    for request in [*record["input_source_requests"], *record.get("source_plan", {}).get("requests", [])]:
+        result.setdefault(request["evidence_id"], request)
+    return [deepcopy(result[key]) for key in sorted(result)]
+
+
+def check_extra(record):
+    return {"source_requests": deepcopy(record["input_source_requests"])} if record["input_source_requests"] else None
+
+
+def rewrite_extra(record):
+    extra = {"discrepancies": deepcopy(record["issues"]),
+        "original_check_response": deepcopy(record["check"]["response"]),
+        "check_cited_evidence": deepcopy(record["check"]["cited_evidence"])}
+    requests = requested_sources(record)
+    if requests:
+        extra["source_requests"] = requests
+    if "source_plan" in record:
+        extra["source_delivery_plan"] = deepcopy(record["source_plan"])
+    return extra
+
+
+def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources, max_rewrites, ledger):
     """Callbacks own native admission, usage, fencing and task budgets."""
     ledger.update(version=VERSION, original_final=deepcopy(final), original_final_hash=hash_json(final),
         status="checking", items=[], model_assisted_is_not_proof=True, accepted_final=deepcopy(final))
@@ -317,8 +398,10 @@ def run(final, originals, meta, *, mode, check, rewrite, choose, max_rewrites, l
         entry = {"item_id": row["id"], "original": deepcopy(row["item"]), "attempts": [], "status": "checking"}
         ledger["items"].append(entry)
         current = deepcopy(row)
+        requested = []
         for attempt in range(max_rewrites + 1):
-            record = {"item": deepcopy(current["item"]), "item_hash": hash_json(current["item"]), "metric_checks": []}
+            record = {"item": deepcopy(current["item"]), "item_hash": hash_json(current["item"]),
+                "metric_checks": [], "input_source_requests": deepcopy(requested)}
             entry["attempts"].append(record)
             for spec in metric_specs(current):
                 selected, decision_id = choose("fact_metric", spec["state"], spec["options"], spec["question"])
@@ -337,7 +420,10 @@ def run(final, originals, meta, *, mode, check, rewrite, choose, max_rewrites, l
                 apply_item(candidate, row, current["item"])
                 ledger["accepted_final"] = deepcopy(candidate)
                 break
+            if source_gaps(record):
+                resolve_sources(current, candidate, record)
             replacement = rewrite(current, candidate, record)
+            requested = requested_sources(record)
             current = {**current, "item": replacement}
     ledger["status"] = "model_supported" if all(e["status"] == "model_supported" for e in ledger["items"]) else "unverified"
     ledger["accepted_final_hash"] = hash_json(candidate)
@@ -383,10 +469,15 @@ def validate(result, originals, meta):
                 raise PartitionError("stored_fact_request_changed")
             if position < len(measurements) - 1 and event.reason != "input_limit_exceeded":
                 raise PartitionError("stored_fact_unnecessary_focus")
+        if "delivered_ranges" in record and record["delivered_ranges"] != [
+                {"evidence_id": s.evidence_id, "start_byte": s.start_byte, "end_byte": s.end_byte} for s in spans]:
+            raise PartitionError("stored_fact_delivered_ranges_changed")
         if "response" not in record:
             if not interrupted:
                 raise PartitionError("stored_fact_response_missing")
             return None, refs, spans
+        if "delivered_ranges" not in record:
+            raise PartitionError("stored_fact_delivered_ranges_missing")
         if (record.get("delivery") != kind or record.get("payload_hash") != hash_json(payload)
                 or record.get("schema_hash") != hash_json(schema) or record.get("response_hash") != hash_json(record["response"])):
             raise PartitionError("stored_fact_response_or_input_changed")
@@ -414,11 +505,14 @@ def validate(result, originals, meta):
         if not 1 <= len(attempts) <= limit:
             raise PartitionError("stored_fact_attempt_limit_changed")
         current = deepcopy(row)
+        requested = []
         complete = False
         for number, attempt in enumerate(attempts):
             terminal = interrupted and ordinal == len(entries) - 1 and number == len(attempts) - 1
             if attempt.get("item") != current["item"] or attempt.get("item_hash") != hash_json(current["item"]):
                 raise PartitionError("stored_fact_candidate_changed")
+            if attempt.get("input_source_requests") != requested:
+                raise PartitionError("stored_fact_source_carry_changed")
             specs, checks = list(metric_specs(current)), attempt.get("metric_checks", [])
             if len(checks) > len(specs) or not terminal and len(checks) != len(specs):
                 raise PartitionError("stored_metric_coverage_changed")
@@ -436,11 +530,12 @@ def validate(result, originals, meta):
                 if not terminal:
                     raise PartitionError("stored_fact_check_omitted")
                 break
-            raw, refs, _ = replay_call("fact_check", [current], attempt["check"])
+            raw, refs, checked_spans = replay_call("fact_check", [current], attempt["check"], check_extra(attempt))
             if raw is None:
                 break
             try:
-                checked = accept_check(raw, [current], refs)[current["id"]]
+                checked = accept_check(raw, [current], refs,
+                    [o["evidence_id"] for o in unread_inventory(originals, checked_spans)])[current["id"]]
             except PartitionError as error:
                 if not terminal or ledger["interruption_reason"] != str(error):
                     raise
@@ -449,18 +544,35 @@ def validate(result, originals, meta):
             if attempt.get("assessments") != checked or attempt.get("issues") != expected_issues:
                 raise PartitionError("stored_fact_assessment_changed")
             if not expected_issues or number == limit - 1:
+                if "source_plan" in attempt:
+                    raise PartitionError("stored_unnecessary_fact_source_plan")
                 expected_status = "model_supported" if not expected_issues else "unverified"
                 if number != len(attempts) - 1 or entry.get("status") != expected_status or entry.get("accepted") != current["item"]:
                     raise PartitionError("stored_fact_acceptance_changed")
                 apply_item(candidate, row, current["item"])
                 complete = True
                 break
+            gaps = source_gaps(attempt)
+            if gaps:
+                plan = attempt.get("source_plan")
+                if plan is None:
+                    if not terminal:
+                        raise PartitionError("stored_fact_source_plan_missing")
+                    break
+                parent = source_parent(result.input_hash, ledger["original_final_hash"], current, attempt)
+                expected_plan = {"version": 1, "parent_plan_id": parent,
+                    "reason": "required_context_from_existing_frozen_originals", "prior_response_hash": hash_json(raw),
+                    "gaps": gaps, "complete": True, "requests": deepcopy(raw["source_requests"])}
+                expected_plan["plan_id"] = hash_json(expected_plan)
+                if plan != expected_plan:
+                    raise PartitionError("stored_fact_source_plan_changed")
+            elif "source_plan" in attempt:
+                raise PartitionError("stored_unnecessary_fact_source_plan")
             if "rewrite" not in attempt:
                 if not terminal:
                     raise PartitionError("stored_fact_rewrite_omitted")
                 break
-            extra = {"discrepancies": expected_issues, "original_check_response": deepcopy(raw),
-                "check_cited_evidence": deepcopy(attempt["check"]["cited_evidence"])}
+            extra = rewrite_extra(attempt)
             rewritten, refs, spans = replay_call("fact_rewrite", [current], attempt["rewrite"], extra)
             if rewritten is None:
                 break
@@ -473,6 +585,7 @@ def validate(result, originals, meta):
             if attempt["rewrite"].get("accepted") != replacement:
                 raise PartitionError("stored_fact_rewrite_changed")
             retain_sources(candidate, spans)
+            requested = requested_sources(attempt)
             current = {**current, "item": replacement}
         if not complete and not interrupted:
             raise PartitionError("stored_fact_check_incomplete")
