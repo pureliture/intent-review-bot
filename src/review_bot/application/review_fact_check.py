@@ -219,6 +219,7 @@ def delivery(rows, final, originals, meta, *, kind, extra=None):
         payload["canonical_facts"]["intent_perspectives"] = {
             "catalog_version": CATALOG_VERSION,
             "catalog": [asdict(perspective) for perspective in PERSPECTIVES],
+            "empty_field_rule": "An unchanged original field equal to the empty string contains no factual assertion. Return state=non_factual, a non-empty reason such as 'Empty field contains no factual assertion', and citations=[] for that field. Keep the original empty field and its item in the request and response coverage; never use an empty reason or supported for it.",
             "scope_policy": {
                 "review_all_eight_from_fixed_catalog": True,
                 "initial_tev_applicability": "Provisional focus hypothesis; independently correct it from the frozen PR originals and fixed questions.",

@@ -830,3 +830,23 @@ def test_source_grounded_perspective_non_applicability_is_still_permitted():
     assert item["verdict"] == "not_apply" and item["reasoning"] == legitimate
     assert not any(json.loads(request.user_content)["stage"] == "fact_rewrite" for request in review.requests)
     validate_partition_result(result, task)
+
+
+
+def test_intent_empty_field_rule_preserves_original_field_and_strict_response_contract():
+    from review_bot.application.source_partition import SourceOriginal
+    from review_bot.domain.intent_perspectives import PERSPECTIVES
+    source = SourceOriginal("S-scope", "def answer():\n    return 42\n", "source", "a.py", "head", "a" * 40)
+    item = {"perspective_id": PERSPECTIVES[0].id, "verdict": "aligned", "statement": "The function returns 42.",
+        "reasoning": "The exact HEAD return statement supports this assertion.", "failure_condition": "", "citations": []}
+    final = {"summary": "Static review.", "findings": [], "perspectives": [item], "questions": []}
+    row = facts.items(final)[1]
+    payload, schema, _, _ = facts.request_spec("fact_check", [row], final, [source], {}, kind="complete_originals")
+    rule = payload["canonical_facts"]["intent_perspectives"]["empty_field_rule"]
+    assert "state=non_factual" in rule and "non-empty reason" in rule and "citations=[]" in rule
+    assert payload["items"][0]["original_item"] == item
+    assert payload["items"][0]["fields"]["failure_condition"] == ""
+    assessment = schema["properties"]["items"]["properties"][row["id"]]["properties"]["failure_condition"]
+    assert assessment["properties"]["reason"]["minLength"] == 1
+    assert "non_factual" in assessment["properties"]["state"]["enum"]
+    assert assessment["properties"]["citations"]["minItems"] == 0
