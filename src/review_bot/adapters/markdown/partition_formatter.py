@@ -40,6 +40,18 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, **_opt
                 lines.append(f"- {_escape(row['stage'])} · {_escape(row['observation_id'])}: {_escape(row['reason'])}")
     if result.summary:
         lines.append(_escape(result.summary))
+    if result.partition.get("fact_verification"):
+        verification = result.partition["fact_verification"]
+        lines.extend(["", "#### 사실 검토" if ko else "#### Factual review",
+            "- 코드 판단은 모델이 원문과 대조한 결과이며, 정확성을 증명하지는 않습니다." if ko else
+            "- Code claims were checked by a model against originals; this is not a proof of accuracy."])
+        for entry in verification["items"]:
+            corrected = len(entry["attempts"]) > 1
+            lines.append(f"- {_escape(entry['item_id'])}: {_escape(entry['status'])}" +
+                (" · 재작성 후 재검토" if ko and corrected else " · rewritten and rechecked" if corrected else ""))
+        if verification["status"] != "model_supported":
+            lines.append("- 미검증 항목이 남아 있으므로 완료된 리뷰가 아닙니다." if ko else
+                "- Unverified items remain; this is not a completed review.")
     for item in (*result.perspectives, *result.findings):
         label = item.get("perspective_id", "발견사항" if ko else "Finding")
         lines.extend(["", f"#### {_escape(label)}"])

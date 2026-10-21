@@ -19,6 +19,7 @@ from review_bot.application.architecture_review import ModelProfile, build_syste
 from review_bot.application.model_execution import ModelExecutionBudget
 from review_bot.application.partition_choices import plan_candidates
 from review_bot.application.partition_integration import native_integration_pages
+from review_bot.application.review_fact_check import run as run_fact_verification
 from review_bot.application.source_citations import citation_spans
 from review_bot.application.declared_intent_review import PROMPT_VERSION, SYSTEM_PROMPTS, response_schema, run_review_b_pipeline
 from review_bot.domain.intent_models import IntentReviewLimits
@@ -46,7 +47,7 @@ def architecture_input_fingerprint(snapshot, classification, config, client, *, 
             from review_bot.application.source_partition import partition_original
             return hash_json({"schema": "partition-evaluation/architecture", "snapshot": asdict(snapshot),
                 "classification": asdict(classification), "config": config.config_hash, "model": _profile(client),
-                "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, native_integration_pages,
+                "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, native_integration_pages, run_fact_verification,
                     LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient)})
         architecture = config.architecture.model_dump(mode="json")
         ruleset = Path(architecture["ruleset_resource"])
@@ -89,7 +90,7 @@ def intent_input_fingerprint(task, config, client, *, planning_client=None, sele
                 "model": _profile(client), "planner": _profile(planning_client),
                 "trial": config.partition_evaluation.model_dump(mode="json"),
                 "language": config.output.language,
-                "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, native_integration_pages,
+                "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, native_integration_pages, run_fact_verification,
                     LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient)})
         if config.intent.pipeline == "perspectives-v1":
             from review_bot.adapters.markdown.intent_perspective_formatter import format_intent_perspective_markdown

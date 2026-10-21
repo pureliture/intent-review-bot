@@ -57,6 +57,19 @@ class PartitionModelClient:
                 body = self.transform(payload, body)
             return body if isinstance(body, ModelResponse) else ModelResponse(json.dumps(body, ensure_ascii=False),
                 {"input_tokens": self.count_input_tokens(request), "output_tokens": 10})
+        elif stage == "fact_check":
+            ref = next(block["reference_id"] for source in payload["originals"] for block in source["blocks"])
+            body = {"items": {row["item_id"]: {field: {"state": "supported" if value else "non_factual",
+                "reason": "Synthetic factual check; not evidence of native semantic quality.",
+                "citations": [{"reference_id": ref}] if value else []}
+                for field, value in row["fields"].items()} for row in payload["items"]}}
+        elif stage == "fact_rewrite":
+            replacement = deepcopy(payload["items"][0]["original_item"])
+            ref = next(block["reference_id"] for source in payload["originals"] for block in source["blocks"])
+            if isinstance(replacement, dict):
+                replacement["citations"] = [{"reference_id": ref}]
+            body = {"replacement": replacement, "correction_reason": "Synthetic complete replacement for contract checks.",
+                "correction_citations": [{"reference_id": ref}]}
         else:
             spans = [*payload.get("originals", payload.get("original_quotes", [])), *payload.get("pr_purpose", [])]
             spans = [{**s, "text": "".join(b["text"] for b in s["blocks"])} if "blocks" in s else s for s in spans]

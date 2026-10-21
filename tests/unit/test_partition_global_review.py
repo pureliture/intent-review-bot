@@ -119,7 +119,7 @@ def test_fixed_source_planning_cannot_exceed_shared_call_budget_and_preserves_pr
             body["missing_context"] = ["Need src/value.py head return contract."]
         return body
     task, result, _ = _run(transform=missing, planning_transform=_select_fixed_value_source,
-        max_calls=baseline.usage["calls"])
+        max_calls=baseline.usage["calls"] - len(baseline.partition["fact_verification"]["items"]))
     assert result.status == "failed" and result.reason == "call_limit_exceeded"
     attempt = result.partition["global_review"]["attempts"][0]
     assert attempt["response"]["missing_context"]
@@ -358,7 +358,7 @@ def test_repeated_invalid_global_response_never_becomes_final():
 
 def test_global_stage_uses_the_existing_shared_call_budget():
     _, baseline, _ = _run()
-    task, result, client = _run(max_calls=baseline.usage["calls"] - 1)
+    task, result, client = _run(max_calls=baseline.usage["calls"] - len(baseline.partition["fact_verification"]["items"]) - 1)
     assert result.status == "failed" and result.reason == "call_limit_exceeded"
     assert result.partition["integration_final"] and "final" not in result.partition
     assert not any(json.loads(r.user_content)["stage"] == "global_review" for r in client.requests)

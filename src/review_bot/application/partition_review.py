@@ -19,6 +19,7 @@ from typing import Callable
 from review_bot.application.architecture_review import ModelProfile
 from review_bot.application import partition_choices as choices
 from review_bot.application import partition_global_review as global_review
+from review_bot.application import review_fact_check as fact_check
 from review_bot.application.partition_integration import native_integration_pages, combine_final_pages, reconcile_final_context, has_insufficient_judgement, prior_context_updates
 from review_bot.application.source_citations import citation_spans, citation_catalog, source_blocks, signal_context_spans, referenced_source_spans
 from review_bot.application.review_output_contract import render_output_contract
@@ -38,7 +39,7 @@ from review_bot.domain.intent_perspectives import PERSPECTIVES
 from review_bot.domain.models_v1 import ModelRequest, Snapshot, TaskInput
 from review_bot.domain.partition_review import PartitionReviewLimits, PartitionReviewResult
 
-PROMPT_VERSION = "partitioned-review/v12-fixed-context-repair"
+PROMPT_VERSION = "partitioned-review/v13-factual-recheck"
 MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
 MAX_MODEL_CITATIONS = 32
@@ -516,9 +517,10 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         output = current.max_output_tokens
         if stage == "review_partition" and limits.observation_output_tokens is not None:
             output = min(output, limits.observation_output_tokens)
-        if stage not in ("final_review", "review_partition", "global_review"):
+        if stage not in ("final_review", "review_partition", "global_review", "fact_check", "fact_rewrite"):
             raise PartitionError("free_form_tev_request_forbidden")
-        prompt = (global_review.PROMPT + (PMD_METRIC_REFERENCE if mode == "architecture" else "")
+        prompt = (fact_check.CHECK_PROMPT if stage == "fact_check" else fact_check.REWRITE_PROMPT if stage == "fact_rewrite" else
+            global_review.PROMPT + (PMD_METRIC_REFERENCE if mode == "architecture" else "")
             if stage == "global_review" else prompts["final" if stage == "final_review" else "observe"])
         prompt += render_output_contract(schema)
         prompt += "\nWrite every prose value in Korean." if language == "ko" else "\nWrite every prose value in English."
@@ -1304,11 +1306,67 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                 if "final" in attempt:
                     global_review.inherit_global_context(data, raw, accepted, correction)
                 data["references"].update({ref: refs[ref] for ref in global_review._refs(raw) if ref in refs})
+        # A validated synthesis is still provisional with respect to factual
+        # accuracy. Keep it unchanged, then check/correct only its factual items.
+        partitions["pre_verification_final"] = deepcopy(final)
+        verification = {}
+        partitions["fact_verification"] = verification
+
+        def fact_call(stage, rows, candidate, record, extra=None):
+            call = {"measurements": [], "extra": deepcopy(extra)}
+            record["check" if stage == "fact_check" else "rewrite"] = call
+            for kind in ("complete_originals", "cited_originals", "cited_ranges"):
+                payload, schema, refs, spans = fact_check.request_spec(stage, rows, candidate, originals, meta,
+                    kind=kind, extra=extra)
+                req = request(stage, payload, schema, profile)
+                call["measurements"].append({"stage_index": len(budget.records) - first_record, "delivery": kind})
+                if measure(req, review_client, profile, stage + ":" + kind + ":admission", for_generation=True):
+                    break
+            else:
+                raise Stop("fact_check_original_evidence_exceeds_context")
+            call.update(delivery=kind, payload_hash=hash_json(payload), schema_hash=hash_json(schema))
+            raw, index = execute(req, review_client, profile, stage)
+            call.update(response=deepcopy(raw), response_hash=hash_json(raw), stage_index=index - first_record)
+            try:
+                call["cited_evidence"] = fact_check.decode_citations(
+                    [{"reference_id": ref} for ref in sorted(set(global_review._refs(raw)))], refs)
+            except PartitionError as error:
+                call["validation_error"] = str(error)
+                raise
+            return raw, refs, spans, index
+
+        def factual_check(rows, candidate, record):
+            raw, refs, _, index = fact_call("fact_check", rows, candidate, record)
+            accepted = fact_check.accept_check(raw, rows, refs)
+            budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
+            return accepted
+
+        def factual_rewrite(row, candidate, record):
+            extra = {"discrepancies": deepcopy(record["issues"]),
+                "original_check_response": deepcopy(record["check"]["response"]),
+                "check_cited_evidence": deepcopy(record["check"]["cited_evidence"])}
+            raw, refs, spans, index = fact_call("fact_rewrite", [row], candidate, record, extra)
+            replacement = fact_check.accept_rewrite(raw, row, refs, mode, meta)
+            record["rewrite"]["accepted"] = deepcopy(replacement)
+            # New citations are drawn only from the frozen, actually delivered
+            # corpus. The original final and its entire source record remain.
+            fact_check.retain_sources(candidate, spans)
+            budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
+            return replacement
+
+        try:
+            final = fact_check.run(final, originals, meta, mode=mode, check=factual_check,
+                rewrite=factual_rewrite, choose=choose, max_rewrites=limits.max_rechecks, ledger=verification)
+        except (Stop, PartitionError) as error:
+            verification.update(status="unverified", interruption_reason=str(error))
+            final = deepcopy(verification.get("accepted_final", final))
+            verification["accepted_final_hash"] = hash_json(final)
         partitions["final"] = final
         partitions["final_covered_unit_ids"] = sorted({u for row in review_notes for u in row["covered_unit_ids"]})
-        status = "partial_review" if final["missing_context"] or has_insufficient_judgement(
+        status = "partial_review" if verification["status"] != "model_supported" or final["missing_context"] or has_insufficient_judgement(
             [*final["perspectives"], *final["findings"]]) else "completed"
-        reason = "unresolved_context" if status == "partial_review" else "validated"
+        reason = ("factual_verification_incomplete" if verification["status"] != "model_supported" else
+            "unresolved_context" if status == "partial_review" else "validated")
 
     except Planned:
         status, reason = "planned", "global_mode_selection_validated"
@@ -1337,13 +1395,16 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     hashes = {"observe": hash_json(prompts["observe"]),
         "plan": hash_json({"system": choices.SYSTEM, "contract": choices.VERSION}),
         "select": hash_json(choices.SYSTEM), "final": hash_json(prompts["final"]),
-        "global": hash_json(global_review.PROMPT + (PMD_METRIC_REFERENCE if mode == "architecture" else ""))}
+        "global": hash_json(global_review.PROMPT + (PMD_METRIC_REFERENCE if mode == "architecture" else "")),
+        "fact_check": hash_json(fact_check.CHECK_PROMPT), "fact_rewrite": hash_json(fact_check.REWRITE_PROMPT),
+        "fact_contract": hash_json({"version": fact_check.VERSION, "metrics": fact_check.METRICS,
+            "options": fact_check.CATEGORY_OPTIONS, "question": fact_check.CATEGORY_QUESTION})}
     identity = {"shared_plan_id": partitions.get("shared_plan_id"), "mode": mode, "language": language,
         "input_hash": meta.get("input_hash", ""), "limits": asdict(limits),
         "prompts": hashes, "models": {"review": asdict(profile) if profile else None,
         "planner": asdict(planner) if planner else None}}
     identity["implementation"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-        for name in ("partition_review.py", "source_partition.py", "model_execution.py", "partition_choices.py", "source_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py")}
+        for name in ("partition_review.py", "source_partition.py", "model_execution.py", "partition_choices.py", "source_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py", "review_fact_check.py")}
     identity["implementation"].update({"adapters/" + name: hashlib.sha256(
         (Path(__file__).parents[1] / "adapters" / name).read_bytes()).hexdigest()
         for name in ("llamacpp.py", "llamacpp_macbook.py", "intent_planner.py")})
@@ -1360,6 +1421,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         "observation_accounting_complete": final is not None, "excluded_observations": len(exclusions),
         "original_results_preserved": final is not None, "final_source_coverage_verified": final is not None,
         "semantic_retention_verified": False,
+        "fact_verification": partitions.get("fact_verification", {}).get("status", "not_run"),
         "review_complete": status == "completed", "repository_wide": False},
         common.usage, common.model_delivery, tuple(local_records), language=language,
         summary=final["summary"] if final else "", findings=tuple(final["findings"]) if final else (),
@@ -1505,6 +1567,8 @@ def _validate_closed_trace(result, known_units):
         if any(records[key]["input_observation_ids"] != expected_pages for key in ids):
             raise PartitionError("stored_fixed_source_observations_changed")
         used.extend(ids)
+    used.extend(check["decision_id"] for item in partition.get("fact_verification", {}).get("items", [])
+        for attempt in item["attempts"] for check in attempt.get("metric_checks", []))
     if sorted(used) != sorted(records):
         raise PartitionError("unreferenced_closed_decision")
 
@@ -1762,8 +1826,9 @@ def _validate_observation_tracking(partition, known_units, originals, *, plannin
 def _validate_global_review(result, originals, meta):
     partition = result.partition
     pages = partition["integration_pages"]
+    synthesis = partition.get("pre_verification_final", partition.get("final"))
     if len(pages) == 1:
-        if "global_review" in partition or partition.get("final") != partition["integration_final"]:
+        if "global_review" in partition or synthesis != partition["integration_final"]:
             raise PartitionError("stored_single_page_conclusion_changed")
         return
     mode = partition["operator_selected_mode"]
@@ -1844,7 +1909,7 @@ def _validate_global_review(result, originals, meta):
             global_review.inherit_global_context(data, raw, clean, number)
         data["references"].update({ref: refs[ref] for ref in global_review._refs(raw) if ref in refs})
     if record["status"] == "validated":
-        if accepted is None or partition.get("final") != accepted:
+        if accepted is None or synthesis != accepted:
             raise PartitionError("stored_global_final_changed")
     elif result.status in ("completed", "partial_review") or "final" in partition:
         raise PartitionError("stored_unvalidated_global_conclusion")
@@ -1852,7 +1917,7 @@ def _validate_global_review(result, originals, meta):
 
 def validate_partition_result(result: PartitionReviewResult, task) -> None:
     """Recheck immutable originals, coverage and extracted quotes before output."""
-    if type(result) is not PartitionReviewResult or result.schema_version != 11 or result.review_type not in ("A", "B", "PLAN"):
+    if type(result) is not PartitionReviewResult or result.schema_version != 12 or result.review_type not in ("A", "B", "PLAN"):
         raise PartitionError("invalid_partition_result")
     if result.status not in ("planned", "measured", "completed", "partial_review", "failed", "not_run"):
         raise PartitionError("invalid_partition_result_status")
@@ -1951,6 +2016,7 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
         _validate_observation_tracking(result.partition, known_units, by_id,
             signal_spans=signal_context_spans(originals, meta.get("target_details", [])), target_paths=meta["target_paths"], review_meta=meta)
         _validate_global_review(result, originals, meta)
+        fact_check.validate(result, originals, meta)
         final = result.partition.get("final", {})
         if not result.partition.get("units_prepared") or result.partition.get("final_covered_unit_ids") != sorted(known_units):
             raise PartitionError("incomplete_partition_coverage")
@@ -1958,7 +2024,11 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
             final.get("summary"), final.get("findings"), final.get("questions"), final.get("perspectives")):
             raise PartitionError("partition_conclusion_mismatch")
         missing = final.get("missing_context", [])
-        sufficient = not missing and not has_insufficient_judgement([*result.perspectives, *result.findings])
+        factual = result.partition["fact_verification"]["status"]
+        sufficient = factual == "model_supported" and not missing and not has_insufficient_judgement([*result.perspectives, *result.findings])
+        if result.scope.get("fact_verification") != factual or (
+                factual != "model_supported" and result.reason != "factual_verification_incomplete"):
+            raise PartitionError("partition_fact_completion_mismatch")
         if (result.status == "completed") != sufficient or result.scope.get("review_complete") != sufficient:
             raise PartitionError("partition_completion_mismatch")
         if (result.scope.get("observation_accounting_complete") is not True or
