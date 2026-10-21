@@ -22,6 +22,7 @@ from review_bot.adapters.github.intent_sources import collect_intent_sources, in
 from review_bot.adapters.llamacpp import LlamaCppModelClient
 from review_bot.adapters.markdown.formatter import format_review_markdown
 from review_bot.adapters.markdown.intent_formatter import format_intent_markdown
+from review_bot.adapters.beam_cloud import BeamCloudModelClient
 from review_bot.adapters.model_http import reset_model_request_context, set_model_request_context
 from review_bot.adapters.ollama import OllamaModelClient
 from review_bot.application.classification import classify_pr
@@ -140,7 +141,7 @@ class WorkerLoop:
         self._stop_event = stop_event if stop_event is not None else threading.Event()
         if isinstance(self.intent_selection_client, LlamaCppModelClient):
             self.intent_selection_client.request_cancelled = self._stop_event.is_set
-        if isinstance(self.model_client, (OllamaModelClient, LlamaCppModelClient)):
+        if isinstance(self.model_client, (OllamaModelClient, LlamaCppModelClient, BeamCloudModelClient)):
             self.model_client.request_cancelled = self._stop_event.is_set
         if self._ollama_selector_client is not None:
             self._ollama_selector_client.request_cancelled = self._stop_event.is_set
@@ -174,7 +175,7 @@ class WorkerLoop:
         """Verify and warm explicitly configured local models before taking a job lease."""
         if self._models_prepared:
             return
-        if isinstance(self.model_client, (OllamaModelClient, LlamaCppModelClient)):
+        if isinstance(self.model_client, (OllamaModelClient, LlamaCppModelClient, BeamCloudModelClient)):
             self.model_client.warmup()
         if self._ollama_selector_client is not None:
             self._ollama_selector_client.warmup()

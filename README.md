@@ -436,3 +436,15 @@ launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0
 launchctl setenv OLLAMA_FLASH_ATTENTION 1
 ```
 Quit and reopen the existing Ollama app after setting them. They affect all models and reduce KV-cache precision, not model weights or the configured context. These launch-environment values apply to the current login session; reapply after a new login unless your startup environment supplies them. No automatic startup hook is installed by this project.
+
+### Explicit Beam Cloud review and local TEV1 4B
+
+`model.profile: macbook-beam-cloud-tev4b` is an explicit alternative selected for the current real-PR evaluation. It does not change the existing local-only profiles.
+
+- `MACBOOK_BEAM_BASE_URL=http://127.0.0.1:11434`: the local Ollama bridge must expose exactly `beam:cloud`, the canonical cloud model `beam`, and the official Ollama cloud host. The review role records Beam's 1,048,576-token context and a 32,678-token output reservation; the existing task input/token/deadline budgets still apply.
+- `MACBOOK_TEV4B_BASE_URL=http://127.0.0.1:18139/v1`: the official `tev1:4b` GGUF weights run as `tev1-4b-q8_0` through llama.cpp with exactly one generation slot and 131,072 tokens per slot. Native template/tokenizer measurement and the existing closed-choice contracts remain in force.
+- Both roles share `REVIEW_BOT_MACBOOK_MODEL_STATE_DIR`. This profile sends review inputs to Ollama Cloud; TEV decisions execute on the Mac. Construction and metadata preparation do not generate tokens.
+- Ollama Cloud does not promise server-enforced JSON schemas. The complete schema is included in the effective request, and the program retains strict response, citation and fact validators. Invalid output is not promoted to a verified review.
+- The cloud bridge measures the exact effective prompt with an accounted one-output-token request, never a byte/token estimate. Identical measured requests can use an instance-local memo; paid measurements, responses, retries and uncertainty retain their existing shared-budget/admission records. Requests set `truncate: false` and `shift: false`; original input is not silently removed to fit.
+
+These are implementation and configuration contracts. The current commit's live PR, semantic quality and actual App publication evidence remain separate from synthetic adapter checks.

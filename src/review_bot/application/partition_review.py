@@ -868,7 +868,9 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             raise Stop("no_review_targets")
         if profile is None or planner is None:
             raise Stop("partition_model_profile_unset")
-        if any(p.provider != "llamacpp" and not p.is_mock for p in (profile, planner)):
+        if any(p.provider != "llamacpp" and not p.is_mock
+            and getattr(client, "supports_native_input_measurement", False) is not True
+            for p, client in ((profile, review_client), (planner, planning_client))):
             raise Stop("partition_requires_native_token_measurement")
         essential = 3 if mode == "planning" else 2 if prepared_plan is not None else 5
         if not limits.measure_only and budget.totals()[0] + essential > limits.max_calls:

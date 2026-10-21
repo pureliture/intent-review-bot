@@ -124,3 +124,35 @@ def test_no_profile_does_not_enable_macbook_from_environment(monkeypatch):
     monkeypatch.setenv("REVIEW_MODEL_PROFILE", "macbook-llamacpp")
     assert model_clients.build_review_client(None) is None
     assert model_clients.build_selector_client(None) is None
+
+
+def test_explicit_beam_tev4b_profile_composes_distinct_models_without_http(monkeypatch, tmp_path, valid_config_yaml):
+    monkeypatch.setenv("MACBOOK_BEAM_BASE_URL", "http://127.0.0.1:11434")
+    monkeypatch.setenv("MACBOOK_TEV4B_BASE_URL", "http://127.0.0.1:18139/v1")
+    settings = ModelConfig(call_timeout_seconds=17, max_output_bytes=1048576)
+    profile = model_clients.BEAM_CLOUD_TEV4B_PROFILE
+    review = model_clients.build_review_client(profile, settings)
+    planning = model_clients.build_planning_client(profile, settings)
+    selector = model_clients.build_selector_client(profile, settings)
+    perspectives = model_clients.build_intent_selection_client(profile, settings)
+    assert review.model == "beam:cloud" and review.profile.provider == "ollama-cloud"
+    assert review.profile.max_input_tokens + review.profile.max_output_tokens == 1048576
+    assert review.profile.max_output_tokens == 32678
+    assert review.supports_native_input_measurement is True
+    for client in (planning, selector, perspectives):
+        assert client.model == "tev1-4b-q8_0"
+        assert client._context_tokens == 131072 and client._server_generation_slots == 1
+        assert client.api_url == "http://127.0.0.1:18139/v1"
+    for client in (review, planning, selector, perspectives):
+        assert client.request_admission.db_path == tmp_path / "mac-admission/requests.sqlite"
+    config, _ = load_review_config_from_str(valid_config_yaml.replace("profile: null", "profile: " + profile))
+    worker = WorkerLoop(config, Mock(spec=JobStore))
+    assert worker.model_client.model == "beam:cloud"
+    assert worker.model_client.request_cancelled == worker._stop_event.is_set
+    monkeypatch.delenv("MACBOOK_BEAM_BASE_URL")
+    with pytest.raises(ValueError, match="MACBOOK_BEAM_BASE_URL"):
+        model_clients.build_review_client(profile)
+    monkeypatch.delenv("MACBOOK_TEV4B_BASE_URL")
+    assert model_clients.build_planning_client(profile) is None
+    with pytest.raises(ValueError, match="MACBOOK_TEV4B_BASE_URL"):
+        model_clients.build_selector_client(profile)

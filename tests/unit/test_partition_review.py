@@ -1276,3 +1276,22 @@ def test_prior_context_delivery_does_not_force_the_model_to_keep_a_positive_stat
     assert result.status == "partial_review" and result.reason == "unresolved_context"
     assert result.partition["final"]["missing_context"]
     validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("native_measurement", [False, True])
+def test_partition_requires_explicit_native_measurement_for_cloud_provider(native_measurement):
+    review = PartitionModelClient()
+    review.profile = replace(review.profile, provider="ollama-cloud", is_mock=False)
+    review.supports_native_input_measurement = native_measurement
+    review.token_count_receipt = {"delivery": "sent", "model_calls": 1,
+        "usage": {"input_tokens": 100, "output_tokens": 1}}
+    task = make_task()
+    result = run_partition_review(task, "intent", review, PartitionModelClient(), limits=limits())
+    if native_measurement:
+        assert result.status == "completed", result.reason
+        assert review.count_requests and review.requests
+        validate_partition_result(result, task)
+    else:
+        assert result.status == "not_run"
+        assert result.reason == "partition_requires_native_token_measurement"
+        assert review.count_requests == [] and review.requests == []

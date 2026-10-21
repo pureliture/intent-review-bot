@@ -17,7 +17,8 @@ from review_bot.adapters.ollama import OLLAMA_PROFILE, OllamaDecisionClient, Oll
 from review_bot.config import ModelConfig
 from review_bot.ports import ModelClient
 
-MACBOOK_PROFILES = (MACBOOK_LLAMACPP_PROFILE, MACBOOK_GRANITE_PROFILE)
+BEAM_CLOUD_TEV4B_PROFILE = "macbook-beam-cloud-tev4b"
+MACBOOK_PROFILES = (MACBOOK_LLAMACPP_PROFILE, MACBOOK_GRANITE_PROFILE, BEAM_CLOUD_TEV4B_PROFILE)
 MODEL_PROFILES = (OLLAMA_PROFILE, LLAMACPP_PROFILE, *MACBOOK_PROFILES)
 
 
@@ -38,7 +39,10 @@ def build_review_client(profile: str | None, settings: ModelConfig | None = None
         timeout_seconds=settings.call_timeout_seconds, max_output_bytes=settings.max_output_bytes,
         max_attempts=settings.max_attempts,
     )
-    if profile == LLAMACPP_PROFILE:
+    if profile == BEAM_CLOUD_TEV4B_PROFILE:
+        from review_bot.adapters.beam_cloud import BeamCloudModelClient
+        client = BeamCloudModelClient(api_url=_endpoint("MACBOOK_BEAM_BASE_URL", profile), **options)
+    elif profile == LLAMACPP_PROFILE:
         client = LlamaCppModelClient(api_url=_endpoint("ME707_BONSAI_BASE_URL"), **options)
     elif profile == MACBOOK_LLAMACPP_PROFILE:
         client = MacBookLlamaCppModelClient(api_url=_endpoint("MACBOOK_LFM_BASE_URL", profile), **options)
@@ -59,7 +63,11 @@ def build_selector_client(profile: str | None, settings: ModelConfig | None = No
     if profile not in MODEL_PROFILES:
         raise ValueError("Unsupported model profile")
     settings = settings or ModelConfig()
-    if profile == LLAMACPP_PROFILE:
+    if profile == BEAM_CLOUD_TEV4B_PROFILE:
+        from review_bot.adapters.tev4b import MacBookTev4bDecisionClient
+        client = MacBookTev4bDecisionClient(
+            api_url=_endpoint("MACBOOK_TEV4B_BASE_URL", profile), timeout_seconds=settings.call_timeout_seconds)
+    elif profile == LLAMACPP_PROFILE:
         client = LlamaCppDecisionClient(
             api_url=_endpoint("ME707_TEV1_BASE_URL"), timeout_seconds=settings.call_timeout_seconds,
         )
@@ -84,13 +92,18 @@ def build_planning_client(profile: str | None, settings: ModelConfig | None = No
         raise ValueError("Unsupported model profile")
     from review_bot.adapters.intent_planner import LlamaCppPlanClient, MacBookLlamaCppPlanClient
 
-    variable = "MACBOOK_TEV1_BASE_URL" if profile in MACBOOK_PROFILES else "ME707_TEV1_BASE_URL"
+    variable = ("MACBOOK_TEV4B_BASE_URL" if profile == BEAM_CLOUD_TEV4B_PROFILE else
+        "MACBOOK_TEV1_BASE_URL" if profile in MACBOOK_PROFILES else "ME707_TEV1_BASE_URL")
     if not os.environ.get(variable, "").strip():
         return None
     settings = settings or ModelConfig()
     options = dict(api_url=_endpoint(variable, profile), timeout_seconds=settings.call_timeout_seconds,
         max_output_bytes=settings.max_output_bytes, max_attempts=settings.max_attempts)
-    client = MacBookLlamaCppPlanClient(**options) if profile in MACBOOK_PROFILES else LlamaCppPlanClient(**options)
+    if profile == BEAM_CLOUD_TEV4B_PROFILE:
+        from review_bot.adapters.tev4b import MacBookTev4bPlanClient
+        client = MacBookTev4bPlanClient(**options)
+    else:
+        client = MacBookLlamaCppPlanClient(**options) if profile in MACBOOK_PROFILES else LlamaCppPlanClient(**options)
     client.request_admission = (
         macbook_model_admission(settings.max_concurrency) if profile in MACBOOK_PROFILES
         else default_model_admission(settings.max_concurrency)
@@ -108,8 +121,13 @@ def build_intent_selection_client(profile: str | None, settings: ModelConfig | N
 
     settings = settings or ModelConfig()
     local = profile in MACBOOK_PROFILES
-    variable = "MACBOOK_TEV1_BASE_URL" if local else "ME707_TEV1_BASE_URL"
-    cls = MacBookIntentSelectionClient if local else LlamaCppIntentSelectionClient
+    variable = ("MACBOOK_TEV4B_BASE_URL" if profile == BEAM_CLOUD_TEV4B_PROFILE else
+        "MACBOOK_TEV1_BASE_URL" if local else "ME707_TEV1_BASE_URL")
+    if profile == BEAM_CLOUD_TEV4B_PROFILE:
+        from review_bot.adapters.tev4b import MacBookTev4bIntentSelectionClient
+        cls = MacBookTev4bIntentSelectionClient
+    else:
+        cls = MacBookIntentSelectionClient if local else LlamaCppIntentSelectionClient
     client = cls(api_url=_endpoint(variable, profile), timeout_seconds=settings.call_timeout_seconds)
     client.request_admission = (macbook_model_admission(settings.max_concurrency) if local
         else default_model_admission(settings.max_concurrency))
