@@ -201,6 +201,71 @@ def test_real_partition_result_roundtrip_revalidates_original_task_and_result(tm
     assert cache.load(44, 99, "intent", KEY, validate_and_decode=restore) is None
 
 
+@pytest.mark.parametrize("corruption", [None, "omit", "duplicate", "quote"])
+def test_cache_preserves_note_object_order_and_rejects_missing_duplicate_or_changed_quotes(tmp_path, corruption):
+    from review_bot.application.partition_review import run_partition_review, _note_references
+    from review_bot.application.source_partition import PartitionError
+    from review_bot.domain.partition_review import PartitionReviewLimits
+    from review_bot.runtime.stored_partition_review import decode_stored_partition_review
+    from tests.fixtures.intent_perspectives import make_task
+    from tests.fixtures.partition_review import PartitionModelClient
+
+    def distinct_drafts(payload, body):
+        if payload["stage"] == "review_partition":
+            refs = [entry["reference_id"] for source in payload["citation_catalog"] for entry in source["ranges"]]
+            assert len(refs) >= 3
+            for index, draft in enumerate(body["draft_assessments"].values()):
+                draft["citations"] = [{"reference_id": refs[index % len(refs)]}]
+        return body
+
+    task = make_task()
+    review, tev = PartitionModelClient(group_all=True, transform=distinct_drafts), PartitionModelClient(group_all=True)
+    result = run_partition_review(task, "intent", review, tev,
+        limits=PartitionReviewLimits(max_total_tokens=1000000, max_calls=128))
+    assert result.status == "completed", result.reason
+    original = {"task": asdict(task), "result": asdict(result)}
+    snapshot = deepcopy(original)
+    row = original["result"]["partition"]["review_observations"][0]
+    raw = row["raw_response"]
+    _, before_refs = _note_references(raw, raw["draft_assessments"])
+    _, after_refs = _note_references(json.loads(canonical(raw)), raw["draft_assessments"])
+    assert before_refs != after_refs
+    calls = len(review.requests) + len(tev.requests)
+    cache = SharedReviewCache(tmp_path)
+    assert cache.save(44, 99, "intent", KEY, original, validate_and_decode=decode_stored_partition_review)
+    stored = json.loads(path(tmp_path).read_bytes())["packet"]
+    assert list(stored["result"]["partition"]["review_observations"][0]["raw_response"]["draft_assessments"]) == list(raw["draft_assessments"])
+    assert stored == json.loads(json.dumps(original, ensure_ascii=False))
+    restored = cache.load(44, 99, "intent", KEY, validate_and_decode=decode_stored_partition_review)
+    assert restored is not None and asdict(restored[1]) == asdict(result)
+    assert original == snapshot and row["citations"] == snapshot["result"]["partition"]["review_observations"][0]["citations"]
+    if corruption:
+        invalid = deepcopy(original)
+        citations = invalid["result"]["partition"]["review_observations"][0]["citations"]
+        if corruption == "omit":
+            citations.pop()
+        elif corruption == "duplicate":
+            citations.append(deepcopy(citations[0]))
+        else:
+            citations[0]["quote"] += " forged"
+        with pytest.raises(PartitionError, match="stored_original_result_citation_changed|stored_partition_quote_mismatch"):
+            decode_stored_partition_review(deepcopy(invalid))
+        assert not cache.save(44, 99, "intent", KEY, invalid, validate_and_decode=decode_stored_partition_review)
+        assert cache.load(44, 99, "intent", KEY, validate_and_decode=decode_stored_partition_review) is not None
+    assert len(review.requests) + len(tev.requests) == calls
+
+
+def test_existing_canonical_planning_cache_keeps_its_checksum_and_remains_readable(tmp_path):
+    original = packet("planning")
+    cache = SharedReviewCache(tmp_path)
+    assert cache.save(44, 99, "planning", KEY, original, validate_and_decode=decode)
+    target = path(tmp_path, mode="planning")
+    envelope = json.loads(target.read_bytes())
+    assert envelope["packet_hash"] == hashlib.sha256(canonical(original)).hexdigest()
+    target.write_bytes(canonical(envelope))
+    assert cache.load(44, 99, "planning", KEY, validate_and_decode=decode) == original
+
+
 def test_architecture_cache_codec_restores_real_task_dataclass(tmp_path, worker_review_inputs):
     from review_bot.application.partition_review import run_partition_review
     from review_bot.domain.models_v1 import TaskInput

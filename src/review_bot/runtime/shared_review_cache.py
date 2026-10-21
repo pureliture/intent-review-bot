@@ -130,9 +130,13 @@ class SharedReviewCache:
         temporary = None
         try:
             path = self._path(installation_id, repository_id, mode, generation_key)
-            encoded_packet = _canonical(packet)
+            # Preserve the exact object traversal used by strict replay;
+            # canonical ordering remains only the checksum contract.
+            encoded_packet = json.dumps(packet, ensure_ascii=False, sort_keys=False,
+                separators=(",", ":"), allow_nan=False).encode("utf-8")
             if len(encoded_packet) > self.max_bytes:
                 return False
+            packet_hash = hashlib.sha256(_canonical(packet)).hexdigest()
             frozen_packet = json.loads(encoded_packet, object_pairs_hook=_unique,
                 parse_constant=_reject_constant)
             if not _complete_packet(frozen_packet, mode) or validate_and_decode(frozen_packet) is None:
@@ -140,8 +144,9 @@ class SharedReviewCache:
             # The callback gets an isolated decoded object; preserve the recorded bytes.
             envelope = {"schema_version": 1, "installation_id": installation_id,
                 "repository_id": repository_id, "mode": mode, "generation_key": generation_key,
-                "packet": json.loads(encoded_packet), "packet_hash": hashlib.sha256(encoded_packet).hexdigest()}
-            raw = _canonical(envelope)
+                "packet": json.loads(encoded_packet), "packet_hash": packet_hash}
+            raw = json.dumps(envelope, ensure_ascii=False, sort_keys=False,
+                separators=(",", ":"), allow_nan=False).encode("utf-8")
             if len(raw) > self.max_bytes:
                 return False
             if path.exists() or path.is_symlink():

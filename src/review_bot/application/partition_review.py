@@ -1616,7 +1616,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             plan = {"version": 1, "parent_plan_id": parent,
                 "reason": "required_context_from_existing_frozen_originals",
                 "prior_response_hash": hash_json(raw), "gaps": fact_check.source_gaps(record),
-                "complete": True, "requests": deepcopy(raw["source_requests"])}
+                "complete": True, "requests": fact_check.planned_source_requests(record)}
             plan["plan_id"] = hash_json(plan)
             record["source_plan"] = plan
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict
+import ast
 import json
 import re
 
@@ -86,6 +87,15 @@ For claims about multiple named methods/components, check EACH named component.
 A property present in one method cannot be attributed to both. A shared loop
 does not establish shared filtering, validation or side effects. Differences
 must be stated even when the overall recommendation remains reasonable.
+For named-function or call-path assertions, inspect the exact caller implementation
+and EVERY claimed wrapper or validator on that route. A helper's existence or an
+equivalent check on another route does not support the claimed route. In each
+field's reason, account for EVERY literal clause and named symbol, including the
+claimed route; do not omit a disputed clause while approving the true clauses.
+If an implementation necessary to verify that route is not in the delivered
+sources, choose unverifiable and request its exact frozen evidence_id through
+source_requests from fixed_original_inventory. Do not infer repository absence
+from a missing implementation in this packet.
 When a field mixes true and false clauses, return contradicted and identify
 the exact incorrect clause and source guard/method. Do not repair the claim in
 your reason and then label the unchanged original supported. A false clause
@@ -108,6 +118,13 @@ or assert tests/deployment occurred. The original remains in the private audit t
 Keep every item's identity and target IDs. Return each complete replacement and an
 explicit correction reason with citations. For multiple items, key the replacements
 by the exact supplied item IDs. Select supplied reference IDs only.
+For named-function or call-path assertions, inspect the exact caller implementation
+and EVERY claimed wrapper or validator on that route. A helper's existence or an
+equivalent check on another route does not support the claimed route. In the
+correction reason, account for each original literal clause and named symbol that
+you correct. Preserve the accurate clauses. If a necessary implementation is not
+delivered, keep the unresolved limitation explicit for the factual recheck; do
+not invent a route or silently remove the disputed assertion to obtain approval.
 """
 
 
@@ -667,10 +684,89 @@ def citation_binding_issues(row, assessments, originals, cited_evidence):
     return result
 
 
-def issues(assessments, metric_checks, *, row, originals, cited_evidence):
+def callable_delivery_issues(row, assessments, originals, delivered_ranges):
+    """An implementation delivery gap, never a call-graph/semantic verdict.
+
+    A complete production HEAD definition must be delivered, not merely a name
+    or a call site. Complete code still does not prove the claimed call route.
+    """
+    if delivered_ranges is None:
+        return []
+    known, by_id = {}, {source.evidence_id: source for source in originals}
+    for source in originals:
+        path = source.path.lower()
+        if (source.version != "head" or not path.endswith((".py", ".java"))
+                or {"test", "tests"} & set(path.split("/"))
+                or path.rsplit("/", 1)[-1].startswith("test_")
+                or path.endswith("_test.py")):
+            continue
+        if path.endswith(".py"):
+            try:
+                starts = [0, *(index + 1 for index, byte in enumerate(source.raw) if byte == 10)]
+                definitions = [(node.name,
+                    starts[min([node.lineno, *(decorator.lineno for decorator in node.decorator_list)]) - 1],
+                    starts[node.end_lineno - 1] + node.end_col_offset)
+                    for node in ast.walk(ast.parse(source.text))
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            except (SyntaxError, ValueError, RecursionError):
+                continue
+        else:
+            from tree_sitter import Parser
+            from review_bot.application.source_partition import _language
+            parser = Parser(_language("java"))
+            tree = parser.parse(source.raw)
+            if tree.root_node.has_error:
+                continue
+            stack, definitions = [tree.root_node], []
+            while stack:
+                node = stack.pop()
+                stack.extend(node.named_children)
+                if node.type in ("method_declaration", "constructor_declaration", "compact_constructor_declaration"):
+                    name = node.child_by_field_name("name")
+                    if name is not None:
+                        definitions.append((source.raw[name.start_byte:name.end_byte].decode("utf-8"), node.start_byte, node.end_byte))
+        for name, start, end in definitions:
+            known.setdefault(name, []).append({"evidence_id": source.evidence_id, "start_byte": start, "end_byte": end})
+    cover = {}
+    for span in sorted(delivered_ranges, key=lambda value: (value["evidence_id"], value["start_byte"], value["end_byte"])):
+        make_span(by_id[span["evidence_id"]], span["start_byte"], span["end_byte"], "fact_delivery")
+        ranges = cover.setdefault(span["evidence_id"], [])
+        if ranges and span["start_byte"] <= ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], span["end_byte"]))
+        else:
+            ranges.append((span["start_byte"], span["end_byte"]))
+    def covered(definition):
+        return any(start <= definition["start_byte"] and definition["end_byte"] <= end
+            for start, end in cover.get(definition["evidence_id"], []))
+    tokens = lambda text: set(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", text))
+    result = []
+    for field, text in fields(row).items():
+        missing = sorted(name for name in tokens(text) & known.keys() if not any(map(covered, known[name])))
+        if assessments[field]["state"] != "supported" or not missing:
+            continue
+        reason = "No complete fixed HEAD implementation is delivered for the named callables: " + ", ".join(missing) + ". Read the exact definitions before supporting this field; name presence or a call site is insufficient and this does not determine whether the claimed route is true."
+        result.append({"kind": "source_assertion", "field": field, "state": "unverifiable", "reason": reason,
+            "citations": [], "missing_callable_names": missing,
+            "missing_callable_definitions": [{"name": name, **definition} for name in missing for definition in known[name]],
+            "required_sources": [{"evidence_id": key, "reason": reason}
+                for key in sorted({definition["evidence_id"] for name in missing for definition in known[name]})]})
+    return result
+
+
+def issues(assessments, metric_checks, *, row, originals, cited_evidence, delivered_ranges=None):
     return [dict(kind="source_assertion", field=key, **deepcopy(value)) for key, value in assessments.items()
         if value["state"] in ("contradicted", "unverifiable")] + citation_binding_issues(
-            row, assessments, originals, cited_evidence) + [deepcopy(c["issue"]) for c in metric_checks if c["issue"]]
+            row, assessments, originals, cited_evidence) + callable_delivery_issues(
+            row, assessments, originals, delivered_ranges) + [deepcopy(c["issue"]) for c in metric_checks if c["issue"]]
+
+
+def planned_source_requests(record):
+    """Union program-required originals with unchanged model requests."""
+    requests = {}
+    for request in [*record["check"]["response"]["source_requests"],
+            *(request for issue in record["issues"] for request in issue.get("required_sources", []))]:
+        requests.setdefault(request["evidence_id"], deepcopy(request))
+    return list(requests.values())
 
 
 def source_gaps(record):
@@ -785,7 +881,8 @@ def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources
                     "selected_key": selected["key"], "issue": metric_issue(spec, selected)})
             record["assessments"] = assessments[current["id"]]
             record["issues"] = issues(record["assessments"], record["metric_checks"], row=current,
-                originals=originals, cited_evidence=record["check"]["cited_evidence"])
+                originals=originals, cited_evidence=record["check"]["cited_evidence"],
+                delivered_ranges=record["check"]["delivered_ranges"])
             if not record["issues"] or number == max_rewrites:
                 entry.update(status="unverified" if record["issues"] else "model_supported", accepted=deepcopy(current["item"]))
                 apply_item(candidate, current, current["item"])
@@ -1086,7 +1183,8 @@ def validate(result, originals, meta):
                     raise
                 break
             expected_issues = issues(checked, checks, row=current,
-                originals=originals, cited_evidence=attempt["check"]["cited_evidence"])
+                originals=originals, cited_evidence=attempt["check"]["cited_evidence"],
+                delivered_ranges=attempt["check"]["delivered_ranges"])
             if attempt.get("assessments") != checked or attempt.get("issues") != expected_issues:
                 raise PartitionError("stored_fact_assessment_changed")
             if not expected_issues or number == limit - 1:
@@ -1108,7 +1206,7 @@ def validate(result, originals, meta):
                 parent = source_parent(result.input_hash, ledger["original_final_hash"], current, attempt)
                 expected_plan = {"version": 1, "parent_plan_id": parent,
                     "reason": "required_context_from_existing_frozen_originals", "prior_response_hash": hash_json(raw),
-                    "gaps": gaps, "complete": True, "requests": deepcopy(raw["source_requests"])}
+                    "gaps": gaps, "complete": True, "requests": planned_source_requests(attempt)}
                 expected_plan["plan_id"] = hash_json(expected_plan)
                 if plan != expected_plan:
                     raise PartitionError("stored_fact_source_plan_changed")

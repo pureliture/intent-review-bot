@@ -21,6 +21,102 @@ def limits(**kwargs):
     return PartitionReviewLimits(max_calls=128, max_total_tokens=1000000, **kwargs)
 
 
+@pytest.mark.parametrize("suffix,content,symbol,cut", [
+    ("py", "def visible():\n    return True\n\ndef hidden_guard():\n    return False\n", "hidden_guard", "def hidden_guard"),
+    ("java", "class Worker {\n void visible() {}\n void hiddenGuard() {}\n}\n", "hiddenGuard", " void hiddenGuard"),
+])
+def test_callable_delivery_guard_uses_only_production_head_code_without_changing_raw_state(suffix, content, symbol, cut):
+    from review_bot.application.source_partition import SourceOriginal
+    head = SourceOriginal("head", content, "source", "src/Worker." + suffix, "head", "a" * 40)
+    base = SourceOriginal("base", "def legacy_only(): pass\n", "source", "src/legacy.py", "base", "b" * 40)
+    test = SourceOriginal("test", "def commit(): pass\n", "source", "tests/test_fake.py", "head", "a" * 40)
+    prose = SourceOriginal("pr", "The claim mentions " + symbol, "pr_text")
+    sources = [head, base, test, prose]
+    row = {"id": "summary", "kind": "summary", "item": "The route mentions " + symbol + "."}
+    raw = {"text": {"state": "supported", "reason": "Original unchanged model assessment.", "citations": []}}
+    snapshot = deepcopy(raw)
+    partial = [{"evidence_id": "head", "start_byte": 0, "end_byte": content.index(cut)},
+        {"evidence_id": "pr", "start_byte": 0, "end_byte": len(prose.raw)}]
+    gaps = facts.callable_delivery_issues(row, raw, sources, partial)
+    assert raw == snapshot
+    assert gaps[0]["state"] == "unverifiable" and gaps[0]["missing_callable_names"] == [symbol]
+    assert [request["evidence_id"] for request in gaps[0]["required_sources"]] == ["head"]
+    assert not facts.callable_delivery_issues({**row, "item": "commit legacy_only unknown_name"}, raw, sources, partial)
+    assert not facts.callable_delivery_issues(row, {"text": {**raw["text"], "state": "non_factual"}}, sources, partial)
+    # A complete definition clears only delivery, never proves a call route.
+    assert not facts.callable_delivery_issues(row, raw, sources,
+        [{"evidence_id": "head", "start_byte": 0, "end_byte": len(head.raw)}])
+
+
+@pytest.mark.parametrize("delivery,expected_gap", [("callsite_and_base", True), ("one_byte_gap", True), ("adjacent_complete", False)])
+def test_callable_delivery_requires_same_head_complete_definition_extent(delivery, expected_gap):
+    from review_bot.application.source_partition import SourceOriginal
+    text = 'def trace(func):\n    return func\n\n@trace\nasync def hidden_guard():\n    return "한글"\n\ndef caller():\n    return hidden_guard()\n'
+    head = SourceOriginal("head", text, "source", "src/service.py", "head", "a" * 40)
+    base = SourceOriginal("base", text, "source", "src/service.py", "base", "b" * 40)
+    row = {"id": "summary", "kind": "summary", "item": "The caller uses hidden_guard."}
+    raw = {"text": {"state": "supported", "reason": "Original raw judgement.", "citations": []}}
+    bounds = lambda key, start, end: {"evidence_id": key, "start_byte": start, "end_byte": end}
+    if delivery == "callsite_and_base":
+        ranges = [bounds("head", head.raw.index(b"def caller"), len(head.raw)), bounds("base", 0, len(base.raw))]
+    elif delivery == "one_byte_gap":
+        end = head.raw.index('"한글"'.encode()) + len('"한글"'.encode())
+        ranges = [bounds("head", 0, end - 1), bounds("head", end, len(head.raw))]
+    else:
+        cut = head.raw.index(b"async def")
+        ranges = [bounds("head", 0, cut), bounds("head", cut, len(head.raw))]
+    result = facts.callable_delivery_issues(row, raw, [head, base], ranges)
+    assert bool(result) is expected_gap
+    assert raw["text"]["state"] == "supported"
+    if result:
+        definition = result[0]["missing_callable_definitions"][0]
+        assert definition["evidence_id"] == "head"
+        assert head.raw[definition["start_byte"]:definition["end_byte"]].decode() == '@trace\nasync def hidden_guard():\n    return "한글"'
+        assert [source["evidence_id"] for source in result[0]["required_sources"]] == ["head"]
+
+
+def test_program_callable_gap_carries_frozen_source_through_existing_rewrite_and_replay():
+    from review_bot.domain.models_v1 import CodeFile, Snapshot
+    task = _metric_task()
+    path, text = "src/Hidden.java", "class Hidden { void hiddenGuard() {} }\n"
+    source = CodeFile(path, text, hashlib.sha256(text.encode()).hexdigest(), "source")
+    head = replace(task.snapshot.head, files=(*task.snapshot.head.files, source))
+    pr = replace(task.snapshot.pr, changed_files=(*task.snapshot.pr.changed_files, path))
+    task = build_task_input(Snapshot(pr, task.snapshot.base, head), task.delta, task.classification)
+    literal = "The supplied HEAD source defines hiddenGuard."
+    def count(request):
+        payload = json.loads(request.user_content)
+        if payload["stage"] in ("fact_check", "fact_rewrite") and not payload.get("recheck", {}).get("source_requests"):
+            if any(source["path"] == path for source in payload["originals"]):
+                return 1000
+        return 100
+    def transform(payload, body):
+        if payload["stage"] == "final_review":
+            body["summary"] = literal
+        elif payload["stage"] == "fact_rewrite":
+            body = {"replacement": payload["items"][0]["original_item"],
+                "correction_reason": "Read the missing fixed implementation; preserve the original assertion.",
+                "correction_citations": [{"reference_id": _reference(payload, path)}]}
+        return body
+    review = PartitionModelClient(counter=count, transform=transform, group_all=True)
+    review.profile = replace(review.profile, max_input_tokens=500)
+    result = run_partition_review(task, "architecture", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed", result.reason
+    entry = result.partition["fact_verification"]["items"][0]
+    first, second = entry["attempts"]
+    assert first["assessments"]["text"]["state"] == "supported"
+    assert first["check"]["response"]["source_requests"] == []
+    assert first["issues"][0]["missing_callable_names"] == ["hiddenGuard"]
+    assert first["source_plan"]["requests"] == facts.planned_source_requests(first)
+    assert second["input_source_requests"] == first["source_plan"]["requests"]
+    assert entry["original"] == entry["accepted"] == result.summary == literal
+    validate_partition_result(result, task)
+    changed = deepcopy(result)
+    changed.partition["fact_verification"]["items"][0]["attempts"][0]["source_plan"]["requests"] = []
+    with pytest.raises(PartitionError):
+        validate_partition_result(changed, task)
+
+
 def _capacity_review_client():
     from dataclasses import asdict
     from hashlib import sha256
@@ -444,6 +540,15 @@ def test_checker_receives_literal_prose_and_exact_claim_rules_without_repairing_
     assert "not a weaker true paraphrase" in request.system_prompt
     assert "check EACH named component" in request.system_prompt
     assert "necessary conditions, sufficient conditions" in request.system_prompt
+    for prompt in (request.system_prompt, facts.REWRITE_PROMPT):
+        assert "inspect the exact caller implementation" in prompt
+        assert "EVERY claimed wrapper or validator on that route" in prompt
+        assert "equivalent check on another route does not support the claimed route" in prompt
+    assert "field's reason, account for EVERY literal clause and named symbol" in request.system_prompt
+    assert "choose unverifiable and request its exact frozen evidence_id" in request.system_prompt
+    assert "source_requests from fixed_original_inventory" in request.system_prompt
+    assert "keep the unresolved limitation explicit for the factual recheck" in facts.REWRITE_PROMPT
+    assert "silently remove the disputed assertion" in facts.REWRITE_PROMPT
     assert result.partition["identity"]["prompts"]["fact_check"] == hash_json(facts.CHECK_PROMPT)
     assert result.prompt_version == "partitioned-review/v17-shared-service-batched-facts"
     assert result.model["is_mock"] is True  # no semantic accuracy claim from this fixture
