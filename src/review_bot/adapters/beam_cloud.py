@@ -259,6 +259,9 @@ class BeamCloudModelClient:
             count = self._usage(data, 1)["input_tokens"]
             if "truncated" in data and data["truncated"] is not False:
                 raise PermanentModelError("Beam cloud input truncation is forbidden")
+            # A paid native count may outlast the metadata TTL. Refresh metadata
+            # before caching this exact count, without another prompt evaluation.
+            self._verify(deadline)
             # Bounded, per-instance memo; never persisted or shared across metadata refreshes.
             if len(self._memo) >= 128:
                 self._memo.clear()

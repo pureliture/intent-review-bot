@@ -251,6 +251,83 @@ def test_cloud_json_is_validated_without_claiming_provider_grammar(transport):
     assert caught.value.delivery == "sent" and caught.value.usage == {"input_tokens": 64, "output_tokens": 4}
 
 
+def test_meter_crossing_metadata_expiry_refreshes_without_another_paid_count(transport, monkeypatch):
+    from types import SimpleNamespace
+    import time
+    from review_bot.adapters import beam_cloud
+    calls, changes, _ = transport
+    clock = [time.monotonic()]
+    monkeypatch.setattr(beam_cloud, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    client = BeamCloudModelClient()
+    client.warmup()
+    initial = clock[0]
+    earlier = replace(request(), user_content="Earlier exact input")
+    assert client.count_input_tokens(earlier) == 64
+    assert len(client._memo) == 1
+    clock[0] = initial + 58
+
+    def slow_count(req, payload, data):
+        if req.url.path == "/api/chat" and payload["options"]["num_predict"] == 1:
+            clock[0] = initial + 61
+        return data
+
+    changes["handler"] = slow_count
+    assert client.count_input_tokens(request()) == 64
+    assert client.token_count_receipt == {"delivery": "sent", "model_calls": 1,
+        "usage": {"input_tokens": 64, "output_tokens": 1}}
+    result = client.complete(request())
+    assert result.usage == {"input_tokens": 64, "output_tokens": 4}
+    assert [path for _, path, _ in calls] == ["/api/tags", "/api/show", "/api/chat", "/api/chat",
+        "/api/tags", "/api/show", "/api/chat"]
+    chats = [payload for _, path, payload in calls if path == "/api/chat"]
+    assert [payload["options"]["num_predict"] for payload in chats] == [1, 1, 32]
+    assert chats[1]["messages"] == chats[2]["messages"] and chats[1]["format"] == chats[2]["format"]
+    assert client.token_count_receipt == {"delivery": "sent", "model_calls": 1,
+        "usage": {"input_tokens": 64, "output_tokens": 1}}
+    assert len(client._memo) == 1  # Refreshed metadata drops the unrelated old count.
+    before = deepcopy(calls)
+    with pytest.raises(PermanentModelError, match="fresh exact native") as caught:
+        client.complete(earlier)
+    assert caught.value.delivery == "not_sent" and caught.value.usage == {"input_tokens": 0, "output_tokens": 0}
+    assert calls == before
+
+
+@pytest.mark.parametrize("fault", ["remote_host", "context"])
+def test_post_meter_metadata_failure_preserves_paid_measurement_receipt_and_blocks_generation(transport, monkeypatch, fault):
+    from types import SimpleNamespace
+    import time
+    from review_bot.adapters import beam_cloud
+    calls, changes, _ = transport
+    clock = [time.monotonic()]
+    monkeypatch.setattr(beam_cloud, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    client = BeamCloudModelClient()
+    client.warmup()
+    initial = clock[0]
+    clock[0] = initial + 58
+
+    def slow_count_then_bad_metadata(req, payload, data):
+        if req.url.path == "/api/chat":
+            clock[0] = initial + 61
+        elif req.url.path == "/api/tags" and fault == "remote_host":
+            data["models"][0]["remote_host"] = "https://unapproved.invalid"
+        elif req.url.path == "/api/show" and fault == "context":
+            data["model_info"]["beam.context_length"] = 131072
+        return data
+
+    changes["handler"] = slow_count_then_bad_metadata
+    with pytest.raises(PermanentModelError):
+        client.count_input_tokens(request())
+    assert client.token_count_receipt == {"delivery": "sent", "model_calls": 1,
+        "usage": {"input_tokens": 64, "output_tokens": 1}}
+    assert client._memo == {}
+    before = deepcopy(calls)
+    with pytest.raises(PermanentModelError, match="fresh exact native") as caught:
+        client.complete(request())
+    assert caught.value.delivery == "not_sent" and caught.value.usage == {"input_tokens": 0, "output_tokens": 0}
+    assert calls == before
+    assert [payload["options"]["num_predict"] for _, path, payload in calls if path == "/api/chat"] == [1]
+
+
 def test_direct_or_expired_completion_never_hides_a_paid_measurement(transport):
     calls, _, _ = transport
     client = BeamCloudModelClient()
