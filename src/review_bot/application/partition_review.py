@@ -794,6 +794,11 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                 "prior_context_policy": "These are earlier accepted decisions for the SAME fixed context IDs, copied with their complete reasons, original quoted evidence and source-response hashes. Keep an unchanged prior state by omitting that context_updates key. A source absent from this page was not absent from an earlier page that delivered it. Emit a new update only when supplied evidence changes the earlier decision, and explain that evidence and correction. Never reopen a resolved item solely because this page lacks that source. Earlier quotes here document the existing decision; they do not add review targets or new citation IDs."} if prior_context else {}),
             "initial_perspective_selection": partitions.get("scope_selection", {}).get("perspectives", []),
             "perspective_policy": "review_all_eight_from_fixed_catalog" if mode == "intent" else "not_applicable",
+            **({"perspective_applicability_policy": {
+                "initial_selection": "Provisional TEV focus, not a final verdict or an instruction to exclude a perspective.",
+                "final_review": "Judge all eight fixed perspectives from the fixed PR purpose and original code. Correct initial applicability when the originals support it; retain the original selection in the audit record.",
+                "not_apply": "Requires a concrete PR-scope reason grounded in the fixed perspective definition and originals. A page focusing on other perspectives, an initial TEV choice, or an earlier draft is not evidence of inapplicability.",
+                "missing_context": "Missing necessary originals is insufficient_context, not proof that a relevant perspective does not apply."}} if mode == "intent" else {}),
             "perspective_catalog": [asdict(p) for p in PERSPECTIVES] if mode == "intent" or mode == "planning" and "intent" in available_modes else []},
             tracked_schema(schema, rows), profile)
 

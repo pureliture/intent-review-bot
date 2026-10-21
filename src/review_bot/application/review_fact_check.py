@@ -213,6 +213,22 @@ def delivery(rows, final, originals, meta, *, kind, extra=None):
         "execution_facts": {"target_tests_executed_by_bot": False,
             "target_builds_executed_by_bot": False, "runtime_deployment_verified_by_this_review": False},
         "scope": "Static frozen PR review. Code entailment checks are model-assisted, not proofs."}
+    if any(row["kind"] == "perspectives" for row in rows):
+        from review_bot.domain.intent_perspectives import CATALOG_VERSION, PERSPECTIVES
+
+        payload["canonical_facts"]["intent_perspectives"] = {
+            "catalog_version": CATALOG_VERSION,
+            "catalog": [asdict(perspective) for perspective in PERSPECTIVES],
+            "scope_policy": {
+                "review_all_eight_from_fixed_catalog": True,
+                "initial_tev_applicability": "Provisional focus hypothesis; independently correct it from the frozen PR originals and fixed questions.",
+                "check_scope_premises": "Check any asserted applicability or exclusion premise in statement and reasoning against this program-owned catalog and the frozen PR scope. The verdict is a judgement, but its asserted scope premises are still checkable assertions.",
+                "unsupported_exclusions": "Page focus, attention to other perspectives, an earlier TEV not_apply label, or absence from a selected page do not establish that a fixed perspective is outside the PR. A valid code citation does not support an invented page-focus exclusion.",
+                "assessment_rule": "Use contradicted for a scope premise that conflicts with the fixed review contract or supplied originals, and unverifiable when its asserted boundary lacks necessary evidence. Do not mark such a factual scope premise non_factual merely because it accompanies a review verdict.",
+                "source_grounded_not_apply": "not_apply remains allowed when the actual PR purpose and originals establish a concrete non-applicability boundary for the fixed question. Do not force apply, aligned, a concern, or any other verdict for all eight.",
+                "correction": "Use the existing complete-item correction when a scope premise is unsupported. Preserve the original item and initial TEV choices in the audit trail, keep perspective_id, and select any allowed verdict justified by the frozen sources.",
+            },
+        }
     return payload, refs, spans
 
 

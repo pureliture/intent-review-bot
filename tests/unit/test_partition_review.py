@@ -1295,3 +1295,31 @@ def test_partition_requires_explicit_native_measurement_for_cloud_provider(nativ
         assert result.status == "not_run"
         assert result.reason == "partition_requires_native_token_measurement"
         assert review.count_requests == [] and review.requests == []
+
+
+def test_initial_perspective_exclusions_are_provisional_and_final_review_accounts_for_all_eight():
+    seen = []
+
+    def exclude_initial(payload, body):
+        if payload["stage"] == "select_perspective":
+            body["choice"] = next(row["label"] for row in payload["options"] if row["key"] == "not_apply")
+        return body
+
+    def final_contract(payload, body):
+        if payload["stage"] == "final_review":
+            assert all(row["decision"] == "not_apply" for row in payload["initial_perspective_selection"])
+            policy = payload["perspective_applicability_policy"]
+            assert "Provisional TEV focus" in policy["initial_selection"]
+            assert "not evidence of inapplicability" in policy["not_apply"]
+            assert len(payload["perspective_catalog"]) == 8
+            seen.append(payload)
+        return body
+
+    task = make_task()
+    result = run_partition_review(task, "intent", PartitionModelClient(transform=final_contract),
+        PartitionModelClient(transform=exclude_initial), limits=limits())
+    assert result.status == "completed", result.reason
+    assert seen and len(result.perspectives) == 8
+    assert all(row["verdict"] == "aligned" for row in result.perspectives)
+    assert all(row["decision"] == "not_apply" for row in result.partition["scope_selection"]["perspectives"])
+    validate_partition_result(result, task)

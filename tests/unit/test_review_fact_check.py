@@ -745,3 +745,88 @@ def test_known_native_batch_output_limit_splits_items_after_bounded_recovery_onl
         assert not result.usage["usage_complete"]
         assert not result.partition["output_recoveries"] and not result.partition["rejected_model_outputs"]
     validate_partition_result(result, task)
+
+
+
+def test_fixed_perspective_scope_premises_use_existing_four_item_rewrite_batch():
+    from dataclasses import asdict
+    from review_bot.domain.intent_perspectives import CATALOG_VERSION, PERSPECTIVES
+    excluded = {"problem_success", "outcome_connection", "preservation", "assumptions_tradeoffs"}
+    invented = "This perspective is excluded because this page focuses on other perspectives."
+    observed_contexts = []
+    def plan_transform(payload, body):
+        if payload["stage"] == "select_perspective" and payload["state"]["perspective"]["id"] in excluded:
+            body["choice"] = next(option["label"] for option in payload["options"] if option["key"] == "not_apply")
+        return body
+    def review_transform(payload, body):
+        stage = payload["stage"]
+        if stage == "final_review":
+            for item in body["perspectives"]:
+                if item["perspective_id"] in excluded:
+                    item.update(verdict="not_apply", statement=invented, reasoning=invented)
+        elif stage in ("fact_check", "fact_rewrite"):
+            context = payload["canonical_facts"]["intent_perspectives"]
+            assert context["catalog_version"] == CATALOG_VERSION
+            assert context["catalog"] == [asdict(perspective) for perspective in PERSPECTIVES]
+            assert context["scope_policy"]["review_all_eight_from_fixed_catalog"] is True
+            assert "Provisional" in context["scope_policy"]["initial_tev_applicability"]
+            assert "Page focus" in context["scope_policy"]["unsupported_exclusions"]
+            observed_contexts.append(context)
+            if stage == "fact_check":
+                assert payload["originals"] and payload["fixed_original_inventory"] == []
+                for row in payload["items"]:
+                    if row["item_id"].startswith("perspectives:") and row["original_item"]["reasoning"] == invented:
+                        for field in ("statement", "reasoning"):
+                            body["items"][row["item_id"]][field].update(state="contradicted",
+                                reason="Page focus and a provisional TEV label cannot establish exclusion under the fixed scope policy.")
+            else:
+                replacements = {}
+                for row in payload["items"]:
+                    item = deepcopy(row["original_item"])
+                    item.update(verdict="aligned", statement="The fixed perspective was independently reviewed against the complete PR originals.",
+                        reasoning="The PR purpose and actual HEAD behavior support this judgement, independently of the initial focus hint.",
+                        citations=[{"reference_id": _reference(payload)}])
+                    replacements[row["item_id"]] = {"replacement": item,
+                        "correction_reason": "Correct the unsupported page-focus exclusion using the fixed catalog and original source.",
+                        "correction_citations": item["citations"]}
+                return {"items": replacements}
+        return body
+    task = make_task()
+    review = PartitionModelClient(transform=review_transform)
+    result = run_partition_review(task, "intent", review,
+        PartitionModelClient(group_all=True, transform=plan_transform), limits=limits())
+    assert result.status == "completed", result.reason
+    hints = {row["perspective_id"]: row["decision"] for row in result.partition["scope_selection"]["perspectives"]}
+    assert {key for key, value in hints.items() if value == "not_apply"} == excluded
+    original = result.partition["pre_verification_final"]
+    assert {item["perspective_id"] for item in original["perspectives"] if item["verdict"] == "not_apply"} == excluded
+    assert all(item["verdict"] == "aligned" for item in result.perspectives) and len(result.perspectives) == 8
+    rewrites = [json.loads(request.user_content) for request in review.requests if json.loads(request.user_content)["stage"] == "fact_rewrite"]
+    checks = [json.loads(request.user_content) for request in review.requests if json.loads(request.user_content)["stage"] == "fact_check"]
+    assert len(rewrites) == 1 and len(rewrites[0]["items"]) == 4
+    assert len(checks) == 2 and len(checks[0]["items"]) == 9 and len(checks[1]["items"]) == 4
+    assert {row["original_item"]["perspective_id"] for row in rewrites[0]["items"]} == excluded
+    assert len(observed_contexts) == 3
+    validate_partition_result(result, task)
+
+
+def test_source_grounded_perspective_non_applicability_is_still_permitted():
+    legitimate = "The fixed change restores the existing local string result contract and introduces no additional operational assumption or accepted cost."
+    def transform(payload, body):
+        if payload["stage"] == "final_review":
+            for item in body["perspectives"]:
+                if item["perspective_id"] == "assumptions_tradeoffs":
+                    item.update(verdict="not_apply", statement=legitimate, reasoning=legitimate)
+        elif payload["stage"] == "fact_check":
+            context = payload["canonical_facts"]["intent_perspectives"]
+            assert "not_apply remains allowed" in context["scope_policy"]["source_grounded_not_apply"]
+            assert "Do not force apply" in context["scope_policy"]["source_grounded_not_apply"]
+        return body
+    task = make_task(repair=True)
+    review = PartitionModelClient(transform=transform)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    item = next(item for item in result.perspectives if item["perspective_id"] == "assumptions_tradeoffs")
+    assert item["verdict"] == "not_apply" and item["reasoning"] == legitimate
+    assert not any(json.loads(request.user_content)["stage"] == "fact_rewrite" for request in review.requests)
+    validate_partition_result(result, task)

@@ -117,7 +117,12 @@ class GitHubApiClient:
                             if len(content) + len(chunk) > max_response_bytes:
                                 raise GitHubResponseLimitError("source_response_limit_exceeded")
                             content.extend(chunk)
-                        resp = httpx.Response(streamed.status_code, headers=streamed.headers,
+                        # iter_bytes already decoded the wire representation. Keep
+                        # validators/metadata without reapplying its encoding or length.
+                        decoded_headers = streamed.headers.copy()
+                        decoded_headers.pop("Content-Encoding", None)
+                        decoded_headers.pop("Content-Length", None)
+                        resp = httpx.Response(streamed.status_code, headers=decoded_headers,
                             content=bytes(content), request=self._safe_request(method))
         except GitHubResponseLimitError:
             raise
