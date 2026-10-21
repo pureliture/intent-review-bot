@@ -126,7 +126,7 @@ def test_intent_fact_check_corrects_false_execution_claim_and_rechecks_without_c
 @pytest.mark.parametrize("state", ["contradicted", "unverifiable"])
 def test_source_check_rewrites_only_the_failing_item_and_preserves_all_other_results(state):
     def transform(payload, body):
-        if payload["stage"] == "fact_check" and payload["items"][0]["item_id"] == "perspectives:2":
+        if payload["stage"] == "fact_check" and "perspectives:2" in body["items"]:
             body["items"]["perspectives:2"]["reasoning"].update(state=state, reason="Precise unresolved or contradictory premise.")
         if payload["stage"] == "fact_rewrite":
             item = deepcopy(payload["items"][0]["original_item"])
@@ -149,11 +149,14 @@ def test_source_check_rewrites_only_the_failing_item_and_preserves_all_other_res
 
 def test_fact_checks_cannot_bypass_existing_task_budget_or_promote_unchecked_items():
     task = make_task()
+    baseline = run_partition_review(task, "intent", PartitionModelClient(), PartitionModelClient(group_all=True), limits=limits())
+    fact_index = next(i for i, stage in enumerate(baseline.stages) if stage.stage == "fact_check" and stage.attempts)
+    cap = sum(len(stage.attempts) for stage in baseline.stages[:fact_index])
     result = run_partition_review(task, "intent", PartitionModelClient(), PartitionModelClient(group_all=True),
-        limits=PartitionReviewLimits(max_calls=15, max_total_tokens=1000000))
+        limits=PartitionReviewLimits(max_calls=cap, max_total_tokens=1000000))
     assert result.status == "partial_review" and result.reason == "factual_verification_incomplete"
     assert result.partition["fact_verification"]["interruption_reason"] == "call_limit_exceeded"
-    assert result.usage["calls"] <= 15 and result.usage["usage_complete"]
+    assert result.usage["calls"] <= cap and result.usage["usage_complete"]
     assert result.partition["final"] == result.partition["pre_verification_final"]
     validate_partition_result(result, task)
 
@@ -312,7 +315,7 @@ def test_checker_receives_literal_prose_and_exact_claim_rules_without_repairing_
     assert "check EACH named component" in request.system_prompt
     assert "necessary conditions, sufficient conditions" in request.system_prompt
     assert result.partition["identity"]["prompts"]["fact_check"] == hash_json(facts.CHECK_PROMPT)
-    assert result.prompt_version == "partitioned-review/v16-explicit-finding-dispositions"
+    assert result.prompt_version == "partitioned-review/v17-shared-service-batched-facts"
     assert result.model["is_mock"] is True  # no semantic accuracy claim from this fixture
 
 
@@ -452,4 +455,293 @@ def test_invalid_fact_source_request_is_a_readable_partial_without_source_expans
     assert result.status == "partial_review" and result.reason == "factual_verification_incomplete"
     assert result.partition["fact_verification"]["interruption_reason"] == "fact_source_request_invalid"
     assert not any(json.loads(req.user_content)["stage"] == "fact_rewrite" for req in review.requests)
+    validate_partition_result(result, task)
+
+
+def test_final_items_share_one_native_admitted_fact_check_without_merge_call():
+    task = make_task()
+    client = PartitionModelClient()
+    result = run_partition_review(task, "intent", client, PartitionModelClient(), limits=limits())
+    checks = [json.loads(req.user_content) for req in client.requests if json.loads(req.user_content)["stage"] == "fact_check"]
+    assert len(checks) == 1
+    assert [row["item_id"] for row in checks[0]["items"]] == [row["id"] for row in facts.items(result.partition["pre_verification_final"])]
+    assert result.status == "completed"
+    validate_partition_result(result, task)
+
+
+def test_native_overflow_splits_item_batches_with_complete_deterministic_id_coverage():
+    def count(req):
+        payload = json.loads(req.user_content)
+        return len(payload["items"]) * 100 if payload["stage"] == "fact_check" else 100
+    client = PartitionModelClient(counter=count)
+    client.profile = replace(client.profile, max_input_tokens=250)
+    task = make_task()
+    result = run_partition_review(task, "intent", client, PartitionModelClient(), limits=limits())
+    checks = [json.loads(req.user_content) for req in client.requests if json.loads(req.user_content)["stage"] == "fact_check"]
+    ids = [row["item_id"] for payload in checks for row in payload["items"]]
+    assert ids == [row["id"] for row in facts.items(result.partition["pre_verification_final"])]
+    assert all(len(payload["items"]) <= 2 for payload in checks)
+    assert result.status == "completed", result.reason
+    validate_partition_result(result, task)
+
+
+def _small_source_page_counter(req, *, stage):
+    payload = json.loads(req.user_content)
+    if payload["stage"] != stage:
+        return 100
+    size = sum(len(block["text"].encode()) for source in payload["originals"] for block in source["blocks"])
+    return 100 if payload.get("source_page") and size <= 20 else 1000
+
+
+def test_single_oversized_fixed_source_is_losslessly_paged_without_promoting_cross_page_support():
+    client = PartitionModelClient(counter=lambda req: _small_source_page_counter(req, stage="fact_check"))
+    client.profile = replace(client.profile, max_input_tokens=250)
+    task = _metric_task()
+    result = run_partition_review(task, "architecture", client, PartitionModelClient(), limits=limits(max_rechecks=0))
+    assert result.status == "partial_review"
+    assert result.partition["final"] == result.partition["pre_verification_final"]
+    ledger = result.partition["fact_verification"]
+    call = ledger["items"][0]["attempts"][0]["check"]
+    assert call["split"] == "sources" and "interruption_reason" not in ledger
+    assert ledger["items"][0]["status"] == "unverified"
+    packets = [json.loads(req.user_content) for req in client.requests if json.loads(req.user_content)["stage"] == "fact_check"]
+    from review_bot.application.partition_review import prepare_originals
+    originals, meta = prepare_originals(task, "architecture")
+    _, _, cover = facts.delivery(facts.items(result.partition["pre_verification_final"]), result.partition["pre_verification_final"], originals, meta, kind="complete_originals")
+    for span in cover:
+        pieces = sorted((source for packet in packets for source in packet["originals"] if source["evidence_id"] == span.evidence_id), key=lambda source: source["start_byte"])
+        assert "".join(block["text"] for source in pieces for block in source["blocks"]) == span.text
+        assert pieces[0]["start_byte"] == span.start_byte and pieces[-1]["end_byte"] == span.end_byte
+    validate_partition_result(result, task)
+
+
+def test_oversized_rewrite_pages_keep_raw_replies_and_recheck_the_complete_replacement():
+    corrected = "Complete corrected assertion."
+    def transform(payload, body):
+        if payload["stage"] == "fact_check" and payload["items"][0]["original_item"] != corrected:
+            body["items"]["summary"]["text"].update(state="contradicted", reason="The original premise is false.")
+        if payload["stage"] == "fact_check" and payload.get("source_page") and payload["fixed_original_inventory"]:
+            source = payload["fixed_original_inventory"][0]
+            body["items"]["summary"]["text"].update(state="unverifiable", reason="Need another exact frozen original for this candidate.")
+            body["source_requests"] = [{"evidence_id": source["evidence_id"], "reason": "Carry this actual source into the final recheck."}]
+        if payload["stage"] == "fact_rewrite":
+            body["replacement"] = corrected
+        return body
+    client = PartitionModelClient(counter=lambda req: _small_source_page_counter(req, stage="fact_rewrite"), transform=transform)
+    client.profile = replace(client.profile, max_input_tokens=250)
+    task = _metric_task()
+    result = run_partition_review(task, "architecture", client, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    first, second = result.partition["fact_verification"]["items"][0]["attempts"]
+    assert first["rewrite"]["split"] == "sources"
+    assert all("response" in child for child in first["rewrite"]["children"])
+    assert second["item"] == corrected == result.summary
+    assert second["input_source_requests"]
+    validate_partition_result(result, task)
+
+
+def test_exact_duplicate_source_text_keeps_every_original_identity_and_byte_on_readback():
+    from review_bot.application.source_partition import SourceOriginal
+    original = "def run():\n    return 'same exact bytes'\n"
+    sources = [SourceOriginal("S-base", original, "source", "a.py", "base", "a" * 40),
+        SourceOriginal("S-head", original, "source", "a.py", "head", "b" * 40)]
+    final = {"summary": "Same implementation.", "findings": [], "perspectives": [], "questions": []}
+    payload, _, refs, spans = facts.request_spec("fact_check", facts.items(final), final, sources, {}, kind="complete_originals")
+    assert isinstance(payload["originals"][1]["blocks"][0]["text"], dict)
+    materialized = facts.materialize_source_texts(payload)
+    assert [source["evidence_id"] for source in materialized] == ["S-base", "S-head"]
+    assert [source["version"] for source in materialized] == ["base", "head"]
+    assert all("".join(block["text"] for block in source["blocks"]) == original for source in materialized)
+    assert len(refs) == 2 and len(spans) == 2
+
+
+def test_source_capacity_split_preserves_multibyte_unicode_boundaries():
+    from review_bot.application.source_partition import SourceOriginal
+    source = SourceOriginal("S-unicode", "😀a", "source", "a.py", "head", "a" * 40)
+    left, right = facts.split_ranges([{"evidence_id": source.evidence_id, "start_byte": 0, "end_byte": len(source.raw)}], [source])
+    assert left[0]["end_byte"] == right[0]["start_byte"] == 4
+    assert source.raw[:4].decode() + source.raw[4:].decode() == source.text
+
+
+def test_citation_limit_applies_to_each_assessment_rather_than_whole_batch():
+    from review_bot.application.source_partition import SourceOriginal, make_span
+    from review_bot.application.source_citations import citation_spans
+    source = SourceOriginal("S-many", "a\n" * 400, "source", "a.py", "head", "a" * 40)
+    refs = citation_spans([make_span(source, 0, len(source.raw), "test")], {source.evidence_id: source})
+    assert len(refs) > 32
+    raw = {"items": {"a": [{"reference_id": ref} for ref in refs]}}
+    assert len(facts.response_citations(raw, refs)) == len(refs)
+
+
+@pytest.mark.parametrize("rewrite_capacity,expected_rewrite_calls", [(250, 1), (150, 2)])
+def test_two_factual_errors_share_rewrite_and_batch_recheck_with_id_coverage(rewrite_capacity, expected_rewrite_calls):
+    failing = {"perspectives:0", "perspectives:1"}
+    corrected = "The complete corrected factual premise."
+    def counter(request):
+        payload = json.loads(request.user_content)
+        return len(payload["items"]) * 100 if payload["stage"] == "fact_rewrite" else 100
+    def transform(payload, body):
+        if payload["stage"] == "fact_check":
+            for row in payload["items"]:
+                if row["item_id"] in failing and row["original_item"]["reasoning"] != corrected:
+                    body["items"][row["item_id"]]["reasoning"].update(state="contradicted", reason="This exact premise must be corrected.")
+        if payload["stage"] == "fact_rewrite":
+            replacements = {}
+            for row in payload["items"]:
+                item = deepcopy(row["original_item"])
+                item["reasoning"] = corrected
+                item["citations"] = [{"reference_id": _reference(payload)}]
+                replacements[row["item_id"]] = {"replacement": item,
+                    "correction_reason": "Correct this item's premise with frozen evidence.", "correction_citations": item["citations"]}
+            return {"items": replacements} if len(replacements) > 1 else next(iter(replacements.values()))
+        return body
+    client = PartitionModelClient(counter=counter, transform=transform)
+    client.profile = replace(client.profile, max_input_tokens=rewrite_capacity)
+    task = make_task()
+    result = run_partition_review(task, "intent", client, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    rewrites = [json.loads(req.user_content) for req in client.requests if json.loads(req.user_content)["stage"] == "fact_rewrite"]
+    checks = [json.loads(req.user_content) for req in client.requests if json.loads(req.user_content)["stage"] == "fact_check"]
+    assert len(rewrites) == expected_rewrite_calls
+    assert {row["item_id"] for payload in rewrites for row in payload["items"]} == failing
+    assert len(rewrites[0]["recheck"]["checker_outputs"]) == 1
+    assert set(next(iter(rewrites[0]["recheck"]["checker_outputs"].values()))["original_check_response"]["items"]) == {
+        row["item_id"] for row in checks[0]["items"]}
+    assert len(checks) == 2 and {row["item_id"] for row in checks[1]["items"]} == failing
+    assert all(row["original_item"]["reasoning"] == corrected for row in checks[1]["items"])
+    ledger = result.partition["fact_verification"]
+    for entry in ledger["items"]:
+        assert len(entry["attempts"]) == (2 if entry["item_id"] in failing else 1)
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("whole_claim_fits", [True, False])
+def test_oversized_original_requires_direct_whole_claim_recheck_after_complete_discovery(whole_claim_fits):
+    task = _metric_task()
+    declaration = "static final int ANSWER = 42;"
+    content = "class A {\n  " + declaration + "\n" + "  // retain this exact frozen context\n" * 100 + "}\n"
+    head = replace(task.snapshot.head, files=tuple(replace(file, content=content,
+        content_hash=hashlib.sha256(content.encode()).hexdigest()) if file.path == "src/A.java" else file
+        for file in task.snapshot.head.files))
+    task = build_task_input(replace(task.snapshot, head=head), task.delta, task.classification)
+    literal = ("The HEAD declaration sets ANSWER to 42." if whole_claim_fits else
+        "The HEAD declaration and a separate caller jointly guarantee the same value.")
+    def count(request):
+        payload = json.loads(request.user_content)
+        if payload["stage"] != "fact_check":
+            return 100
+        if "whole_claim_recheck" in payload:
+            return 100 if whole_claim_fits else 1000
+        size = sum(len(block["text"].encode()) for source in facts.materialize_source_texts(payload) for block in source["blocks"])
+        return 100 if payload.get("source_page") and size <= 250 else 1000
+    def transform(payload, body):
+        if payload["stage"] == "final_review":
+            body["summary"] = literal
+        if payload["stage"] == "fact_check":
+            proof = next((block for source in facts.materialize_source_texts(payload)
+                if source["version"] == "head" and source["path"] == "src/A.java"
+                for block in source["blocks"] if declaration in block["text"]), None)
+            field = body["items"]["summary"]["text"]
+            field.update(state="supported" if proof else "unverifiable",
+                reason="The exact HEAD declaration supports the complete literal assertion." if proof else "This page has no evidence of the declaration.",
+                citations=[{"reference_id": proof["reference_id"]}] if proof else [])
+        return body
+    client = PartitionModelClient(counter=count, transform=transform)
+    client.profile = replace(client.profile, max_input_tokens=250)
+    result = run_partition_review(task, "architecture", client, PartitionModelClient(), limits=limits(max_rechecks=0))
+    ledger = result.partition["fact_verification"]
+    call = ledger["items"][0]["attempts"][0]["check"]
+    assert call["split"] == "sources" and len(call["discovery"]["pages"]) > 1
+    assert all(page["response_hash"] == hash_json(page["response"]) for page in call["discovery"]["pages"])
+    assert call["whole_claim"]["rows"][0]["item"] == literal
+    assert call["discovery_response"]["items"]["summary"]["text"]["state"] == "unverifiable"
+    assert result.summary == literal
+    pages = [json.loads(request.user_content) for request in client.requests
+        if json.loads(request.user_content)["stage"] == "fact_check" and json.loads(request.user_content).get("source_page")]
+    head_pieces = sorted((source for page in pages for source in facts.materialize_source_texts(page)
+        if source["path"] == "src/A.java" and source["version"] == "head"), key=lambda source: source["start_byte"])
+    assert "".join(block["text"] for source in head_pieces for block in source["blocks"]) == content
+    if whole_claim_fits:
+        assert result.status == "completed", result.reason
+        focused = next(json.loads(request.user_content) for request in client.requests
+            if json.loads(request.user_content).get("whole_claim_recheck"))
+        assert focused["items"][0]["original_item"] == literal
+        assert focused["whole_claim_recheck"]["pages"] == call["discovery"]["pages"]
+        assert sum(len(block["text"].encode()) for source in facts.materialize_source_texts(focused) for block in source["blocks"]) < len(content.encode())
+        for mutation in ("discovery_cover", "focused_evidence"):
+            changed = deepcopy(result)
+            changed_call = changed.partition["fact_verification"]["items"][0]["attempts"][0]["check"]
+            if mutation == "discovery_cover":
+                changed_call["discovery"]["pages"][0]["delivered_ranges"][0]["end_byte"] -= 1
+            else:
+                changed_call["whole_claim"]["source_ranges"][0]["end_byte"] -= 1
+            with pytest.raises(PartitionError):
+                validate_partition_result(changed, task)
+    else:
+        assert result.status == "partial_review"
+        assert call["whole_claim"]["admission_rejected"]
+        assert "response" not in call["whole_claim"]
+        assert ledger["items"][0]["status"] == "unverified"
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("limited_stage", ["fact_check", "fact_rewrite"])
+@pytest.mark.parametrize("known_usage", [True, False])
+def test_known_native_batch_output_limit_splits_items_after_bounded_recovery_only(limited_stage, known_usage):
+    from review_bot.application.architecture_review import ModelOutputLimitError
+    failing = {"perspectives:0", "perspectives:1"}
+    corrected = "Corrected complete factual premise."
+    review = PartitionModelClient()
+    review.profile = replace(review.profile, max_output_tokens=32678)
+    review.supports_bounded_reasoning = True
+    root_size = 9 if limited_stage == "fact_check" else 2
+    def transform(payload, body):
+        request = review.requests[-1]
+        if payload["stage"] == limited_stage and len(payload["items"]) == root_size:
+            error = ModelOutputLimitError("Known native length truncation")
+            if known_usage:
+                error.delivery = "sent"
+                error.usage = {"input_tokens": 100, "output_tokens": request.max_output_tokens}
+            error.rejected_output = {"finish_reason": "length", "content": '{"unfinished":',
+                "reasoning_content": "Exact rejected native output retained."}
+            raise error
+        if limited_stage == "fact_rewrite" and payload["stage"] == "fact_check":
+            for row in payload["items"]:
+                if row["item_id"] in failing and row["original_item"]["reasoning"] != corrected:
+                    body["items"][row["item_id"]]["reasoning"].update(state="contradicted", reason="Correct this exact factual premise.")
+        if payload["stage"] == "fact_rewrite":
+            item = deepcopy(payload["items"][0]["original_item"])
+            item["reasoning"] = corrected
+            item["citations"] = [{"reference_id": _reference(payload)}]
+            return {"replacement": item, "correction_reason": "Keep this correction with exact frozen evidence.",
+                "correction_citations": item["citations"]}
+        return body
+    review.transform = transform
+    task = make_task()
+    result = run_partition_review(task, "intent", review, PartitionModelClient(), limits=limits())
+    ledger = result.partition["fact_verification"]
+    entry = ledger["items"][0 if limited_stage == "fact_check" else 1]
+    call = entry["attempts"][0]["check" if limited_stage == "fact_check" else "rewrite"]
+    root_calls = [request for request in review.requests if json.loads(request.user_content)["stage"] == limited_stage
+        and len(json.loads(request.user_content)["items"]) == root_size]
+    if known_usage:
+        assert result.status == "completed", result.reason
+        assert len(root_calls) == 2 and root_calls[1].reasoning_budget_tokens is not None
+        assert call["split"] == "items" and call["split_cause"] == "known_output_limit"
+        assert len(call["children"]) == 2 and all("response" in child for child in call["children"])
+        assert result.usage["usage_complete"]
+        assert len(result.partition["rejected_model_outputs"]) == 2
+        assert len(result.partition["output_recoveries"]) == 1
+        assert all(record["output"]["content"] == '{"unfinished":' for record in result.partition["rejected_model_outputs"])
+        changed = deepcopy(result)
+        changed_call = changed.partition["fact_verification"]["items"][0 if limited_stage == "fact_check" else 1]["attempts"][0]["check" if limited_stage == "fact_check" else "rewrite"]
+        changed_call["split_cause"] = "input_limit"
+        with pytest.raises(PartitionError):
+            validate_partition_result(changed, task)
+    else:
+        assert result.status == "partial_review"
+        assert ledger["interruption_reason"] == "usage_unavailable"
+        assert len(root_calls) == 1 and "children" not in call
+        assert not result.usage["usage_complete"]
+        assert not result.partition["output_recoveries"] and not result.partition["rejected_model_outputs"]
     validate_partition_result(result, task)

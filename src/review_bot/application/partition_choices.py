@@ -47,7 +47,7 @@ def mode_options(available):
     combinations = [available, *((m,) for m in reversed(available)), ()]
     rows, seen = [], set()
     meanings = {
-        "architecture": "PMD/CPD-guided structural review of eligible Java+Gradle code; analysis signals are evidence, not automatic defects",
+        "architecture": "PMD/CPD-guided structural review only when the PR needs inspection of responsibilities, dependencies, method control-flow/complexity or duplication. Java+Gradle eligibility alone is not a reason to run analysis. Signals are evidence, not automatic defects",
         "intent": "compare stated PR purpose and implementation through the eight fixed intent perspectives, across supported languages",
     }
     for modes in combinations:

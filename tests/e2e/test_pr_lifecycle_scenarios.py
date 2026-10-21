@@ -346,10 +346,13 @@ class TestScenario5GuardedConcurrentPublicationRace:
                 body = github.comments[comment_id]["body"]
                 assert body.startswith(config.publish.a_marker)
                 assert "### PMD/CPD 아키텍처 리뷰 A" in body
-                assert "**의견 검증 완료**" in body
+                assert "#### 전체 판단" in body and "#### LLM 리뷰" in body
+                assert "이 검토 범위에서 추가로 조치할 발견사항은 없습니다" in body
                 assert f"Architecture pass {generation}" in body
-                assert f"- Base SHA: `{comparison_base}`" in body
-                assert f"- Head SHA: `{head}`" in body
+                assert f"고정된 HEAD `{head}`" in body
+                supplied = json.loads(model.requests[-1].user_content)
+                assert supplied["snapshot"]["base"]["sha"] == comparison_base
+                assert supplied["snapshot"]["head"]["sha"] == head
                 assert target_base not in body
 
             assert comment_ids[0] == comment_ids[1]

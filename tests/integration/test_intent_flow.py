@@ -23,18 +23,22 @@ from review_bot.runtime.webhook import create_webhook_app
 from review_bot.runtime.worker import WorkerLoop
 from tests.conftest import SyntheticGitRepo
 from tests.unit.test_delta_adversarial import make_test_run
+from tests.fixtures.partition_review import PartitionModelClient
 
 SECRET = "synthetic-intent-webhook-secret"
 GOAL = "Serialize request handling"
 
 
-class IntentFixtureModel(MockModelClient):
+class IntentFixtureModel(PartitionModelClient):
     def __init__(self) -> None:
-        super().__init__([], input_tokens=100)
+        super().__init__()
 
     def complete(self, request):
-        self.requests.append(request)
         data = json.loads(request.user_content)
+        if data["stage"] not in ("extract_goals", "observe_changes", "assess"):
+            return super().complete(request)
+        # Explicit legacy/offline HTTP fixtures still import this response helper.
+        self.requests.append(request)
         if data["stage"] == "extract_goals":
             body = {"declared_goals": [{"goal_id": "G1", "statement": GOAL,
                 "quote": GOAL, "evidence_ids": [data["evidence"][0]["id"]]}],
@@ -75,7 +79,7 @@ def intent_flow(tmp_path, synthetic_repo, valid_config_yaml):
     raw["execution"].update(mode="github_app", available_modes=["intent"])
     raw["service"].update(installation_allowlist=[], repository_allowlist=[])
     raw["publish"]["mode"] = "artifact_only"
-    raw["intent"] = {"context_paths": ["tests/test_app.py"]}
+    raw["intent"] = {"pipeline": "perspectives-v1", "context_paths": ["tests/test_app.py"]}
     raw.pop("architecture")
     config, _ = load_review_config_from_str(yaml.safe_dump(raw))
     pr = {"number": 7, "state": "open", "title": GOAL, "body": "Fixes #12", "draft": False,
@@ -133,17 +137,29 @@ def intent_flow(tmp_path, synthetic_repo, valid_config_yaml):
     state.mkdir(mode=0o700)
     store = SQLiteJobStore(state / "jobs.sqlite")
     model = IntentFixtureModel()
+    def select_modes(payload, body):
+        if payload["stage"] == "select_review_scope":
+            modes = flow.mode_selection
+            if modes is None:
+                modes = payload["state"]["available_modes"]
+            key = "review:" + (",".join(modes) if modes else "none")
+            body["choice"] = next(option["label"] for option in payload["options"] if option["key"] == key)
+        return body
+
+    planning_model = PartitionModelClient(name="tev", group_all=True, transform=select_modes)
     reader = GitRepositoryReader(synthetic_repo.repo_dir)
     analyzer = Mock()
     analyzer.run_analysis.side_effect = AssertionError("B must not initialize/use Java analysis")
-    worker = WorkerLoop(config, store, analyzer=analyzer, model_client=model, worker_id="intent-worker",
+    worker = WorkerLoop(config, store, analyzer=analyzer, model_client=model, planning_client=planning_model, worker_id="intent-worker",
         github_client_factory=lambda run: github,
         repo_reader_factory=lambda run, pr_data, client: reader, artifact_root=state)
     with TestClient(create_webhook_app(config, store, secret=SECRET)) as client:
         try:
-            yield SimpleNamespace(config=config, state=state, store=store, model=model, worker=worker,
+            flow = SimpleNamespace(config=config, state=state, store=store, model=model, worker=worker,
                 client=client, pr=pr, issue=issue, calls=calls, reader=reader, analyzer=analyzer,
-                issue_status=issue_status, comments=comments, github=github)
+                issue_status=issue_status, comments=comments, github=github,
+                planning_model=planning_model, mode_selection=None)
+            yield flow
         finally:
             store.close()
 
@@ -188,7 +204,8 @@ def test_signed_python_pr_creates_private_validated_b_without_java(intent_flow):
     assert manifest["modes"]["intent"]["publication"]["reason"] == "artifact_only"
     flow.analyzer.run_analysis.assert_not_called()
     assert not (root / "A/result.json").exists()
-    for name in ("input.json", "goals.json", "observations.json", "result.json", "scope.json", "usage.json", "validation.json", "comment.md", "receipt.json"):
+    for name in ("input.json", "partition.json", "perspectives.json", "fact-verification.json",
+        "result.json", "scope.json", "usage.json", "validation.json", "comment.md", "receipt.json"):
         assert (root / "B" / name).stat().st_mode & 0o777 == 0o600
     assert (root / "B").stat().st_mode & 0o777 == 0o700
 
@@ -226,7 +243,7 @@ def enable_a_fixture(flow):
 
 
 @pytest.mark.parametrize("modes", [("architecture",), ("architecture", "intent"), ("intent", "architecture")])
-def test_selected_modes_preserve_a_v1_and_keep_results_separate(intent_flow, modes):
+def test_selected_modes_keep_partition_a_and_b_results_separate(intent_flow, modes):
     flow = intent_flow
     use_modes(flow, modes)
     enable_a_fixture(flow)
@@ -235,7 +252,7 @@ def test_selected_modes_preserve_a_v1_and_keep_results_separate(intent_flow, mod
     root, status = output(flow)
     manifest = json.loads((root / "manifest.json").read_text())
     a = json.loads((root / "A/result.json").read_text())
-    assert status == "succeeded" and a["schema_version"] == 1 and a["review_type"] == "A"
+    assert status == "succeeded" and a["schema_version"] == 13 and a["review_type"] == "A"
     assert a["status"] == "not_run", "Empty A static signals must not prevent B execution"
     assert flow.analyzer.run_analysis.call_count == 2
     assert set(manifest["modes"]) == set(modes)
@@ -247,7 +264,8 @@ def test_selected_modes_preserve_a_v1_and_keep_results_separate(intent_flow, mod
         assert manifest["modes"]["intent"]["usage"] == b["usage"]
     else:
         assert not (root / "B").exists() and flow.model.requests == []
-        assert all(path != "/repos/org/repo/issues/12" for _, path in flow.calls)
+        assert any(path == "/repos/org/repo/issues/12" for _, path in flow.calls)
+        assert flow.planning_model.requests, "A selection uses the same frozen PR purpose and issue evidence"
 
 
 @pytest.mark.parametrize("a_failure", ["analysis", "preparation", "review", "artifact", "publication"])
@@ -262,7 +280,14 @@ def test_a_local_failure_does_not_discard_valid_b(intent_flow, monkeypatch, a_fa
         flow.worker.analyzer_factory = factory
     elif a_failure == "review":
         enable_a_fixture(flow)
-        monkeypatch.setattr("review_bot.runtime.worker.run_review_a_pipeline", Mock(side_effect=RuntimeError("synthetic-secret")))
+        original_review = flow.worker._review_partitioned
+
+        def review_mode(task, mode, *args, **kwargs):
+            if mode == "architecture":
+                raise RuntimeError("synthetic-secret")
+            return original_review(task, mode, *args, **kwargs)
+
+        monkeypatch.setattr(flow.worker, "_review_partitioned", review_mode)
     elif a_failure == "artifact":
         enable_a_fixture(flow)
         from review_bot.runtime.artifacts import RunArtifacts
@@ -320,13 +345,13 @@ def test_b_not_run_is_explicit_and_does_not_shrink_scope(intent_flow, case, monk
     flow = intent_flow
     if case == "model_unset":
         flow.worker.model_client = None
-        expected = "model_profile_unset"
+        expected = "partition_model_profile_unset"
     elif case == "missing_path":
         use_modes(flow, ("intent",), context_paths=["tests/test_app.py", "tests/missing.py"])
         expected = "incomplete_code_input"
     elif case == "overflow":
         flow.model.profile = flow.model.profile.__class__("mock", "small-profile", 100, is_mock=True)
-        expected = "input_limit_exceeded"
+        expected = "fixed_request_exceeds_input_budget"
     else:
         from review_bot.domain.envelope_v2 import ChangedFile
 
@@ -334,14 +359,17 @@ def test_b_not_run_is_explicit_and_does_not_shrink_scope(intent_flow, case, monk
         monkeypatch.setattr(flow.reader, "get_changed_files", lambda *args: (*original(*args), ChangedFile(".env")))
         expected = "incomplete_code_input"
     assert send_event(flow).status_code == 202
-    assert flow.worker.run_once() is True
+    assert flow.worker.run_once() is False
     root, status = output(flow)
-    b = json.loads((root / "B/result.json").read_text())
-    task = json.loads((root / "B/input.json").read_text())
-    assert status == "succeeded" and (b["status"], b["reason"]) == ("not_run", expected)
-    assert task["reviewed_paths"] == b["scope"]["reviewed_paths"]
+    plan = json.loads((root / "execution-plan.json").read_text())
+    task = json.loads((root / "planning-input.json").read_text())
+    assert status == "failed" and (plan["status"], plan["reason"]) == ("not_run", expected)
+    assert not (root / "B/result.json").exists()
     assert "app.py" in task["reviewed_paths"] and "tests/test_app.py" in task["reviewed_paths"]
-    assert b["usage"]["calls"] == 0 and flow.model.requests == []
+    if case == "missing_path":
+        assert "tests/missing.py" in task["reviewed_paths"]
+    assert plan["usage"]["calls"] == 0 and flow.model.requests == []
+    assert not flow.planning_model.requests
 
 
 def test_issue_text_and_missing_state_change_frozen_snapshot_and_input_hash(intent_flow):
@@ -364,7 +392,6 @@ def test_issue_text_and_missing_state_change_frozen_snapshot_and_input_hash(inte
 
 
 def test_scope_and_text_are_frozen_before_selection_and_analyzer_is_lazy(intent_flow):
-    from review_bot.application.selection import _selection_record
     from review_bot.ports import ModeSelectorPort
 
     flow = intent_flow
@@ -377,20 +404,25 @@ def test_scope_and_text_are_frozen_before_selection_and_analyzer_is_lazy(intent_
     flow.reader.read_tree_blobs = collected
     old_body = flow.issue["body"]
 
-    def select(snapshot, pr, modes):
-        assert collected.call_count == 2
-        assert {item.kind for item in snapshot.evidence} == {"pr_text", "issue_text"}
-        flow.issue["body"] = "Newer text must not mutate the selected snapshot"
-        return _selection_record(snapshot, modes, ("intent",), "fixture-v1")
-
+    flow.mode_selection = ("intent",)
+    original_choice = flow.planning_model.transform
+    def select(payload, body):
+        if payload["stage"] == "select_review_scope":
+            assert collected.call_count >= 2
+            flow.issue["body"] = "Newer text must not mutate the selected snapshot"
+        return original_choice(payload, body)
+    flow.planning_model.transform = select
     flow.worker.mode_selector = Mock(spec=ModeSelectorPort)
-    flow.worker.mode_selector.select_modes.side_effect = lambda snapshot, pr, available_modes: select(snapshot, pr, available_modes)
+    flow.worker.mode_selector.select_modes.side_effect = AssertionError("Legacy selection must not replace TEV")
     assert send_event(flow).status_code == 202 and flow.worker.run_once() is True
     root, _ = output(flow)
     task = json.loads((root / "B/input.json").read_text())
     assert task["snapshot"]["evidence"][1]["content"]["body"] == old_body
-    assert all(call.kwargs["paths"] == ("app.py", "src/main/java/demo/ModeFixture.java", "tests/test_app.py")
+    assert any(set(call.kwargs["paths"]) >= {"app.py", "src/main/java/demo/ModeFixture.java", "tests/test_app.py"}
         for call in collected.call_args_list)
+    assert all(call.kwargs.get("paths") is not None and "outside.py" not in call.kwargs["paths"]
+        for call in collected.call_args_list)
+    flow.worker.mode_selector.select_modes.assert_not_called()
     factory.assert_not_called()
     assert not (root / "A").exists()
 
@@ -441,14 +473,16 @@ def test_common_gates_stop_next_b_call_and_never_publish(intent_flow, monkeypatc
     flow = intent_flow
     use_modes(flow, ("intent",), task_timeout=2)
     clock = [100.0]
-    monkeypatch.setattr("review_bot.runtime.worker.time", SimpleNamespace(monotonic=lambda: clock[0]))
+    for module in ("review_bot.runtime.worker", "review_bot.application.partition_review",
+        "review_bot.application.model_execution"):
+        monkeypatch.setattr(module + ".time", SimpleNamespace(monotonic=lambda: clock[0]))
     original = flow.model.complete
     observed = {}
 
     def complete(request):
         response = original(request)
         observed["run_id"] = flow.worker._current_run_id
-        assert json.loads(request.user_content)["stage"] == "extract_goals"
+        assert json.loads(request.user_content)["stage"] == "review_partition"
         if abort == "stop":
             flow.worker.stop()
         elif abort == "closed":

@@ -1,4 +1,4 @@
-"""Private partition trial output, with no comment publication option."""
+"""Validated partition artifacts and developer-facing PR comment drafts."""
 from __future__ import annotations
 
 from review_bot.adapters.markdown.intent_formatter import _escape
@@ -6,7 +6,7 @@ from review_bot.application.partition_review import validate_partition_result
 from review_bot.domain.partition_review import PartitionReviewResult
 
 
-def format_partition_review_markdown(result: PartitionReviewResult, task, **_options) -> str:
+def _format_private_partition_markdown(result: PartitionReviewResult, task, **_options) -> str:
     if _options.get("publication_mode", "artifact_only") != "artifact_only":
         raise ValueError("partition_evaluation_is_private_only")
     validate_partition_result(result, task)
@@ -74,3 +74,46 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, **_opt
         lines.extend(["", "완료된 리뷰로 제시하지 않습니다. 검토 범위·관측·실행 기록을 함께 확인하세요." if ko else
             "No completed review is claimed. Inspect scope, observations and stage receipts."])
     return "\n".join(lines) + "\n"
+
+
+def format_partition_review_markdown(result: PartitionReviewResult, task, *,
+    publication_mode: str = "artifact_only", marker: str | None = None, max_length: int = 60000,
+    presentation=None, comment_template: str | None = None, **options,
+) -> str:
+    """Render a validated artifact or a developer comment; never publish it."""
+    if publication_mode == "artifact_only":
+        return _format_private_partition_markdown(result, task, **options)
+    if publication_mode != "comment" or result.review_type not in ("A", "B"):
+        raise ValueError("invalid_partition_formatter_options")
+    from review_bot.adapters.markdown.developer_presentation import (
+        actionable_intent_findings, findings_section, finish, label, perspective_section, review_summary,
+        selected_signals, static_analysis, status_sections,
+    )
+    from review_bot.domain.markers import DEFAULT_B_MARKER
+    from review_bot.adapters.markdown.formatter import DEFAULT_A_MARKER
+
+    validate_partition_result(result, task)
+    architecture = result.review_type == "A"
+    title = label(presentation, "title_a" if architecture else "title_b", "PMD/CPD 아키텍처 리뷰 A" if architecture else "의도 리뷰 B")
+    marker = marker or (DEFAULT_A_MARKER if architecture else DEFAULT_B_MARKER)
+    paths = result.scope.get("reviewed_paths", ())
+    scope = f"검토 범위: 고정된 HEAD `{result.head_sha}`와 비교 기준의 {len(paths)}개 파일 및 제공된 PR 원문. 코드·빌드·테스트를 실행하지 않았습니다."
+    if result.status != "completed" or result.validation_errors:
+        final = result.partition.get("final", {})
+        unreviewed = list(final.get("missing_context", ())) + list(result.validation_errors)
+        return finish(marker, title, status_sections(result, ko=result.language == "ko", unreviewed=unreviewed),
+            scope=scope, max_length=max_length)
+    summary = review_summary(result.summary, task, is_mock=result.model.get("is_mock"))
+    sections = {"summary": summary}
+    if architecture:
+        target_reviews = result.partition.get("final", {}).get("target_reviews", {})
+        signals = selected_signals(task, result.findings)
+        sections["static_analysis"] = static_analysis(task, signals, presentation=presentation)
+        sections["llm_review"] = findings_section(result.findings, result.questions, task,
+            signals=signals, target_reviews=target_reviews, presentation=presentation)
+    else:
+        findings = actionable_intent_findings(result.findings, result.perspectives)
+        sections["llm_review"] = findings_section(findings, result.questions, task, presentation=presentation)
+        sections["perspectives"] = perspective_section(result.perspectives, task, presentation)
+    footer = label(presentation, "footer_notice", "")
+    return finish(marker, title, sections, scope=scope, template=comment_template, max_length=max_length, footer=footer)

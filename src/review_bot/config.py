@@ -126,6 +126,8 @@ class ExecutionConfig(BaseModel):
     selector_uses_model: bool = False
     worker_concurrency: int = Field(ge=1, le=2, default=1)
     task_timeout_seconds: int = Field(ge=1, default=900)
+    max_model_calls: int = Field(ge=1, le=512, default=256)
+    max_total_tokens: int = Field(ge=1, default=8388608)
     pr_actions: list[str] = Field(
         default_factory=lambda: [
             "opened",
@@ -354,7 +356,7 @@ class ReviewBotConfig(BaseModel):
             raise ValueError("architecture configuration is required for A-only execution")
         if self.execution.mode == "github_app" and "mode" not in self.publish.model_fields_set:
             self.publish.mode = "comment"
-        if self.partition_evaluation.enabled and self.publish.mode != "artifact_only":
+        if self.partition_evaluation.enabled and self.publish.mode != "artifact_only" and self.execution.mode != "github_app":
             raise ValueError("partition evaluation requires artifact_only publication")
         if self.partition_evaluation.enabled and "intent" in self.execution.available_modes and self.intent.pipeline != "perspectives-v1":
             raise ValueError("partition intent evaluation requires perspectives-v1")
@@ -374,6 +376,16 @@ class ReviewBotConfig(BaseModel):
     @property
     def config_hash(self) -> str:
         return compute_config_hash(self)
+
+
+def shared_plan_enabled(config: ReviewBotConfig | Any) -> bool:
+    """Every GitHub App review uses TEV selection before any analysis runs.
+
+    The old operator flag remains an opt-in for private fixed-input trials;
+    it is not an escape hatch from selection in the application service.
+    """
+    return (getattr(getattr(config, "execution", None), "mode", None) == "github_app"
+        or getattr(getattr(config, "partition_evaluation", None), "enabled", False) is True)
 
 
 class TargetRepositoryConfig(BaseModel):

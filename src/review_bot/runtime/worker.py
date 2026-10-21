@@ -12,7 +12,8 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,8 @@ from review_bot.application.architecture_review import run_review_a_pipeline
 from review_bot.application.declared_intent_review import run_review_b_pipeline
 from review_bot.application.selection import DeadlineModeSelector, LightweightModeSelector, ModelModeSelector
 from review_bot.application.snapshot import assemble_snapshot_bundle, collect_snapshot_material
-from review_bot.config import ReviewBotConfig
+from review_bot.application.repository_review_settings import RepositoryReviewSettings, SettingsResolution
+from review_bot.config import ReviewBotConfig, shared_plan_enabled
 from review_bot.domain.envelope_v2 import ExecutionReceipt, PublicationReceipt, RunRecord
 from review_bot.domain.intent_models import IntentReviewLimits
 from review_bot.domain.models_v1 import AnalysisRun, Snapshot
@@ -48,6 +50,8 @@ from review_bot.ports import (
 )
 from review_bot.runtime.artifacts import RunArtifacts
 from review_bot.runtime.mode_fingerprints import architecture_input_fingerprint, intent_input_fingerprint
+from review_bot.runtime.shared_review_cache import SharedReviewCache
+from review_bot.runtime.stored_partition_review import decode_stored_partition_review, shared_review_generation_key
 from review_bot.runtime.model_clients import build_intent_selection_client, build_planning_client, build_review_client, build_selector_client
 
 logger = logging.getLogger("review_bot.worker")
@@ -95,6 +99,7 @@ class WorkerLoop:
         stop_event: threading.Event | None = None,
         planning_client: ModelClient | None = None,
         intent_selection_client: ModelClient | None = None,
+        repository_settings_factory: Callable[..., SettingsResolution] | None = None,
     ) -> None:
         self.config = config
         self.job_store = job_store
@@ -103,7 +108,11 @@ class WorkerLoop:
         self.analyzer_factory = analyzer_factory
         self.github_client_factory = github_client_factory
         self.repo_reader_factory = repo_reader_factory
+        self.repository_settings_factory = repository_settings_factory
+        self._repository_settings = SettingsResolution(RepositoryReviewSettings())
         self.artifact_root = artifact_root
+        self._review_cache = SharedReviewCache(artifact_root.parent) if artifact_root is not None else None
+        self._generation_keys: dict[str, str] = {}
         model_settings = getattr(config, "model", None)
         profile = getattr(model_settings, "profile", None)
         self.model_client = model_client if model_client is not None else build_review_client(profile, model_settings)
@@ -115,7 +124,7 @@ class WorkerLoop:
         if (
             mode_selector is None and profile is not None
             and getattr(getattr(config, "execution", None), "selector_uses_model", False)
-            and not config.partition_evaluation.enabled
+            and not shared_plan_enabled(config)
         ):
             self._ollama_selector_client = build_selector_client(profile, model_settings)
             mode_selector = ModelModeSelector(self._ollama_selector_client, model=self._ollama_selector_client.model)
@@ -169,7 +178,7 @@ class WorkerLoop:
             self.model_client.warmup()
         if self._ollama_selector_client is not None:
             self._ollama_selector_client.warmup()
-        if self.config.partition_evaluation.enabled:
+        if shared_plan_enabled(self.config):
             self._prepare_partition_planner()
             if isinstance(self.planning_client, LlamaCppModelClient):
                 self.planning_client.warmup()
@@ -198,8 +207,8 @@ class WorkerLoop:
 
         self._prepare_partition_planner()
         trial = self.config.partition_evaluation
-        limits = PartitionReviewLimits(max_total_tokens=trial.max_total_tokens,
-            max_calls=trial.max_calls, input_target_tokens=trial.input_target_tokens,
+        limits = PartitionReviewLimits(max_total_tokens=trial.max_total_tokens or self.config.execution.max_total_tokens,
+            max_calls=trial.max_calls or self.config.execution.max_model_calls, input_target_tokens=trial.input_target_tokens,
             observation_output_tokens=trial.observation_output_tokens,
             task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
         key = (run.run_id, run.generation, run.attempts)
@@ -209,7 +218,8 @@ class WorkerLoop:
         return run_partition_review(task_input, mode, self.model_client, self.planning_client,
             limits=limits, language=language, before_stage=lambda: self._active(run, deadline),
             shared_budget=self._partition_budget, available_modes=available_modes,
-            prepared_plan=getattr(self, "_partition_plan", None) if mode != "planning" else None)
+            prepared_plan=getattr(self, "_partition_plan", None) if mode != "planning" else None,
+            review_instructions=self._repository_settings.bundle.instructions_for(mode) if mode != "planning" else "")
 
     def _plan_partitioned(self, task_input, available_modes, run, deadline):
         from review_bot.application.partition_review import validate_partition_result
@@ -222,11 +232,86 @@ class WorkerLoop:
         self._partition_plan, self._partition_task = plan, task_input
         return plan
 
+    def _cached_review(self, run, mode):
+        key = self._generation_keys.get(mode)
+        if self._review_cache is None or key is None:
+            return None
+        cached = self._review_cache.load(run.installation_id, run.repository_id, mode, key,
+            validate_and_decode=decode_stored_partition_review)
+        if cached is not None and cached[1].partition.get("deferred_modes"):
+            return None
+        return cached
+
+    def _save_cached_review(self, run, mode, task, result):
+        if getattr(result, "partition", {}).get("deferred_modes"):
+            return
+        key = self._generation_keys.get(mode)
+        if self._review_cache is not None and key is not None:
+            self._review_cache.save(run.installation_id, run.repository_id, mode, key,
+                {"task": asdict(task), "result": asdict(result)},
+                validate_and_decode=decode_stored_partition_review)
+
+    def _presentation_options(self, mode):
+        bundle = self._repository_settings.bundle
+        return {"presentation": dict(bundle.presentation), "comment_template": bundle.comment_template(mode)}
+
+    def _settings_notice(self, markdown):
+        if self._repository_settings.diagnostic is None:
+            return markdown
+        first, separator, rest = markdown.partition("\n")
+        notice = "> 저장소 설정을 적용하지 못해 마지막 정상 설정 또는 내장 기본값으로 검토했습니다."
+        return first + "\n" + notice + "\n" + rest if separator else markdown + "\n" + notice
+
+    def _publication_input_key(self, mode, fallback):
+        key = self._generation_keys.get(mode)
+        if key is None:
+            return fallback
+        root = Path(__file__).parents[1] / "adapters" / "markdown"
+        renderer = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+            for name in ("partition_formatter.py", "developer_presentation.py")}
+        return hashlib.sha256(json.dumps({"generation": key, "renderer": renderer,
+            "presentation": self._repository_settings.bundle.presentation_hash,
+            "settings_notice": self._repository_settings.diagnostic}, sort_keys=True).encode()).hexdigest()
+
+    def _publish_failure_notice(self, run, mode, snapshot, reason, deadline, *, draft=False):
+        if (self.config.publish.mode != "comment" or self.github_client is None
+                or draft and not self.config.publish.draft_comments
+                or mode == "intent" and not self.config.publish.b_comments_enabled):
+            return None
+        from review_bot.adapters.markdown.developer_presentation import finish, status_sections
+
+        marker = self.config.publish.a_marker if mode == "architecture" else self.config.publish.b_marker
+        title = "PMD/CPD·아키텍처 리뷰" if mode == "architecture" else "의도 리뷰"
+        body = finish(marker, title, status_sections(SimpleNamespace(status="not_run", reason=reason),
+            ko=self.config.output.language == "ko", unreviewed=(title,)),
+            scope="검토가 완료되지 않아 코드에 대한 최종 판단은 게시하지 않습니다.",
+            max_length=min(60000, self.config.output.max_comment_characters))
+        auth_before = getattr(self.github_client, "authorization_failures", None)
+        authorization_lost = False
+        try:
+            publication = publish_review_comment(self.github_client, run.repository_id, run.pr_number,
+                snapshot.head_sha, snapshot.target_base_sha, body, marker=marker,
+                publication_guard=lambda: self._active(run, deadline),
+                context_guard=lambda current: not current.get("draft", False) or self.config.publish.draft_comments,
+                strict_target=isinstance(getattr(self.github_client, "bot_login", None), str))
+        except PublicationAuthorizationError as error:
+            publication, authorization_lost = error.receipt, True
+        except GitHubAuthorizationError:
+            publication = PublicationReceipt(None, "unknown",
+                publication_fingerprint(run.repository_id, run.pr_number, snapshot.head_sha, body), marker=marker)
+            authorization_lost = True
+        auth_after = getattr(self.github_client, "authorization_failures", None)
+        if authorization_lost or (type(auth_before) is int and type(auth_after) is int and auth_after > auth_before):
+            has_comment = type(publication.comment_id) is int and publication.comment_id > 0
+            publication = replace(publication, status="unknown" if authorization_lost or has_comment else "failed",
+                reason="publication_authorization_lost", input_fingerprint=None)
+        return publication
+
     def _review_perspectives(self, task_input, run, deadline, language):
         from review_bot.application.intent_perspective_review import run_intent_perspective_review
         from review_bot.domain.intent_perspectives import IntentPerspectiveLimits
 
-        if self.config.partition_evaluation.enabled:
+        if shared_plan_enabled(self.config):
             return self._review_partitioned(task_input, "intent", run, deadline, language)
         self._prepare_intent_selector()
         limits = IntentPerspectiveLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
@@ -320,6 +405,8 @@ class WorkerLoop:
         self._current_run_id = run_id
         self._lease_lost = False
         self._partition_plan = self._partition_task = self._partition_planning_result = None
+        self._generation_keys = {}
+        self._repository_settings = SettingsResolution(RepositoryReviewSettings())
 
         previous_github_client = self.github_client
         previous_repo_reader = self.repo_reader
@@ -380,6 +467,15 @@ class WorkerLoop:
                 if self.repo_reader_factory is not None:
                     self._require_active(run, deadline)
                     self.repo_reader = self.repo_reader_factory(run, pr_data, self.github_client)
+                if self.repository_settings_factory is not None:
+                    auth_before = getattr(self.github_client, "authorization_failures", None)
+                    self._repository_settings = self.repository_settings_factory(
+                        run, pr_data, self.github_client,
+                        before_request=lambda: self._active(run, deadline))
+                    self._require_active(run, deadline)
+                    auth_after = getattr(self.github_client, "authorization_failures", None)
+                    if type(auth_before) is int and type(auth_after) is int and auth_after > auth_before:
+                        raise _CommonFailure("repository_settings_authorization_lost")
 
             # 2. Stage: SELECT
             self._stage(run, RunStage.SELECT, deadline)
@@ -391,7 +487,7 @@ class WorkerLoop:
                 available_modes = tuple(
                     getattr(execution_cfg, "available_modes", ("architecture",))
                 )
-                partition_flow = self.config.partition_evaluation.enabled
+                partition_flow = shared_plan_enabled(self.config)
                 if "intent" in available_modes or partition_flow:
                     if not pr_data:
                         raise RuntimeError("intent_pr_source_unavailable")
@@ -440,14 +536,34 @@ class WorkerLoop:
                         raise _CommonFailure("partition_planning_artifacts_or_material_unavailable")
                     artifacts = RunArtifacts(self.artifact_root, run)
                     artifacts.save_common(snapshot=review_snap, selection=mode_sel, config_hash=self.config.config_hash)
+                    artifacts.write_json("repository-settings.json", self._repository_settings)
                     paths = tuple(sorted({f.path for c in (material.base, material.head) for f in c.files}))
-                    planning_task = build_intent_task_input(review_snap, material.base, material.head, related_paths=paths)
+                    planning_task = build_intent_task_input(review_snap, material.base, material.head,
+                        related_paths=tuple(sorted(set(paths) | set(self.config.intent.context_paths))))
                     artifacts.write_json("planning-input.json", planning_task)
+                    self._prepare_partition_planner()
+                    self._generation_keys["planning"] = shared_review_generation_key(planning_task, self.config,
+                        self.model_client, self.planning_client, self._repository_settings.bundle, "planning")
                     try:
-                        plan = self._plan_partitioned(planning_task, mode_sel.selected_modes, run, deadline)
+                        cached_plan = self._cached_review(run, "planning")
+                        if cached_plan is None:
+                            plan = self._plan_partitioned(planning_task, mode_sel.selected_modes, run, deadline)
+                            self._require_active(run, deadline)
+                            self._save_cached_review(run, "planning", planning_task, plan)
+                        else:
+                            self._partition_task, self._partition_plan = cached_plan
+                            plan = self._partition_planning_result = self._partition_plan
+                            artifacts.write_json("observed-planning-input.json", planning_task)
+                            artifacts.write_json("planning-input.json", self._partition_task)
+                            artifacts.write_json("planning-reuse.json", {"run_key": plan.run_key, "new_model_calls": 0})
                     finally:
                         if self._partition_planning_result is not None:
                             artifacts.save_execution_plan(self._partition_planning_result)
+                    for selected_mode in plan.partition["selected_modes"]:
+                        base_key = shared_review_generation_key(planning_task, self.config, self.model_client,
+                            self.planning_client, self._repository_settings.bundle, selected_mode)
+                        self._generation_keys[selected_mode] = hashlib.sha256(json.dumps(
+                            {"generation": base_key, "plan_id": plan.partition["plan_id"]}, sort_keys=True).encode()).hexdigest()
                     mode_sel = record_planned_modes(review_snap, available_modes,
                         plan.partition["selected_modes"], plan.partition["plan_id"])
                     artifacts.save_common(snapshot=review_snap, selection=mode_sel, config_hash=self.config.config_hash)
@@ -484,7 +600,13 @@ class WorkerLoop:
             for mode in mode_sel.selected_modes:
                 self._require_active(run, deadline)
                 try:
-                    if mode == "architecture":
+                    deferred = self._partition_plan.partition.get("deferred_modes", {}) if self._partition_plan is not None else {}
+                    if mode in deferred:
+                        error_code = "partition_mode_planning_deferred:" + deferred[mode]
+                        receipt = ExecutionReceipt(2, mode, mode_sel.selection_id, review_snap.snapshot_id,
+                            run.generation, run.fingerprint, "failed", error_code=error_code,
+                            publication=self._publish_failure_notice(run, mode, review_snap, error_code, deadline, draft=draft))
+                    elif mode == "architecture":
                         receipt = self._execute_architecture(run, review_snap, pr_snap, classification, mode_sel,
                             artifacts, title, body, draft, deadline)
                     else:
@@ -496,7 +618,8 @@ class WorkerLoop:
                     prefix = "worker" if mode_sel.selected_modes == ("architecture",) else mode
                     error_code = str(exc) if isinstance(exc, (_ModeFailure, IntentInputError)) else f"{prefix}_pipeline_error:{type(exc).__name__}"
                     receipt = ExecutionReceipt(2, mode, mode_sel.selection_id, review_snap.snapshot_id,
-                        run.generation, run.fingerprint, "failed", error_code=error_code)
+                        run.generation, run.fingerprint, "failed", error_code=error_code,
+                        publication=self._publish_failure_notice(run, mode, review_snap, error_code, deadline, draft=draft))
                 self._require_active(run, deadline)
                 if receipt.publication is not None:
                     eligible = (receipt.execution_status in ("completed", "not_run") and receipt.publication.status == "succeeded"
@@ -519,6 +642,8 @@ class WorkerLoop:
                 ):
                     self._record_publication(run, publication, deadline)
                 receipts[mode] = receipt
+                if publication is not None and publication.reason == "publication_authorization_lost":
+                    raise _CommonFailure("publication_authorization_lost")
             failed = [receipt for receipt in receipts.values() if receipt.execution_status == "failed"
                 or receipt.publication is not None and receipt.publication.status not in ("succeeded", "not_attempted")]
             all_reused = bool(receipts) and all(receipt.reused for receipt in receipts.values())
@@ -529,7 +654,7 @@ class WorkerLoop:
             reason = "unchanged_input" if all_reused and not failed else publication.reason if not failed and publication is not None and publication.status == "not_attempted" else None
             self._require_active(run, deadline)
             if artifacts is not None:
-                if self.config.partition_evaluation.enabled and self._partition_budget is not None:
+                if shared_plan_enabled(self.config) and self._partition_budget is not None:
                     calls, tokens, unknown = self._partition_budget.totals()
                     artifacts.write_json("usage.json", {"calls": calls, "known_total_tokens": tokens,
                         "usage_complete": not unknown, "planning": self._partition_plan.usage if self._partition_plan else None,
@@ -544,6 +669,17 @@ class WorkerLoop:
 
         except Exception as exc:
             error_code = str(exc) if isinstance(exc, (_ModeFailure, _CommonFailure, IntentInputError)) else f"worker_pipeline_error:{type(exc).__name__}"
+            if (isinstance(exc, _CommonFailure) and str(exc).startswith("partition_planning_failed:")
+                    and pr_snap is not None and self._active(run, deadline)):
+                try:
+                    for pending_mode in mode_sel.selected_modes:
+                        notice = self._publish_failure_notice(run, pending_mode, review_snap, error_code, deadline, draft=draft)
+                        if notice is not None and (notice.comment_id is not None or notice.status == "unknown"):
+                            self._record_publication(run, notice, deadline)
+                        if notice is not None and notice.reason == "publication_authorization_lost":
+                            break
+                except _RunAborted:
+                    return False
             if artifacts is not None and self._active(run, deadline):
                 try:
                     artifacts.manifest["error_code"] = error_code
@@ -698,66 +834,72 @@ class WorkerLoop:
                 and classify_pr(current_branch, current_labels, title=current.get("title") or "").review_mode == classification.review_mode
                 and (current.get("draft") is not True or self.config.publish.draft_comments))
 
-        input_fingerprint = architecture_input_fingerprint(review_snap, classification, self.config, self.model_client, title=title, body=body)
+        input_fingerprint = self._publication_input_key("architecture", architecture_input_fingerprint(review_snap, classification, self.config, self.model_client, title=title, body=body))
         if not (draft and not self.config.publish.draft_comments):
             reused = self._reuse_publication(run, "architecture", review_snap, mode_sel, input_fingerprint, deadline, context_guard=context_guard)
             if reused is not None:
                 return reused
-        self._stage(run, RunStage.ANALYZE, deadline)
-        if self.analyzer is None and self.analyzer_factory is not None:
-            self.analyzer = self.analyzer_factory()
-        base_run = head_run = None
-        effective_base_sha, head_sha = pr_snap.base_sha, pr_snap.head_sha
-        if self.analyzer and self.repo_reader:
-            arch_cfg = getattr(self.config, "architecture", None)
-            ruleset = getattr(arch_cfg, "ruleset_resource", "pmd/ruleset.xml")
-            profile = getattr(arch_cfg, "analysis_profile", "java21-jdk-only-v1")
-            analysis_runs: list[AnalysisRun] = []
-            for sha in (effective_base_sha, head_sha):
-                self._require_active(run, deadline)
-                with tempfile.TemporaryDirectory(prefix="review-bot-tree-") as tmp:
-                    source_root = Path(tmp).resolve()
-                    try:
-                        blobs = self.repo_reader.read_tree_blobs(sha)
-                    except Exception as exc:
-                        raise _CommonFailure(f"worker_pipeline_error:{type(exc).__name__}") from None
-                    self._require_active(run, deadline)
-                    for path, content in blobs.items():
-                        relative_path = Path(path)
-                        dest = source_root / relative_path
-                        if relative_path.is_absolute() or ".." in relative_path.parts or not dest.resolve().is_relative_to(source_root):
-                            raise ValueError("Unsafe repository path")
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        dest.write_bytes(content)
-                    self._require_active(run, deadline)
-                    analysis_runs.append(self.analyzer.run_analysis(sha, source_root, ruleset, profile))
-            base_run, head_run = analysis_runs
-        self._stage(run, RunStage.COMPARE, deadline)
-        delta = build_delta(base_run, head_run, rename_map=pr_snap.rename_map) if base_run and head_run else None
-        self._stage(run, RunStage.CONTEXT, deadline)
-        task_input = None
-        if self.repo_reader and delta:
-            try:
-                if self.config.partition_evaluation.enabled:
-                    from review_bot.application.partition_review import prepare_partition_architecture_task
-                    task_input = prepare_partition_architecture_task(self.repo_reader, pr_snap, delta, classification,
-                        before_read=lambda: self._require_active(run, deadline))
-                else:
-                    base_code = self.repo_reader.collect_code_snapshot(effective_base_sha)
-                    self._require_active(run, deadline)
-                    head_code = self.repo_reader.collect_code_snapshot(head_sha)
-            except _RunAborted:
-                raise
-            except Exception as exc:
-                raise _CommonFailure(f"worker_pipeline_error:{type(exc).__name__}") from None
-            self._require_active(run, deadline)
-            if task_input is None:
-                task_input = build_task_input(Snapshot(pr=pr_snap, base=base_code, head=head_code), delta, classification)
-        self._stage(run, RunStage.REVIEW, deadline)
-        if task_input is not None and self.config.partition_evaluation.enabled:
-            result = self._review_partitioned(task_input, "architecture", run, deadline, self.config.output.language)
+        cached = self._cached_review(run, "architecture")
+        if cached is not None:
+            task_input, result = cached
+            base_run = head_run = None
+            head_sha = pr_snap.head_sha
         else:
-            result = run_review_a_pipeline(task_input, self.model_client) if task_input is not None else None
+            self._stage(run, RunStage.ANALYZE, deadline)
+            if self.analyzer is None and self.analyzer_factory is not None:
+                self.analyzer = self.analyzer_factory()
+            base_run = head_run = None
+            effective_base_sha, head_sha = pr_snap.base_sha, pr_snap.head_sha
+            if self.analyzer and self.repo_reader:
+                arch_cfg = getattr(self.config, "architecture", None)
+                ruleset = getattr(arch_cfg, "ruleset_resource", "pmd/ruleset.xml")
+                profile = getattr(arch_cfg, "analysis_profile", "java21-jdk-only-v1")
+                analysis_runs: list[AnalysisRun] = []
+                for sha in (effective_base_sha, head_sha):
+                    self._require_active(run, deadline)
+                    with tempfile.TemporaryDirectory(prefix="review-bot-tree-") as tmp:
+                        source_root = Path(tmp).resolve()
+                        try:
+                            blobs = self.repo_reader.read_tree_blobs(sha)
+                        except Exception as exc:
+                            raise _CommonFailure(f"worker_pipeline_error:{type(exc).__name__}") from None
+                        self._require_active(run, deadline)
+                        for path, content in blobs.items():
+                            relative_path = Path(path)
+                            dest = source_root / relative_path
+                            if relative_path.is_absolute() or ".." in relative_path.parts or not dest.resolve().is_relative_to(source_root):
+                                raise ValueError("Unsafe repository path")
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            dest.write_bytes(content)
+                        self._require_active(run, deadline)
+                        analysis_runs.append(self.analyzer.run_analysis(sha, source_root, ruleset, profile))
+                base_run, head_run = analysis_runs
+            self._stage(run, RunStage.COMPARE, deadline)
+            delta = build_delta(base_run, head_run, rename_map=pr_snap.rename_map) if base_run and head_run else None
+            self._stage(run, RunStage.CONTEXT, deadline)
+            task_input = None
+            if self.repo_reader and delta:
+                try:
+                    if shared_plan_enabled(self.config):
+                        from review_bot.application.partition_review import prepare_partition_architecture_task
+                        task_input = prepare_partition_architecture_task(self.repo_reader, pr_snap, delta, classification,
+                            before_read=lambda: self._require_active(run, deadline))
+                    else:
+                        base_code = self.repo_reader.collect_code_snapshot(effective_base_sha)
+                        self._require_active(run, deadline)
+                        head_code = self.repo_reader.collect_code_snapshot(head_sha)
+                except _RunAborted:
+                    raise
+                except Exception as exc:
+                    raise _CommonFailure(f"worker_pipeline_error:{type(exc).__name__}") from None
+                self._require_active(run, deadline)
+                if task_input is None:
+                    task_input = build_task_input(Snapshot(pr=pr_snap, base=base_code, head=head_code), delta, classification)
+            self._stage(run, RunStage.REVIEW, deadline)
+            if task_input is not None and shared_plan_enabled(self.config):
+                result = self._review_partitioned(task_input, "architecture", run, deadline, self.config.output.language)
+            else:
+                result = run_review_a_pipeline(task_input, self.model_client) if task_input is not None else None
         self._stage(run, RunStage.VALIDATE, deadline)
         self._stage(run, RunStage.PUBLISH, deadline)
         writes_comment = self.config.publish.mode == "comment" and not (draft and not self.config.publish.draft_comments)
@@ -769,22 +911,28 @@ class WorkerLoop:
             raise _ModeFailure("artifact_root_required")
         analysis_failed = any(getattr(value, "status", None) in ("failed", "missing_report") for value in (base_run, head_run))
         status = "failed" if analysis_failed or result.status == "failed" else result.status
-        if self.config.partition_evaluation.enabled and result.status == "partial_review":
+        if shared_plan_enabled(self.config) and result.status == "partial_review":
             status = "failed"
         core_receipt = ExecutionReceipt(2, "architecture", mode_sel.selection_id, review_snap.snapshot_id,
-            run.generation, result.run_key, status, a_result=result, usage=result.usage,
+            run.generation, result.run_key, status, a_result=result, usage=({"calls": 0, "model_calls": 0, "input_tokens": 0, "output_tokens": 0} if cached is not None else result.usage),
             coverage=result.scope, limitations=tuple(task_input.limitations),
-            model_delivery={"status": "sent" if result.usage and result.usage.get("calls", 0) else "not_attempted" if self.model_client is None else "unknown"},
+            model_delivery={"status": "not_attempted" if cached is not None else "sent" if result.usage and result.usage.get("calls", 0) else "not_attempted" if self.model_client is None else "unknown"},
             error_code="analysis_failed" if analysis_failed else result.reason if status == "failed" else None,
             input_fingerprint=input_fingerprint)
         try:
             formatter = format_review_markdown
-            if self.config.partition_evaluation.enabled:
+            if shared_plan_enabled(self.config):
                 from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
                 formatter = format_partition_review_markdown
             markdown = formatter(result, task_input, marker=marker,
                 max_length=self.config.output.max_comment_characters,
-                artifact_notice="전체 A 자료는 비공개 서비스 결과 파일에 보존됩니다." if artifacts is not None else None)
+                artifact_notice="전체 A 자료는 비공개 서비스 결과 파일에 보존됩니다." if artifacts is not None else None,
+                **({"publication_mode": "comment" if writes_comment else "artifact_only"} if shared_plan_enabled(self.config) else {}),
+                **self._presentation_options("architecture"))
+            markdown = self._settings_notice(markdown)
+            self._require_active(run, deadline)
+            if status == "completed" and cached is None:
+                self._save_cached_review(run, "architecture", task_input, result)
             self._require_active(run, deadline)
             if artifacts is not None:
                 artifacts.save_review(snapshot=review_snap, selection=mode_sel, task_input=task_input,
@@ -845,19 +993,19 @@ class WorkerLoop:
         if stored is None:
             raise _ModeFailure("fixed_intent_input_unavailable")
         task_input = decode_intent_task_input(stored[0])
-        if self.config.partition_evaluation.enabled:
+        if shared_plan_enabled(self.config):
             self._plan_partitioned(task_input, ("intent",), run, deadline)
         self._stage(run, RunStage.REVIEW, deadline)
         result = self._review_perspectives(task_input, run, deadline, stored[1])
         self._stage(run, RunStage.VALIDATE, deadline)
-        if self.config.partition_evaluation.enabled:
+        if shared_plan_enabled(self.config):
             from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
             markdown = format_partition_review_markdown(result, task_input)
         else:
             markdown = format_intent_perspective_markdown(result, task_input)
         output = self.artifact_root / "fixed" / run.run_id / f"attempt-{run.attempts}"
         artifacts = IntentArtifacts(output)
-        if self.config.partition_evaluation.enabled:
+        if shared_plan_enabled(self.config):
             artifacts.save_execution_plan(task_input, self._partition_plan)
         artifacts.save(task_input, result, markdown)
         self._require_active(run, deadline)
@@ -877,15 +1025,15 @@ class WorkerLoop:
             raise _ModeFailure("intent_material_unavailable")
         if artifacts is None:
             raise _ModeFailure("artifact_root_required")
-        task_input = self._partition_task if self.config.partition_evaluation.enabled else build_intent_task_input(
+        task_input = self._partition_task if shared_plan_enabled(self.config) else build_intent_task_input(
             review_snap, material.base, material.head, related_paths=tuple(self.config.intent.context_paths))
         if task_input is None:
             raise _ModeFailure("partition_plan_input_unavailable")
         marker = self.config.publish.b_marker
-        code_first = self.config.intent.pipeline == "code-first-v2"
-        perspectives = self.config.intent.pipeline == "perspectives-v1"
+        code_first = not shared_plan_enabled(self.config) and self.config.intent.pipeline == "code-first-v2"
+        perspectives = shared_plan_enabled(self.config) or self.config.intent.pipeline == "perspectives-v1"
         if perspectives:
-            if self.config.partition_evaluation.enabled:
+            if shared_plan_enabled(self.config):
                 self._prepare_partition_planner()
             else:
                 self._prepare_intent_selector()
@@ -901,6 +1049,8 @@ class WorkerLoop:
         else:
             input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client)
 
+        input_fingerprint = self._publication_input_key("intent", input_fingerprint)
+
         def source_guard(current: dict[str, Any]) -> bool:
             self._require_active(run, deadline)
             fresh = intent_sources_current(self.github_client, review_snap, current,
@@ -908,44 +1058,56 @@ class WorkerLoop:
             self._require_active(run, deadline)
             return fresh
 
-        if not perspectives and not (draft and not self.config.publish.draft_comments):
+        if not (draft and not self.config.publish.draft_comments):
             reused = self._reuse_publication(run, "intent", review_snap, mode_sel, input_fingerprint, deadline, source_guard=source_guard)
             if reused is not None:
                 return reused
         self._stage(run, RunStage.REVIEW, deadline)
-        if perspectives:
-            from review_bot.adapters.markdown.intent_perspective_formatter import format_intent_perspective_markdown
-            result = self._review_perspectives(task_input, run, deadline, self.config.output.language)
-            formatter = format_intent_perspective_markdown
-            if self.config.partition_evaluation.enabled:
-                from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
-                formatter = format_partition_review_markdown
-        elif code_first:
-            from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
-            from review_bot.application.code_first_intent_review import run_code_first_review
-            from review_bot.domain.code_first_intent_models import CodeFirstReviewLimits
-
-            limits = CodeFirstReviewLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
-            result = run_code_first_review(task_input, self.model_client, planning_client=self.planning_client,
-                before_stage=lambda: self._active(run, deadline), limits=limits)
-            formatter = format_code_intent_markdown
+        cached = self._cached_review(run, "intent")
+        if cached is not None:
+            task_input, result = cached
+            from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
+            formatter = format_partition_review_markdown
         else:
-            limits = IntentReviewLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
-            result = run_review_b_pipeline(task_input, self.model_client, before_stage=lambda: self._active(run, deadline), limits=limits)
-            formatter = format_intent_markdown
+            if perspectives:
+                from review_bot.adapters.markdown.intent_perspective_formatter import format_intent_perspective_markdown
+                result = self._review_perspectives(task_input, run, deadline, self.config.output.language)
+                formatter = format_intent_perspective_markdown
+                if shared_plan_enabled(self.config):
+                    from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
+                    formatter = format_partition_review_markdown
+            elif code_first:
+                from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
+                from review_bot.application.code_first_intent_review import run_code_first_review
+                from review_bot.domain.code_first_intent_models import CodeFirstReviewLimits
+
+                limits = CodeFirstReviewLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
+                result = run_code_first_review(task_input, self.model_client, planning_client=self.planning_client,
+                    before_stage=lambda: self._active(run, deadline), limits=limits)
+                formatter = format_code_intent_markdown
+            else:
+                limits = IntentReviewLimits(task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
+                result = run_review_b_pipeline(task_input, self.model_client, before_stage=lambda: self._active(run, deadline), limits=limits)
+                formatter = format_intent_markdown
         self._stage(run, RunStage.VALIDATE, deadline)
         execution_status = "failed" if perspectives and result.status != "completed" else result.status
         core_receipt = ExecutionReceipt(2, "intent", mode_sel.selection_id, review_snap.snapshot_id, run.generation,
-            result.run_key, execution_status, usage=result.usage,
-            coverage=result.scope, limitations=result.limitations, model_delivery=result.model_delivery,
+            result.run_key, execution_status, usage=({"calls": 0, "model_calls": 0, "input_tokens": 0, "output_tokens": 0} if cached is not None else result.usage),
+            coverage=result.scope, limitations=result.limitations,
+            model_delivery=({"status": "not_attempted"} if cached is not None else result.model_delivery),
             error_code=result.reason if execution_status == "failed" else None, b_result=result, input_fingerprint=input_fingerprint)
         reason = ("artifact_only" if self.config.publish.mode == "artifact_only" else "b_comments_disabled"
             if not self.config.publish.b_comments_enabled else "draft_comments_disabled"
-            if draft and not self.config.publish.draft_comments else result.reason if result.status != "completed" else None)
+            if draft and not self.config.publish.draft_comments else None)
         try:
             markdown = formatter(result, task_input, marker=marker,
                 max_length=min(60000, self.config.output.max_comment_characters),
-                publication_mode="comment" if reason is None else "artifact_only")
+                publication_mode="comment" if reason is None else "artifact_only",
+                **self._presentation_options("intent"))
+            markdown = self._settings_notice(markdown)
+            self._require_active(run, deadline)
+            if result.status == "completed" and cached is None:
+                self._save_cached_review(run, "intent", task_input, result)
             self._require_active(run, deadline)
             artifacts.save_intent(task_input, result, markdown)
         except (_RunAborted, _CommonFailure, GitHubAuthorizationError):

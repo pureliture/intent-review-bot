@@ -20,7 +20,12 @@ def test_b_publication_defaults_do_not_opt_in_or_change_a_hash(valid_config_yaml
     config, digest = load_review_config_from_str(valid_config_yaml)
     assert config.publish.b_marker == B_MARKER
     assert config.publish.b_comments_enabled is False
-    assert digest == "9e26359acd9f85ec286c422413611353ccb6d052fb6c6c652cd68d6d60252656"
+    # New shared-plan resource defaults are part of the operator configuration.
+    # Omitting B publication fields must still equal their explicit defaults.
+    explicit = yaml.safe_load(valid_config_yaml)
+    explicit["publish"].update(b_marker=B_MARKER, b_comments_enabled=False)
+    _, explicit_digest = load_review_config_from_str(yaml.safe_dump(explicit))
+    assert digest == explicit_digest
 
 
 @pytest.mark.parametrize("marker", [A_MARKER, "", "<!-- unsafe -->\n<script>", "<!-- a --> <!-- b -->", "<!-- @all -->"])

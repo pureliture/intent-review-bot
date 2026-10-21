@@ -9,6 +9,8 @@ execution:
   available_modes: [architecture, intent]
   worker_concurrency: 2
   task_timeout_seconds: 14400
+  max_model_calls: 256
+  max_total_tokens: 8388608
 service:
   repository_allowlist: [pureliture/neurons]
 architecture:

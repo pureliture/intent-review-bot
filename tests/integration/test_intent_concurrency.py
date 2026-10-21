@@ -31,11 +31,12 @@ from review_bot.config import load_review_config_from_str
 from review_bot.domain.models_v1 import ModelRequest
 from review_bot.runtime.webhook import create_webhook_app
 from review_bot.runtime.worker import WorkerLoop
-from tests.integration.test_intent_flow import GOAL, SECRET, IntentFixtureModel, SyntheticGitRepo
+from tests.integration.test_intent_flow import GOAL, SECRET, SyntheticGitRepo
+from tests.fixtures.partition_review import PartitionModelClient
 
 WAIT_SECONDS = 10
 MODEL_URL = "http://localhost:8080/v1"
-STAGES = ("extract_goals", "observe_changes", "assess")
+STAGES = ("review_partition", "final_review", "fact_check")
 HEAD_SOURCE = "from threading import Lock\nlock = Lock()\ndef handle():\n    with lock:\n        return 1\n"
 
 
@@ -124,9 +125,9 @@ class ControlledLlamaHTTP:
             self.condition.notify_all()
         if gate is not None:
             assert gate.wait(WAIT_SECONDS), "The test did not release its held generation"
-        response = IntentFixtureModel().complete(model_request)
+        response = PartitionModelClient().complete(model_request)
         assert set(json.loads(response.text)) == set(schema["required"])
-        assert response.usage == {"input_tokens": 100, "output_tokens": 50}
+        assert response.usage == {"input_tokens": 100, "output_tokens": 10}
         return httpx.Response(200, json={
             "model": REVIEW_MODEL,
             "choices": [{"index": 0, "finish_reason": "stop",
@@ -270,7 +271,7 @@ def concurrency_flow(tmp_path: Path, valid_config_yaml: str, monkeypatch: pytest
             readers.append((run.run_id, run.pr_number, pr_data["base"]["sha"], pr_data["head"]["sha"]))
             return GitRepositoryReader(repo.repo_dir)
 
-        workers.append(WorkerLoop(config, stores[index + 1], model_client=model, worker_id=f"intent-worker-{index}",
+        workers.append(WorkerLoop(config, stores[index + 1], model_client=model, planning_client=PartitionModelClient(name="tev", group_all=True), worker_id=f"intent-worker-{index}",
             github_client_factory=lambda run, client=github: client, repo_reader_factory=reader_factory,
             artifact_root=state, analyzer_factory=analyzer_factory, lease_duration=30, stop_event=stop))
 
@@ -344,22 +345,22 @@ def assert_private_result(flow, run, *, publication="artifact_only"):
     assert task["snapshot"]["pr_number"] == run["pr_number"]
     assert task["reviewed_paths"] == ["app.py", "tests/test_app.py"] and "outside.py" not in json.dumps(task)
     assert next(item["content"] for item in task["head"]["files"] if item["path"] == "app.py") == HEAD_SOURCE
-    assert result["goals"]["declared_goals"][0]["quote"] == GOAL
-    assert {key: result["usage"][key] for key in ("calls", "input_tokens", "output_tokens")} == {
-        "calls": 3, "input_tokens": 300, "output_tokens": 150,
-    }
-    assert [stage["stage"] for stage in result["stages"]] == list(STAGES)
-    for stage in result["stages"]:
+    assert result["schema_version"] == 13 and len(result["perspectives"]) == 8
+    review_stages = [stage for stage in result["stages"] if stage["attempts"]]
+    assert [stage["stage"].split(":")[0] for stage in review_stages] == list(STAGES)
+    for stage in review_stages:
         assert stage["measured_input_tokens"] == 100 and len(stage["attempts"]) == 1
         assert stage["token_measurement_delivery"] == "sent" and stage["token_measurement_model_calls"] == 0
         assert stage["token_measurement_usage"] == {"input_tokens": 0, "output_tokens": 0}
         assert stage["attempts"][0]["usage"] == {"input_tokens": 100, "output_tokens": 50}
+    assert result["usage"]["usage_complete"] is True
+    assert result["usage"]["calls"] == sum(len(s["attempts"]) for s in result["stages"])
     if publication == "artifact_only":
         assert receipt["publication"]["reason"] == publication and receipt["publication"]["status"] == "not_attempted"
     else:
         assert receipt["publication"]["status"] == publication
     assert list(root.rglob("result.json")) == [root / "B/result.json"] and not (root / "A").exists()
-    for name in ("input.json", "goals.json", "observations.json", "result.json", "scope.json", "usage.json",
+    for name in ("input.json", "partition.json", "perspectives.json", "fact-verification.json", "result.json", "scope.json", "usage.json",
         "validation.json", "comment.md", "receipt.json"):
         assert (root / "B" / name).is_file()
     for path in (root, *root.rglob("*")):

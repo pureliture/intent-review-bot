@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -201,6 +202,57 @@ class GitHubApiClient:
         self._bound_repository = self.repository
         self._repository_id = repository_id
         return self.repository
+
+    def get_default_branch_sha(
+        self, repository_id: int | None = None, *,
+        before_request: Callable[[], bool] | None = None,
+        max_response_bytes: int = 65536, timeout_seconds: float = 10.0,
+    ) -> str:
+        """Capture the bound base repository's current default branch commit once."""
+        expected_id = self.repository_id if repository_id is None else repository_id
+        self._check_repository_id(expected_id)
+        if type(max_response_bytes) is not int or not 1 <= max_response_bytes <= 524288:
+            raise ValueError("Invalid GitHub source byte bound")
+        if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 20:
+            raise ValueError("Invalid GitHub source time bound")
+        repo = self._repository_for(repository_id=expected_id)
+        deadline = time.monotonic() + timeout_seconds
+
+        def read(url: str, label: str) -> dict[str, Any]:
+            if before_request is not None and before_request() is not True:
+                raise ValueError("github_read_gate_closed")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise httpx.TimeoutException("GitHub source deadline exceeded", request=self._safe_request())
+            response = self._request("GET", url, max_response_bytes=max_response_bytes,
+                timeout_seconds=remaining)
+            if before_request is not None and before_request() is not True:
+                raise ValueError("github_read_gate_closed")
+            return self._json(response, label)
+
+        metadata = read(f"{self.api_url}/repos/{repo}", "repository")
+        branch = metadata.get("default_branch")
+        if (
+            type(metadata.get("id")) is not int or metadata["id"] != expected_id
+            or not isinstance(metadata.get("full_name"), str)
+            or metadata["full_name"].casefold() != repo.casefold()
+            or not isinstance(branch, str) or not 1 <= len(branch) <= 255
+            or branch.startswith(("-", "/")) or branch.endswith(("/", ".", ".lock"))
+            or any(part in ("", ".", "..") for part in branch.split("/"))
+            or ".." in branch or "@{" in branch
+            or re.search(r"[\x00-\x20\x7f~^:?*\[\\]", branch)
+        ):
+            raise ValueError("invalid_default_branch_repository")
+        reference = read(f"{self.api_url}/repos/{repo}/git/ref/heads/{quote(branch, safe='')}",
+            "default branch reference")
+        commit = reference.get("object")
+        if (
+            reference.get("ref") != f"refs/heads/{branch}" or not isinstance(commit, dict)
+            or commit.get("type") != "commit" or not isinstance(commit.get("sha"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", commit["sha"]) is None
+        ):
+            raise ValueError("invalid_default_branch_commit")
+        return commit["sha"]
 
     def _resolve_repo_and_pr(self, *args: Any, **kwargs: Any) -> tuple[str, int]:
         if len(args) == 1:

@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import re
+from dataclasses import asdict, replace
+
+import pytest
 
 from review_bot.adapters.markdown.formatter import format_review_markdown
 from review_bot.domain.changes import Measurement
@@ -185,98 +188,131 @@ def _build_test_fixtures(
     return result, task_input
 
 
-def test_markdown_formatter_header_and_marker() -> None:
-    result, task_input = _build_test_fixtures()
-    markdown = format_review_markdown(result, task_input)
-
-    lines = markdown.splitlines()
-    assert lines[0] == "<!-- review-bot:architecture:v1 -->"
-    assert lines[1] == "### PMD/CPD 아키텍처 리뷰 A"
-    assert "- 리뷰 모드: **일반 PR**" in markdown
-    assert f"- Base SHA: `{result.base_sha}`" in markdown
-    assert f"- Head SHA: `{result.head_sha}`" in markdown
-    assert "- 모델 실행: **의견 검증 완료**" in markdown
-
-
-def test_markdown_formatter_refactoring_mode_badge() -> None:
-    result, task_input = _build_test_fixtures(review_mode="refactoring")
-    markdown = format_review_markdown(result, task_input)
-    assert "- 리뷰 모드: **리팩토링 PR**" in markdown
-
-
-def test_markdown_formatter_stale_warning_banner() -> None:
-    result, task_input = _build_test_fixtures()
-    stale_reason = "head commit moved from aaaaaaaa to bbbbbbbb"
-    markdown = format_review_markdown(result, task_input, stale_reason=stale_reason)
-
-    assert "> ⚠️ **오래된 결과 — 현재 PR 리뷰로 사용하지 마세요.**" in markdown
-    assert stale_reason in markdown
+def test_markdown_formatter_selected_static_template_and_llm_sections() -> None:
+    result, task = _build_test_fixtures(findings_count=1)
+    before = asdict(result)
+    markdown = format_review_markdown(result, task)
+    assert markdown.splitlines()[:2] == ["<!-- review-bot:architecture:v1 -->", "### PMD/CPD 아키텍처 리뷰 A"]
+    assert "#### 전체 판단" in markdown
+    assert "#### 정적 분석" in markdown
+    assert "| 측정 영역 | 이번 PR 검토 범위 |" in markdown
+    assert "CognitiveComplexity" in markdown
+    assert "5 → 15" in markdown
+    assert "#### LLM 리뷰" in markdown
+    assert "관련 정적 신호:" in markdown
+    assert "https://github.com/owner/repo/blob/" + "b" * 40 in markdown
+    assert "#L10-L20" in markdown
+    assert "<details>" in markdown
+    assert "plan:" not in markdown and "Tokens:" not in markdown
+    assert asdict(result) == before
 
 
-def test_markdown_formatter_mock_banner() -> None:
-    result, task_input = _build_test_fixtures(is_mock=True)
-    markdown = format_review_markdown(result, task_input)
-    assert "> **모의 모델 결과입니다. 계약 검증이며 실제 LLM 리뷰 품질 검증이 아닙니다.**" in markdown
+def test_markdown_formatter_does_not_promote_unadopted_metric_signals() -> None:
+    result, task = _build_test_fixtures(findings_count=1)
+    unrelated = replace(task.signals[0].signal, signal_id="unadopted", measurements=(Measurement("hidden_metric", 1, 100),))
+    task = replace(task, signals=(*task.signals, SelectedSignal(unrelated, "review", "New metric")))
+    result = replace(result, analysis=replace(result.analysis, signals=(*result.analysis.signals, unrelated)))
+    markdown = format_review_markdown(result, task)
+    assert "hidden_metric" not in markdown
+    assert "| 검토 대상으로 선택한 신호 | 1건 |" in markdown
 
 
-def test_markdown_formatter_delta_table_6_states() -> None:
-    result, task_input = _build_test_fixtures()
-    markdown = format_review_markdown(result, task_input)
+def test_markdown_formatter_includes_change_relevant_existing_finding() -> None:
+    result, task = _build_test_fixtures(findings_count=1)
+    signal = replace(task.signals[0].signal, change="existing")
+    task = replace(task, signals=(SelectedSignal(signal, "context", "Existing but changed path"),))
+    markdown = format_review_markdown(result, task)
+    assert "existing" in markdown and "| 검토 대상으로 선택한 신호 | 1건 |" in markdown
 
-    assert "| existing | new | worsened | improved | resolved | unknown |" in markdown
-    assert "| 0 | 0 | 1 | 0 | 0 | 0 |" in markdown
+
+def test_markdown_formatter_non_comparable_delta_retains_analysis_limit() -> None:
+    result, task = _build_test_fixtures(comparable=False)
+    markdown = format_review_markdown(result, task)
+    assert "분석 비교가 불완전하거나 조건이 다릅니다" in markdown
+    assert "분석 0건으로 확정하지 않습니다" in markdown
 
 
-def test_markdown_formatter_non_comparable_delta_notice() -> None:
-    result, task_input = _build_test_fixtures(comparable=False)
-    markdown = format_review_markdown(result, task_input)
+@pytest.mark.parametrize("status", ["failed", "not_run", "partial_review"])
+def test_markdown_formatter_incomplete_is_status_only(status) -> None:
+    result, task = _build_test_fixtures()
+    result = replace(result, status=status, reason="context_missing", summary="DO NOT PUBLISH PARTIAL JUDGEMENT")
+    markdown = format_review_markdown(result, task)
+    assert "리뷰 미완료" in markdown and "판단에 필요한 정보가 아직 부족합니다" in markdown
+    assert "context\\_missing" not in markdown and status.replace("_", "\\_") not in markdown
+    assert "미검토·미확정 범위" in markdown
+    assert "DO NOT PUBLISH" not in markdown and "Complex method logic" not in markdown
+    assert "#### LLM 리뷰" not in markdown
 
-    assert "> 분석 비교가 불완전하거나 조건이 다릅니다. 신호가 없더라도 분석 0건으로 확정하지 않습니다." in markdown
-    assert "| existing | new | worsened |" not in markdown
+
+def test_markdown_formatter_validation_error_or_stale_is_status_only() -> None:
+    result, task = _build_test_fixtures()
+    for options, changed in [({"stale_reason": "head changed"}, result), ({}, replace(result, validation_errors=("citation mismatch",)))]:
+        markdown = format_review_markdown(changed, task, **options)
+        assert "리뷰 미완료" in markdown
+        assert "Complex method logic" not in markdown
 
 
 def test_markdown_formatter_grounded_citations_and_escaping() -> None:
-    unsafe_quote = "int @admin = 42; <b>bold</b> `rm -rf /`"
-    result, task_input = _build_test_fixtures(quote_text=unsafe_quote)
-    markdown = format_review_markdown(result, task_input)
-
-    assert "#### 검증된 의견" in markdown
-    assert "<pre><code>" in markdown
-    assert "</code></pre>" in markdown
-    # Check @-mention neutralized
-    assert "@\u200badmin" in markdown
-    # Check raw HTML tags escaped
-    assert "&lt;b&gt;bold&lt;/b&gt;" in markdown
+    result, task = _build_test_fixtures(quote_text="int @admin = 42; <b>bold</b> `unsafe`")
+    markdown = format_review_markdown(result, task)
+    assert "<summary>인용 원문</summary>" in markdown
+    assert "<pre><code>" in markdown and "</code></pre>" in markdown
+    assert "@\u200badmin" in markdown and "&lt;b&gt;bold&lt;/b&gt;" in markdown
+    assert markdown.count("<details>") == markdown.count("</details>")
 
 
-def test_markdown_formatter_questions_and_scope() -> None:
-    result, task_input = _build_test_fixtures()
-    markdown = format_review_markdown(result, task_input)
-
-    assert "#### 정보 요청" in markdown
-    assert "Can this method be refactored?" in markdown
-    assert "#### 코드 입력과 의견 대상" in markdown
-    assert "| base | 1 / 100 | 1 / 100 | 0 | 완료 |" in markdown
-    assert "| head | 1 / 120 | 1 / 120 | 0 | 완료 |" in markdown
-    assert "<sub>📊 전체 레포 누적: PMD/CPD 기준 분석</sub>" in markdown
-    assert "<sub>🤖 자동 생성: review-bot architecture review A</sub>" in markdown
+def test_markdown_formatter_no_findings_is_scoped_and_short() -> None:
+    result, task = _build_test_fixtures(findings_count=0)
+    result = replace(result, questions=())
+    markdown = format_review_markdown(result, task)
+    assert "이 검토 범위에서 추가로 조치할 발견사항은 없습니다." in markdown
+    assert "고정된 HEAD" in markdown
+    assert "전체 레포 누적" not in markdown and len(markdown) < 1500
 
 
-def test_markdown_formatter_truncation_under_60k() -> None:
-    # Build large result with 150 findings to trigger > 60k chars
-    result, task_input = _build_test_fixtures(findings_count=150, quote_text="A" * 600)
-    markdown = format_review_markdown(result, task_input, max_length=60000)
+def test_markdown_formatter_cpd_retains_all_duplicate_locations() -> None:
+    from review_bot.domain.models_v1 import CpdDuplication, CpdOccurrence
+    result, task = _build_test_fixtures(findings_count=1)
+    duplication = CpdDuplication(12, 80, (
+        CpdOccurrence("src/main/java/Calc.java", "src/main/java/Calc.java", 10, 21),
+        CpdOccurrence("src/main/java/Other.java", "src/main/java/Other.java", 30, 41),
+    ), "duplicate")
+    signal = replace(task.signals[0].signal, tool="cpd", head_findings=(duplication,), measurements=())
+    task = replace(task, signals=(SelectedSignal(signal, "review", "Changed duplication"),))
+    markdown = format_review_markdown(result, task)
+    assert "<summary>CPD · 변경과 관련된 중복 위치</summary>" in markdown
+    assert "#L10-L21" in markdown and "Other.java#L30-L41" in markdown
+    assert "12 / 80" in markdown
 
-    assert len(markdown) <= 60000
-    # Marker must strictly remain on line 1
+
+def test_markdown_formatter_preserves_measurement_precision() -> None:
+    result, task = _build_test_fixtures(findings_count=1)
+    signal = replace(task.signals[0].signal, measurements=(Measurement("tcc", 0.015149999999999999, 0.01667),))
+    task = replace(task, signals=(SelectedSignal(signal, "review", "Relevant structure"),))
+    assert "0.015149999999999999 → 0.01667" in format_review_markdown(result, task).replace("\\.", ".")
+
+
+def test_markdown_formatter_mock_result_is_visible() -> None:
+    result, task = _build_test_fixtures(is_mock=True)
+    assert "모의 모델 결과" in format_review_markdown(result, task)
+
+
+def test_markdown_formatter_templates_reorder_whole_sections_without_execution() -> None:
+    result, task = _build_test_fixtures(findings_count=1)
+    markdown = format_review_markdown(result, task, comment_template="<script>@admin</script>\n{{llm_review}}\n{{summary}}\n{{static_analysis}}")
     assert markdown.splitlines()[0] == "<!-- review-bot:architecture:v1 -->"
-    # Omission notice must be inserted
-    assert "댓글 표시 한도:" in markdown
-    assert "상세 구간은 artifact에서 확인하세요" in markdown
-    # Metadata footer preserved
-    assert "<sub>🤖 자동 생성: review-bot architecture review A</sub>" in markdown
+    assert "&lt;script&gt;@\u200badmin&lt;/script&gt;" in markdown
+    assert markdown.index("#### LLM 리뷰") < markdown.index("#### 전체 판단") < markdown.index("#### 정적 분석")
+    for invalid in ("{{summary}}", "{{summary}}{{summary}}{{static_analysis}}{{llm_review}}", "{{summary}}{{static_analysis}}{{llm_review}}{{danger}}"):
+        with pytest.raises(ValueError, match="invalid_comment_template"):
+            format_review_markdown(result, task, comment_template=invalid)
 
-    # Verify no broken/unclosed <pre><code> tags
-    open_tags = len(re.findall(r"<pre><code>", markdown))
-    close_tags = len(re.findall(r"</code></pre>", markdown))
-    assert open_tags == close_tags, f"Mismatched <pre><code>: {open_tags} open vs {close_tags} close"
+
+def test_markdown_formatter_truncation_does_not_publish_partial_conclusions() -> None:
+    result, task = _build_test_fixtures(findings_count=150, quote_text="A" * 600)
+    markdown = format_review_markdown(result, task, max_length=60000)
+    assert len(markdown) <= 60000
+    assert markdown.splitlines()[0] == "<!-- review-bot:architecture:v1 -->"
+    assert "comment_limit_exceeded" in markdown
+    assert "Complex method logic" not in markdown
+    assert len(re.findall(r"<pre><code>", markdown)) == len(re.findall(r"</code></pre>", markdown))

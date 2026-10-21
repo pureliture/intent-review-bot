@@ -55,7 +55,7 @@ def test_known_output_limit_gets_one_bounded_reasoning_recovery_with_identical_i
     assert result.partition["rejected_model_outputs"][0]["output"]["content"] == '{"partial":'
     assert result.partition["rejected_model_outputs"][0]["output"]["reasoning_content"]
     assert len(result.partition["output_recoveries"]) == 1
-    assert result.usage["usage_complete"] and result.usage["calls"] == 24
+    assert result.usage["usage_complete"] and result.usage["calls"] == 16
     validate_partition_result(result, task)
     altered = deepcopy(result)
     altered.partition["rejected_model_outputs"][0]["output"]["content"] += "changed"
@@ -120,7 +120,7 @@ def test_output_recovery_after_a_source_recheck_preserves_both_kinds_of_history(
     assert len(result.partition["rejected_model_outputs"]) == 1
     assert len(result.partition["output_recoveries"]) == 1
     assert result.partition["source_recheck_requests"][0]["admitted"]
-    assert result.usage["calls"] == 25 and result.usage["usage_complete"]
+    assert result.usage["calls"] == 17 and result.usage["usage_complete"]
     validate_partition_result(result, task)
 
 
@@ -138,8 +138,8 @@ def test_native_measured_plan_observation_selection_and_review_reach_eight_persp
     assert len(result.partition["groups"][0]["unit_ids"]) > 1
     tev_stages = [json.loads(r.user_content)["stage"] for r in tev.requests]
     assert tev_stages == ["plan_partitions", "observe_partition", "observe_partition", "select_review_scope"] + ["select_perspective"] * 8
-    assert [json.loads(r.user_content)["stage"] for r in review.requests] == ["review_partition", "final_review"] + ["fact_check"] * 9
-    assert result.usage["calls"] == 23 and result.usage["usage_complete"] is True
+    assert [json.loads(r.user_content)["stage"] for r in review.requests] == ["review_partition", "final_review"] + ["fact_check"]
+    assert result.usage["calls"] == 15 and result.usage["usage_complete"] is True
     import hashlib
     from pathlib import Path
     from review_bot.adapters import intent_planner, llamacpp, llamacpp_macbook
@@ -147,8 +147,9 @@ def test_native_measured_plan_observation_selection_and_review_reach_eight_persp
         path = Path(module.__file__)
         assert result.partition["identity"]["implementation"]["adapters/" + path.name] == hashlib.sha256(path.read_bytes()).hexdigest()
     assert "비공개" in format_partition_review_markdown(result, task)
-    with pytest.raises(ValueError, match="private_only"):
-        format_partition_review_markdown(result, task, publication_mode="comment")
+    developer_comment = format_partition_review_markdown(result, task, publication_mode="comment")
+    assert "비공개" not in developer_comment
+    assert "의도 리뷰" in developer_comment
 
 
 def test_initial_group_judgements_and_all_their_references_reach_final_without_summary():
@@ -296,14 +297,14 @@ def test_job_fence_cancels_before_any_model_call():
 def test_modes_share_one_call_budget_without_double_counting_usage():
     import time
     from review_bot.application.code_first_intent_review import _Budget
-    cap = PartitionReviewLimits(max_total_tokens=1000000, max_calls=24)
+    cap = PartitionReviewLimits(max_total_tokens=1000000, max_calls=16)
     shared = _Budget(cap, time.monotonic() + 900, None)
     review, tev = PartitionModelClient(), PartitionModelClient(group_all=True)
     first = run_partition_review(make_task(), "intent", review, tev, limits=cap, shared_budget=shared)
-    assert first.status == "completed" and first.usage["calls"] == 23
+    assert first.status == "completed" and first.usage["calls"] == 15
     second = run_partition_review(make_task(), "intent", review, tev, limits=cap, shared_budget=shared)
     assert second.reason == "call_limit_exceeded" and second.usage["calls"] == 0
-    assert len(review.requests) + len(tev.requests) == 23
+    assert len(review.requests) + len(tev.requests) == 15
 
 
 def test_architecture_uses_same_executor_and_keeps_analysis_as_evidence():
@@ -576,7 +577,8 @@ def test_bonsai_limit_refines_units_and_only_safe_candidates_are_offered():
     tev.profile = replace(tev.profile, max_input_tokens=2000)
     result = run_partition_review(task, "intent", review, tev, limits=limits())
     assert result.status == "partial_review" and result.reason == "factual_verification_incomplete"
-    assert result.partition["fact_verification"]["interruption_reason"] == "fact_check_original_evidence_exceeds_context"
+    assert result.partition["fact_verification"]["status"] == "unverified"
+    assert any(entry["status"] != "model_supported" for entry in result.partition["fact_verification"]["items"])
     assert any(u["boundary"].startswith("line_fallback") for u in result.partition["units"])
     offered = [json.loads(r.user_content)["state"]["candidate_plans"] for r in tev.requests
         if json.loads(r.user_content)["stage"] == "plan_partitions"]

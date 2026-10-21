@@ -804,10 +804,13 @@ def test_worker_tree_cleanup_on_failure(
         "SELECT status, stage, error, lease_expires_at FROM runs WHERE run_id = ?;", (run.run_id,),
     ).fetchone()
     error_type = "RuntimeError" if failure == "analyze" else "OSError"
-    assert (status, stage, error, lease) == ("failed", "analyze", f"worker_pipeline_error:{error_type}", None)
+    notice_posted = failure != "read"
+    assert (status, stage, error, lease) == ("failed", "publish" if notice_posted else "analyze", f"worker_pipeline_error:{error_type}", None)
     assert f"tree {failure} failed" not in error
-    assert store._get_connection().execute("SELECT COUNT(*) FROM publication_receipts;").fetchone()[0] == 0
-    assert worker.github_client.comments == {}
+    assert store._get_connection().execute("SELECT COUNT(*) FROM publication_receipts;").fetchone()[0] == int(notice_posted)
+    assert len(worker.github_client.comments) == int(notice_posted)
+    if notice_posted:
+        assert "리뷰 미완료" in next(iter(worker.github_client.comments.values()))["body"]
     assert worker._current_run_id is None
 
 
@@ -838,11 +841,12 @@ def test_worker_tree_cannot_escape_temporary_root(
     status, stage, error = store._get_connection().execute(
         "SELECT status, stage, error FROM runs WHERE run_id = ?;", (run.run_id,),
     ).fetchone()
-    assert (status, stage) == ("failed", "analyze")
+    assert (status, stage) == ("failed", "publish")
     assert error == "worker_pipeline_error:ValueError"
     assert unsafe_path not in error
-    assert store._get_connection().execute("SELECT COUNT(*) FROM publication_receipts;").fetchone()[0] == 0
-    assert worker.github_client.comments == {}
+    assert store._get_connection().execute("SELECT COUNT(*) FROM publication_receipts;").fetchone()[0] == 1
+    assert "리뷰 미완료" in next(iter(worker.github_client.comments.values()))["body"]
+    assert unsafe_path not in next(iter(worker.github_client.comments.values()))["body"]
 
 
 @pytest.mark.parametrize("boundary", ["before_read", "after_read", "after_write", "between_analyses"])
@@ -946,8 +950,8 @@ def test_worker_publishes_formatted_review_with_real_receipt(
     comment = next(iter(github.comments.values()))
     assert comment["body"] == format_review_markdown(result, task, marker=marker)
     assert r"Worker architecture review completed\." in comment["body"]
-    assert f"- Base SHA: `{'a' * 40}`" in comment["body"]
-    assert f"- Head SHA: `{'b' * 40}`" in comment["body"]
+    assert f"HEAD `{'b' * 40}`" in comment["body"]
+    assert "전체 판단" in comment["body"]
     if existing:
         assert comment["id"] == previous_id
         assert len(github.posted_comments) == 1
@@ -998,8 +1002,13 @@ def test_worker_missing_publication_input_never_records_success(
     ).fetchone()
     assert (status, stage) == ("failed", "publish")
     assert ("github_client_unavailable" if missing == "github_client" else "review_result_unavailable") in error
-    assert store._get_connection().execute("SELECT COUNT(*) FROM publication_receipts;").fetchone()[0] == 0
-    assert github.posted_comments == [] and github.updated_comments == []
+    notices = [] if missing == "github_client" else github.posted_comments
+    assert len(notices) == (0 if missing == "github_client" else 1)
+    assert store._get_connection().execute("SELECT COUNT(*) FROM publication_receipts;").fetchone()[0] == len(notices)
+    assert store._get_connection().execute("SELECT COUNT(*) FROM publication_receipts WHERE input_fingerprint IS NOT NULL;").fetchone()[0] == 0
+    assert github.updated_comments == []
+    if notices:
+        assert "리뷰 미완료" in notices[0]["body"]
     assert worker._current_run_id is None
 
 
