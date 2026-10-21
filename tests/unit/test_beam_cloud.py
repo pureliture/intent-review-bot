@@ -11,7 +11,7 @@ from review_bot.adapters.beam_cloud import (
     BEAM_CONTEXT_TOKENS, BEAM_MAX_OUTPUT_TOKENS, BeamCloudModelClient,
 )
 from review_bot.adapters.model_http import reset_model_request_context, set_model_request_context
-from review_bot.application.architecture_review import ModelOutputLimitError, PermanentModelError
+from review_bot.application.architecture_review import ModelOutputLimitError, PermanentModelError, TransientModelError
 from review_bot.domain.models_v1 import ModelRequest
 
 HTTP_CLIENT = httpx.Client
@@ -177,6 +177,50 @@ def test_unknown_consumption_retains_shared_generating_ticket(transport, fault):
         client.count_input_tokens(request())
     assert "secret-provider-detail" not in str(caught.value)
     assert client.token_count_receipt == {"delivery": "unknown", "model_calls": None, "usage": None}
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT state FROM model_admission").fetchall() == [("uncertain",)]
+
+
+def test_exact_completed_concurrency_rejection_frees_capacity_without_inventing_usage(transport):
+    calls, changes, database = transport
+    def reject(req, payload, data):
+        if req.url.path == "/api/chat":
+            return httpx.Response(429, json={"error": "too many concurrent requests"})
+        return data
+    changes["handler"] = reject
+    client = BeamCloudModelClient()
+    with pytest.raises(TransientModelError, match="^Beam cloud HTTP 429$") as caught:
+        client.count_input_tokens(request())
+    assert getattr(caught.value, "delivery", None) is None and getattr(caught.value, "usage", None) is None
+    assert client.token_count_receipt == {"delivery": "unknown", "model_calls": None, "usage": None}
+    assert len([path for _, path, _ in calls if path == "/api/chat"]) == 1
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM model_admission").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("status,body", [
+    (429, b'{"error":"rate limit exceeded"}'),
+    (502, b'{"error":"too many concurrent requests"}'),
+    (429, b'{"error":"too many concurrent requests","eval_count":0}'),
+    (429, b'{"error":"too many concurrent requests",'),
+    (200, b'{"error":"too many concurrent requests"}'),
+])
+def test_other_http_or_invalid_rejections_keep_uncertain_capacity_and_error_class(transport, status, body):
+    calls, changes, database = transport
+    def reject(req, payload, data):
+        if req.url.path == "/api/chat":
+            return httpx.Response(status, content=body, headers={"Content-Type": "application/json"})
+        return data
+    changes["handler"] = reject
+    client = BeamCloudModelClient()
+    expected = PermanentModelError if status == 200 else TransientModelError
+    with pytest.raises(expected) as caught:
+        client.count_input_tokens(request())
+    if status != 200:
+        assert str(caught.value) == f"Beam cloud HTTP {status}"
+    assert getattr(caught.value, "delivery", None) is None and getattr(caught.value, "usage", None) is None
+    assert client.token_count_receipt == {"delivery": "unknown", "model_calls": None, "usage": None}
+    assert len([path for _, path, _ in calls if path == "/api/chat"]) == 1
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT state FROM model_admission").fetchall() == [("uncertain",)]
 

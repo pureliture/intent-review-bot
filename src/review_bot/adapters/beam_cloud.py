@@ -154,6 +154,15 @@ class BeamCloudModelClient:
                                 body.extend(chunk)
                             self._remaining(deadline)
                             if response.status_code != 200:
+                                if response.status_code == 429:
+                                    try:
+                                        rejected = _object(bytes(body)) == {"error": "too many concurrent requests"}
+                                    except PermanentModelError:
+                                        rejected = False
+                                    if rejected:
+                                        # This completed admission rejection frees only this
+                                        # ticket. Delivery accounting and usage stay unknown.
+                                        ticket.finish()
                                 error = TransientModelError if response.status_code in (408, 429) or response.status_code >= 500 else PermanentModelError
                                 raise error(f"Beam cloud HTTP {response.status_code}")
                             data = _object(bytes(body))
