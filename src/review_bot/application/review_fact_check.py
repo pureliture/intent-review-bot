@@ -106,6 +106,8 @@ premise needs one of those originals, request its exact evidence_id through
 source_requests with a precise reason. Prefer actual HEAD test/source assertions
 over author-reported claims. Do not invent paths or request execution/discovery.
 Use no requests when the supplied evidence suffices or no listed original helps.
+
+For citations[].reference_id, copy an allowed reference_id from citation_catalog exactly; never substitute a source-level evidence_id (including S-prefixed IDs), even for whole-file or test-presence claims. The evidence_id namespace is used for source_requests from fixed_original_inventory, not for citations.
 """
 REWRITE_PROMPT = """Correct each supplied review item independently using its unchanged
 original text, explicit factual discrepancies, exact frozen sources and canonical

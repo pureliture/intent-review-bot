@@ -550,6 +550,10 @@ def test_checker_receives_literal_prose_and_exact_claim_rules_without_repairing_
     assert "field's reason, account for EVERY literal clause and named symbol" in request.system_prompt
     assert "choose unverifiable and request its exact frozen evidence_id" in request.system_prompt
     assert "source_requests from fixed_original_inventory" in request.system_prompt
+    namespace_rule = "For citations[].reference_id, copy an allowed reference_id from citation_catalog exactly; never substitute a source-level evidence_id (including S-prefixed IDs), even for whole-file or test-presence claims. The evidence_id namespace is used for source_requests from fixed_original_inventory, not for citations."
+    assert namespace_rule in request.system_prompt
+    assert request.system_prompt.index(namespace_rule) < request.system_prompt.index("Program output contract")
+    assert namespace_rule not in facts.REWRITE_PROMPT
     assert "keep the unresolved limitation explicit for the factual recheck" in facts.REWRITE_PROMPT
     assert "silently remove the disputed assertion" in facts.REWRITE_PROMPT
     assert result.partition["identity"]["prompts"]["fact_check"] == hash_json(facts.CHECK_PROMPT)
