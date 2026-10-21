@@ -838,6 +838,52 @@ def test_rejected_grounding_is_rechecked_once_without_rewriting_the_rejected_res
     validate_partition_result(result, task)
 
 
+def test_two_allowed_disposition_citations_get_exact_feedback_in_the_existing_single_recheck():
+    from copy import deepcopy
+    task = make_task()
+    original_task = deepcopy(asdict(task))
+    rejected_response = []
+    allowed_references = []
+
+    def two_allowed_references(payload, body):
+        if payload["stage"] == "review_partition":
+            references = [span["reference_id"] for source in payload["citation_catalog"] for span in source["ranges"]]
+            assert len(set(references)) >= 2
+            body["citations"] = [{"reference_id": ref} for ref in references[:2]]
+        elif payload["stage"] == "final_review" and "source_recheck" not in payload:
+            observation = next(iter(body["observation_dispositions"]))
+            schema = review.requests[-1].response_schema["properties"]["observation_dispositions"]["properties"][observation]
+            refs = schema["properties"]["citations"]["items"]["properties"]["reference_id"]["enum"]
+            assert len(refs) >= 2
+            assert schema["properties"]["citations"]["maxItems"] == schema["properties"]["citations"]["minItems"] == 1
+            allowed_references.extend(refs)
+            body["observation_dispositions"][observation]["citations"] = [{"reference_id": ref} for ref in refs[:2]]
+            rejected_response.append(deepcopy(body))
+        return body
+
+    review = PartitionModelClient(transform=two_allowed_references)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed", result.reason
+    finals = [json.loads(req.user_content) for req in review.requests if json.loads(req.user_content)["stage"] == "final_review"]
+    assert len(finals) == 2
+    rejected = result.partition["rejected_final_attempts"]
+    assert len(rejected) == 1 and rejected[0]["response"] == rejected_response[0]
+    observation = next(iter(rejected_response[0]["observation_dispositions"]))
+    citations = rejected[0]["response"]["observation_dispositions"][observation]["citations"]
+    assert len(citations) == 2 and all(c["reference_id"] in allowed_references for c in citations)
+    expected = ("observation_disposition_citation_count:"
+        f"json_path=$.observation_dispositions.{observation}.citations;"
+        f"observation_id={observation};expected=1;actual=2")
+    assert rejected[0]["reason"] == finals[1]["source_recheck"]["validation_error"] == expected
+    assert finals[1]["source_recheck"]["rejected_response"] == rejected_response[0]
+    assert finals[0]["original_quotes"] == finals[1]["original_quotes"]
+    assert finals[0]["observations"] == finals[1]["observations"]
+    accepted = result.partition["final"]["observation_dispositions"]
+    assert len(accepted) == 1 and len(accepted[0]["citations"]) == 1
+    assert asdict(task) == original_task
+    validate_partition_result(result, task)
+
+
 def test_missing_target_review_cannot_be_reported_as_completed():
     def omit(payload, body):
         if payload["stage"] == "final_review" and body["target_reviews"]:

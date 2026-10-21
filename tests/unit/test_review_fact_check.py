@@ -833,20 +833,96 @@ def test_source_grounded_perspective_non_applicability_is_still_permitted():
 
 
 
-def test_intent_empty_field_rule_preserves_original_field_and_strict_response_contract():
+@pytest.mark.parametrize("mode", ["intent", "architecture"])
+def test_empty_field_rule_preserves_original_field_and_strict_response_contract(mode):
     from review_bot.application.source_partition import SourceOriginal
     from review_bot.domain.intent_perspectives import PERSPECTIVES
     source = SourceOriginal("S-scope", "def answer():\n    return 42\n", "source", "a.py", "head", "a" * 40)
-    item = {"perspective_id": PERSPECTIVES[0].id, "verdict": "aligned", "statement": "The function returns 42.",
+    item = {"statement": "The function returns 42.",
         "reasoning": "The exact HEAD return statement supports this assertion.", "failure_condition": "", "citations": []}
-    final = {"summary": "Static review.", "findings": [], "perspectives": [item], "questions": []}
+    if mode == "intent":
+        item.update(perspective_id=PERSPECTIVES[0].id, verdict="aligned")
+    else:
+        item.update(verdict="improvement", basis="observed_structure", target_ids=[])
+    final = {"summary": "Static review.", "findings": [item] if mode == "architecture" else [],
+        "perspectives": [item] if mode == "intent" else [], "questions": []}
     row = facts.items(final)[1]
     payload, schema, _, _ = facts.request_spec("fact_check", [row], final, [source], {}, kind="complete_originals")
-    rule = payload["canonical_facts"]["intent_perspectives"]["empty_field_rule"]
+    rule = payload["canonical_facts"]["empty_field_rule"]
     assert "state=non_factual" in rule and "non-empty reason" in rule and "citations=[]" in rule
+    assert "empty_field_rule" not in payload["canonical_facts"].get("intent_perspectives", {})
     assert payload["items"][0]["original_item"] == item
     assert payload["items"][0]["fields"]["failure_condition"] == ""
     assessment = schema["properties"]["items"]["properties"][row["id"]]["properties"]["failure_condition"]
     assert assessment["properties"]["reason"]["minLength"] == 1
     assert "non_factual" in assessment["properties"]["state"]["enum"]
     assert assessment["properties"]["citations"]["minItems"] == 0
+
+
+def test_true_test_claim_with_header_citation_uses_existing_rewrite_to_repair_binding():
+    from review_bot.application.intent_context import build_intent_task_input
+    from tests.fixtures.intent_review import digest
+    task = make_task()
+    path = "tests/test_label.py"
+    header = "import os\nimport sys\nimport json\nimport pathlib\nimport subprocess\nimport tempfile\nimport unittest\n\n"
+    assertion = '    assert label(7) == "7"\n'
+    content = header + "def test_label():\n    from src.caller import label\n" + assertion
+    def replace_test(snapshot):
+        files = tuple(replace(file, content=content, content_hash=digest(content)) if file.path == path else file for file in snapshot.files)
+        inventory = digest(":".join(f"{file.path}:{file.content_hash}" for file in sorted(files, key=lambda file: file.path)))
+        return replace(snapshot, files=files, inventory_hash=inventory)
+    task = build_intent_task_input(task.snapshot, replace_test(task.base), replace_test(task.head),
+        related_paths=("src/caller.py", path))
+    literal = "The supplied test source asserts that label(7) equals the string 7."
+    checked_fields = []
+    def reference(payload, needle):
+        sources = facts.materialize_source_texts(payload) if "originals" in payload else payload["original_quotes"]
+        return next(block["reference_id"] for source in sources if source["path"] == path and source["version"] == "head"
+            for block in source["blocks"] if needle in block["text"])
+    def transform(payload, body):
+        stage = payload["stage"]
+        if stage == "final_review":
+            item = next(item for item in body["perspectives"] if item["perspective_id"] == "supporting_evidence")
+            item.update(statement=literal, reasoning="The HEAD test contains an explicit assertion for the caller's expected string output.",
+                citations=[{"reference_id": reference(payload, "import os")}])
+        elif stage == "fact_check":
+            rule = payload["canonical_facts"]["citation_grounding_rule"]
+            assert "ORIGINAL item's citation set" in rule and "return unverifiable" in rule
+            assert "do not silently repair" in rule and "empty or non_factual fields" in rule
+            for row in payload["items"]:
+                item = row["original_item"]
+                if isinstance(item, dict) and item.get("perspective_id") == "supporting_evidence":
+                    assert item["failure_condition"] == "" and row["fields"]["failure_condition"] == ""
+                    assert body["items"][row["item_id"]]["failure_condition"]["state"] == "non_factual"
+                    original_binding_supported = any(assertion.strip() in cite["quote"] for cite in item["citations"])
+                    checked_fields.append(original_binding_supported)
+                    if not original_binding_supported:
+                        for field in ("statement", "reasoning"):
+                            body["items"][row["item_id"]][field].update(state="unverifiable",
+                                reason="The claim is true in the full HEAD test, but this item's original citation contains only imports and omits the assertion.",
+                                citations=[{"reference_id": reference(payload, assertion.strip())}])
+        elif stage == "fact_rewrite":
+            item = deepcopy(payload["items"][0]["original_item"])
+            assert item["perspective_id"] == "supporting_evidence"
+            item["citations"] = [{"reference_id": reference(payload, assertion.strip())}]
+            return {"replacement": item, "correction_reason": "Replace the import-only citation with the exact test assertion range; keep the supported prose.",
+                "correction_citations": item["citations"]}
+        return body
+    review = PartitionModelClient(transform=transform)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    assert checked_fields == [False, True]
+    original = next(item for item in result.partition["pre_verification_final"]["perspectives"] if item["perspective_id"] == "supporting_evidence")
+    accepted = next(item for item in result.perspectives if item["perspective_id"] == "supporting_evidence")
+    assert original["citations"][0]["quote"] == header and original["citations"][0]["end_line"] == 8
+    assert accepted["statement"] == original["statement"] == literal
+    assert accepted["reasoning"] == original["reasoning"] and accepted["failure_condition"] == ""
+    assert any(assertion.strip() in cite["quote"] and cite["begin_line"] == 9 for cite in accepted["citations"])
+    entry = next(entry for entry in result.partition["fact_verification"]["items"] if entry["original"] == original)
+    first, second = entry["attempts"]
+    assert first["assessments"]["statement"]["state"] == "unverifiable"
+    assert any(assertion.strip() in cite["quote"] for cite in first["check"]["cited_evidence"])
+    assert second["assessments"]["statement"]["state"] == "supported"
+    assert len([request for request in review.requests if json.loads(request.user_content)["stage"] == "fact_rewrite"]) == 1
+    assert result.summary == result.partition["pre_verification_final"]["summary"]
+    validate_partition_result(result, task)

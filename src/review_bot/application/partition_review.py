@@ -275,6 +275,10 @@ def _validate_dispositions(value, rows, parse_citations):
             raise PartitionError("invalid_observation_disposition")
         seen.add(key)
         reason = bounded_text(row["reason"])
+        if isinstance(row["citations"], list) and len(row["citations"]) > 1:
+            raise PartitionError("observation_disposition_citation_count:"
+                f"json_path=$.observation_dispositions.{key}.citations;"
+                f"observation_id={key};expected=1;actual={len(row['citations'])}")
         refs = bounded_array(row["citations"], maximum=1)
         # Even an exclusion carries its own evidence anchor for the audit trail.
         # A reasoned correction remains distinct from an unresolved evidence gap.

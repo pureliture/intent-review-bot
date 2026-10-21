@@ -213,13 +213,22 @@ def delivery(rows, final, originals, meta, *, kind, extra=None):
         "execution_facts": {"target_tests_executed_by_bot": False,
             "target_builds_executed_by_bot": False, "runtime_deployment_verified_by_this_review": False},
         "scope": "Static frozen PR review. Code entailment checks are model-assisted, not proofs."}
+    if any(value == "" for row in rows for value in fields(row).values()):
+        payload["canonical_facts"]["empty_field_rule"] = "An unchanged original field equal to the empty string contains no factual assertion. Return state=non_factual, a non-empty reason such as 'Empty field contains no factual assertion', and citations=[] for that field. Keep the original empty field and its item in the request and response coverage; never use an empty reason or supported for it."
+    if any(isinstance(row["item"], dict) and "citations" in row["item"] for row in rows):
+        payload["canonical_facts"]["citation_grounding_rule"] = (
+            "For each nonempty factual field of an original_item with citations, supported requires that the ORIGINAL item's citation set directly supports every asserted source fact and relationship. "
+            "Citation existence, matching bytes, or the same file is insufficient; imports/header lines do not establish later test assertions, and an adjacent range does not establish an omitted assignment or storage operation. "
+            "Check this original citation binding separately from whether the claim is true elsewhere in the full originals. If the prose is true elsewhere but the original citation set does not support it, return unverifiable and explain the exact binding gap; your checker citations may identify the actual supporting ranges for the existing complete-item rewrite. "
+            "When the full originals support the existing prose, preserve those supported assertions and correct the replacement citation ranges rather than weakening the claim to match an unrelated quote. "
+            "Your own correct checker citations do not silently repair the unchanged original_item.citations or justify supported for that binding gap. Recheck the actual replacement citations after rewrite. "
+            "This binding requirement does not apply to empty or non_factual fields; a summary without its own citations retains its existing source-check treatment. Preserve original fields, items, citation sets and all audit responses.")
     if any(row["kind"] == "perspectives" for row in rows):
         from review_bot.domain.intent_perspectives import CATALOG_VERSION, PERSPECTIVES
 
         payload["canonical_facts"]["intent_perspectives"] = {
             "catalog_version": CATALOG_VERSION,
             "catalog": [asdict(perspective) for perspective in PERSPECTIVES],
-            "empty_field_rule": "An unchanged original field equal to the empty string contains no factual assertion. Return state=non_factual, a non-empty reason such as 'Empty field contains no factual assertion', and citations=[] for that field. Keep the original empty field and its item in the request and response coverage; never use an empty reason or supported for it.",
             "scope_policy": {
                 "review_all_eight_from_fixed_catalog": True,
                 "initial_tev_applicability": "Provisional focus hypothesis; independently correct it from the frozen PR originals and fixed questions.",
