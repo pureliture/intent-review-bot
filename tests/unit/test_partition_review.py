@@ -557,6 +557,64 @@ def test_architecture_context_only_page_has_a_satisfiable_empty_findings_contrac
     validate_partition_result(result, task)
 
 
+def test_context_only_architecture_rechecks_eight_intent_perspectives_once_with_exact_empty_feedback():
+    from copy import deepcopy
+    from review_bot.domain.intent_perspectives import PERSPECTIVES
+    task = _pmd_partition_task()
+    original_task = deepcopy(asdict(task))
+    rejected_response = []
+
+    def count(request):
+        payload = json.loads(request.user_content)
+        return 200 + 100 * len(payload["observations"]) if payload["stage"] == "final_review" else 100
+
+    def wrong_mode_first(payload, body):
+        if payload["stage"] == "final_review" and not payload["review_targets"] and "source_recheck" not in payload:
+            cite = payload["citation_catalog"][0]["ranges"][0]["reference_id"]
+            body["perspectives"] = [{"perspective_id": item.id, "verdict": "aligned",
+                "statement": "Synthetic intent judgement on the wrong review mode.",
+                "reasoning": "This supplied reference remains in the rejected original.",
+                "failure_condition": "", "citations": [{"reference_id": cite}]} for item in PERSPECTIVES]
+            rejected_response.append(deepcopy(body))
+        return body
+
+    review = PartitionModelClient(counter=count, transform=wrong_mode_first)
+    review.profile = replace(review.profile, max_input_tokens=350)
+    result = run_partition_review(task, "architecture", review, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    contexts = [request for request in review.requests if json.loads(request.user_content)["stage"] == "final_review"
+        and not json.loads(request.user_content)["review_targets"]]
+    assert len(contexts) == 2
+    expected = "architecture_perspectives_must_be_empty:json_path=$.perspectives;expected=0;actual=8;required=[]"
+    retry = json.loads(contexts[1].user_content)
+    assert retry["source_recheck"]["validation_error"] == expected
+    assert retry["source_recheck"]["rejected_response"] == rejected_response[0]
+    assert json.loads(contexts[0].user_content)["original_quotes"] == retry["original_quotes"]
+    rejected = result.partition["rejected_final_attempts"]
+    assert len(rejected) == 1 and rejected[0]["reason"] == expected
+    assert rejected[0]["response"] == rejected_response[0] and len(rejected[0]["response"]["perspectives"]) == 8
+    for request in contexts:
+        schema = request.response_schema["properties"]["perspectives"]
+        assert schema == {"type": "array", "items": {"type": "object", "properties": {},
+            "required": [], "additionalProperties": False}, "maxItems": 0, "minItems": 0}
+    for request in review.requests:
+        if json.loads(request.user_content)["stage"] in ("final_review", "global_review"):
+            assert "perspectives MUST be []" in request.system_prompt
+    assert result.perspectives == () and asdict(task) == original_task
+    validate_partition_result(result, task)
+
+
+def test_intent_final_schema_preserves_7d80_canonical_bytes():
+    from hashlib import sha256
+    from review_bot.application.partition_review import _final_schema
+    # Captured from the installed 7d80 baseline before the A-only schema change.
+    schema = _final_schema(("Q-head", "Q-base"), "intent", ("src/A.java",), ("M-context",),
+        {"src/A.java": ("Q-head",)}, ("E-PR-01", "S-head"))
+    encoded = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) == 3664
+    assert sha256(encoded).hexdigest() == "529638902cdd3167864dc11f403d6f1e21b794e7e40ec3f0f0c310bb46f0d86a"
+
+
 def test_global_target_cannot_escape_the_current_integration_pages_target_scope():
     task = _pmd_partition_task()
     identifier = next(signal.signal.signal_id for signal in task.signals if signal.role == "review")

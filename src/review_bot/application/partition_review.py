@@ -150,6 +150,10 @@ because they are separate. A request remaining after the recheck keeps the revie
 """
 
 PMD_METRIC_REFERENCE = """
+Architecture mode A stays fixed on every page, including context-only pages
+without review_targets and the global review. In final/integration/global
+responses, perspectives MUST be []. Never switch to intent/B or emit its eight
+perspectives. If an observation schema omits perspectives, do not add that field.
 PMD metric meanings: ATFD is Access To Foreign Data, not test coverage. TCC is
 Tight Class Cohesion, not coupling. WMC is the aggregate method complexity of a
 class. Class cyclomatic totals differ from individual method maxima. NPath counts
@@ -323,7 +327,7 @@ def _final_schema(ids, mode, targets, contexts=(), target_references=None, origi
             target_references[key] if target_references is not None else ids), MAX_MODEL_CITATIONS), "minItems": 1}}) for key in targets})
     context_only = mode == "architecture" and not targets
     return _obj({"summary": _text(), "findings": _array(_obj({}) if context_only else finding, 0 if context_only else 20), "questions": _array(_text(), 20),
-        "perspectives": {**_array(judgement, 8 if mode == "intent" else 0), "minItems": 8 if mode == "intent" else 0},
+        "perspectives": {**_array(judgement if mode == "intent" else _obj({}), 8 if mode == "intent" else 0), "minItems": 8 if mode == "intent" else 0},
         "missing_context": _array(_text(), 32), "context_updates": updates, "target_reviews": reviews,
         "source_requests": _array(_obj({"evidence_id": {"type": "string", "enum": list(original_ids)},
             "reason": _text()}), 32 if original_ids else 0)})
@@ -1163,6 +1167,9 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     raise PartitionError("target_review_without_source")
                 target_reviews[key] = {"state": review["state"], "reason": bounded_text(review["reason"]), "citations": refs}
             perspectives, seen = [], set()
+            if mode == "architecture" and isinstance(body["perspectives"], list) and body["perspectives"]:
+                raise PartitionError("architecture_perspectives_must_be_empty:"
+                    f"json_path=$.perspectives;expected=0;actual={len(body['perspectives'])};required=[]")
             for value in bounded_array(body["perspectives"], maximum=8):
                 row = bounded_object(value, {"perspective_id", "verdict", "statement", "reasoning", "failure_condition", "citations"})
                 identifier = row["perspective_id"]
@@ -1177,7 +1184,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     not any(c["path"] and c["version"] == "head" for c in clean["citations"])):
                     raise PartitionError("concern_without_head_failure_evidence")
                 perspectives.append(clean)
-            if (mode == "intent" and seen != set(PERSPECTIVE_IDS)) or (mode == "architecture" and perspectives):
+            if mode == "intent" and seen != set(PERSPECTIVE_IDS):
                 raise PartitionError("incomplete_partition_perspectives")
             findings = []
             for value in bounded_array(body["findings"], maximum=20):
