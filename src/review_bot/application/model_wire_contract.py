@@ -85,7 +85,7 @@ def compact_schema(schema):
 
 
 
-def _beam_thinking(request):
+def _beam_thinking_setting(request):
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -101,9 +101,11 @@ def _beam_thinking(request):
         payload = json.loads(request.user_content, object_pairs_hook=unique, parse_constant=reject_constant)
     except (ValueError, TypeError, RecursionError):
         return False
-    return (request.model == BEAM_CLOUD_MODEL and isinstance(payload, dict)
-        and payload.get("stage") in ("final_review", "fact_check", "fact_rewrite")
-        and payload.get("mode") in ("intent", "architecture") and payload.get("language") in ("ko", "en"))
+    if (request.model == BEAM_CLOUD_MODEL and isinstance(payload, dict)
+            and payload.get("stage") in ("final_review", "fact_check", "fact_rewrite")
+            and payload.get("mode") in ("intent", "architecture") and payload.get("language") in ("ko", "en")):
+        return "low" if payload["stage"] == "final_review" else True
+    return False
 
 
 def beam_wire_payload(request):
@@ -112,7 +114,7 @@ def beam_wire_payload(request):
     return {"model": request.model, "messages": [
         {"role": "system", "content": request.system_prompt + contract},
         {"role": "user", "content": request.user_content}],
-        "format": schema, "stream": False, "think": _beam_thinking(request), "truncate": False, "shift": False,
+        "format": schema, "stream": False, "think": _beam_thinking_setting(request), "truncate": False, "shift": False,
         "options": {"num_ctx": BEAM_CONTEXT_TOKENS,
             "num_predict": request.max_output_tokens if request.max_output_tokens is not None else BEAM_MAX_OUTPUT_TOKENS,
             "temperature": 0, "seed": 0}}

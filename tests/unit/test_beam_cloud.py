@@ -47,7 +47,8 @@ def transport(monkeypatch, tmp_path):
         elif req.url.path == "/api/show":
             assert payload == {"model": "beam:cloud"}
             data = {"model_info": {"general.architecture": "beam", "beam.context_length": 1048576},
-                "details": {"family": "beam", "parent_model": "beam"}, "capabilities": ["completion", "thinking", "tools"]}
+                "details": {"family": "beam", "parent_model": "beam"}, "capabilities": ["completion", "thinking", "tools"],
+                "thinking": {"values": ["low", "medium", "high", "xhigh", "max"], "default": "max"}}
         else:
             assert req.url.path == "/api/chat"
             data = completion(payload["options"]["num_predict"], prompt=changes.get("prompt", 64))
@@ -80,7 +81,8 @@ def test_only_selected_program_stages_enable_identical_meter_and_generation_thin
         max_output_tokens=BEAM_MAX_OUTPUT_TOKENS)
     original = deepcopy(asdict(task))
     expected = beam_wire_payload(task)
-    assert expected["think"] is True
+    setting = "low" if stage == "final_review" else True
+    assert expected["think"] == setting and type(expected["think"]) is type(setting)
     assert beam_wire_payload(replace(task, model="tev1:4b"))["think"] is False
     assert expected["messages"][1] == {"role": "user", "content": task.user_content}
     assert expected["messages"][0]["content"].startswith(task.system_prompt)
@@ -93,7 +95,7 @@ def test_only_selected_program_stages_enable_identical_meter_and_generation_thin
     assert client.count_input_tokens(task) == 64
     assert client.complete(task).usage == {"input_tokens": 64, "output_tokens": 4}
     chats = [payload for _, path, payload in calls if path == "/api/chat"]
-    assert len(chats) == 2 and all(payload["think"] is True for payload in chats)
+    assert len(chats) == 2 and all(payload["think"] == setting and type(payload["think"]) is type(setting) for payload in chats)
     meter = deepcopy(expected)
     meter["options"]["num_predict"] = 1
     assert chats == [meter, expected]
@@ -175,19 +177,31 @@ def test_effective_full_schema_prompt_metering_memo_and_reasoning_success(transp
         assert connection.execute("SELECT COUNT(*) FROM model_admission").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("fault", ["model", "remote_host", "context"])
+@pytest.mark.parametrize("fault", ["model", "remote_host", "context", "thinking_capability", "thinking_missing", "thinking_unsupported", "thinking_malformed"])
 def test_metadata_mismatch_has_no_paid_evaluation(transport, fault):
     calls, changes, _ = transport
     def corrupt(req, payload, data):
         if req.url.path == "/api/tags" and fault in ("model", "remote_host"):
             data["models"][0][fault] = "other" if fault == "model" else "https://unapproved.invalid"
-        if req.url.path == "/api/show" and fault == "context":
-            data["model_info"]["beam.context_length"] = 131072
+        if req.url.path == "/api/show":
+            if fault == "context":
+                data["model_info"]["beam.context_length"] = 131072
+            elif fault == "thinking_capability":
+                data["capabilities"].remove("thinking")
+            elif fault == "thinking_missing":
+                data.pop("thinking")
+            elif fault == "thinking_unsupported":
+                data["thinking"]["values"] = [True, False, "medium", "high", "max"]
+            elif fault == "thinking_malformed":
+                data["thinking"]["values"] = "low"
         return data
     changes["handler"] = corrupt
+    client = BeamCloudModelClient()
     with pytest.raises(PermanentModelError):
-        BeamCloudModelClient().count_input_tokens(request())
+        client.count_input_tokens(request())
     assert all(path != "/api/chat" for _, path, _ in calls)
+    assert client.token_count_receipt == {"delivery": "not_sent", "model_calls": 0,
+        "usage": {"input_tokens": 0, "output_tokens": 0}}
 
 
 def test_native_input_reservation_rejects_before_full_generation(transport):

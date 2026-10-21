@@ -214,10 +214,13 @@ class BeamCloudModelClient:
                 raise PermanentModelError("Ollama does not expose the exact pinned beam cloud identity")
             data = self._request("POST", "/api/show", {"model": self.model}, deadline)
             info, details, capabilities = data.get("model_info"), data.get("details"), data.get("capabilities")
+            thinking = data.get("thinking")
             if (not isinstance(info, dict) or info.get("general.architecture") != "beam"
                     or type(info.get("beam.context_length")) is not int or info["beam.context_length"] != BEAM_CONTEXT_TOKENS
                     or not isinstance(details, dict) or details.get("parent_model") != "beam" or details.get("family") != "beam"
-                    or not isinstance(capabilities, list) or "completion" not in capabilities
+                    or not isinstance(capabilities, list) or "completion" not in capabilities or "thinking" not in capabilities
+                    or not isinstance(thinking, dict) or not isinstance(thinking.get("values"), list)
+                    or "low" not in thinking["values"]
                     or data.get("remote_model") not in (None, "beam")
                     or data.get("remote_host") not in (None, "https://ollama.com", "https://ollama.com:443")):
                 raise PermanentModelError("Unsupported beam cloud metadata or context")
