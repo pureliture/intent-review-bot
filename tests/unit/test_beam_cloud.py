@@ -68,9 +68,9 @@ def transport(monkeypatch, tmp_path):
     return calls, changes, tmp_path / "admission/requests.sqlite"
 
 
-@pytest.mark.parametrize("stage", ["fact_check", "fact_rewrite"])
+@pytest.mark.parametrize("stage", ["final_review", "fact_check", "fact_rewrite"])
 @pytest.mark.parametrize("mode", ["intent", "architecture"])
-def test_only_program_fact_stages_enable_identical_meter_and_generation_thinking(transport, stage, mode):
+def test_only_selected_program_stages_enable_identical_meter_and_generation_thinking(transport, stage, mode):
     from dataclasses import asdict
     from review_bot.application.model_wire_contract import beam_wire_payload, beam_meter_wire_sha256
     from hashlib import sha256
@@ -104,7 +104,7 @@ def test_only_program_fact_stages_enable_identical_meter_and_generation_thinking
 
 @pytest.mark.parametrize("content", [
     '{"stage":"review_partition","mode":"intent","language":"ko"}',
-    '{"stage":"final_review","mode":"architecture","language":"en"}',
+    '{"stage":"review_partition","mode":"architecture","language":"en","source":{"stage":"final_review"}}',
     '{"stage":"global_review","mode":"intent","language":"ko"}',
     '{"stage":"plan_partitions","mode":"planning","language":"ko"}',
     '{"stage":"fact_metric","mode":"intent","language":"ko"}',

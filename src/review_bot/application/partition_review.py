@@ -381,6 +381,43 @@ def _final_schema(ids, mode, targets, contexts=(), target_references=None, origi
             "reason": _text()}), 32 if original_ids else 0)})
 
 
+TARGET_REFERENCE_POLICY = (
+    "For each target_reviews key choose citations ONLY from that target's allowed_reference_ids. "
+    "provided_sources describes the actual versions and exact byte coverage in THIS request. "
+    "A BASE source can legitimately support review of deleted files or BASE behavior; do not force HEAD. "
+    "A claim about HEAD cannot be established by BASE alone. If necessary HEAD bytes are not delivered, "
+    "use an existing fixed_head_candidates evidence_id through source_requests or retain insufficient_context. "
+    "Candidate existence is not delivery or proof. Never borrow another target's references, invent IDs, "
+    "or claim the whole PR lacks a source merely because this page does not deliver it."
+)
+
+
+def _target_reference_context(targets, target_paths, references, supplied, originals):
+    """Present existing choices and byte coverage; select or alter no source."""
+    by_id = {original.evidence_id: original for original in originals}
+    cover = {}
+    for span in sorted(supplied, key=lambda value: (value.evidence_id, value.start_byte, value.end_byte)):
+        original = by_id[span.evidence_id]
+        if span.source_hash != original.digest:
+            raise PartitionError("target_reference_source_hash_mismatch")
+        ranges = cover.setdefault(span.evidence_id, [])
+        if ranges and span.start_byte <= ranges[-1][1]:
+            ranges[-1][1] = max(ranges[-1][1], span.end_byte)
+        else:
+            ranges.append([span.start_byte, span.end_byte])
+    def identity(original):
+        return {"evidence_id": original.evidence_id, "path": original.path,
+            "version": original.version, "sha": original.sha, "source_hash": original.digest,
+            "total_bytes": len(original.raw)}
+    return {target: {"allowed_reference_ids": list(references[target]),
+        "provided_sources": [{**identity(original), "delivered_ranges": deepcopy(cover[original.evidence_id]),
+            "complete": cover[original.evidence_id] == [[0, len(original.raw)]]}
+            for original in originals if original.path in target_paths[target] and original.evidence_id in cover],
+        "fixed_head_candidates": [identity(original) for original in originals
+            if original.path in target_paths[target] and original.version == "head"]}
+        for target in targets}
+
+
 def _source_requests(values, originals):
     result, seen = [], set()
     for value in bounded_array(values, maximum=32):
@@ -850,11 +887,14 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             if span.path in meta["target_paths"][key]) for key in targets}
         schema = _final_schema(tuple(quote_choices(supplied, retained)), mode, targets, contexts, references,
             [o.evidence_id for o in originals])
+        target_context = _target_reference_context(targets, meta["target_paths"], references, supplied, originals)
         if previous is not None:
             schema = _obj({**schema["properties"], "correction_reason": _text()})
         return request("final_review", {"observations": observation_payload(rows), "original_quotes": source_blocks(supplied, {o.evidence_id: o for o in originals}), "citation_catalog": quote_catalog(supplied, retained),
             "source_coverage": source_coverage,
-            **({"source_recheck": previous,
+            "target_reference_context": target_context, "target_reference_policy": TARGET_REFERENCE_POLICY,
+            **({"source_recheck": {**deepcopy(previous), "target_reference_context": deepcopy(target_context),
+                    "target_reference_policy": TARGET_REFERENCE_POLICY},
                 "recheck_instruction": "Recheck the earlier interpretation and any requested originals against the SAME frozen base/head sources and diff. A defect fixed in head is not a current concern. Preserve genuine remaining concerns with actual head code and failure conditions. Correct the interpretation or its evidence; never fabricate evidence to retain the old verdict. Explain every correction in correction_reason. Clear source_requests only when the necessary recheck is satisfied."} if previous is not None else {}),
             "delivery_scope": "An unchanged original group result is attached; this request may contain only part of its original source. Other parts are reviewed on other integration pages. Do not claim missing PR input solely because it is on another page.",
             "review_targets": targets, "review_target_details": meta.get("target_details", []), "input_limitations": meta["limitations"],
@@ -1308,9 +1348,13 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             working, source_spans = batch["inputs"], batch["sources"]
             page_final = None
             previous, retained, accepted_retained = None, [], []
+            accepted_request_context = {}
             available_rechecks = limits.max_rechecks
             for recheck in range(available_rechecks + 1):
                 request_value = final_request(working, source_spans, previous, retained)
+                context = json.loads(request_value.user_content)["target_reference_context"]
+                request_context = {"target_reference_context": context,
+                    "target_reference_context_hash": hash_json(context)}
                 try:
                     raw, index = execute(request_value, review_client, profile,
                         "final_review:source_recheck" if previous is not None else "final_review")
@@ -1326,6 +1370,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                 try:
                     page_final = accept_final_response(raw, working, final_spans(working, [*source_spans, *retained]), previous is not None, retained)
                     accepted_retained = list(retained)
+                    accepted_request_context = request_context
                     if page_final["source_requests"] and recheck < available_rechecks:
                         requested_sources = [make_span(o, 0, len(o.raw), "requested_original")
                             for o in originals if o.evidence_id in {row["evidence_id"] for row in page_final["source_requests"]}]
@@ -1358,6 +1403,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                                 raise
                             fits = False
                         partitions.setdefault("source_recheck_requests", []).append({"response": deepcopy(raw),
+                            **deepcopy(request_context),
                             "final": deepcopy(page_final), "response_hash": hash_json(raw), "page_index": len(final_pages),
                             "retained_citations": span_payload(retained),
                             "retained_reply_citations": span_payload(next_retained),
@@ -1375,6 +1421,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     reason = str(error) if isinstance(error, PartitionError) else "invalid_final_response"
                     budget.records[index] = replace(budget.records[index], status="failed", reason=reason)
                     partitions.setdefault("rejected_final_attempts", []).append({"response": deepcopy(raw),
+                        **deepcopy(request_context),
                         "reason": reason, "stage_index": index - first_record,
                         "covered_observations": [row["observation_id"] for row in working]})
                     if recheck == available_rechecks:
@@ -1383,6 +1430,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
             final_pages.append(page_final)
             partitions["integration_pages"].append({"inputs": deepcopy(working),
+                **deepcopy(accepted_request_context),
                 "prior_context_updates": prior_context_updates(partitions["integration_pages"]),
                 "planned_sources": span_payload(final_spans(batch["inputs"], batch["sources"])),
                 "retained_citations": span_payload(accepted_retained),
@@ -1658,13 +1706,13 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         status = "failed" if any(r.attempts for r in budget.records[first_record:]) else "not_run"
         if (budget.records and budget.records[-1].attempts and budget.records[-1].reason != "validated"
                 and not any(row["stage_index"] == len(budget.records) - first_record - 1
-                    for row in partitions.get("rejected_review_attempts", []))):
+                    for key in ("rejected_review_attempts", "rejected_final_attempts") for row in partitions.get(key, []))):
             budget.records[-1] = replace(budget.records[-1], status="failed", reason="invalid_model_response")
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
         status, reason = "failed", "invalid_partition_response_or_input"
         if (budget.records and budget.records[-1].attempts and budget.records[-1].reason != "validated"
                 and not any(row["stage_index"] == len(budget.records) - first_record - 1
-                    for row in partitions.get("rejected_review_attempts", []))):
+                    for key in ("rejected_review_attempts", "rejected_final_attempts") for row in partitions.get(key, []))):
             budget.records[-1] = replace(budget.records[-1], status="failed", reason="invalid_model_response")
     local_records = budget.records[first_record:]
     partitions["rejected_model_outputs"] = [{"stage_index": index - first_record, **deepcopy(item)}
@@ -2092,6 +2140,7 @@ def _validate_observation_tracking(partition, known_units, originals, *, plannin
                 raise PartitionError("stored_source_recheck_request_changed")
             delivered_sources.extend(history["final"]["supplied_quotes"])
             native_deliveries.append({"inputs": page["inputs"], "response": history["response"],
+                **{key: history[key] for key in ("target_reference_context", "target_reference_context_hash") if key in history},
                 "prior_context_updates": page["prior_context_updates"],
                 "final": history["final"], "retained_citations": history["retained_citations"],
                 "planned_sources": [], "delivery_sources": history["final"]["supplied_quotes"]})
@@ -2132,6 +2181,14 @@ def _validate_observation_tracking(partition, known_units, originals, *, plannin
         wire = page["response"]
         quotes = citation_spans(list(spans.values()), originals,
             [*root_anchors, *[asdict(span) for span in restore_retained(page.get("retained_citations", []))]])
+        if target_paths is not None and any(key in page for key in ("target_reference_context", "target_reference_context_hash")):
+            paths = {span.path for span in spans.values() if span.path}
+            targets = [key for key, source_paths in target_paths.items() if paths.intersection(source_paths)]
+            references = {key: tuple(ref for ref, span in quotes.items() if span.path in target_paths[key]) for key in targets}
+            target_context = _target_reference_context(targets, target_paths, references, list(spans.values()), list(originals.values()))
+            if (page.get("target_reference_context") != target_context or
+                    page.get("target_reference_context_hash") != hash_json(target_context)):
+                raise PartitionError("stored_target_reference_context_changed")
         def decode(refs):
             normalized = []
             for item in refs:

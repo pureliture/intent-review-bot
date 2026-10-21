@@ -1181,6 +1181,7 @@ def test_reviewed_target_without_citations_is_rechecked_once_and_never_accepted_
 @pytest.mark.parametrize("state", ["reviewed", "not_apply", "insufficient_context"])
 def test_target_review_mixed_citations_get_one_exact_recheck_without_erasing_raw_refs(outside, state):
     from copy import deepcopy
+    from review_bot.application.context import hash_json
     task = make_task()
     original_task = deepcopy(asdict(task))
     rejected_response = []
@@ -1220,8 +1221,87 @@ def test_target_review_mixed_citations_get_one_exact_recheck_without_erasing_raw
     assert finals[1]["source_recheck"]["validation_error"] == expected
     assert finals[1]["source_recheck"]["rejected_response"] == rejected_response[0]
     assert finals[0]["original_quotes"] == finals[1]["original_quotes"]
+    first_context = finals[0]["target_reference_context"][target]
+    last_context = finals[1]["target_reference_context"][target]
+    assert first_context == last_context
+    schema = next(req for req in reversed(review.requests) if json.loads(req.user_content)["stage"] == "final_review").response_schema["properties"]["target_reviews"]["properties"][target]
+    assert last_context["allowed_reference_ids"] == schema["properties"]["citations"]["items"]["properties"]["reference_id"]["enum"]
+    assert ref not in last_context["allowed_reference_ids"]
+    assert finals[1]["source_recheck"]["target_reference_context"] == finals[1]["target_reference_context"]
+    assert finals[1]["source_recheck"]["target_reference_policy"] == finals[1]["target_reference_policy"]
+    assert all(source["path"] == target for source in last_context["provided_sources"])
     assert asdict(task) == original_task
     validate_partition_result(result, task)
+    changed = deepcopy(result)
+    page = changed.partition["integration_pages"][0]
+    page["target_reference_context"][target]["allowed_reference_ids"].append(ref)
+    page["target_reference_context_hash"] = hash_json(page["target_reference_context"])
+    with pytest.raises(PartitionError, match="stored_target_reference_context_changed"):
+        validate_partition_result(changed, task)
+
+
+@pytest.mark.parametrize("head_exists", [False, True])
+def test_target_reference_context_preserves_base_only_delivery_and_optional_head_inventory(head_exists):
+    from review_bot.application.partition_review import _target_reference_context
+    from review_bot.application.source_citations import citation_spans
+    from review_bot.application.source_partition import SourceOriginal, make_span
+    target = "src/deleted_or_changed.py"
+    base = SourceOriginal("base", "def run():\n    return 32\n", "source", target, "base", "a" * 40)
+    head = SourceOriginal("head", "def run():\n    return 34\n", "source", target, "head", "b" * 40)
+    originals = [base, head] if head_exists else [base]
+    cut = base.raw.index(b"    return")
+    spans = [make_span(base, 0, cut, "part"), make_span(base, cut, len(base.raw), "part")]
+    refs = tuple(citation_spans(spans, {source.evidence_id: source for source in originals}))
+    metadata = _target_reference_context([target], {target: [target]}, {target: refs}, spans, originals)[target]
+    assert metadata["allowed_reference_ids"] == list(refs)
+    assert len(metadata["provided_sources"]) == 1
+    assert metadata["provided_sources"][0]["version"] == "base"
+    assert metadata["provided_sources"][0]["delivered_ranges"] == [[0, len(base.raw)]]
+    assert metadata["provided_sources"][0]["complete"] is True
+    assert [candidate["evidence_id"] for candidate in metadata["fixed_head_candidates"]] == (["head"] if head_exists else [])
+
+
+def test_repeated_target_reference_rejection_preserves_precise_stage_reason_and_both_raw_replies():
+    bad = []
+    def reject(payload, body):
+        if payload["stage"] == "final_review":
+            target = next(iter(body["target_reviews"]))
+            outside = next(source["ranges"][0]["reference_id"] for source in payload["citation_catalog"] if source["path"] != target)
+            body["target_reviews"][target]["citations"] = [{"reference_id": outside}]
+            bad.append(json.loads(json.dumps(body)))
+        return body
+    review = PartitionModelClient(group_all=True, transform=reject)
+    result = run_partition_review(make_task(), "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "failed" and result.reason.startswith("target_review_citation_outside_target:")
+    rejected = result.partition["rejected_final_attempts"]
+    assert len(rejected) == len(bad) == 2
+    assert [item["response"] for item in rejected] == bad
+    assert result.stages[-1].reason == rejected[-1]["reason"] == result.reason
+
+
+@pytest.mark.parametrize("metadata", ["legacy_absent", "missing_context", "missing_hash"])
+def test_target_reference_metadata_is_optional_for_legacy_but_never_weakens_existing_gates(metadata):
+    from copy import deepcopy
+    task, review = make_task(), PartitionModelClient(group_all=True)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed"
+    changed = deepcopy(result)
+    page = changed.partition["integration_pages"][0]
+    if metadata == "legacy_absent":
+        page.pop("target_reference_context")
+        page.pop("target_reference_context_hash")
+        validate_partition_result(changed, task)
+        # Absence of supplementary metadata never permits another target's ref.
+        payload = next(json.loads(req.user_content) for req in review.requests if json.loads(req.user_content)["stage"] == "final_review")
+        target = next(iter(page["response"]["target_reviews"]))
+        outside = next(source["ranges"][0]["reference_id"] for source in payload["citation_catalog"] if source["path"] != target)
+        page["response"]["target_reviews"][target]["citations"] = [{"reference_id": outside}]
+        with pytest.raises(PartitionError, match="stored_target_review_evidence_invalid"):
+            validate_partition_result(changed, task)
+    else:
+        page.pop("target_reference_context" if metadata == "missing_context" else "target_reference_context_hash")
+        with pytest.raises(PartitionError, match="stored_target_reference_context_changed"):
+            validate_partition_result(changed, task)
 
 
 def test_two_allowed_disposition_citations_get_exact_feedback_in_the_existing_single_recheck():
