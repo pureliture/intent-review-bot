@@ -978,3 +978,134 @@ def test_citation_binding_distinct_evidence_identity_remains_a_conservative_gap(
     assert gap["kind"] == "source_assertion" and gap["state"] == "unverifiable"
     assert gap["binding_gap_ranges"] == [{"evidence_id": other.evidence_id, "start_byte": 0, "end_byte": len(other.raw)}]
     assert assessment["statement"]["state"] == "supported" and row["item"]["citations"] == [own]
+
+
+
+def test_architecture_rewrite_declares_existing_concern_guard_and_analysis_attribution():
+    from review_bot.application.source_partition import SourceOriginal, make_span
+    base = SourceOriginal("S-base", "class A {}\n", "source", "A.java", "base", "a" * 40)
+    head = SourceOriginal("S-head", "class A { void lookup() {} }\n", "source", "A.java", "head", "b" * 40)
+    span = make_span(head, 0, len(head.raw), "test")
+    quote = {"evidence_id": span.evidence_id, "start_byte": span.start_byte, "end_byte": span.end_byte, "quote": span.text}
+    item = {"statement": "Inspect the reported lookup complexity.", "reasoning": "The fixed PMD observation reports CognitiveComplexity 17 for lookup.",
+        "failure_condition": "", "verdict": "improvement", "basis": "analysis_signal", "target_ids": ["pmd-lookup"], "citations": [quote]}
+    final = {"summary": "Static review.", "findings": [item], "perspectives": [], "questions": []}
+    row = facts.items(final)[1]
+    details = [{"target_id": "pmd-lookup", "tool": "pmd", "change": "new", "paths": ["A.java"],
+        "measurements": [{"name": "CognitiveComplexity", "base": None, "head": 17}]}]
+    payload, schema, refs, _ = facts.request_spec("fact_rewrite", [row], final, [base, head], {"target_details": details}, kind="complete_originals")
+    assert payload["canonical_facts"]["analysis_targets"] == details
+    rule = payload["canonical_facts"]["architecture_analysis_grounding_rule"]
+    assert "owning member" in rule and "newly reported analysis signal" in rule
+    assert "both frozen base and head originals" in rule and "not evidence that its implementation is absent" in rule
+    assert "Do not promote an improvement to concern" in payload["canonical_facts"]["architecture_rewrite_contract"]
+    replacement_schema = schema["properties"]["replacement"]
+    conditional = replacement_schema["allOf"][0]
+    assert conditional["if"]["properties"]["verdict"]["const"] == "concern"
+    assert conditional["then"]["properties"]["failure_condition"] == {"type": "string", "minLength": 1, "pattern": r"\S"}
+    head_refs = [key for key, value in refs.items() if value.path and value.version == "head"]
+    assert conditional["then"]["properties"]["citations"]["contains"]["properties"]["reference_id"]["enum"] == head_refs
+    cite = [{"reference_id": head_refs[0]}]
+    raw = {"replacement": {**item, "verdict": "concern", "citations": cite}, "correction_reason": "Source-based correction.", "correction_citations": cite}
+    for empty in ("", "   "):
+        raw["replacement"]["failure_condition"] = empty
+        with pytest.raises(PartitionError, match="fact_rewrite_concern_without_head_condition"):
+            facts.accept_rewrite(raw, row, refs, "architecture")
+    raw["replacement"]["failure_condition"] = "When lookup receives an unbounded input, HEAD cannot complete the operation."
+    assert facts.accept_rewrite(raw, row, refs, "architecture")["verdict"] == "concern"
+    base_ref = next(key for key, value in refs.items() if value.version == "base")
+    raw["replacement"]["citations"] = [{"reference_id": base_ref}]
+    with pytest.raises(PartitionError, match="fact_rewrite_concern_without_head_condition"):
+        facts.accept_rewrite(raw, row, refs, "architecture")
+    for verdict in ("improvement", "insufficient_context"):
+        raw["replacement"].update(verdict=verdict, failure_condition="")
+        assert facts.accept_rewrite(raw, row, refs, "architecture")["verdict"] == verdict
+
+
+def test_architecture_only_rewrite_schema_is_absent_from_intent_findings_and_wire(monkeypatch):
+    from review_bot.application.source_partition import SourceOriginal, make_span
+    from review_bot.domain.intent_perspectives import PERSPECTIVES
+    source = SourceOriginal("S-wire", "def answer():\n    return 42\n", "source", "a.py", "head", "a" * 40)
+    span = make_span(source, 0, len(source.raw), "test")
+    quote = {"evidence_id": span.evidence_id, "start_byte": span.start_byte, "end_byte": span.end_byte, "quote": span.text}
+    common = {"statement": "A source assertion.", "reasoning": "A source explanation.", "failure_condition": "", "citations": [quote]}
+    finding = {**common, "basis": "observed_structure", "verdict": "improvement", "target_ids": []}
+    final = {"summary": "Static review.", "findings": [finding], "perspectives": [{**common, "perspective_id": item.id, "verdict": "aligned"} for item in PERSPECTIVES], "questions": []}
+    rows = facts.items(final)
+    before = []
+    for kind in ("complete_originals", "cited_originals", "cited_ranges"):
+        payload, schema, refs, _ = facts.request_spec("fact_rewrite", rows[1:], final, [source], {"target_details": [{"tool": "source_review"}]}, kind=kind)
+        assert "architecture_analysis_grounding_rule" not in payload["canonical_facts"]
+        assert "architecture_rewrite_contract" not in payload["canonical_facts"]
+        assert "allOf" not in schema["properties"]["items"]["properties"]["findings:0"]["properties"]["replacement"]
+        before.append(json.dumps({"payload": payload, "schema": schema}, ensure_ascii=False, separators=(",", ":")))
+    actual_rewrite_schema = facts.rewrite_schema
+    def without_architecture_branch(row, refs, *, architecture=False):
+        assert architecture is False
+        return actual_rewrite_schema(row, refs)
+    monkeypatch.setattr(facts, "rewrite_schema", without_architecture_branch)
+    for index, kind in enumerate(("complete_originals", "cited_originals", "cited_ranges")):
+        payload, schema, _, _ = facts.request_spec("fact_rewrite", rows[1:], final, [source], {"target_details": [{"tool": "source_review"}]}, kind=kind)
+        assert json.dumps({"payload": payload, "schema": schema}, ensure_ascii=False, separators=(",", ":")) == before[index]
+
+
+def test_original_support_reference_ids_use_exact_union_and_gate_only_supported_fields():
+    from review_bot.application.source_partition import SourceOriginal
+    source = SourceOriginal("S-ids", "abcdefghij", "source", "a.py", "head", "a" * 40)
+    citations = [{"evidence_id": source.evidence_id, "start_byte": start, "end_byte": end, "quote": source.raw[start:end].decode()}
+        for start, end in ((0, 4), (4, 8))]
+    item = {"statement": "A source assertion.", "reasoning": "A pure question?", "failure_condition": "", "citations": citations}
+    final = {"summary": "No own citations.", "findings": [item], "perspectives": [], "questions": []}
+    rows = facts.items(final)
+    for start, end, has_support in ((0, 8, True), (8, 10, False)):
+        payload, schema, refs, _ = facts.request_spec("fact_check", rows, final, [source], {}, kind="cited_ranges",
+            ranges=[{"evidence_id": source.evidence_id, "start_byte": start, "end_byte": end}])
+        summary, finding = payload["items"]
+        assert "original_support_reference_ids" not in summary and finding["original_item"] == item
+        ids = finding["original_support_reference_ids"]
+        assert bool(ids) is has_support
+        if has_support:
+            combined = "Q" + hash_json((source.evidence_id, source.digest, 0, 8))[:12]
+            assert combined in ids
+        assert set(ids) == {key for key, span in refs.items() if span.evidence_id == source.evidence_id and 0 <= span.start_byte < span.end_byte <= 8}
+        fields_schema = schema["properties"]["items"]["properties"]["findings:0"]["properties"]
+        condition = fields_schema["statement"]["allOf"][0]
+        assert condition["if"]["properties"]["state"]["const"] == "supported"
+        allowed = condition["then"]["properties"]["citations"]["items"]
+        assert (allowed["properties"]["reference_id"]["enum"] == ids) if has_support else allowed is False
+        assert "allOf" not in fields_schema["failure_condition"]
+        assert "allOf" not in schema["properties"]["items"]["properties"]["summary"]["properties"]["text"]
+        assert set(fields_schema["statement"]["properties"]["citations"]["items"]["properties"]["reference_id"]["enum"]) == set(refs)
+        preservation = payload["canonical_facts"]["citation_grounding_rule"]
+        assert "preserve the original statement, reasoning, failure_condition and verdict exactly" in preservation
+
+
+
+def test_korean_tcc_metric_extraction_matches_three_recorded_native_controls():
+    from review_bot.application import partition_choices
+    # Hashes cover the exact saved probe state, Korean options/question and choice schema.
+    controls = [{'item_id': 'findings:5',
+      'prose': {'statement': 'RagFlowTargetAdapter는 ATFD 9, TCC 0.070, WMC 80으로 외부 데이터 접근이 많고 응집도가 낮은 God Class 경향을 보인다.',
+                'reasoning': 'PMD가 보고한 ATFD 9, TCC 0.070, WMC 80은 클래스가 여러 외부 객체/데이터에 접근하면서 메서드 간 응집도가 낮음을 나타낸다. 이는 구조적 관찰이며, '
+                             'supplied code만으로는 런타임 실패를 의미하지 않는다.',
+                'failure_condition': ''},
+      'expected_request_parts_sha256': 'a38d2fbf996af2f9151d2e0032d3e0a249e15e82832e412cc70d33c4c18c62d4'},
+     {'item_id': 'findings:5',
+      'prose': {'statement': 'TCC가 낮으므로 결합도가 심각하지 않다.', 'reasoning': 'TCC 수치로 결합도가 낮음을 판단한다.', 'failure_condition': ''},
+      'expected_request_parts_sha256': 'd060cbd28587b3595dab94b93c501769c30536a70e73477fb5c269b46685012b'},
+     {'item_id': 'findings:5',
+      'prose': {'statement': 'TCC가 낮아 응집도가 낮다.', 'reasoning': '이 수치는 결합도를 나타내지 않는다.', 'failure_condition': ''},
+      'expected_request_parts_sha256': 'efc545fd4d764c05a91d69bfbddde31e4ce7d3c493a23997b4a95345ceb6ae3a'}]
+    for control in controls:
+        row = {"id": control["item_id"], "kind": "findings", "item": control["prose"]}
+        korean = list(facts.metric_specs(row, language="ko"))
+        tcc = next(spec for spec in korean if spec["state"]["target_metric"] == "TCC")
+        assert hash_json({"state": tcc["state"], "options": tcc["options"], "question": tcc["question"],
+            "schema": partition_choices.choice_schema(tcc["options"])}) == control["expected_request_parts_sha256"]
+        assert tcc["options"] == facts.KOREAN_TCC_OPTIONS and tcc["question"] == facts.KOREAN_TCC_QUESTION
+        english = next(spec for spec in facts.metric_specs(row) if spec["state"]["target_metric"] == "TCC")
+        assert english["options"] == facts.CATEGORY_OPTIONS["TCC"] and english["question"] == facts.CATEGORY_QUESTION
+        for spec in korean:
+            if spec["state"]["target_metric"] != "TCC":
+                assert spec["options"] == facts.CATEGORY_OPTIONS[spec["state"]["target_metric"]]
+                assert spec["question"] == facts.CATEGORY_QUESTION

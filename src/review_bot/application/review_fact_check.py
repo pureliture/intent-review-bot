@@ -48,6 +48,12 @@ clause ('not coupling') does not assert coupling. Inspect all prose fields; excl
 quoted source text. If it asserts incompatible categories select other_or_multiple.
 Categories asserted about OTHER metrics must not affect this choice. This is
 claim extraction, not factual approval or correction."""
+KOREAN_TCC_QUESTION = '리뷰 문장이 target_metric으로 무엇을 판단했다고 실제로 서술하는가? 지표의 올바른 정의를 맞히지 말고, 문장이 주장한 내용만 선택하라. 다른 지표의 주장을 섞지 마라. 응집도와 결합도는 서로 다른 말이다. 부정한 내용은 주장한 내용이 아니다. 이름과 숫자만 있으면 no_meaning_claim이다.'
+KOREAN_TCC_OPTIONS = choices.label_options([{'key': 'cohesion', 'description': 'TCC로 메서드 간 응집도 또는 관련성을 판단했다고 서술한다.'},
+ {'key': 'coupling', 'description': 'TCC로 결합도를 판단했다고 서술한다. 높다, 낮다, 심각하지 않다는 판단도 포함한다.'},
+ {'key': 'no_meaning_claim', 'description': 'TCC 이름과 값만 있고 TCC가 무엇을 뜻하는지 주장하지 않는다.'},
+ {'key': 'other_or_multiple', 'description': 'TCC에 대해 위에 없는 의미 또는 서로 다른 여러 의미를 긍정적으로 주장한다.'},
+ {'key': 'uncertain', 'description': 'TCC에 관한 주장을 구분할 수 없다.'}])
 _NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 _METRIC_LITERAL_LIST = re.compile(r"\s*(?:(?:" + "|".join(map(re.escape, METRICS)) +
     r")\s*[:=]?\s*" + _NUMBER + r"\s*[,;/]?\s*)+(?:이다|입니다)?\.?\s*", re.I)
@@ -132,7 +138,7 @@ def fields(row):
         key: item[key] for key in ("statement", "reasoning", "failure_condition")}
 
 
-def metric_specs(row):
+def metric_specs(row, *, language="en"):
     prose = "\n".join(fields(row).values())
     # The grammar recognizes only a literal list such as `TCC=0.07, WMC=80`.
     # Such a list asserts numeric values, not a semantic category. Actual value
@@ -144,7 +150,8 @@ def metric_specs(row):
             yield {"state": {"field": "fact_metric:" + row["id"] + ":" + metric,
                 "item_id": row["id"], "prose": fields(row), "target_metric": metric,
                 "scope": "Extract asserted meaning; no canonical answer is supplied to the extractor."},
-                "options": CATEGORY_OPTIONS[metric], "question": CATEGORY_QUESTION}
+                "options": KOREAN_TCC_OPTIONS if language == "ko" and metric == "TCC" else CATEGORY_OPTIONS[metric],
+                "question": KOREAN_TCC_QUESTION if language == "ko" and metric == "TCC" else CATEGORY_QUESTION}
 
 
 def metric_issue(spec, selected):
@@ -213,6 +220,12 @@ def delivery(rows, final, originals, meta, *, kind, extra=None):
         "execution_facts": {"target_tests_executed_by_bot": False,
             "target_builds_executed_by_bot": False, "runtime_deployment_verified_by_this_review": False},
         "scope": "Static frozen PR review. Code entailment checks are model-assisted, not proofs."}
+    if not final.get("perspectives") and meta.get("target_details"):
+        payload["canonical_facts"]["architecture_analysis_grounding_rule"] = (
+            "Read each analysis_targets entry's measurements together with the exact frozen PMD message, path and owning member. "
+            "Keep the reported metric value and member attribution intact; a nearby method or a citation spanning a method boundary does not inherit the reported member's metric. If ownership is unavailable, state that limit instead of guessing. "
+            "An analysis delta marked new means a newly reported analysis signal, not a newly added class, function or file. Establish any claimed entity addition from both frozen base and head originals. "
+            "PR prose excluding a feature from the requested review scope is not evidence that its implementation is absent.")
     if any(value == "" for row in rows for value in fields(row).values()):
         payload["canonical_facts"]["empty_field_rule"] = "An unchanged original field equal to the empty string contains no factual assertion. Return state=non_factual, a non-empty reason such as 'Empty field contains no factual assertion', and citations=[] for that field. Keep the original empty field and its item in the request and response coverage; never use an empty reason or supported for it."
     if any(isinstance(row["item"], dict) and "citations" in row["item"] for row in rows):
@@ -221,6 +234,8 @@ def delivery(rows, final, originals, meta, *, kind, extra=None):
             "Citation existence, matching bytes, or the same file is insufficient; imports/header lines do not establish later test assertions, and an adjacent range does not establish an omitted assignment or storage operation. "
             "Check this original citation binding separately from whether the claim is true elsewhere in the full originals. If the prose is true elsewhere but the original citation set does not support it, return unverifiable and explain the exact binding gap; your checker citations may identify the actual supporting ranges for the existing complete-item rewrite. "
             "When the full originals support the existing prose, preserve those supported assertions and correct the replacement citation ranges rather than weakening the claim to match an unrelated quote. "
+            "During complete-item rewrite preserve every existing citation that genuinely supports a retained assertion, and include the recorded binding-gap witnesses needed to support all retained fields. Do not rotate valid support for one field out of the item while adding support for another; the model must return the complete corrected citation set. "
+            "If every recorded issue is a program binding-gap issue and all original field assessments are supported/non_factual, preserve the original statement, reasoning, failure_condition and verdict exactly; correct only citations using the existing valid support and the needed gap witnesses. "
             "For supported, select supporting checker references wholly contained in the ORIGINAL item's citation range union for the same evidence_id. If your supporting references extend outside that union, use unverifiable so the existing rewrite can correct the item's citation binding. "
             "Your own correct checker citations do not silently repair the unchanged original_item.citations or justify supported for that binding gap. Recheck the actual replacement citations after rewrite. "
             "This binding requirement does not apply to empty or non_factual fields; a summary without its own citations retains its existing source-check treatment. Preserve original fields, items, citation sets and all audit responses.")
@@ -245,6 +260,12 @@ def delivery(rows, final, originals, meta, *, kind, extra=None):
 
 def request_spec(stage, rows, final, originals, meta, *, kind, extra=None, ranges=None, whole_claim=None):
     payload, refs, spans = delivery(rows, final, originals, meta, kind=kind, extra=extra)
+    architecture_rewrite = stage == "fact_rewrite" and not final.get("perspectives")
+    if architecture_rewrite and any(row["kind"] == "findings" for row in rows):
+        payload["canonical_facts"]["architecture_rewrite_contract"] = (
+            "For architecture finding replacements, concern requires a non-whitespace failure_condition describing the concrete operation/input and incorrect behavior that remains in HEAD, plus at least one citation to a supplied HEAD original with a nonempty source path. "
+            "Do not promote an improvement to concern while retaining an empty failure_condition, even when HEAD citations exist. "
+            "Choose improvement, insufficient_context or another allowed verdict only when the actual frozen evidence supports that judgement; do not invent a concern or downgrade a real concern merely to bypass the output contract. Keep the complete item, target identity, correction reason and exact citations.")
     if ranges is not None:
         by_id = {o.evidence_id: o for o in originals}
         spans = [make_span(by_id[r["evidence_id"]], r["start_byte"], r["end_byte"], "fact_page") for r in ranges]
@@ -281,6 +302,16 @@ def request_spec(stage, rows, final, originals, meta, *, kind, extra=None, range
             "with all identity and offsets retained. Resolve it using supplied original blocks. A slice outside this source page remains unavailable.")
     inventory = unread_inventory(originals, spans)
     payload["fixed_original_inventory"] = inventory
+    if stage == "fact_check":
+        for row, item in zip(rows, payload["items"]):
+            support_ids = original_support_reference_ids(row, refs)
+            if support_ids is not None:
+                item["original_support_reference_ids"] = support_ids
+        if any("original_support_reference_ids" in item for item in payload["items"]):
+            payload["canonical_facts"]["original_support_reference_rule"] = (
+                "For a nonempty factual field of an item with original_support_reference_ids, supported may cite ONLY IDs in that item's supplied list. "
+                "These are the actual catalog ranges contained in its original citation union, including adjacent cited pieces; an empty list cannot support a factual field. "
+                "Other supplied catalog IDs remain available as contradicted/unverifiable evidence and correction witnesses. This list does not itself prove entailment, and does not apply to empty/non_factual fields or items without their own citations.")
     # Exact repeated blocks (often unchanged base/head methods) have one text
     # owner. Each original keeps its own IDs, hashes, versions and byte ranges.
     owners = {}
@@ -294,7 +325,8 @@ def request_spec(stage, rows, final, originals, meta, *, kind, extra=None, range
         payload["source_text_reference_contract"] = ("source_block_text_ref reproduces the exact text of an earlier block in THIS packet. "
             "All original identities, versions and offsets remain independent; identical bytes do not imply identical source identity.")
     schema = check_schema(rows, refs, [o["evidence_id"] for o in inventory]) if stage == "fact_check" else (
-        rewrite_schema(rows[0], refs) if len(rows) == 1 else obj({"items": obj({row["id"]: rewrite_schema(row, refs) for row in rows})}))
+        rewrite_schema(rows[0], refs, architecture=architecture_rewrite) if len(rows) == 1 else
+        obj({"items": obj({row["id"]: rewrite_schema(row, refs, architecture=architecture_rewrite) for row in rows})}))
     return payload, schema, refs, spans
 
 
@@ -409,7 +441,15 @@ def check_schema(rows, refs, source_ids=()):
     assessment = obj({"state": {"type": "string", "enum": ["supported", "contradicted", "unverifiable", "non_factual"]},
         "reason": text(), "citations": cite_schema(refs)})
     request = obj({"evidence_id": {"type": "string", "enum": list(source_ids) or ["no_unread_original"]}, "reason": text()})
-    return obj({"items": obj({row["id"]: obj({key: assessment for key in fields(row)}) for row in rows}),
+    def field_schema(row, key):
+        schema = deepcopy(assessment)
+        support_ids = original_support_reference_ids(row, refs)
+        if support_ids is not None and fields(row)[key].strip():
+            allowed = obj({"reference_id": {"type": "string", "enum": support_ids}}) if support_ids else False
+            schema["allOf"] = [{"if": {"properties": {"state": {"const": "supported"}}, "required": ["state"]},
+                "then": {"properties": {"citations": {"type": "array", "items": allowed, "minItems": 1}}}}]
+        return schema
+    return obj({"items": obj({row["id"]: obj({key: field_schema(row, key) for key in fields(row)}) for row in rows}),
         "source_requests": {"type": "array", "items": request, "maxItems": min(8, len(source_ids))}})
 
 
@@ -463,7 +503,7 @@ def accept_check(raw, rows, refs, source_ids=()):
     return deepcopy(raw["items"])
 
 
-def rewrite_schema(row, refs):
+def rewrite_schema(row, refs, *, architecture=False):
     original = row["item"]
     replacement = text(True)
     if isinstance(original, dict):
@@ -480,6 +520,13 @@ def rewrite_schema(row, refs):
                     else {"type": "array", "items": {"type": "string", "enum": original[key] or ["unused"]},
                         "minItems": len(original[key]), "maxItems": len(original[key])})
         replacement = obj(properties)
+        if architecture and row["kind"] == "findings":
+            head_refs = [key for key, span in refs.items()
+                if getattr(span, "path", "") and getattr(span, "version", "") == "head"]
+            replacement["allOf"] = [{"if": {"properties": {"verdict": {"const": "concern"}}, "required": ["verdict"]},
+                "then": {"properties": {"failure_condition": {"type": "string", "minLength": 1, "pattern": r"\S"},
+                    "citations": {"type": "array", "contains": obj({"reference_id": {"type": "string", "enum": head_refs}}) if head_refs else False,
+                        "minContains": 1}}}}]
     return obj({"replacement": replacement, "correction_reason": text(), "correction_citations": cite_schema(refs, required=True)})
 
 
@@ -564,6 +611,28 @@ def retain_sources(candidate, spans):
     candidate["supplied_quotes"] = list(existing.values())
 
 
+def original_citation_union(row):
+    item = row["item"]
+    if not isinstance(item, dict) or not item.get("citations"):
+        return None
+    union = {}
+    for cite in sorted(item["citations"], key=lambda cite: (cite["evidence_id"], cite["start_byte"], cite["end_byte"])):
+        ranges = union.setdefault(cite["evidence_id"], [])
+        if ranges and cite["start_byte"] <= ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], cite["end_byte"]))
+        else:
+            ranges.append((cite["start_byte"], cite["end_byte"]))
+    return union
+
+
+def original_support_reference_ids(row, refs):
+    union = original_citation_union(row)
+    if union is None:
+        return None
+    return [key for key, span in refs.items() if any(start <= span.start_byte < span.end_byte <= end
+        for start, end in union.get(span.evidence_id, []))]
+
+
 def citation_binding_issues(row, assessments, originals, cited_evidence):
     """Conservative binding guard, not a semantic falsehood determination.
 
@@ -571,18 +640,11 @@ def citation_binding_issues(row, assessments, originals, cited_evidence):
     That still requires explicit re-review; raw assessments and items stay intact.
     Containment alone never proves that the cited bytes entail the prose.
     """
-    item = row["item"]
-    if not isinstance(item, dict) or not item.get("citations"):
+    union = original_citation_union(row)
+    if union is None:
         return []
     by_id = {original.evidence_id: original for original in originals}
-    union = {}
-    for span in sorted(quote_spans(item["citations"], by_id),
-            key=lambda span: (span.evidence_id, span.start_byte, span.end_byte)):
-        ranges = union.setdefault(span.evidence_id, [])
-        if ranges and span.start_byte <= ranges[-1][1]:
-            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], span.end_byte))
-        else:
-            ranges.append((span.start_byte, span.end_byte))
+    quote_spans(row["item"]["citations"], by_id)
     references = {"Q" + hash_json((cite["evidence_id"], by_id[cite["evidence_id"]].digest,
         cite["start_byte"], cite["end_byte"]))[:12]: cite for cite in cited_evidence}
     result = []
@@ -679,7 +741,7 @@ def rewrite_batch_extra(rows, records):
     return extra
 
 
-def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources, max_rewrites, ledger):
+def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources, max_rewrites, ledger, language="en"):
     """Callbacks own native admission, usage, fencing and task budgets."""
     ledger.update(version=VERSION, original_final=deepcopy(final), original_final_hash=hash_json(final),
         status="checking", items=[], model_assisted_is_not_proof=True, accepted_final=deepcopy(final))
@@ -716,7 +778,7 @@ def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources
         for state in active:
             current, entry = state["row"], state["entry"]
             record = records[current["id"]]
-            for spec in metric_specs(current):
+            for spec in metric_specs(current, language=language):
                 selected, decision_id = choose("fact_metric", spec["state"], spec["options"], spec["question"])
                 record["metric_checks"].append({"decision_id": decision_id, "spec": deepcopy(spec),
                     "selected_key": selected["key"], "issue": metric_issue(spec, selected)})
@@ -978,7 +1040,7 @@ def validate(result, originals, meta):
                 raise PartitionError("stored_fact_candidate_changed")
             if attempt.get("input_source_requests") != requested:
                 raise PartitionError("stored_fact_source_carry_changed")
-            specs, checks = list(metric_specs(current)), attempt.get("metric_checks", [])
+            specs, checks = list(metric_specs(current, language=result.language)), attempt.get("metric_checks", [])
             if len(checks) > len(specs) or not terminal and len(checks) != len(specs):
                 raise PartitionError("stored_metric_coverage_changed")
             for spec, check in zip(specs, checks):

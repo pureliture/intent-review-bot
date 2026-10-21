@@ -157,6 +157,12 @@ acyclic paths; cognitive complexity describes code understandability, not runtim
 cost. A null base measurement is unavailable/not reported, not zero. Do not infer
 an increase from a null base or invent reporting thresholds. Reported complexity
 and GodClass signals are structural observations, not demonstrated runtime failures.
+Keep each reported metric value bound to its actual path, member and PMD message.
+A value reported for one method does not belong to an adjacent method merely
+because both occur in one citation block. A new analysis signal is not proof of
+a newly added class or method; compare the actual base and head originals.
+PR prose stating that a feature is out of scope does not prove its implementation
+is absent from the supplied code. Review the code rather than inferring absence.
 """
 
 
@@ -1543,7 +1549,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         try:
             final = fact_check.run(final, originals, meta, mode=mode, check=factual_check,
                 rewrite=factual_rewrite, choose=choose, resolve_sources=factual_sources,
-                max_rewrites=limits.max_rechecks, ledger=verification)
+                max_rewrites=limits.max_rechecks, ledger=verification, language=language)
         except (Stop, PartitionError) as error:
             verification.update(status="unverified", interruption_reason=str(error))
             final = deepcopy(verification.get("accepted_final", final))
@@ -1585,7 +1591,9 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         "global": hash_json(global_review.PROMPT + (PMD_METRIC_REFERENCE if mode == "architecture" else "") + guidance),
         "fact_check": hash_json(fact_check.CHECK_PROMPT), "fact_rewrite": hash_json(fact_check.REWRITE_PROMPT),
         "fact_contract": hash_json({"version": fact_check.VERSION, "metrics": fact_check.METRICS,
-            "options": fact_check.CATEGORY_OPTIONS, "question": fact_check.CATEGORY_QUESTION})}
+            "options": fact_check.CATEGORY_OPTIONS, "question": fact_check.CATEGORY_QUESTION,
+            "korean_tcc_options": fact_check.KOREAN_TCC_OPTIONS,
+            "korean_tcc_question": fact_check.KOREAN_TCC_QUESTION})}
     identity = {"shared_plan_id": partitions.get("shared_plan_id"), "mode": mode, "language": language,
         "input_hash": meta.get("input_hash", ""), "limits": asdict(limits),
         "prompts": hashes, "models": {"review": asdict(profile) if profile else None,
