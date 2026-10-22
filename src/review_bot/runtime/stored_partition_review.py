@@ -22,7 +22,7 @@ _GENERATION_IMPLEMENTATION = (
     "application/review_output_contract.py", "application/context.py", "application/intent_context.py",
     "application/delta.py", "application/architecture_review.py",
     "adapters/llamacpp.py", "adapters/llamacpp_macbook.py", "adapters/intent_planner.py",
-    "adapters/beam_cloud.py", "adapters/tev4b.py",
+    "adapters/openrouter_chat.py", "adapters/openrouter_decisions.py", "adapters/openrouter_common.py", "adapters/tev4b.py",
     "adapters/intent_selection.py", "adapters/model_http.py", "adapters/ollama.py", "runtime/model_clients.py",
     "domain/intent_perspectives.py", "domain/partition_review.py", "domain/intent_models.py",
     "domain/models_v1.py", "domain/envelope_v2.py", "domain/changes.py", "domain/status.py",
