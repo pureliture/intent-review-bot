@@ -20,7 +20,7 @@ from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 HTTP_CLIENT = httpx.Client
 SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}},
     "required": ["ok"], "additionalProperties": False}
-REVIEW_MODEL = "minimax/minimax-m3.1-flash:free"
+REVIEW_MODEL = "recursive/flint-v1.0:free"
 DECISION_MODEL = "perplexity/pplx-decider-flash-v1.2"
 
 
@@ -53,7 +53,7 @@ def ledger(monkeypatch, tmp_path):
         calls.append((req.method, req.url.path))
         if req.url.path == "/api/v1/models":
             return httpx.Response(200, json={"data": [
-                {"id": REVIEW_MODEL, "context_length": 1000000,
+                {"id": REVIEW_MODEL, "context_length": 262144,
                     "architecture": {"output_modalities": ["text"]}},
                 {"id": DECISION_MODEL, "context_length": 262144,
                     "architecture": {"output_modalities": ["decisions"]}}]})
@@ -116,7 +116,7 @@ def test_review_usage_over_budget_discards_result(ledger):
         calls.append((req.method, req.url.path))
         if req.url.path == "/api/v1/models":
             return httpx.Response(200, json={"data": [
-                {"id": REVIEW_MODEL, "context_length": 1000000,
+                {"id": REVIEW_MODEL, "context_length": 262144,
                     "architecture": {"output_modalities": ["text"]}}]})
         return httpx.Response(200, json={
             "model": REVIEW_MODEL,

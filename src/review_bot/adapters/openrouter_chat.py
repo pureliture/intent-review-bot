@@ -8,7 +8,7 @@ endpoint, and no memo of measured counts. Each ``complete`` performs
 exactly one ``POST /api/v1/chat/completions`` after a fail-closed
 byte-upper-bound pre-gate, and validates the response usage post-send.
 
-Default model: ``minimax/minimax-m3.1-flash:free`` (1M context). The
+Default model: ``recursive/flint-v1.0:free`` (256K context). The
 128K production envelope (input 98,394 + output 32,678) still binds
 through ``min(app_budget, model_context)``.
 """
@@ -50,8 +50,8 @@ from review_bot.application.model_wire_contract import compact_schema
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 
 OPENROUTER_REVIEW_PROFILE = "openrouter-review"
-REVIEW_MODEL = "minimax/minimax-m3.1-flash:free"
-REVIEW_CONTEXT_TOKENS = 1000000
+REVIEW_MODEL = "recursive/flint-v1.0:free"
+REVIEW_CONTEXT_TOKENS = 262144
 # Production 128K envelope from the agreed app budget: input + output.
 APP_INPUT_TOKENS = 98394
 APP_OUTPUT_TOKENS = 32678

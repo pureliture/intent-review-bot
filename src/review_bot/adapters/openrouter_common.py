@@ -9,7 +9,7 @@ reserve is caught post-send by the response usage check and fails
 closed; it is never reinterpreted as a fitting request.
 
 Exact local tokenizers are unavailable for the validation models
-(minimax tokenizer "Other", weights unreleased; pplx decider likewise),
+(flint tokenizer "Other", weights unreleased; pplx decider likewise),
 so this conservative bound is the interim proof. It is fail-closed, not
 an estimate: it can only refuse, never wrongly admit.
 """
