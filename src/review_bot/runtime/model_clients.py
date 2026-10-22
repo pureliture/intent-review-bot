@@ -29,7 +29,10 @@ from review_bot.ports import ModelClient
 
 BEAM_CLOUD_TEV4B_PROFILE = "macbook-beam-cloud-tev4b"
 MACBOOK_PROFILES = (MACBOOK_LLAMACPP_PROFILE, MACBOOK_GRANITE_PROFILE, BEAM_CLOUD_TEV4B_PROFILE)
-OPENROUTER_PROFILES = (OPENROUTER_REVIEW_PROFILE, OPENROUTER_DECISION_PROFILE)
+# Deployment profile: review/planning/minimax-chat and decision/pplx-decisions
+# under one name, mirroring me707-llamacpp (bonsai review + tev1 selection).
+OPENROUTER_PROFILE = "openrouter"
+OPENROUTER_PROFILES = (OPENROUTER_PROFILE, OPENROUTER_REVIEW_PROFILE, OPENROUTER_DECISION_PROFILE)
 MODEL_PROFILES = (OLLAMA_PROFILE, LLAMACPP_PROFILE, *MACBOOK_PROFILES, *OPENROUTER_PROFILES)
 
 
@@ -71,7 +74,7 @@ def build_review_client(profile: str | None, settings: ModelConfig | None = None
         timeout_seconds=settings.call_timeout_seconds, max_output_bytes=settings.max_output_bytes,
         max_attempts=settings.max_attempts,
     )
-    if profile in (BEAM_CLOUD_TEV4B_PROFILE, OPENROUTER_REVIEW_PROFILE):
+    if profile in (BEAM_CLOUD_TEV4B_PROFILE, OPENROUTER_PROFILE, OPENROUTER_REVIEW_PROFILE):
         if profile == BEAM_CLOUD_TEV4B_PROFILE and os.environ.get("MACBOOK_BEAM_CONTEXT_TOKENS"):
             raise ValueError("MACBOOK_BEAM_CONTEXT_TOKENS is retired with the Beam bridge; use the OpenRouter app budget")
         client = OpenRouterReviewClient(api_key=_openrouter_key(profile), origin=_openrouter_origin(),
@@ -106,7 +109,7 @@ def build_selector_client(profile: str | None, settings: ModelConfig | None = No
         from review_bot.adapters.tev4b import MacBookTev4bDecisionClient
         client = MacBookTev4bDecisionClient(
             api_url=_endpoint("MACBOOK_TEV4B_BASE_URL", profile), timeout_seconds=settings.call_timeout_seconds)
-    elif profile == OPENROUTER_DECISION_PROFILE:
+    elif profile in (OPENROUTER_PROFILE, OPENROUTER_DECISION_PROFILE):
         client = OpenRouterDecisionClient(api_key=_openrouter_key(profile), origin=_openrouter_origin(),
             model=_openrouter_model("OPENROUTER_DECISION_MODEL", OPENROUTER_DECISION_MODEL_DEFAULT, profile),
             timeout_seconds=settings.call_timeout_seconds, app_input_tokens=settings.decision_input_tokens,
@@ -172,6 +175,8 @@ def build_intent_selection_client(profile: str | None, settings: ModelConfig | N
         return None
     if profile == OPENROUTER_DECISION_PROFILE:
         raise ValueError("Intent perspective selection needs text generation; openrouter-decision cannot serve it")
+    if profile == OPENROUTER_PROFILE:
+        return build_intent_selection_client(OPENROUTER_REVIEW_PROFILE, settings)
     if profile == OPENROUTER_REVIEW_PROFILE:
         settings = settings or ModelConfig()
         from review_bot.adapters.openrouter_chat import OpenRouterReviewClient as _IntentReviewClient

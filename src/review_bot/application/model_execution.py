@@ -281,8 +281,13 @@ class ModelExecutionBudget:
             if reason == "received" and usage is None:
                 reason = "usage_unavailable"
             context_limit = min(profile.max_input_tokens or self.limits.max_input_tokens, self.limits.max_input_tokens)
+            # Output is capped at the profile ceiling: adapters may floor tiny
+            # per-request reservations (e.g. mandatory reasoning headroom), so
+            # the request value alone is not the effective cap. The adapter
+            # still enforces its own exact wire cap pre- and post-send.
+            output_limit = max(request.max_output_tokens or 0, profile.max_output_tokens or 0)
             if usage is not None and (usage["input_tokens"] > context_limit
-                    or usage["output_tokens"] > request.max_output_tokens):
+                    or usage["output_tokens"] > output_limit):
                 reason, retry = "usage_limit_exceeded", False
             attempt = IntentModelAttempt(number, "completed" if reason == "received" else "failed", delivery, reason,
                 started_at, datetime.now(UTC).isoformat(), max(0, int((time.monotonic() - start) * 1000)), usage, hash_json(asdict(actual)))

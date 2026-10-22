@@ -54,6 +54,8 @@ REVIEW_CONTEXT_TOKENS = 1000000
 # Production 128K envelope from the agreed app budget: input + output.
 APP_INPUT_TOKENS = 98394
 APP_OUTPUT_TOKENS = 32678
+# Minimax always reasons; the wire output reservation never goes below this.
+_MINIMAX_WIRE_FLOOR_TOKENS = 512
 _CHAT_PATH = "/api/v1/chat/completions"
 _ZERO_USAGE = {"input_tokens": 0, "output_tokens": 0}
 
@@ -75,6 +77,11 @@ def review_wire_payload(request: ModelRequest) -> tuple[dict[str, Any], int]:
     maximum = request.max_output_tokens if request.max_output_tokens is not None else APP_OUTPUT_TOKENS
     if type(maximum) is not int or not 0 < maximum <= APP_OUTPUT_TOKENS:
         raise PermanentModelError("Invalid OpenRouter review output reservation")
+    # Minimax reasoning is mandatory and billed as completion tokens. Tiny
+    # legacy reservations (e.g. 16-token closed choices) cannot fit reasoning
+    # plus content, so the wire reservation is floored. The floor participates
+    # in the same byte-bound pre-gate and post-send usage check.
+    floored = max(maximum, _MINIMAX_WIRE_FLOOR_TOKENS)
     schema = compact_schema(request.response_schema)
     contract = ("\n\nReturn exactly one JSON object matching this entire response schema. "
         "Do not add prose or fields.\n"
@@ -84,10 +91,11 @@ def review_wire_payload(request: ModelRequest) -> tuple[dict[str, Any], int]:
             {"role": "user", "content": request.user_content}],
         "response_format": {"type": "json_schema", "json_schema": {
             "name": "review_bot", "strict": True, "schema": schema}},
-        "stream": False, "temperature": 0, "max_tokens": maximum}
+        "stream": False, "temperature": 0, "max_tokens": floored,
+        "reasoning": {"effort": "low"}}
     # Canonicalize through the shared encoder so the fingerprinted bytes
     # equal the transmitted bytes.
-    return json.loads(encode(payload).decode("utf-8")), maximum
+    return json.loads(encode(payload).decode("utf-8")), floored
 
 
 class OpenRouterReviewClient:
