@@ -45,7 +45,6 @@ DECISION_CONTEXT_TOKENS = 262144
 APP_INPUT_TOKENS = 126976
 APP_OUTPUT_TOKENS = 4096
 _DECISIONS_PATH = "/api/alpha/decisions"
-_MAX_DECISION_BYTES = 64 * 1024
 
 
 def _positive(value: Any) -> bool:
@@ -275,8 +274,10 @@ class OpenRouterDecisionClient:
             answer_key: str, criteria_keys: set[str], choices: dict[str, Any],
     ) -> tuple[str, dict[str, int]]:
         """One decisions POST with usage-validated answer. Shared by both roles."""
-        if len(body) > _MAX_DECISION_BYTES:
-            raise PermanentModelError("OpenRouter decision input exceeds 64 KiB; truncation is forbidden")
+        # No separate 64 KiB protocol cap: the byte-upper-bound pre-gate below
+        # enforces the app input budget against exact wire bytes, and the
+        # transport cap bounds the body. (The 64 KiB ceiling belonged to the
+        # retired local SystemOne bridge.)
         deadline = time.monotonic() + timeout_seconds
         with self._lock:
             model_context = self._verify(deadline)
