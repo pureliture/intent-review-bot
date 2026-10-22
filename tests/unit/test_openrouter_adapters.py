@@ -266,7 +266,7 @@ def test_review_payload_omits_reasoning_cap_by_default():
 def test_review_payload_carries_reasoning_cap_when_set():
     from review_bot.adapters.openrouter_chat import review_wire_payload
     payload, _ = review_wire_payload(review_request(model=REVIEW_MODEL), reasoning_max_tokens=2048)
-    assert payload["reasoning"] == {"effort": "low", "max_tokens": 2048}
+    assert payload["reasoning"] == {"max_tokens": 2048}
 
 
 def test_review_payload_rejects_invalid_reasoning_cap():

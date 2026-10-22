@@ -95,7 +95,9 @@ def review_wire_payload(request: ModelRequest, *, reasoning_max_tokens: int | No
     if reasoning_max_tokens is not None:
         if type(reasoning_max_tokens) is not int or reasoning_max_tokens < 1:
             raise PermanentModelError("Invalid reasoning token cap")
-        reasoning["max_tokens"] = reasoning_max_tokens
+        # OpenRouter accepts only one of effort/max_tokens. The cap alone
+        # bounds burn-heavy thinking; the provider applies its default effort.
+        reasoning = {"max_tokens": reasoning_max_tokens}
     payload = {"model": request.model, "messages": [
             {"role": "system", "content": request.system_prompt + contract},
             {"role": "user", "content": request.user_content}],
