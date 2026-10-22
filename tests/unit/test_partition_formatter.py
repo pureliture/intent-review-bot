@@ -133,3 +133,32 @@ def test_explicit_finding_verdict_precedes_its_condition_and_analysis_basis():
             ("insufficient_evidence", "작성자 확인 질문"), ("author_question", "작성자 확인 질문")):
         assert judgement_label({"verdict": verdict, "basis": "analysis_signal", "failure_condition": "A concrete condition."}) == expected
     assert judgement_label({"judgement": "concern", "basis": "analysis_signal"}) == "확인된 문제"
+
+
+def test_findings_sort_by_severity_blocking_problems_first():
+    from types import SimpleNamespace
+    from review_bot.adapters.markdown.developer_presentation import findings_section
+    task = SimpleNamespace(snapshot=SimpleNamespace(pr=SimpleNamespace(
+        repository="o/r", number=1, changed_files=("a.py",))))
+    findings = [
+        {"statement": "low question", "verdict": "insufficient_context", "reason": "r",
+         "citations": []},
+        {"statement": "top problem", "verdict": "concern", "reason": "r", "citations": []},
+        {"statement": "mid risk", "verdict": "conditional_risk", "reason": "r",
+         "failure_condition": "c", "citations": []},
+    ]
+    markdown = findings_section(findings, [], task)
+    assert markdown.index("top problem") < markdown.index("mid risk") < markdown.index("low question")
+
+
+def test_walkthrough_table_counts_findings_per_changed_file():
+    from types import SimpleNamespace
+    from review_bot.adapters.markdown.developer_presentation import walkthrough
+    task = SimpleNamespace(reviewed_paths=("a.py", "b.py"),
+        snapshot=SimpleNamespace())
+    findings = [{"statement": "s", "verdict": "concern", "reason": "r",
+        "citations": [{"path": "a.py"}, {"path": "a.py"}]}]
+    table = walkthrough(task, findings, [])
+    assert "<summary>변경 파일 둘러보기</summary>" in table
+    assert "| a\\.py | 2건 |" in table
+    assert "| b\\.py | 0건 |" in table

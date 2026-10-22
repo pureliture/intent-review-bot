@@ -66,7 +66,7 @@ def format_review_markdown(
 ) -> str:
     """Present selected static signals and adopted LLM opinions to developers."""
     from review_bot.adapters.markdown.developer_presentation import (
-        findings_section, finish, label, review_summary, selected_signals, static_analysis, status_sections,
+        findings_section, finish, label, review_summary, selected_signals, static_analysis, status_sections, walkthrough,
     )
 
     title = label(presentation, "title_a", "PMD/CPD 아키텍처 리뷰 A")
@@ -81,6 +81,9 @@ def format_review_markdown(
         return finish(marker, title, status_sections(result, unreviewed=unreviewed), scope="", max_length=max_length)
     signals = selected_signals(task_input, (*result.findings, *result.questions))
     summary = review_summary(result.summary, task_input, is_mock=result.model.get("is_mock"))
+    walk = walkthrough(task_input, result.findings, result.questions, signals=signals)
+    if walk:
+        summary += "\n\n" + walk
     sections = {"summary": summary,
         "static_analysis": static_analysis(task_input, signals, presentation=presentation),
         "llm_review": findings_section(result.findings, result.questions, task_input, signals=signals, presentation=presentation)}

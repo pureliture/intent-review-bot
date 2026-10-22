@@ -86,7 +86,7 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
     if publication_mode != "comment" or result.review_type not in ("A", "B"):
         raise ValueError("invalid_partition_formatter_options")
     from review_bot.adapters.markdown.developer_presentation import (
-        actionable_intent_findings, findings_section, finish, label, perspective_section, review_summary,
+        actionable_intent_findings, findings_section, finish, label, perspective_section, review_summary, walkthrough,
         selected_signals, static_analysis, status_sections,
     )
     from review_bot.domain.markers import DEFAULT_B_MARKER
@@ -106,11 +106,19 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
     if architecture:
         target_reviews = result.partition.get("final", {}).get("target_reviews", {})
         signals = selected_signals(task, result.findings)
+        walk = walkthrough(task, result.findings, result.questions, signals=signals)
+        if walk:
+            sections["summary"] = summary + "\n\n" + walk
+        target_reviews = result.partition.get("final", {}).get("target_reviews", {})
+        signals = selected_signals(task, result.findings)
         sections["static_analysis"] = static_analysis(task, signals, presentation=presentation)
         sections["llm_review"] = findings_section(result.findings, result.questions, task,
             signals=signals, target_reviews=target_reviews, presentation=presentation)
     else:
         findings = actionable_intent_findings(result.findings, result.perspectives)
+        walk = walkthrough(task, findings, result.questions)
+        if walk:
+            sections["summary"] = summary + "\n\n" + walk
         sections["llm_review"] = findings_section(findings, result.questions, task, presentation=presentation)
         sections["perspectives"] = perspective_section(result.perspectives, task, presentation)
     footer = label(presentation, "footer_notice", "")

@@ -267,11 +267,59 @@ def judgement_label(finding) -> str:
     return escape(verdict)
 
 
+def _severity_rank(finding) -> int:
+    """CodeRabbit-style triage order: blocking problems first, questions last."""
+    verdict = finding.get("verdict", finding.get("judgement", ""))
+    if verdict in ("confirmed_issue", "concern"):
+        return 0
+    if verdict == "conditional_risk" or finding.get("failure_condition"):
+        return 1
+    if verdict == "improvement":
+        return 2
+    return 3
+
+
+def walkthrough(task, findings, questions=(), *, signals=()) -> str:
+    """Deterministic file-by-file table: which changed files drew findings.
+
+    No model prose; counts come from validated citations and selected signals.
+    Mirrors CodeRabbit's walkthrough at comment scale: one collapsed block.
+    """
+    if hasattr(task, "reviewed_paths") and not hasattr(task.snapshot, "pr"):
+        files = list(task.reviewed_paths)
+    else:
+        try:
+            files = list(task.snapshot.pr.changed_files)
+        except AttributeError:
+            files = []
+    if not files:
+        return ""
+    counts: dict[str, int] = {path: 0 for path in files}
+    for item in (*findings, *questions):
+        for raw in row(item).get("citations", ()):
+            path = row(raw).get("path")
+            if path in counts:
+                counts[path] += 1
+    flagged = set()
+    for signal in signals:
+        for path in getattr(signal, "paths", ()):
+            if path in counts:
+                flagged.add(path)
+    lines = ["| 파일 | 지적 | 정적 신호 |", "|---|---|---|"]
+    for path in files:
+        mark = "없음"
+        if path in flagged:
+            mark = "있음"
+        lines.append(f"| {escape(path)} | {counts[path]}건 | {mark} |")
+    return details("변경 파일 둘러보기", "\n".join(lines))
+
+
 def findings_section(findings, questions, task, *, signals=(), target_reviews=None, presentation=None) -> str:
     from review_bot.adapters.markdown.formatter import _a_link
 
     lines = ["#### " + label(presentation, "llm_section", "LLM 리뷰"), ""]
     actionable = [row(item) for item in findings if row(item).get("judgement", row(item).get("verdict")) != "acceptable_with_evidence"]
+    actionable.sort(key=_severity_rank)
     if not actionable and not questions:
         lines.append("이 검토 범위에서 추가로 조치할 발견사항은 없습니다.")
     by_id = {signal.signal_id: signal for signal in signals}
