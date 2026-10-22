@@ -703,7 +703,8 @@ class TestMarkdownFormatterAdversarialHardening:
         assert len(rendered) <= 60000
         assert rendered.startswith("<!-- review-bot:architecture:v1 -->")
         assert "리뷰 본문 표시 보류:" in rendered
-        assert "검토 범위: 고정된 HEAD" in rendered
+        assert "본문 전체를 싣지 못했습니다" in rendered
+        assert "검토 범위: 고정된 HEAD" not in rendered
         assert "Excessive architectural responsibility" not in rendered
         assert rendered.count("<details>") == rendered.count("</details>")
 

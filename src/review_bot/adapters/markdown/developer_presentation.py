@@ -62,12 +62,13 @@ def finish(marker: str, title: str, sections: Mapping[str, str], *, scope: str,
     if type(max_length) is not int or not 1000 <= max_length <= 60000:
         raise ValueError("invalid_comment_length")
     intro = f"{marker}\n### {title}\n\n"
-    rendered = intro + compose(sections, template) + "\n\n" + scope
+    rendered = intro + compose(sections, template) + ("\n\n" + scope if scope else "")
     if footer:
         rendered += "\n\n" + footer
     if len(rendered) + 1 > max_length:
         # Never publish a shortened subset of conclusions as a complete review.
-        rendered = intro + "> 리뷰 본문 표시 보류: 댓글 길이 한도를 초과했습니다.\n\n미게시 범위: 전체 판단, 발견사항, 관점별 검토와 인용 원문을 포함한 리뷰 본문 전체. 전체 결과는 저장된 산출물을 확인하세요.\n\n" + scope
+        rendered = (intro + "> 리뷰 본문 표시 보류: 댓글 길이 한도를 초과했습니다.\n\n본문 전체를 싣지 못했습니다."
+            + ("\n\n" + scope if scope else ""))
     if len(rendered) + 1 > max_length:
         raise ValueError("comment_notice_too_large")
     return rendered + "\n"
@@ -88,17 +89,18 @@ _STATUS_REASONS = {
         "The review material exceeds the available input capacity."),
     "model_output_limit": ("리뷰 응답이 길이 한도에 걸려 완전한 결과를 받지 못했습니다.",
         "The review response reached its length limit before a complete result was received."),
-    "usage_unavailable": ("모델 요청의 토큰 사용량을 확인할 수 없어 검토를 계속하지 못했습니다.",
-        "The review could not continue because model usage could not be confirmed."),
+    "usage_unavailable": ("모델 응답을 끝까지 확인하지 못해 검토를 계속하지 못했습니다.",
+        "The review could not continue because the model response could not be confirmed."),
     "model_cancelled": ("모델 요청이 취소되어 검토를 마치지 못했습니다.",
         "The model request was cancelled before the review finished."),
     "model_timeout": ("모델 응답을 제한 시간 안에 받지 못했습니다.",
         "The model did not respond within the time limit."),
     "model_not_configured": ("리뷰 모델이 설정되지 않아 검토를 시작하지 못했습니다.",
         "The review could not start because no review model is configured."),
-    "invalid_partition_response_or_input": ("리뷰 입력 또는 응답을 확인하는 과정에서 문제가 발견되었습니다.",
-        "A problem was found while checking the review input or response."),
-    "invalid_partition_options": ("리뷰 실행 설정을 확인해야 합니다.", "The review execution settings need to be checked."),
+    "invalid_partition_response_or_input": ("리뷰 자료를 읽는 과정에서 문제가 발견되었습니다.",
+        "A problem was found while reading the review material."),
+    "invalid_partition_options": ("리뷰를 시작할 조건이 맞지 않아 중단했습니다.",
+        "The review stopped because the conditions to start it were not met."),
     "stage_gate_rejected": ("다음 검토 단계에 필요한 확인을 통과하지 못했습니다.",
         "The checks required for the next review stage did not pass."),
 }
@@ -114,15 +116,13 @@ def status_sections(result, *, ko=True, unreviewed=()) -> dict[str, str]:
                 "The initial review plan could not be established. " + known[1])
     if reason is None:
         # Pipeline error text may include provider responses or internal details.
-        reason = ("리뷰를 완료하지 못했습니다. 실행 기록을 확인한 뒤 다시 검토해야 합니다.",
-            "The review could not be completed. Check the execution record before retrying.")
+        reason = ("리뷰를 완료하지 못했습니다. 새로운 커밋이 올라오면 다시 검토합니다.",
+            "The review could not be completed. It will be reviewed again when a new commit is pushed.")
     explanation = reason[0 if ko else 1]
     body = (f"> **리뷰 미완료** · {explanation}\n\n최종 판단을 게시하지 않습니다." if ko else
         f"> **Review incomplete** · {explanation}\n\nNo final assessment is available.")
     if unreviewed:
         body += ("\n\n미검토·미확정 범위: " if ko else "\n\nUnreviewed or unresolved scope: ") + "; ".join(escape(v) for v in unreviewed)
-    else:
-        body += "\n\n미검토·미확정 범위: 준비된 PR 범위의 최종 통합 판단." if ko else "\n\nUnreviewed or unresolved scope: the final assessment of the prepared PR scope."
     return {"status": body}
 
 
@@ -296,8 +296,7 @@ def findings_section(findings, questions, task, *, signals=(), target_reviews=No
             rules = sorted({getattr(f, "rule", "CPD") for f in signal.head_findings})
             metrics = measurement_text(signal.measurements)
             lines.extend(["", f"관련 정적 신호: [{escape(', '.join(rules))}](#signal-{target}) · {escape(signal.change)}" +
-                (" · " + escape(metrics) if metrics else ""),
-                "이 신호는 검토 위치를 연결하며 위 판단의 실행 중 재현 증거를 뜻하지 않습니다."])
+                (" · " + escape(metrics) if metrics else "")])
             for violation in signal.head_findings:
                 for loc in getattr(violation, "occurrences", (violation,)):
                     lines.append(_a_link(task.snapshot.pr.repository, task.snapshot.head.sha, loc.path, loc.begin_line, loc.end_line))

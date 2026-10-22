@@ -57,7 +57,7 @@ def test_partition_incomplete_never_exposes_partial_summary_or_findings():
     assert "검토 요청 횟수 한도에 도달해 확인을 마치지 못했습니다" in markdown
     assert result.reason.replace("_", "\\_") not in markdown
     assert "#### 전체 판단" not in markdown and "#### LLM 리뷰" not in markdown
-    assert "미검토·미확정 범위" in markdown
+    assert "미검토·미확정 범위" not in markdown
 
 
 def test_status_notice_explains_known_reason_and_hides_unknown_pipeline_error():
@@ -76,7 +76,7 @@ def test_status_notice_explains_known_reason_and_hides_unknown_pipeline_error():
             "partition_planning_failed:RuntimeError: private-provider-response"):
         result.reason = reason
         unknown = status_sections(result)["status"]
-        assert "실행 기록을 확인한 뒤 다시 검토해야 합니다" in unknown
+        assert "새로운 커밋이 올라오면 다시 검토합니다" in unknown
         for private in ("RuntimeError", "private-provider", "Traceback", "internal/path", "usage_unavailable"):
             assert private not in unknown
 
@@ -89,7 +89,7 @@ def test_initial_plan_notice_preserves_only_the_exact_known_reason(ko):
     result = SimpleNamespace(status="not_run", reason="partition_planning_failed:usage_unavailable")
     notice = status_sections(result, ko=ko, unreviewed=("intent",))["status"]
     assert ("초기 리뷰 계획을 확정하지 못했습니다" if ko else "The initial review plan could not be established") in notice
-    assert ("모델 요청의 토큰 사용량을 확인할 수 없어" if ko else "model usage could not be confirmed") in notice
+    assert ("모델 응답을 끝까지 확인하지 못해" if ko else "model response could not be confirmed") in notice
     assert "intent" in notice and "partition_planning_failed" not in notice and "usage_unavailable" not in notice
 
 

@@ -239,7 +239,7 @@ def test_markdown_formatter_incomplete_is_status_only(status) -> None:
     markdown = format_review_markdown(result, task)
     assert "리뷰 미완료" in markdown and "판단에 필요한 정보가 아직 부족합니다" in markdown
     assert "context\\_missing" not in markdown and status.replace("_", "\\_") not in markdown
-    assert "미검토·미확정 범위" in markdown
+    assert "미검토·미확정 범위" not in markdown
     assert "DO NOT PUBLISH" not in markdown and "Complex method logic" not in markdown
     assert "#### LLM 리뷰" not in markdown
 
@@ -266,7 +266,7 @@ def test_markdown_formatter_no_findings_is_scoped_and_short() -> None:
     result = replace(result, questions=())
     markdown = format_review_markdown(result, task)
     assert "이 검토 범위에서 추가로 조치할 발견사항은 없습니다." in markdown
-    assert "고정된 HEAD" in markdown
+    assert "고정된 HEAD" not in markdown
     assert "전체 레포 누적" not in markdown and len(markdown) < 1500
 
 
@@ -315,7 +315,7 @@ def test_markdown_formatter_truncation_does_not_publish_partial_conclusions() ->
     assert len(markdown) <= 60000
     assert markdown.splitlines()[0] == "<!-- review-bot:architecture:v1 -->"
     assert "댓글 길이 한도를 초과했습니다" in markdown
-    assert "미게시 범위: 전체 판단, 발견사항, 관점별 검토와 인용 원문을 포함한 리뷰 본문 전체" in markdown
+    assert "본문 전체를 싣지 못했습니다" in markdown
     assert "comment_limit_exceeded" not in markdown
     assert "Complex method logic" not in markdown
     assert "A" * 600 not in markdown

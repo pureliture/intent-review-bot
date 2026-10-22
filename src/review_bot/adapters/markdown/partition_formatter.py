@@ -96,13 +96,11 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
     architecture = result.review_type == "A"
     title = label(presentation, "title_a" if architecture else "title_b", "PMD/CPD 아키텍처 리뷰 A" if architecture else "의도 리뷰 B")
     marker = marker or (DEFAULT_A_MARKER if architecture else DEFAULT_B_MARKER)
-    paths = result.scope.get("reviewed_paths", ())
-    scope = f"검토 범위: 고정된 HEAD `{result.head_sha}`와 비교 기준의 {len(paths)}개 파일 및 제공된 PR 원문. 코드·빌드·테스트를 실행하지 않았습니다."
     if result.status != "completed" or result.validation_errors:
         final = result.partition.get("final", {})
         unreviewed = list(final.get("missing_context", ())) + list(result.validation_errors)
         return finish(marker, title, status_sections(result, ko=result.language == "ko", unreviewed=unreviewed),
-            scope=scope, max_length=max_length)
+            scope="", max_length=max_length)
     summary = review_summary(result.summary, task, is_mock=result.model.get("is_mock"))
     sections = {"summary": summary}
     if architecture:
@@ -116,4 +114,4 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
         sections["llm_review"] = findings_section(findings, result.questions, task, presentation=presentation)
         sections["perspectives"] = perspective_section(result.perspectives, task, presentation)
     footer = label(presentation, "footer_notice", "")
-    return finish(marker, title, sections, scope=scope, template=comment_template, max_length=max_length, footer=footer)
+    return finish(marker, title, sections, scope="", template=comment_template, max_length=max_length, footer=footer)

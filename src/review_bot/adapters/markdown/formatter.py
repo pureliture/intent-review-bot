@@ -70,18 +70,15 @@ def format_review_markdown(
     )
 
     title = label(presentation, "title_a", "PMD/CPD 아키텍처 리뷰 A")
-    paths = task_input.snapshot.pr.changed_files if task_input is not None else result.pr.changed_files
-    scope = f"검토 범위: 고정된 HEAD `{result.head_sha}`의 변경 {len(paths)}개 파일과 제공된 관련 원문. 코드·빌드·테스트를 실행하지 않았습니다."
     if task_input is None:
-        scope = f"확인 대상: HEAD `{result.head_sha}`의 변경 {len(paths)}개 파일. 제공된 원문과 실제 검토 범위는 확인하지 못했습니다."
         return finish(marker, title, status_sections(result,
             unreviewed=("검토 입력이 없어 정적 신호와 코드 근거를 다시 확인할 수 없습니다.",)),
-            scope=scope, max_length=max_length)
+            scope="", max_length=max_length)
     if result.status != "completed" or result.reason != "validated" or result.validation_errors or stale_reason:
         unreviewed = list(result.validation_errors)
         if stale_reason:
             unreviewed.append("최신 코드와 일치하지 않는 결과: " + stale_reason)
-        return finish(marker, title, status_sections(result, unreviewed=unreviewed), scope=scope, max_length=max_length)
+        return finish(marker, title, status_sections(result, unreviewed=unreviewed), scope="", max_length=max_length)
     signals = selected_signals(task_input, (*result.findings, *result.questions))
     summary = review_summary(result.summary, task_input, is_mock=result.model.get("is_mock"))
     sections = {"summary": summary,
@@ -90,4 +87,4 @@ def format_review_markdown(
     footer = _a_escape(artifact_notice) if artifact_notice is not None else _a_artifact_link(artifact_url) if artifact_url else ""
     if presentation and presentation.get("footer_notice"):
         footer += ("\n\n" if footer else "") + label(presentation, "footer_notice", "")
-    return finish(marker, title, sections, scope=scope, template=comment_template, max_length=max_length, footer=footer)
+    return finish(marker, title, sections, scope="", template=comment_template, max_length=max_length, footer=footer)
