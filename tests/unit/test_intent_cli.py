@@ -137,14 +137,16 @@ def test_cli_existing_local_profile_records_native_preflight_usage(tmp_path: Pat
         if request.url.path == "/api/show":
             return httpx.Response(200, json=model_info(payload["model"]))
         assert request.url.path == "/api/chat"
+        # Zero-measurement contract: no count-only (num_predict==1) call exists.
+        # Every chat is a generation; the byte gate proves the budget pre-send.
+        assert payload["options"]["num_predict"] != 1
         stage = json.loads(payload["messages"][1]["content"])["stage"]
-        count_only = payload["options"]["num_predict"] == 1
-        if count_only and stage == failure_stage:
+        if stage == failure_stage:
             raise httpx.ReadTimeout("private transport details", request=request)
         return httpx.Response(200, json=chat_response(
-            "{" if count_only else json.dumps(stage_bodies()[STAGES.index(stage)]),
-            prompt_eval_count=100, eval_count=1 if count_only else 50,
-            done_reason="length" if count_only else "stop",
+            json.dumps(stage_bodies()[STAGES.index(stage)]),
+            prompt_eval_count=100, eval_count=50,
+            done_reason="stop",
         ))
 
     def client(**kwargs):
@@ -154,31 +156,39 @@ def test_cli_existing_local_profile_records_native_preflight_usage(tmp_path: Pat
 
     monkeypatch.setattr(httpx, "Client", client)
     output = tmp_path / "native-profile"
-    assert cli.main(["intent", "--input", str(fixed_input(tmp_path)), "--output", str(output),
-        "--model-profile", "ollama-local-128k"]) == 0
-    result = json.loads((output / "B/result.json").read_text())
     if failure_stage:
-        assert [request.url.path for request in requests] == ["/api/show", *["/api/chat"] * 3]
-        assert result["reason"] == "token_count_unavailable"
-        assert result["usage"]["calls"] == 1
-        assert result["usage"]["model_calls"] is None
-        assert result["usage"]["known_model_calls"] == 2
-        assert result["usage"]["known_input_tokens"] == 200
-        assert result["usage"]["known_output_tokens"] == 51
+        assert cli.main(["intent", "--input", str(fixed_input(tmp_path)), "--output", str(output),
+            "--model-profile", "ollama-local-128k"]) == 1
+        result = json.loads((output / "B/result.json").read_text())
+        assert [request.url.path for request in requests] == ["/api/show", *["/api/chat"] * 2]
+        assert result["reason"] == "model_timeout"
+        assert result["usage"]["calls"] == 2
+        assert result["usage"]["token_measurements"] == 0
+        assert result["usage"]["metering_input_tokens"] == 0
+        assert result["usage"]["metering_output_tokens"] == 0
         assert result["usage"]["input_tokens"] is None
-        assert result["stages"][1]["token_measurement_delivery"] == "unknown"
+        assert result["usage"]["known_input_tokens"] == 100
+        assert result["usage"]["known_output_tokens"] == 50
+        assert result["stages"][1]["status"] == "failed"
         assert result["stages"][2]["status"] == "not_attempted"
         assert result["goals"] and not result["observations"]
         assert result["findings"] == []
         assert "private transport details" not in json.dumps(result)
         return
-    assert [request.url.path for request in requests] == ["/api/show", *["/api/chat"] * 6]
+    assert cli.main(["intent", "--input", str(fixed_input(tmp_path)), "--output", str(output),
+        "--model-profile", "ollama-local-128k"]) == 0
+    result = json.loads((output / "B/result.json").read_text())
+    assert [request.url.path for request in requests] == ["/api/show", *["/api/chat"] * 3]
+    assert (result["status"], result["reason"]) == ("completed", "validated")
     assert result["usage"]["calls"] == 3
-    assert result["usage"]["model_calls"] == 6
-    assert result["usage"]["input_tokens"] == 600
-    assert result["usage"]["output_tokens"] == 153
-    assert all(stage["token_measurement_usage"] == {"input_tokens": 100, "output_tokens": 1} for stage in result["stages"])
-    assert all(stage["token_measurement_delivery"] == "sent" for stage in result["stages"])
+    assert result["usage"]["token_measurements"] == 0
+    assert result["usage"]["metering_input_tokens"] == 0
+    assert result["usage"]["metering_output_tokens"] == 0
+    assert result["usage"]["input_tokens"] == 300
+    assert result["usage"]["output_tokens"] == 150
+    assert all(stage["token_measurement"] == "not_attempted" for stage in result["stages"])
+    assert all(stage["token_measurement_model_calls"] == 0 for stage in result["stages"])
+    assert all(stage["measured_input_tokens"] is None for stage in result["stages"])
 
 
 def test_cli_invalid_final_response_retains_earlier_files_and_usage(tmp_path: Path, monkeypatch) -> None:

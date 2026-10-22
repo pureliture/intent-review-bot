@@ -1136,19 +1136,8 @@ def validate(result, originals, meta):
             capacity = next((item for item in result.partition.get("native_capacity_rejections", [])
                 if item["stage_index"] == index), None)
             if capacity is not None:
-                from review_bot.application.model_execution import capacity_input_hash
-                from review_bot.application.model_wire_contract import beam_meter_wire_sha256
-                from review_bot.domain.models_v1 import ModelRequest
-                profile = result.partition["identity"]["models"]["review"]
-                user = json.dumps({"stage": stage, "mode": mode, "language": result.language, **payload},
-                    ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-                if capacity["capacity_rejection"]["source_input_hash"] != capacity_input_hash(
-                        prompt, user, schema, profile["model"], profile["max_output_tokens"]):
-                    raise PartitionError("stored_fact_capacity_request_changed")
-                request = ModelRequest(1, profile["model"], prompt, user, profile["timeout_seconds"],
-                    profile["max_output_tokens"], schema)
-                if capacity["capacity_rejection"]["wire_sha256"] != beam_meter_wire_sha256(request):
-                    raise PartitionError("stored_fact_capacity_wire_changed")
+                # Native metering evidence is retired and can no longer be revalidated.
+                raise PartitionError("stored_fact_capacity_wire_changed")
             if position < len(measurements) - 1 and event.reason != "input_limit_exceeded":
                 raise PartitionError("stored_fact_unnecessary_focus")
         historical_rejection = False

@@ -410,9 +410,9 @@ def run_intent_perspective_review(task_input: IntentTaskInput, model_client: Mod
         return finish("not_run", "model_profile_unset" if profile is None else "selection_profile_unset")
     output = profile.max_output_tokens
     request = _request(task, profile, state, language, "draft_review")
-    count, index = budget.measure(request, model_client, profile, label="full_input_admission",
+    admitted, index = budget.measure(request, model_client, profile, label="full_input_admission",
         reserve_calls=10, reserve_tokens=2 * output + 8 * SELECTION_OUTPUT_TOKENS, generate=False)
-    if count is None:
+    if not admitted:
         return stopped(index)
     for position, perspective in enumerate(PERSPECTIVES):
         request = _selection_request(task, selector, perspective)

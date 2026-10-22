@@ -196,7 +196,7 @@ class ModelConfig(BaseModel):
     unconfigured_action: Literal["not_run", "fail"] = "not_run"
     input_policy: Literal["full_or_not_run"] = "full_or_not_run"
     overflow_action: Literal["not_run", "fail"] = "not_run"
-    require_token_count: bool = True
+    require_token_count: bool = False
     allow_summarization: bool = False
     allow_truncation: bool = False
     allow_automatic_splitting: bool = False
@@ -204,6 +204,15 @@ class ModelConfig(BaseModel):
     call_timeout_seconds: int = Field(ge=1, default=60)
     max_attempts: int = Field(ge=1, default=1)
     max_output_bytes: int = Field(ge=1, default=32768)
+    # Operator-owned token budgets. Changing these needs no code deploy,
+    # only a config change. The byte-upper-bound gate enforces them.
+    # require_token_count is retired: no measurement-only call exists.
+    review_input_tokens: int = Field(ge=1, default=98394)
+    review_output_tokens: int = Field(ge=1, default=32678)
+    decision_input_tokens: int = Field(ge=1, default=126976)
+    decision_output_tokens: int = Field(ge=1, default=4096)
+    framing_reserve_tokens: int = Field(ge=0, default=8192)
+    max_transport_bytes: int = Field(ge=1024, default=16 * 1024 * 1024)
     required_profile_limits: list[str] = Field(
         default_factory=lambda: [
             "max_input_bytes",

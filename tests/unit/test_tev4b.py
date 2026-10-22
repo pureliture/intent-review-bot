@@ -55,7 +55,7 @@ def test_exact_4b_identity_is_offline_and_server_context_must_be_128k(mock_http)
     assert {request.url.path for request in short_calls} == {"/v1/models", "/props"}
 
 
-def test_closed_planning_and_perspective_choices_use_native_template_and_tokenizer(mock_http):
+def test_closed_planning_and_perspective_choices_use_exact_wire_without_measurement(mock_http):
     options = choices.mode_options(("architecture", "intent"))
     selected = next(option for option in options if option["key"] == "review:intent")
 
@@ -71,18 +71,20 @@ def test_closed_planning_and_perspective_choices_use_native_template_and_tokeniz
             "options": options}), 10, 8, choices.choice_schema(options))
     for client_type in (tev4b.MacBookTev4bPlanClient, tev4b.MacBookTev4bIntentSelectionClient):
         client = client_type(api_url=API_URL)
-        assert client.count_input_tokens(request) == 42
+        before = len(calls)
+        bound = client.admission_bytes(request)
+        assert type(bound) is int
+        assert len(calls) == before
         result = client.complete(request)
         assert choices.accept_choice(json.loads(result.text), options)["modes"] == ["intent"]
-    templates = [json.loads(call.content) for call in calls if call.url.path == "/apply-template"]
+        assert result.usage == {"input_tokens": 42, "output_tokens": 8}
     generations = [json.loads(call.content) for call in calls if call.url.path == "/v1/chat/completions"]
-    assert templates and len(generations) == 2
-    assert all(payload["chat_template_kwargs"] == {"enable_thinking": False} for payload in templates)
+    assert len(generations) == 2
+    assert all(payload["chat_template_kwargs"] == {"enable_thinking": False} for payload in generations)
     assert all(payload["model"] == "tev1-4b-q8_0" and payload["max_tokens"] == 8
         and payload["response_format"]["json_schema"]["schema"] == request.response_schema for payload in generations)
-    assert sum(call.url.path == "/tokenize" for call in calls) >= 4
-    assert all(call.url.path in {"/v1/models", "/props", "/apply-template", "/tokenize", "/v1/chat/completions"}
-        for call in calls)
+    assert [call.url.path for call in calls] == ["/v1/models", "/props", "/v1/chat/completions"] * 2
+    assert not any(call.url.path in ("/apply-template", "/tokenize") for call in calls)
     count = len(calls)
     with pytest.raises(PermanentModelError, match="registered PR selection metadata"):
         tev4b.MacBookTev4bDecisionClient(api_url=API_URL).complete(request)

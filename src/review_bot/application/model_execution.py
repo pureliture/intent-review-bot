@@ -1,14 +1,18 @@
-"""Shared bounded model execution, native metering and delivery receipts.
+"""Shared bounded model execution and delivery receipts.
 
 Review pipelines own their prompts and validation. This module owns admission,
 usage accounting, retry bounds and cancellation; it does not select review modes.
+
+There is no metering path: no measurement-only request is ever issued for
+any client. Admission checks calls, deadlines and transport bytes only.
+The input-token budget is proven pre-send by each adapter's exact-wire
+byte-upper-bound gate; the response usage is recorded post-send and any
+budget exceedance fails closed.
 """
 from __future__ import annotations
 
 import json
-import re
 import time
-from hashlib import sha256
 from copy import deepcopy
 from asyncio import CancelledError as AsyncCancelledError
 from collections.abc import Callable
@@ -17,83 +21,17 @@ from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from review_bot.application.architecture_review import ModelProfile, TransientModelError, ModelOutputLimitError, ModelInputCapacityError
+from review_bot.application.architecture_review import ModelProfile, TransientModelError, ModelOutputLimitError, ModelInputCapacityError, PermanentModelError
 from review_bot.application.context import hash_json
 from review_bot.application.intent_context import MAX_INPUT_BYTES, IntentInputError, strict_json_loads
 from review_bot.domain.intent_models import IntentModelAttempt, IntentStageRecord
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 from review_bot.ports import ModelClient
-from review_bot.application.model_wire_contract import BEAM_CLOUD_MODEL, BEAM_CONTEXT_TOKENS, BEAM_MAX_OUTPUT_TOKENS
 
 MAX_OUTPUT_BYTES = 65536
 MAX_ATTEMPTS = 3
 MAX_REJECTED_OUTPUT_BYTES = 1024 * 1024
 OUTPUT_RECOVERY_FINAL_RESERVE = 8192
-_NATIVE_CAPACITY = re.compile(r"The prompt is too long: ([1-9][0-9]*), model maximum context length: ([1-9][0-9]*) \(ref: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\)")
-
-
-def native_capacity_count(body, context):
-    """Recognize only the completed pinned provider's exact rejection protocol."""
-    try:
-        value = strict_json_loads(body, max_bytes=4096)
-        if not isinstance(value, dict) or set(value) != {"error"} or not isinstance(value["error"], str):
-            return None
-        match = _NATIVE_CAPACITY.fullmatch(value["error"])
-        if match is not None:
-            count, maximum = map(int, match.groups())
-            if context == maximum == BEAM_CONTEXT_TOKENS and maximum < count <= 10**9:
-                return count
-    except (ValueError, TypeError, OverflowError, RecursionError):
-        pass
-    return None
-
-
-def capacity_input_hash(system, user, schema, model, output):
-    return hash_json({"system": system, "user": user, "schema": schema, "model": model, "output": output})
-
-
-def capacity_reservation(record, packet, profile=None, request=None):
-    """Validate capacity evidence without converting its unknown usage to zero."""
-    if not isinstance(packet, dict) or set(packet) != {"capacity_rejection", "budget_reservation", "witness_hash"}:
-        raise ValueError("invalid_native_capacity_evidence")
-    proof = packet["capacity_rejection"]
-    keys = {"provider", "model", "status", "response_body", "response_sha256", "wire_sha256",
-        "input_tokens", "context_tokens", "output_tokens_reserved", "completed", "request_hash", "source_input_hash"}
-    if not isinstance(proof, dict) or set(proof) != keys:
-        raise ValueError("invalid_native_capacity_evidence")
-    count = native_capacity_count(proof["response_body"], proof["context_tokens"])
-    if (count is None or proof["input_tokens"] != count or type(proof["input_tokens"]) is not int
-            or proof["provider"] != "ollama-cloud" or proof["model"] != BEAM_CLOUD_MODEL
-            or proof["status"] != 400 or type(proof["status"]) is not int or proof["completed"] is not True
-            or type(proof["context_tokens"]) is not int or proof["output_tokens_reserved"] != 1
-            or type(proof["output_tokens_reserved"]) is not int
-            or proof["response_sha256"] != sha256(proof["response_body"].encode("utf-8")).hexdigest()
-            or not isinstance(proof["wire_sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", proof["wire_sha256"]) is None
-            or proof["request_hash"] != record.request_hash or record.request_hash != record.token_measurement_request_hash
-            or not isinstance(proof["source_input_hash"], str) or re.fullmatch(r"[0-9a-f]{64}", proof["source_input_hash"]) is None
-            or packet["witness_hash"] != hash_json(proof)
-            or packet["budget_reservation"] != {"model_calls": 1, "total_tokens": count + 1}
-            or any(type(value) is not int for value in packet["budget_reservation"].values())
-            or record.measured_input_tokens != count or record.token_measurement != "measured"
-            or record.attempts or record.token_measurement_usage is not None
-            or record.token_measurement_delivery != "unknown" or record.token_measurement_model_calls is not None):
-        raise ValueError("invalid_native_capacity_evidence")
-    # Physical context authority comes from the pinned native error protocol
-    # and exact Beam meter wire, not from an application's stricter role cap.
-    # Keep supported lower output reservations (e.g. 512) while rejecting an
-    # operating profile that exceeds either native capacity or output limits.
-    if profile is not None and (profile.provider != proof["provider"] or profile.model != proof["model"]
-            or type(profile.max_input_tokens) is not int or profile.max_input_tokens <= 0
-            or type(profile.max_output_tokens) is not int or not 0 < profile.max_output_tokens <= BEAM_MAX_OUTPUT_TOKENS
-            or profile.max_input_tokens + profile.max_output_tokens > BEAM_CONTEXT_TOKENS):
-        raise ValueError("invalid_native_capacity_profile")
-    if request is not None:
-        from review_bot.application.model_wire_contract import beam_meter_wire_sha256
-        if (request.model != BEAM_CLOUD_MODEL or proof["wire_sha256"] != beam_meter_wire_sha256(request)
-                or proof["source_input_hash"] != capacity_input_hash(request.system_prompt,
-                    request.user_content, request.response_schema, request.model, request.max_output_tokens)):
-            raise ValueError("invalid_native_capacity_wire")
-    return packet["budget_reservation"]
 
 
 class ModelLimits(Protocol):
@@ -147,23 +85,6 @@ def response_usage(response: ModelResponse) -> dict[str, int] | None:
     return {"input_tokens": value["input_tokens"], "output_tokens": value["output_tokens"]}
 
 
-def measurement_receipt(record: IntentStageRecord, client: ModelClient, profile: ModelProfile) -> IntentStageRecord:
-    try:
-        receipt = getattr(client, "token_count_receipt", None)
-    except Exception:
-        receipt = None
-    if receipt is None and profile.is_mock:
-        return replace(record, token_measurement_delivery="not_attempted", token_measurement_model_calls=0,
-            token_measurement_usage={"input_tokens": 0, "output_tokens": 0})
-    if isinstance(receipt, dict) and set(receipt) == {"delivery", "model_calls", "usage"}:
-        usage = response_usage(ModelResponse("", receipt["usage"]))
-        if receipt["delivery"] in ("not_sent", "sent") and type(receipt["model_calls"]) is int and receipt["model_calls"] == 0 and usage == {"input_tokens": 0, "output_tokens": 0}:
-            return replace(record, token_measurement_delivery=receipt["delivery"], token_measurement_model_calls=0, token_measurement_usage=usage)
-        if receipt["delivery"] == "sent" and type(receipt["model_calls"]) is int and receipt["model_calls"] == 1 and usage is not None and usage["output_tokens"] <= 1:
-            return replace(record, token_measurement_delivery="sent", token_measurement_model_calls=1, token_measurement_usage=usage)
-    return replace(record, token_measurement_delivery="unknown", token_measurement_model_calls=None, token_measurement_usage=None)
-
-
 def model_profile(client: ModelClient | None, limits: ModelLimits) -> ModelProfile | None:
     try:
         active = getattr(client, "profile", None)
@@ -177,7 +98,6 @@ class ModelExecutionBudget:
         self.limits, self.deadline, self.fence = limits, deadline, fence
         self.records: list[IntentStageRecord] = []
         self.rejected_outputs: dict[int, list[dict]] = {}
-        self.capacity_rejections: dict[int, dict] = {}
         self.output_recoveries: list[dict] = []
 
     def execute_bounded_output(self, request: ModelRequest, client: ModelClient, profile: ModelProfile, *,
@@ -209,12 +129,9 @@ class ModelExecutionBudget:
 
     def totals(self) -> tuple[int, int, bool]:
         attempts = [attempt for record in self.records for attempt in record.attempts]
-        measured = [record for record in self.records if record.token_measurement != "not_attempted"]
         known = [attempt.usage for attempt in attempts if attempt.usage is not None]
-        known.extend(record.token_measurement_usage for record in measured if record.token_measurement_usage is not None)
-        calls = len(attempts) + sum(record.token_measurement_model_calls or 0 for record in measured)
-        unknown = any(attempt.usage is None or attempt.delivery == "unknown" for attempt in attempts) or any(
-            record.token_measurement_usage is None or record.token_measurement_model_calls is None for record in measured)
+        calls = len(attempts)
+        unknown = any(attempt.usage is None or attempt.delivery == "unknown" for attempt in attempts)
         return calls, sum(usage["input_tokens"] + usage["output_tokens"] for usage in known), unknown
 
     def guard(self) -> str | None:
@@ -224,35 +141,33 @@ class ModelExecutionBudget:
             return "model_cancelled"
 
     def operational_totals(self) -> tuple[int, int, bool]:
-        """Hard admission bounds; totals() remains actual, possibly unknown usage."""
-        calls, tokens, _ = self.totals()
-        unknown = any(attempt.usage is None or attempt.delivery == "unknown"
-            for record in self.records for attempt in record.attempts)
-        for index, record in enumerate(self.records):
-            if record.token_measurement == "not_attempted":
-                continue
-            if record.token_measurement_usage is None or record.token_measurement_model_calls is None:
-                try:
-                    reservation = capacity_reservation(record, self.capacity_rejections.get(index))
-                except (ValueError, TypeError, KeyError):
-                    unknown = True
-                else:
-                    calls += reservation["model_calls"]
-                    tokens += reservation["total_tokens"]
-        return calls, tokens, unknown
+        """Hard admission bounds over generation attempts only.
+
+        No metering calls exist, so there is no measurement accounting.
+        Only the usage riding on real responses is recorded.
+        """
+        return self.totals()
 
     def measure(self, request: ModelRequest, client: ModelClient, profile: ModelProfile, *,
         label: str, reserve_calls: int, reserve_tokens: int, generate: bool = True,
-    ) -> tuple[int | None, int]:
+    ) -> tuple[bool, int]:
+        """Admission without any measurement call.
+
+        Checks fence, call/deadline/transport budgets, then asks the
+        client for its exact-wire admission bound (``admission_bytes``:
+        wire bytes plus the client's framing reserve, a proven token
+        upper bound). The input-token budget is therefore proven pre-send
+        without any extra request; the response usage is recorded
+        post-send. Returns (admitted, index).
+        """
         record = IntentStageRecord(label, prompt_hash=hash_json({"system": request.system_prompt, "schema": request.response_schema}))
         index = len(self.records)
         self.records.append(record)
         reason = self.guard()
         calls, tokens, unknown = self.operational_totals()
-        meter_reserve = 0 if profile.is_mock else 1
         if reason is None and unknown:
             reason = "usage_unavailable"
-        if reason is None and calls + meter_reserve + int(generate) + reserve_calls > self.limits.max_calls:
+        if reason is None and calls + int(generate) + reserve_calls > self.limits.max_calls:
             reason = "call_limit_exceeded"
         if reason is None and tokens + request.max_output_tokens + reserve_tokens > self.limits.max_total_tokens:
             reason = "task_token_limit_exceeded"
@@ -261,67 +176,45 @@ class ModelExecutionBudget:
             reason = "task_deadline_exceeded"
         actual = replace(request, timeout_seconds=min(profile.timeout_seconds, max(1, int(remaining))))
         size = len(json.dumps(asdict(actual), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        record = replace(record, request_hash=hash_json(asdict(actual)), request_bytes=size)
+        record = replace(record, request_hash=hash_json(asdict(actual)), request_bytes=size,
+            token_measurement="not_attempted", measured_input_tokens=None,
+            token_measurement_request_hash=None, token_measurement_delivery="not_attempted",
+            token_measurement_model_calls=0, token_measurement_usage=None)
         if reason is None and size > min(profile.max_input_bytes, MAX_INPUT_BYTES):
             reason = "input_limit_exceeded"
-        if reason:
-            self.records[index] = replace(record, status="not_run", reason=reason)
-            return None, index
-        record = replace(record, token_measurement_request_hash=hash_json(asdict(actual)))
-        count = None
-        count_reason = None
-        capacity = None
-        try:
-            count = client.count_input_tokens(actual)
-            if type(count) is not int or count < 0:
-                count = None
-        except (Exception, AsyncCancelledError) as error:
-            if isinstance(error, (CancelledError, AsyncCancelledError)):
-                count_reason = "model_cancelled"
-            elif isinstance(error, ModelInputCapacityError):
-                proof = deepcopy(error.capacity_rejection)
-                if isinstance(proof, dict) and type(proof.get("input_tokens")) is int:
-                    capacity = {"capacity_rejection": proof, "witness_hash": hash_json(proof),
-                        "budget_reservation": {"model_calls": 1, "total_tokens": proof["input_tokens"] + 1}}
-                    count = proof["input_tokens"]
-        record = measurement_receipt(record, client, profile)
-        self.records[index] = replace(record, measured_input_tokens=count,
-            token_measurement="measured" if count is not None else "unknown")
-        if capacity is not None:
+        bound: int | None = None
+        if reason is None:
             try:
-                capacity_reservation(self.records[index], capacity, profile, actual)
-            except (ValueError, TypeError, KeyError):
-                count = None
-                self.records[index] = replace(self.records[index], measured_input_tokens=None, token_measurement="unknown")
+                admission = getattr(client, "admission_bytes", None)
+                bound = admission(actual) if callable(admission) else None
+            except Exception:
+                bound = None
+                reason = "token_count_unavailable"
             else:
-                self.capacity_rejections[index] = capacity
-        reason = self.guard() or count_reason
-        calls, tokens, unknown = self.operational_totals()
-        if reason is None and unknown:
-            reason = "usage_unavailable"
-        if reason is None and count is None:
-            reason = "token_count_unavailable"
-        if index in self.capacity_rejections:
-            # The rejected meter is charged its full bound before any fallback.
-            reason = reason or ("call_limit_exceeded" if calls + reserve_calls > self.limits.max_calls else
-                "task_token_limit_exceeded" if tokens + reserve_tokens > self.limits.max_total_tokens else
-                "input_limit_exceeded")
-        if reason is None and calls + int(generate) + reserve_calls > self.limits.max_calls:
-            reason = "call_limit_exceeded"
-        context_limit = min(profile.max_input_tokens or self.limits.max_input_tokens, self.limits.max_input_tokens)
-        if reason is None and count > context_limit:
-            reason = "input_limit_exceeded"
-        if reason is None and tokens + count + request.max_output_tokens + reserve_tokens > self.limits.max_total_tokens:
-            reason = "task_token_limit_exceeded"
-        self.records[index] = replace(self.records[index], status="not_run" if reason else "completed", reason=reason or "input_measured")
-        return (None if reason else count), index
+                if bound is not None and (type(bound) is not int or bound < 0):
+                    bound = None
+                    reason = "token_count_unavailable"
+        if reason is None and bound is not None:
+            context_limit = min(profile.max_input_tokens or self.limits.max_input_tokens, self.limits.max_input_tokens)
+            if bound > context_limit:
+                reason = "input_limit_exceeded"
+        if reason:
+            self.records[index] = replace(record, status="not_run", reason=reason,
+                # Keep the computed admission bound on bound-proven overflow
+                # so split logic distinguishes it from unverified refusal.
+                # No measurement call was made; this is a byte upper bound.
+                measured_input_tokens=bound if reason == "input_limit_exceeded" else None)
+            return False, index
+        self.records[index] = replace(record, measured_input_tokens=bound,
+            status="completed", reason="input_measured")
+        return True, index
 
     def execute(self, request: ModelRequest, client: ModelClient, profile: ModelProfile, *,
         label: str, reserve_calls: int, reserve_tokens: int,
     ) -> tuple[Any | None, int]:
-        count, index = self.measure(request, client, profile, label=label,
+        admitted, index = self.measure(request, client, profile, label=label,
             reserve_calls=reserve_calls, reserve_tokens=reserve_tokens)
-        if count is None:
+        if not admitted:
             return None, index
         for number in range(1, profile.max_attempts + 1):
             reason = self.guard()
@@ -330,7 +223,7 @@ class ModelExecutionBudget:
                 reason = "usage_unavailable"
             if reason is None and calls + 1 + reserve_calls > self.limits.max_calls:
                 reason = "call_limit_exceeded"
-            if reason is None and tokens + count + request.max_output_tokens + reserve_tokens > self.limits.max_total_tokens:
+            if reason is None and tokens + request.max_output_tokens + reserve_tokens > self.limits.max_total_tokens:
                 reason = "task_token_limit_exceeded"
             remaining = self.deadline - time.monotonic()
             if reason is None and remaining < 1:
@@ -351,6 +244,13 @@ class ModelExecutionBudget:
             except (Exception, AsyncCancelledError) as error:
                 reason = "model_cancelled" if isinstance(error, (CancelledError, AsyncCancelledError)) else (
                     "model_timeout" if isinstance(error, TimeoutError) else "model_error")
+                if isinstance(error, ModelInputCapacityError) or (
+                        isinstance(error, PermanentModelError)
+                        and "byte-upper-bound" in str(error)):
+                    # Proven over-budget pre-send (adapter exact-wire gate)
+                    # or provider-side context enforcement. No generation
+                    # happened; treat as admission refusal, not a model error.
+                    reason = "input_limit_exceeded"
                 try:
                     receipt_delivery = getattr(error, "delivery", None)
                     receipt_usage = response_usage(ModelResponse("", getattr(error, "usage", None)))
@@ -360,6 +260,10 @@ class ModelExecutionBudget:
                     delivery, usage = "not_sent", {"input_tokens": 0, "output_tokens": 0}
                 elif receipt_delivery == "sent" and receipt_usage is not None:
                     delivery, usage = "sent", receipt_usage
+                if reason == "input_limit_exceeded":
+                    retry = False
+                    self.records[index] = replace(self.records[index], status="not_run", reason=reason)
+                    return None, index
                 if (isinstance(error, ModelOutputLimitError) and delivery == "sent" and usage is not None
                         and usage["output_tokens"] == actual.max_output_tokens):
                     reason = "model_output_limit"

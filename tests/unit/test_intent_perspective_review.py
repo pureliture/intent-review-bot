@@ -197,10 +197,24 @@ def test_recheck_never_becomes_an_unbounded_loop(maximum):
 
 
 def test_full_input_preflight_blocks_before_any_generations():
-    main = PerspectiveModelClient(counter=lambda request: 2000)
-    result, main, selector = run(main=main, limits=IntentPerspectiveLimits(max_input_tokens=1000))
+    # Zero-measurement contract: counter= is ignored; admission uses
+    # admission_bytes (exact-wire bound). A huge bound exceeds the token
+    # budget so admission refuses with input_limit_exceeded before any complete().
+    main = PerspectiveModelClient()
+    main.admission_bytes = lambda request: 10**9
+    assert not hasattr(main, "token_count_receipt")
+    result, main, selector = run(main=main,
+        limits=IntentPerspectiveLimits(max_input_tokens=1000))
     assert result.status == "not_run" and result.reason == "input_limit_exceeded"
     assert not main.requests and not selector.requests
+    assert main.count_requests == [] and selector.count_requests == []
+    full = next(row for row in result.stages if row.stage == "full_input_admission")
+    assert (full.status, full.reason) == ("not_run", "input_limit_exceeded")
+    assert full.measured_input_tokens == 10**9
+    assert all(record.token_measurement == "not_attempted" for record in result.stages)
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0
+    assert result.usage["metering_output_tokens"] == 0
 
 
 def test_no_profile_means_zero_requests_and_zero_measurements():

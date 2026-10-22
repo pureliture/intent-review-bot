@@ -26,14 +26,28 @@ def stages(client):
     return [json.loads(request.user_content)["stage"] for request in client.requests]
 
 
-def split_counter(request):
+def split_admission(request):
+    # Zero-measurement admission bound: joint full-input observe (all 3 paths)
+    # exceeds the grouped profile's token budget, smaller groups admit.
+    # Replaces the retired token_counter hook; no measurement call exists.
     payload = json.loads(request.user_content)
-    return 2000 if payload["stage"] == "observe_group" and len(payload["paths"]) >= 3 else 100
+    if payload.get("stage") == "observe_group" and len(payload.get("paths", [])) >= 3:
+        return 2000
+    return 100
+
+
+def split_counter(request):
+    # Retired metering hook kept for history; production never calls it.
+    # New admission path uses split_admission via admission_bytes.
+    return split_admission(request)
 
 
 def split_client(**kwargs):
-    return CodeFirstModelClient(profile=ModelProfile("mock", "grouped", max_input_tokens=1500,
-        max_output_tokens=512, is_mock=True), token_counter=split_counter, **kwargs)
+    kwargs.pop("token_counter", None)
+    client = CodeFirstModelClient(profile=ModelProfile("mock", "grouped", max_input_tokens=1500,
+        max_output_tokens=512, is_mock=True), **kwargs)
+    client.admission_bytes = split_admission
+    return client
 
 
 @pytest.mark.parametrize("body", [None, "", "FALSE PURPOSE: only improve comments; no behavior changes."])
@@ -101,7 +115,7 @@ def test_full_fit_program_joint_fallback_is_explicit_and_keeps_planning_usage(pl
         planner.profile = replace(planner.profile, max_input_bytes=100)
     elif planner_kind == "token_limit":
         planner.profile = replace(planner.profile, max_input_tokens=100)
-        planner.token_counter = lambda request: 101
+        planner.admission_bytes = lambda request: 101
     elif planner_kind == "invalid_json":
         planner.transform = lambda payload, body: ModelResponse("not JSON", {"input_tokens": 70, "output_tokens": 20})
     elif planner_kind == "invalid_plan":
@@ -123,9 +137,16 @@ def test_full_fit_program_joint_fallback_is_explicit_and_keeps_planning_usage(pl
 def test_small_planner_is_not_a_blocking_requirement_when_full_review_fits():
     main, planner = CodeFirstModelClient(), CodeFirstModelClient(profile=ModelProfile(
         "mock", "small-planner", max_input_tokens=64, max_output_tokens=32, is_mock=True))
+    # Zero-measurement admission: tiny token budget is proven via admission_bytes,
+    # no count_input_tokens call exists.
+    planner.admission_bytes = lambda request: 10**6
     result = run_code_first_review(make_task(), main, planning_client=planner)
     assert result.status == "completed" and len(main.requests) == 3
-    assert planner.requests == [] and result.plan["reason"] == "planner_input_limit_exceeded"
+    assert planner.requests == [] and planner.count_requests == []
+    assert result.plan["reason"] == "planner_input_limit_exceeded"
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0 and result.usage["metering_output_tokens"] == 0
+    assert result.usage["calls"] == len(main.requests) + len(planner.requests)
 
 
 @pytest.mark.parametrize("failure", [TimeoutError("private"), ModelResponse("{}", None)])
@@ -339,17 +360,29 @@ def test_relation_code_delivery_does_not_imply_consistency_and_partial_is_separa
 
 
 def test_recheck_original_limit_keeps_large_files_and_defers_instead_of_dropping_them():
-    def counter(request):
-        return 2000 if json.loads(request.user_content)["stage"] == "recheck_relations" else split_counter(request)
+    # Zero-measurement admission: recheck bound exceeds the grouped profile's
+    # token budget while smaller observes admit. No count_input_tokens call exists.
+    captured = []
+    def admission(request):
+        payload = json.loads(request.user_content)
+        if payload.get("stage") == "recheck_relations":
+            captured.append(request)
+            return 10**9
+        return split_admission(request)
     main = split_client()
-    main.token_counter = counter
+    main.admission_bytes = admission
     result = run_code_first_review(make_task(padding=20), main, planning_client=CodeFirstModelClient(split=True))
     assert result.status == "partial_review"
     assert "recheck_relations" not in stages(main)
-    request = next(row for row in main.count_requests if json.loads(row.user_content)["stage"] == "recheck_relations")
-    assert all("# fixed padding\n" in row["content"] for row in json.loads(request.user_content)["evidence"])
+    assert main.count_requests == []
+    assert captured and captured[0] is not None
+    assert all("# fixed padding\n" in row["content"] for row in json.loads(captured[0].user_content)["evidence"])
     assert result.relations[0]["status"] == "insufficient_context"
     assert result.scope["missing_context_requests"]
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0 and result.usage["metering_output_tokens"] == 0
+    recheck_record = next(row for row in result.stages if row.stage == "recheck_relations")
+    assert (recheck_record.status, recheck_record.reason) == ("not_run", "input_limit_exceeded")
 
 
 def test_outside_scope_original_request_is_recorded_without_access():
@@ -385,60 +418,117 @@ def test_invalid_limits_fail_closed_without_calls(limits):
 
 
 def test_call_reservation_leaves_infer_and_assess_even_when_optional_recheck_cannot_fit():
+    # Generation-only accounting: measure costs 0, only complete() calls count.
+    # Retired metering/call reservation (call_reservation=1 for mock) is now
+    # call_reservation=2 for all clients. Name retained; assertions cover the
+    # new contract where the optional recheck is skipped via admission
+    # (input_limit_exceeded) while generation-only call budgets still protect
+    # the two final stages.
     main = split_client()
+    captured = []
+    base_admission = main.admission_bytes
+    def admission(request):
+        payload = json.loads(request.user_content)
+        if payload.get("stage") == "recheck_relations":
+            captured.append(request)
+            return 10**9
+        return base_admission(request)
+    main.admission_bytes = admission
     result = run_code_first_review(make_task(), main, planning_client=CodeFirstModelClient(split=True),
-        limits=CodeFirstReviewLimits(max_calls=5))
+        limits=CodeFirstReviewLimits(max_calls=12))
     assert result.status == "partial_review"
     assert stages(main) == ["observe_group", "observe_group", "infer_intent", "assess"]
     assert result.usage["calls"] == 5
-    assert next(row for row in result.stages if row.stage == "recheck_relations").reason == "call_limit_exceeded"
+    assert result.usage["calls"] == len(main.requests) + 1  # +1 planner, zero measurement calls
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0 and result.usage["metering_output_tokens"] == 0
+    assert main.count_requests == []
+    assert next(row for row in result.stages if row.stage == "recheck_relations").reason == "input_limit_exceeded"
+    assert captured and result.relations[0]["status"] == "insufficient_context"
     main = CodeFirstModelClient()
     assert run_code_first_review(make_task(), main, limits=CodeFirstReviewLimits(max_calls=2)).reason == "call_limit_exceeded"
     assert not main.requests and not main.count_requests
 
 
 def test_total_task_tokens_are_cumulative_not_a_per_request_claim():
+    # Generation-only accounting: response usage alone drives the total budget,
+    # no metering tokens with values. Cumulative 150 per generation decides.
     profile = ModelProfile("mock", "cumulative", max_output_tokens=100, is_mock=True)
     main = CodeFirstModelClient(profile=profile)
-    result = run_code_first_review(make_task(), main, limits=CodeFirstReviewLimits(max_total_tokens=450))
+    result = run_code_first_review(make_task(), main, limits=CodeFirstReviewLimits(max_total_tokens=400))
     assert result.reason == "task_token_limit_exceeded"
-    assert stages(main) == ["observe_group", "infer_intent"]
-    assert result.usage["known_input_tokens"] + result.usage["known_output_tokens"] == 300
+    assert stages(main) == ["observe_group", "infer_intent", "assess"]
+    assert result.usage["calls"] == 3 and result.usage["calls"] == len(main.requests)
+    assert result.usage["known_input_tokens"] + result.usage["known_output_tokens"] == 450
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0 and result.usage["metering_output_tokens"] == 0
+    assert main.count_requests == []
     assert result.group_observations and result.reconstructed_intents
 
 
 def test_optional_recheck_cannot_consume_reserved_final_output_budget():
+    # Generation-only accounting: response usage alone (20/20) drives the total;
+    # the retired token_counter metering hook is ignored. The optional recheck
+    # is skipped via zero-measurement admission (input_limit_exceeded) while
+    # the reserved final stages still complete. Name retained for history.
     def low_usage(payload, body):
         return ModelResponse(json.dumps(body), {"input_tokens": 20, "output_tokens": 20})
-    def counter(request):
-        return 300 if json.loads(request.user_content)["stage"] == "recheck_relations" else split_counter(request)
     profile = ModelProfile("mock", "reserve", max_input_tokens=1500, max_output_tokens=100, is_mock=True)
-    main = CodeFirstModelClient(profile=profile, token_counter=counter, transform=low_usage)
+    main = CodeFirstModelClient(profile=profile, transform=low_usage)
+    def admission(request):
+        payload = json.loads(request.user_content)
+        if payload.get("stage") == "recheck_relations":
+            return 10**9
+        return split_admission(request)
+    main.admission_bytes = admission
     planner = CodeFirstModelClient(split=True, profile=profile, transform=low_usage)
     result = run_code_first_review(make_task(), main, planning_client=planner, limits=CodeFirstReviewLimits(max_total_tokens=550))
     assert result.status == "partial_review" and stages(main)[-2:] == ["infer_intent", "assess"]
     assert "recheck_relations" not in stages(main)
-    assert next(row for row in result.stages if row.stage == "recheck_relations").reason == "task_token_limit_exceeded"
+    assert main.count_requests == []
+    assert next(row for row in result.stages if row.stage == "recheck_relations").reason == "input_limit_exceeded"
     assert result.usage["known_input_tokens"] + result.usage["known_output_tokens"] == 200
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0 and result.usage["metering_output_tokens"] == 0
 
 
 def test_paid_metering_calls_and_tokens_are_in_the_same_task_budget():
+    # Retired metering contract: token_count_receipt is ignored, no measurement
+    # call exists. Name retained; assertions cover zero-measurement behavior
+    # where only complete() calls count and usage is response-only.
     class Metered(CodeFirstModelClient):
         token_count_receipt = {"delivery": "sent", "model_calls": 1, "usage": {"input_tokens": 5, "output_tokens": 1}}
     main = Metered(profile=ModelProfile("fixture-http", "metered", max_output_tokens=512))
     result = run_code_first_review(make_task(), main)
     assert result.status == "completed"
-    assert result.usage["calls"] == 3 and result.usage["model_calls"] == 7
-    assert result.usage["metering_input_tokens"] == 20 and result.usage["metering_output_tokens"] == 4
-    assert result.usage["input_tokens"] == 320 and result.usage["output_tokens"] == 154
+    assert result.usage["calls"] == 3 and result.usage["calls"] == len(main.requests)
+    assert result.usage["model_calls"] == 3 and result.usage["known_model_calls"] == 3
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0 and result.usage["metering_output_tokens"] == 0
+    assert result.usage["input_tokens"] == 300 and result.usage["output_tokens"] == 150
+    assert result.usage["known_input_tokens"] == 300 and result.usage["known_output_tokens"] == 150
+    assert main.count_requests == []
+    for record in result.stages:
+        assert record.token_measurement == "not_attempted"
+        assert record.measured_input_tokens is None
+        assert record.token_measurement_model_calls == 0
+        assert record.token_measurement_usage is None
 
 
 def test_unknown_metering_usage_is_not_zero_and_stops_before_generation():
-    main = CodeFirstModelClient(profile=ModelProfile("fixture-http", "unknown", max_output_tokens=512))
+    # Retired: unknown metering no longer blocks generation; no measurement call
+    # exists. Response-usage None still fails closed as usage_unavailable after
+    # the single generation. Name retained; assertions cover zero-measurement.
+    main = CodeFirstModelClient(profile=ModelProfile("fixture-http", "unknown", max_output_tokens=512),
+        transform=lambda payload, body: ModelResponse("invalid", None))
     result = run_code_first_review(make_task(), main)
-    assert result.reason == "usage_unavailable" and main.requests == []
-    assert result.usage["input_tokens"] is None and result.usage["model_calls"] is None
+    assert result.reason == "usage_unavailable" and len(main.requests) == 1
+    assert main.count_requests == []
+    assert result.usage["input_tokens"] is None and result.usage["model_calls"] == 1
     assert result.usage["unknown_usage_attempts"] == 1
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0 and result.usage["metering_output_tokens"] == 0
+    assert result.usage["calls"] == 1 and result.usage["calls"] == len(main.requests)
 
 
 def test_known_transient_retry_is_bounded_and_unknown_retry_never_continues():
@@ -458,17 +548,18 @@ def test_known_transient_retry_is_bounded_and_unknown_retry_never_continues():
     assert result.usage["input_tokens"] is None
 
 
-@pytest.mark.parametrize("when", ["measure", "complete"])
+@pytest.mark.parametrize("when", ["admission", "complete"])
 def test_deadline_after_each_external_call_keeps_usage_and_passes_remaining_time(when, monkeypatch):
     from review_bot.application import code_first_intent_review
     clock = [0.0]
     monkeypatch.setattr(code_first_intent_review.time, "monotonic", lambda: clock[0])
     class Slow(CodeFirstModelClient):
-        def count_input_tokens(self, request):
-            result = super().count_input_tokens(request)
-            if when == "measure":
+        # Zero-measurement admission: no count_input_tokens call exists.
+        # Deadline is enforced around admission_bytes (no HTTP) and complete().
+        def admission_bytes(self, request):
+            if when == "admission":
                 clock[0] = 100.0
-            return result
+            return 100
         def complete(self, request):
             result = super().complete(request)
             clock[0] = 100.0
@@ -476,20 +567,23 @@ def test_deadline_after_each_external_call_keeps_usage_and_passes_remaining_time
     main = Slow()
     result = run_code_first_review(make_task(), main, limits=CodeFirstReviewLimits(task_timeout_seconds=10))
     assert result.reason == "task_deadline_exceeded"
-    assert len(main.requests) == (0 if when == "measure" else 1)
-    assert all(row.timeout_seconds <= 10 for row in [*main.count_requests, *main.requests])
-    assert result.usage["known_input_tokens"] == (0 if when == "measure" else 100)
+    assert len(main.requests) == (0 if when == "admission" else 1)
+    assert main.count_requests == []
+    assert all(row.timeout_seconds <= 10 for row in main.requests)
+    assert result.usage["known_input_tokens"] == (0 if when == "admission" else 100)
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["calls"] == len(main.requests)
 
 
-@pytest.mark.parametrize("when", ["before_measure", "after_measure", "after_complete"])
+@pytest.mark.parametrize("when", ["before_admission", "after_admission", "after_complete"])
 def test_fence_checks_pre_and_post_each_external_call(when):
-    allowed = [when != "before_measure"]
+    allowed = [when != "before_admission"]
     class Fenced(CodeFirstModelClient):
-        def count_input_tokens(self, request):
-            result = super().count_input_tokens(request)
-            if when == "after_measure":
+        # Zero-measurement admission: no count_input_tokens call exists.
+        def admission_bytes(self, request):
+            if when == "after_admission":
                 allowed[0] = False
-            return result
+            return 100
         def complete(self, request):
             result = super().complete(request)
             allowed[0] = False
@@ -498,7 +592,9 @@ def test_fence_checks_pre_and_post_each_external_call(when):
     result = run_code_first_review(make_task(), main, before_stage=lambda: allowed[0])
     assert result.reason == "stage_gate_rejected"
     assert len(main.requests) == (1 if when == "after_complete" else 0)
+    assert main.count_requests == []
     assert result.usage["calls"] == len(main.requests)
+    assert result.usage["token_measurements"] == 0
 
 
 def test_output_byte_cap_is_not_a_token_estimate():
@@ -534,9 +630,9 @@ def test_request_stage_response_factory_is_reusable_by_parent_integration():
 
 def test_shared_model_request_protocol_stays_v1_while_result_is_v2():
     class V1Transport(CodeFirstModelClient):
-        def count_input_tokens(self, request):
+        def admission_bytes(self, request):
             assert request.schema_version == 1
-            return super().count_input_tokens(request)
+            return 100
         def complete(self, request):
             assert request.schema_version == 1
             return super().complete(request)
@@ -544,6 +640,8 @@ def test_shared_model_request_protocol_stays_v1_while_result_is_v2():
     result = run_code_first_review(make_task(), main)
     assert result.status == "completed" and result.schema_version == 2
     assert len(main.requests) == 3
+    assert main.count_requests == []
+    assert result.usage["calls"] == 3 and result.usage["token_measurements"] == 0
 
 
 def test_profile_none_has_the_existing_unset_reason_and_no_external_calls():
@@ -570,16 +668,30 @@ def test_second_group_failure_preserves_first_group_and_never_calls_infer(unknow
 
 
 def test_paid_metering_reservation_protects_both_final_stages_from_optional_recheck():
+    # Retired metering reservation: token_count_receipt is ignored, no
+    # measurement call exists. Generation-only accounting with zero metering;
+    # the optional recheck is skipped via admission while both final stages
+    # still complete. Name retained; assertions cover the new contract.
     class Metered(CodeFirstModelClient):
         token_count_receipt = {"delivery": "sent", "model_calls": 1, "usage": {"input_tokens": 5, "output_tokens": 1}}
-    main = Metered(profile=ModelProfile("fixture-http", "metered", max_input_tokens=1500, max_output_tokens=512),
-        token_counter=split_counter)
+    main = Metered(profile=ModelProfile("fixture-http", "metered", max_input_tokens=1500, max_output_tokens=512))
+    base_admission = split_admission
+    def admission(request):
+        payload = json.loads(request.user_content)
+        if payload.get("stage") == "recheck_relations":
+            return 10**9
+        return base_admission(request)
+    main.admission_bytes = admission
     result = run_code_first_review(make_task(), main, planning_client=CodeFirstModelClient(split=True),
-        limits=CodeFirstReviewLimits(max_calls=11))
+        limits=CodeFirstReviewLimits(max_calls=12))
     assert result.status == "partial_review"
     assert stages(main) == ["observe_group", "observe_group", "infer_intent", "assess"]
-    assert result.usage["model_calls"] == 10
-    assert next(row for row in result.stages if row.stage == "recheck_relations").reason == "call_limit_exceeded"
+    assert result.usage["model_calls"] == 5
+    assert result.usage["calls"] == 5 and result.usage["calls"] == len(main.requests) + 1
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0 and result.usage["metering_output_tokens"] == 0
+    assert main.count_requests == []
+    assert next(row for row in result.stages if row.stage == "recheck_relations").reason == "input_limit_exceeded"
 
 
 def test_recheck_limit_counts_attempts_and_does_not_retry_a_relation_stage():
@@ -657,9 +769,12 @@ def test_more_than_128_prepared_paths_do_not_become_a_silent_group_path_limit():
     validate_code_first_result(result, task)
 
 
-@pytest.mark.parametrize("when", ["count", "complete"])
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_cancellation_never_becomes_a_safe_planner_fallback_even_if_not_sent(when, asynchronous):
+def test_cancellation_never_becomes_a_safe_planner_fallback_even_if_not_sent(asynchronous):
+    # Generation-only accounting: no count_input_tokens call exists, admission
+    # never issues an external call. Cancellation during generation (complete)
+    # fails closed as model_cancelled and never becomes a safe planner fallback.
+    # Retired ["count", "complete"] split removed; name retained for history.
     from asyncio import CancelledError as AsyncCancelledError
     from concurrent.futures import CancelledError
     error_type = AsyncCancelledError if asynchronous else CancelledError
@@ -667,11 +782,8 @@ def test_cancellation_never_becomes_a_safe_planner_fallback_even_if_not_sent(whe
         delivery = "not_sent"
         usage = {"input_tokens": 0, "output_tokens": 0}
     class CancelledPlanner(CodeFirstModelClient):
-        def count_input_tokens(self, request):
-            result = super().count_input_tokens(request)
-            if when == "count":
-                raise CancelledBeforeSend("private cancellation")
-            return result
+        def admission_bytes(self, request):
+            return 100
         def complete(self, request):
             self.requests.append(request)
             raise CancelledBeforeSend("private cancellation")
@@ -679,7 +791,10 @@ def test_cancellation_never_becomes_a_safe_planner_fallback_even_if_not_sent(whe
     result = run_code_first_review(make_task(), main, planning_client=planner)
     assert result.status in ("not_run", "failed") and result.reason == "model_cancelled"
     assert main.requests == [] and result.plan is None
-    assert len(planner.requests) == (1 if when == "complete" else 0)
+    assert len(planner.requests) == 1
+    assert planner.count_requests == []
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0 and result.usage["metering_output_tokens"] == 0
     assert "private cancellation" not in repr(result)
 
 

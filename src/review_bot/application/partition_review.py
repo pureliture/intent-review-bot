@@ -25,7 +25,7 @@ from review_bot.application.partition_integration import native_integration_page
 from review_bot.application.source_citations import citation_spans, citation_catalog, source_blocks, signal_context_spans, referenced_source_spans
 from review_bot.application.review_output_contract import render_output_contract
 from review_bot.application.code_first_intent_review import _original_text, _originals
-from review_bot.application.model_execution import ModelExecutionBudget, model_profile, capacity_reservation, OUTPUT_RECOVERY_FINAL_RESERVE
+from review_bot.application.model_execution import ModelExecutionBudget, model_profile, OUTPUT_RECOVERY_FINAL_RESERVE
 from review_bot.application.context import build_task_input, hash_json
 from review_bot.application.declared_intent_review import _make_result
 from review_bot.application.intent_context import (
@@ -796,9 +796,9 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         return True
 
     def measure(req, client, current, label, *, for_generation=False):
-        count, index = budget.measure(req, client, current, label=label,
+        admitted, index = budget.measure(req, client, current, label=label,
             reserve_calls=0, reserve_tokens=0, generate=for_generation)
-        if count is None:
+        if not admitted:
             if budget.records[index].reason == "input_limit_exceeded":
                 return False
             raise Stop(budget.records[index].reason)
@@ -806,7 +806,10 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         # planning, observations or final integration. Native profile admission
         # already accounts for the model's output reservation.
         if limits.measure_only and limits.input_target_tokens is not None:
-            return count <= min(current.max_input_tokens or limits.max_input_tokens,
+            bound = budget.records[index].measured_input_tokens
+            if bound is None:
+                return True
+            return bound <= min(current.max_input_tokens or limits.max_input_tokens,
                 limits.input_target_tokens)
         return True
 
@@ -1032,11 +1035,6 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             raise Stop("no_review_targets")
         if profile is None or planner is None:
             raise Stop("partition_model_profile_unset")
-        if any(p.provider != "llamacpp" and not p.is_mock
-            and getattr(client, "supports_native_input_measurement", False) is not True
-            for p, client in (((planner, planning_client),) if mode == "planning" else
-                ((profile, review_client), (planner, planning_client)))):
-            raise Stop("partition_requires_native_token_measurement")
         essential = 3 if mode == "planning" else 2 if prepared_plan is not None else 5
         if not limits.measure_only and budget.totals()[0] + essential > limits.max_calls:
             raise Stop("call_limit_exceeded")
@@ -1101,7 +1099,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             page = pending_units[cursor:cursor + 32]
             while True:
                 candidates = choices.plan_candidates(page, lambda group: group_fits(group, "candidate_group_admission"))
-                inventory = [{"index": i, "native_input_tokens": unit_measurements[u.unit_id],
+                inventory = [{"index": i, "admission_input_tokens": unit_measurements[u.unit_id],
                     **{k: v for k, v in asdict(u).items() if k != "text"}} for i, u in enumerate(page)]
                 state = {"field": "grouping_strategy", "inventory": inventory,
                     "candidate_plans": candidates,
@@ -1111,7 +1109,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     state.update(parent_plan=prepared_plan.partition["execution_plan"],
                         amendment_reasons=deepcopy(partitions["plan_reuse"]["amendments"]),
                         analysis_relations=meta.get("target_details", []))
-                question = "Select one TEV-tokenizer-admitted reading plan. The selected review requests receive separate native consumer admission. Prefer useful joint base/head context; never invent or edit groups."
+                question = "Select one byte-budget-admitted reading plan. The selected review requests receive separate byte-bound consumer admission. Prefer useful joint base/head context; never invent or edit groups."
                 req = choice_request("plan_partitions", state, candidates, question)
                 if len(candidates) == 1 or measure(req, planning_client, planner, "plan_inventory_admission"):
                     break
@@ -1150,7 +1148,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                             prompt_hash=hash_json(req.system_prompt), schema_hash=hash_json(req.response_schema),
                             timeout_seconds=witness["timeout_seconds"])
                 event = budget.records[index]
-                if not accepted and (event.token_measurement != "measured" or type(event.measured_input_tokens) is not int
+                if not accepted and (type(event.measured_input_tokens) is not int
                         or event.measured_input_tokens <= min(profile.max_input_tokens or limits.max_input_tokens, limits.max_input_tokens)):
                     raise Stop("selected_review_input_limit_unverified")
                 probe_cache[key] = (accepted, len(delivery["measurements"]) - 1)
@@ -1851,18 +1849,11 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     local_records = budget.records[first_record:]
     partitions["rejected_model_outputs"] = [{"stage_index": index - first_record, **deepcopy(item)}
         for index, items in budget.rejected_outputs.items() if index >= first_record for item in items]
-    capacity = [{"stage_index": index - first_record, **deepcopy(item)}
-        for index, item in budget.capacity_rejections.items() if index >= first_record]
-    if capacity:
-        partitions["native_capacity_rejections"] = capacity
     partitions["output_recoveries"] = [{**deepcopy(item),
         "failed_stage_index": item["failed_stage_index"] - first_record,
         "recovery_stage_index": item["recovery_stage_index"] - first_record}
         for item in budget.output_recoveries if item["failed_stage_index"] >= first_record]
     common = _make_result(None, status, reason, local_records, active_profile, limits)
-    if capacity:
-        common.usage.update(reserved_model_calls=sum(item["budget_reservation"]["model_calls"] for item in capacity),
-            reserved_tokens=sum(item["budget_reservation"]["total_tokens"] for item in capacity))
     hashes = {"observe": hash_json(prompts["observe"]),
         "plan": hash_json({"system": choices.SYSTEM, "contract": choices.VERSION}),
         "select": hash_json(choices.SYSTEM), "final": hash_json(prompts["final"]),
@@ -1881,7 +1872,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         for name in ("partition_review.py", "source_partition.py", "model_execution.py", "model_wire_contract.py", "partition_choices.py", "source_citations.py", "source_quote_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py", "review_fact_check.py", "selection.py")}
     identity["implementation"].update({"adapters/" + name: hashlib.sha256(
         (Path(__file__).parents[1] / "adapters" / name).read_bytes()).hexdigest()
-        for name in ("llamacpp.py", "llamacpp_macbook.py", "intent_planner.py")})
+        for name in ("llamacpp.py", "llamacpp_macbook.py", "intent_planner.py",
+            "openrouter_chat.py", "openrouter_decisions.py", "openrouter_common.py", "byte_budget.py")})
     identity["implementation"]["domain/models_v1.py"] = hashlib.sha256(
         (Path(__file__).parents[1] / "domain/models_v1.py").read_bytes()).hexdigest()
     partitions["identity"] = identity
@@ -2595,41 +2587,22 @@ def _validate_review_validation_history(result, known_units, originals, meta):
 
 
 def _validate_capacity_rejections(result):
-    """Replay the separate conservative reservations, never actual zero usage."""
+    """Native metering is retired: no metering reservation is recorded or honored.
+
+    Stored runs carrying native capacity packets cannot be revalidated
+    without the retired metering protocol and fail closed. Overflow
+    without any bound remains missing evidence.
+    """
     records = result.partition.get("native_capacity_rejections", [])
-    seen, reserved_calls, reserved_tokens = set(), 0, 0
-    try:
-        if not isinstance(records, list):
-            raise ValueError
-        profile = ModelProfile(**result.partition["identity"]["models"]["review"]) if records else None
-    except (KeyError, TypeError, ValueError):
-        raise PartitionError("stored_native_capacity_profile_changed") from None
-    for item in records:
-        try:
-            if not isinstance(item, dict) or set(item) != {"stage_index", "capacity_rejection", "budget_reservation", "witness_hash"}:
-                raise ValueError
-            index = item["stage_index"]
-            if type(index) is not int or index in seen or not 0 <= index < len(result.stages):
-                raise ValueError
-            seen.add(index)
-            event = result.stages[index]
-            reservation = capacity_reservation(event, {k: v for k, v in item.items() if k != "stage_index"}, profile)
-            if event.status != "not_run" or event.reason not in ("input_limit_exceeded", "call_limit_exceeded",
-                    "task_token_limit_exceeded", "task_deadline_exceeded", "stage_gate_rejected", "model_cancelled"):
-                raise ValueError
-            reserved_calls += reservation["model_calls"]
-            reserved_tokens += reservation["total_tokens"]
-        except (ValueError, TypeError, KeyError):
-            raise PartitionError("stored_native_capacity_rejection_changed") from None
-    for index, event in enumerate(result.stages):
-        if (event.reason == "input_limit_exceeded" and event.token_measurement == "measured"
-                and event.token_measurement_usage is None and index not in seen):
-            raise PartitionError("stored_native_capacity_rejection_missing")
+    if not isinstance(records, list):
+        raise PartitionError("stored_native_capacity_rejection_changed")
     if records:
-        if (result.usage.get("reserved_model_calls") != reserved_calls or result.usage.get("reserved_tokens") != reserved_tokens
-                or result.usage.get("usage_complete") is not False or result.usage.get("unknown_usage_attempts", 0) < len(seen)):
-            raise PartitionError("stored_native_capacity_reservation_changed")
-    elif "reserved_model_calls" in result.usage or "reserved_tokens" in result.usage:
+        raise PartitionError("stored_native_capacity_reservation_changed")
+    for event in result.stages:
+        if (event.reason == "input_limit_exceeded" and event.token_measurement == "measured"
+                and event.token_measurement_usage is None):
+            raise PartitionError("stored_native_capacity_rejection_missing")
+    if "reserved_model_calls" in result.usage or "reserved_tokens" in result.usage:
         raise PartitionError("stored_native_capacity_reservation_changed")
 
 
@@ -2703,16 +2676,14 @@ def _validate_consumer_delivery(result, originals, meta, known_units):
             raise PartitionError("stored_consumer_request_changed")
         count = event.measured_input_tokens
         fit = event.reason == "input_measured" and event.status == "completed"
-        overflow = event.reason == "input_limit_exceeded" and event.token_measurement == "measured" and type(count) is int and count > min(
+        overflow = event.reason == "input_limit_exceeded" and type(count) is int and count > min(
             profile.max_input_tokens or limits.max_input_tokens, limits.max_input_tokens)
         capacity = next((value for value in partition.get("native_capacity_rejections", []) if value["stage_index"] == index), None)
+        if capacity is not None:
+            # Native metering evidence is retired and can no longer be revalidated.
+            raise PartitionError("stored_consumer_capacity_changed")
         if overflow and event.token_measurement_delivery == "unknown":
-            if capacity is None:
-                raise PartitionError("stored_consumer_unbounded_overflow")
-            try:
-                capacity_reservation(event, {k: v for k, v in capacity.items() if k != "stage_index"}, profile, ModelRequest(**expected))
-            except (ValueError, TypeError, KeyError):
-                raise PartitionError("stored_consumer_capacity_changed") from None
+            raise PartitionError("stored_consumer_unbounded_overflow")
         if fit and (type(count) is not int or count < 0 or count > min(profile.max_input_tokens or limits.max_input_tokens, limits.max_input_tokens)):
             raise PartitionError("stored_consumer_admission_changed")
         measured.append(True if fit else False if overflow else None)

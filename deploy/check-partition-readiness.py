@@ -66,13 +66,13 @@ def check(config, result):
             expected, ceiling = {"ok": True}, 128
         request = ModelRequest(1, client.profile.model, system, content,
             min(120, config.model.call_timeout_seconds), ceiling, schema)
-        count = client.count_input_tokens(request)
+        bound = client.admission_bytes(request) if hasattr(client, "admission_bytes") else None
         response = client.complete(request)
-        if type(count) is not int or count <= 0 or strict_json_loads(response.text) != expected:
+        if type(bound) is not int or bound <= 0 or strict_json_loads(response.text) != expected:
             raise ReadinessError("model_contract_probe_failed")
         if not isinstance(response.usage, dict) or not {"input_tokens", "output_tokens"} <= response.usage.keys():
             raise ReadinessError("model_probe_usage_unavailable")
-        result["models"][role] = {"model": client.profile.model, "native_input_tokens": count,
+        result["models"][role] = {"model": client.profile.model, "admission_input_tokens": bound,
             "usage": response.usage, "request_sha256": hashlib.sha256(request.user_content.encode()).hexdigest()}
     result["status"] = "ready_for_pr_tests"
     return result

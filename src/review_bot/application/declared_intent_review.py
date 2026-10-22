@@ -44,7 +44,7 @@ from review_bot.domain.intent_models import (
 )
 from review_bot.application.model_execution import (
     MAX_OUTPUT_BYTES, valid_profile as _valid_profile,
-    stage_gate as _gate, response_usage as _usage, measurement_receipt as _measurement_receipt,
+    stage_gate as _gate, response_usage as _usage,
 )
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 from review_bot.ports import ModelClient
@@ -341,23 +341,16 @@ def _execute_stage(
     if reason:
         return None, replace(record, status="not_run", reason=reason)
     request_bytes = len(json.dumps(asdict(request), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-    record = replace(record, request_hash=hash_json(asdict(request)), request_bytes=request_bytes)
+    record = replace(record, request_hash=hash_json(asdict(request)), request_bytes=request_bytes,
+        token_measurement="not_attempted", measured_input_tokens=None,
+        token_measurement_request_hash=None, token_measurement_delivery="not_attempted",
+        token_measurement_model_calls=0, token_measurement_usage=None)
     if request_bytes > min(profile.max_input_bytes, MAX_INPUT_BYTES) or profile.max_output_tokens > limits.max_total_tokens:
         return None, replace(record, status="not_run", reason="input_limit_exceeded")
-    count_request = replace(request, timeout_seconds=min(profile.timeout_seconds, max(1, int(deadline - time.monotonic()))))
-    record = replace(record, token_measurement_request_hash=hash_json(asdict(count_request)))
-    try:
-        tokens = client.count_input_tokens(count_request)
-        if type(tokens) is not int or tokens < 0:
-            raise ValueError("invalid_token_count")
-    except Exception:
-        record = _measurement_receipt(record, client, profile)
-        return None, replace(record, status="not_run", reason="token_count_unavailable", token_measurement="unknown")
-    record = _measurement_receipt(record, client, profile)
-    record = replace(record, measured_input_tokens=tokens, token_measurement="measured")
+    # No measurement call exists. The input-token budget is proven pre-send
+    # by the adapter's exact-wire byte-upper-bound gate inside complete();
+    # the response usage is validated post-send below.
     input_limit = min(profile.max_input_tokens or limits.max_input_tokens, limits.max_input_tokens)
-    if tokens > input_limit or tokens + profile.max_output_tokens > limits.max_total_tokens:
-        return None, replace(record, status="not_run", reason="input_limit_exceeded")
     attempts = []
     for attempt in range(1, profile.max_attempts + 1):
         reason = _gate(before_stage, deadline)
@@ -407,25 +400,23 @@ def _make_result(
 ) -> ReviewBResult:
     hashes = _prompt_hashes()
     attempts = [attempt for record in records for attempt in record.attempts]
-    measurements = [record for record in records if record.token_measurement != "not_attempted"]
+    # No metering calls exist; measurement lists stay empty by construction.
+    measurements: list = []
     review_input = sum(attempt.usage["input_tokens"] for attempt in attempts if attempt.usage is not None)
     review_output = sum(attempt.usage["output_tokens"] for attempt in attempts if attempt.usage is not None)
-    metering_input = sum(record.token_measurement_usage["input_tokens"] for record in measurements if record.token_measurement_usage is not None)
-    metering_output = sum(record.token_measurement_usage["output_tokens"] for record in measurements if record.token_measurement_usage is not None)
     unknown_review = sum(attempt.usage is None for attempt in attempts)
-    unknown_metering = sum(record.token_measurement_usage is None for record in measurements)
-    unknown = unknown_review + unknown_metering
-    known_input = review_input + metering_input
-    known_output = review_output + metering_output
-    known_model_calls = sum(attempt.delivery == "sent" for attempt in attempts) + sum(record.token_measurement_model_calls or 0 for record in measurements)
-    unknown_model_calls = any(attempt.delivery == "unknown" for attempt in attempts) or any(record.token_measurement_model_calls is None for record in measurements)
+    unknown = unknown_review
+    known_input = review_input
+    known_output = review_output
+    known_model_calls = sum(attempt.delivery == "sent" for attempt in attempts)
+    unknown_model_calls = any(attempt.delivery == "unknown" for attempt in attempts)
     usage = {"calls": len(attempts), "model_calls": None if unknown_model_calls else known_model_calls,
-        "known_model_calls": known_model_calls, "token_measurements": len(measurements),
+        "known_model_calls": known_model_calls, "token_measurements": 0,
         "input_tokens": None if unknown else known_input,
         "output_tokens": None if unknown else known_output, "known_input_tokens": known_input,
         "known_output_tokens": known_output, "unknown_usage_attempts": unknown, "usage_complete": unknown == 0,
         "review_input_tokens": None if unknown_review else review_input, "review_output_tokens": None if unknown_review else review_output,
-        "metering_input_tokens": None if unknown_metering else metering_input, "metering_output_tokens": None if unknown_metering else metering_output}
+        "metering_input_tokens": 0, "metering_output_tokens": 0}
     delivery = {record.stage: {"status": "unknown" if any(attempt.delivery == "unknown" for attempt in record.attempts)
             else "sent" if record.attempts else "not_attempted", "request_hash": record.request_hash,
             "attempts": len(record.attempts), "token_measurement": record.token_measurement,

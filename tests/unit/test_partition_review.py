@@ -144,9 +144,14 @@ def test_native_measured_plan_observation_selection_and_review_reach_eight_persp
     import hashlib
     from pathlib import Path
     from review_bot.adapters import intent_planner, llamacpp, llamacpp_macbook
-    for module in (intent_planner, llamacpp, llamacpp_macbook):
+    from review_bot.adapters import openrouter_chat, openrouter_decisions, openrouter_common, byte_budget
+    for module in (intent_planner, llamacpp, llamacpp_macbook,
+            openrouter_chat, openrouter_decisions, openrouter_common, byte_budget):
         path = Path(module.__file__)
         assert result.partition["identity"]["implementation"]["adapters/" + path.name] == hashlib.sha256(path.read_bytes()).hexdigest()
+    # Zero-measurement: no metering reservation exists; usage is response-only.
+    assert "reserved_model_calls" not in result.usage and "reserved_tokens" not in result.usage
+    assert "native_capacity_rejections" not in result.partition
     assert "비공개" in format_partition_review_markdown(result, task)
     developer_comment = format_partition_review_markdown(result, task, publication_mode="comment")
     assert "비공개" not in developer_comment
@@ -708,7 +713,10 @@ def test_stored_note_recheck_binds_every_rejection_raw_stage_and_request_chain(t
             packet["user_content"] = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             index = item["stage_index"]
             event = events[index]
-            events[index] = replace(event, request_hash=hash_json(packet), token_measurement_request_hash=hash_json(packet),
+            # Zero-measurement: no metering hash exists; token_measurement_request_hash
+            # stays None and token_measurement stays not_attempted. Only the
+            # generation request_hash (and attempt hashes) follow the content.
+            events[index] = replace(event, request_hash=hash_json(packet),
                 attempts=tuple(replace(attempt, request_hash=hash_json(packet)) for attempt in event.attempts))
         altered = replace(altered, stages=tuple(events))
     else:
@@ -1900,6 +1908,8 @@ def test_prior_context_delivery_does_not_force_the_model_to_keep_a_positive_stat
 
 @pytest.mark.parametrize("native_measurement", [False, True])
 def test_partition_requires_explicit_native_measurement_for_cloud_provider(native_measurement):
+    # Zero-measurement: the native tokenizer gate is retired. Cloud providers
+    # complete via byte-bound admission; legacy metering flags are ignored.
     review = PartitionModelClient()
     review.profile = replace(review.profile, provider="ollama-cloud", is_mock=False)
     review.supports_native_input_measurement = native_measurement
@@ -1907,14 +1917,13 @@ def test_partition_requires_explicit_native_measurement_for_cloud_provider(nativ
         "usage": {"input_tokens": 100, "output_tokens": 1}}
     task = make_task()
     result = run_partition_review(task, "intent", review, PartitionModelClient(), limits=limits())
-    if native_measurement:
-        assert result.status == "completed", result.reason
-        assert review.count_requests and review.requests
-        validate_partition_result(result, task)
-    else:
-        assert result.status == "not_run"
-        assert result.reason == "partition_requires_native_token_measurement"
-        assert review.count_requests == [] and review.requests == []
+    assert result.status == "completed", result.reason
+    assert review.count_requests and review.requests
+    assert "native_capacity_rejections" not in result.partition
+    assert "reserved_model_calls" not in result.usage and "reserved_tokens" not in result.usage
+    assert all(type(record.measured_input_tokens) is int or record.measured_input_tokens is None
+        for record in result.stages if record.status == "completed")
+    validate_partition_result(result, task)
 
 
 def test_initial_perspective_exclusions_are_provisional_and_final_review_accounts_for_all_eight():
@@ -1948,6 +1957,8 @@ def test_initial_perspective_exclusions_are_provisional_and_final_review_account
 
 def test_planning_uses_tev_only_and_never_probes_or_generates_with_review_client():
     class ForbiddenReview(PartitionModelClient):
+        def admission_bytes(self, request):
+            pytest.fail("Initial planning must not admit the review model")
         def count_input_tokens(self, request):
             pytest.fail("Initial planning must not meter the review model")
         def complete(self, request):
@@ -2050,77 +2061,90 @@ def test_selected_consumer_refines_only_after_known_overflow_and_keeps_large_uni
 
 
 def test_unknown_selected_native_measurement_stops_without_source_refinement_or_review_generation():
+    # Zero-measurement: admission_bytes raising maps to token_count_unavailable
+    # (no metering call exists). No generation happens and no refinement occurs.
     class UnknownReview(PartitionModelClient):
-        supports_native_input_measurement = True
-        token_count_receipt = None
-        def count_input_tokens(self, request):
+        def admission_bytes(self, request):
             self.count_requests.append(request)
-            self.token_count_receipt = {"delivery": "unknown", "model_calls": None, "usage": None}
-            raise TimeoutError("Unknown measurement consumption")
+            raise TimeoutError("Unknown admission bound")
     review = UnknownReview()
     review.profile = replace(review.profile, provider="ollama-cloud", is_mock=False)
     task = make_task()
     result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
-    assert result.reason == "usage_unavailable" and not review.requests
+    assert result.reason == "token_count_unavailable" and not review.requests
     delivery = result.partition["consumer_delivery"]
     assert not delivery["complete"] and len(delivery["measurements"]) == 1
     assert all("children" not in root for root in delivery["roots"])
-    assert result.usage["usage_complete"] is False
+    assert "native_capacity_rejections" not in result.partition
+    assert "reserved_model_calls" not in result.usage and "reserved_tokens" not in result.usage
     validate_partition_result(result, task)
 
 
 
 @pytest.mark.parametrize("fits_budget", [True, False])
 def test_selected_consumer_native400_keeps_unknown_reservation_and_fresh_children_or_stops_budget(fits_budget):
-    from hashlib import sha256
+    # Zero-measurement: no Beam metering. Admission is a byte-bound int;
+    # a bound over the input limit drives group splitting, other refusals Stop.
+    # Legacy capacity packets fail closed (no reservation, response-usage only).
     import time
-    from review_bot.application.architecture_review import ModelInputCapacityError
-    from review_bot.application.model_execution import ModelExecutionBudget, capacity_input_hash
-    from review_bot.application.context import hash_json
-    from review_bot.application.model_wire_contract import beam_meter_wire_sha256
-    class CapacityReview(PartitionModelClient):
-        supports_native_input_measurement = True
-        token_count_receipt = None
-        def count_input_tokens(self, request):
+    from copy import deepcopy
+    from review_bot.adapters.openrouter_chat import review_wire_payload
+    from review_bot.application.model_execution import ModelExecutionBudget
+    from review_bot.domain.models_v1 import ModelRequest
+
+    class BoundedReview(PartitionModelClient):
+        def admission_bytes(self, request):
             self.count_requests.append(request)
             payload = json.loads(request.user_content)
-            size = sum(len(block["text"].encode()) for source in payload.get("originals", []) for block in source["blocks"])
-            if payload["stage"] == "review_partition" and size > 400:
-                self.token_count_receipt = {"delivery": "unknown", "model_calls": None, "usage": None}
-                body = json.dumps({"error": "The prompt is too long: 1524758, model maximum context length: 1048576 (ref: d7fc51b7-fe86-4bfa-99c6-b70cf9701bb1)"})
-                proof = {"provider": "ollama-cloud", "model": "beam:cloud", "status": 400,
-                    "response_body": body, "response_sha256": sha256(body.encode()).hexdigest(),
-                    "wire_sha256": beam_meter_wire_sha256(request), "input_tokens": 1524758,
-                    "context_tokens": 1048576, "output_tokens_reserved": 1, "completed": True,
-                    "request_hash": hash_json(asdict(request)), "source_input_hash": capacity_input_hash(
-                        request.system_prompt, request.user_content, request.response_schema, request.model, request.max_output_tokens)}
-                raise ModelInputCapacityError("Beam cloud HTTP 400", proof)
-            self.token_count_receipt = {"delivery": "sent", "model_calls": 1, "usage": {"input_tokens": 100, "output_tokens": 1}}
+            if payload["stage"] == "review_partition":
+                # Prove the OpenRouter wire builder is the exact-wire source.
+                wire, maximum = review_wire_payload(request)
+                assert wire["model"] == request.model and maximum == request.max_output_tokens
+                assert isinstance(wire["messages"], list) and wire["stream"] is False
+                size = sum(len(block["text"].encode()) for source in payload.get("originals", []) for block in source["blocks"])
+                if size > 400:
+                    return 1524758
+            if self.counter is not None:
+                try:
+                    return self.counter(request)
+                except Exception:
+                    raise
             return 100
+
     task = _selected_consumer_large_task()
-    review = CapacityReview(name="beam:cloud")
-    review.profile = replace(review.profile, provider="ollama-cloud", max_input_tokens=98394, max_output_tokens=32678, is_mock=False)
+    review = BoundedReview()
+    review.profile = replace(review.profile, max_input_tokens=98394, max_output_tokens=512, is_mock=True)
     tev = PartitionModelClient(group_all=True)
-    settings = PartitionReviewLimits(max_calls=256, max_total_tokens=50000000 if fits_budget else 1000000)
+    settings = PartitionReviewLimits(max_calls=256, max_total_tokens=50000000) if fits_budget else PartitionReviewLimits(max_calls=10, max_total_tokens=800)
     plan = run_partition_review(task, "planning", review, tev, limits=settings, available_modes=("intent",))
-    assert plan.status == "planned" and not review.count_requests and not review.requests
+    assert plan.status == "planned" and not review.requests
+    assert "native_capacity_rejections" not in plan.partition
     budget = ModelExecutionBudget(settings, time.monotonic() + settings.task_timeout_seconds, None)
     result = run_partition_review(task, "intent", review, tev, limits=settings, prepared_plan=plan, shared_budget=budget)
-    assert result.partition["native_capacity_rejections"]
-    assert budget.totals()[2] is True and budget.operational_totals()[2] is False
-    assert result.usage["usage_complete"] is False and result.usage["unknown_usage_attempts"] > 0
-    assert all(row["budget_reservation"] == {"model_calls": 1, "total_tokens": 1524759}
-        for row in result.partition["native_capacity_rejections"])
-    delivery = result.partition["consumer_delivery"]
+    assert "native_capacity_rejections" not in result.partition
+    assert "reserved_model_calls" not in result.usage and "reserved_tokens" not in result.usage
+    assert budget.totals()[2] is False and budget.operational_totals()[2] is False
+    assert result.usage["usage_complete"] is True and result.usage["unknown_usage_attempts"] == 0
+    delivery = result.partition.get("consumer_delivery", {})
     if fits_budget:
         assert result.status in ("completed", "partial_review"), result.reason
         assert delivery["complete"] and delivery["initial_groups"] != delivery["groups"]
         assert result.partition["amended_plan"]["parent_plan_id"] == plan.partition["plan_id"]
         assert review.requests and all(event.measured_input_tokens == 100 for event in result.stages
             if event.stage.startswith("review_partition:G") and event.attempts)
+        # Legacy metering packets can no longer validate and fail closed.
+        legacy = deepcopy(result)
+        legacy.partition["native_capacity_rejections"] = [{"stage_index": 0,
+            "capacity_rejection": {}, "budget_reservation": {}, "witness_hash": "0" * 64}]
+        with pytest.raises(PartitionError, match="stored_native_capacity_reservation_changed"):
+            validate_partition_result(legacy, task)
+        legacy = deepcopy(result)
+        legacy.usage["reserved_model_calls"] = 1
+        with pytest.raises(PartitionError, match="stored_native_capacity_reservation_changed"):
+            validate_partition_result(legacy, task)
     else:
-        assert result.reason == "task_token_limit_exceeded" and not review.requests
-        assert not delivery["complete"] and len(delivery["measurements"]) == 1
+        assert result.status in ("not_run", "failed")
+        assert not delivery.get("complete", False)
     validate_partition_result(result, task)
 
 

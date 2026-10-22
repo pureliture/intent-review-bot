@@ -1,14 +1,14 @@
-"""Pure pinned Beam wire representation shared by transport and replay.
+"""Shared wire helpers.
 
 No HTTP, admission, provider state or logical request mutation belongs here.
+
+``compact_schema`` is provider-neutral JSON size reduction reused by the
+OpenRouter wire builder. There is no metering wire: input budgets are
+proven by the byte-upper-bound pre-gate inside each adapter, never by a
+separate measurement request.
 """
 from copy import deepcopy
-from hashlib import sha256
 import json
-
-BEAM_CLOUD_MODEL = "beam:cloud"
-BEAM_CONTEXT_TOKENS = 1048576
-BEAM_MAX_OUTPUT_TOKENS = 32678
 
 
 def _encode(value):
@@ -83,44 +83,3 @@ def compact_schema(schema):
         result.pop("$defs")
     return result if len(_encode(result)) < len(_encode(schema)) else schema
 
-
-
-def _beam_thinking_setting(request):
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate program JSON key")
-            result[key] = value
-        return result
-
-    def reject_constant(_value):
-        raise ValueError("nonfinite program JSON")
-
-    try:
-        payload = json.loads(request.user_content, object_pairs_hook=unique, parse_constant=reject_constant)
-    except (ValueError, TypeError, RecursionError):
-        return False
-    if (request.model == BEAM_CLOUD_MODEL and isinstance(payload, dict)
-            and payload.get("stage") in ("final_review", "fact_check", "fact_rewrite")
-            and payload.get("mode") in ("intent", "architecture") and payload.get("language") in ("ko", "en")):
-        return "low" if payload["stage"] == "final_review" else True
-    return False
-
-
-def beam_wire_payload(request):
-    schema = compact_schema(request.response_schema)
-    contract = "\n\nReturn exactly one JSON object matching this entire response schema. Do not add prose or fields.\n" + _encode(schema).decode("utf-8")
-    return {"model": request.model, "messages": [
-        {"role": "system", "content": request.system_prompt + contract},
-        {"role": "user", "content": request.user_content}],
-        "format": schema, "stream": False, "think": _beam_thinking_setting(request), "truncate": False, "shift": False,
-        "options": {"num_ctx": BEAM_CONTEXT_TOKENS,
-            "num_predict": request.max_output_tokens if request.max_output_tokens is not None else BEAM_MAX_OUTPUT_TOKENS,
-            "temperature": 0, "seed": 0}}
-
-
-def beam_meter_wire_sha256(request):
-    payload = beam_wire_payload(request)
-    payload["options"]["num_predict"] = 1
-    return sha256(_encode(payload)).hexdigest()

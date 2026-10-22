@@ -31,7 +31,7 @@ from review_bot.config import (
 )
 
 EXPECTED_CANONICAL_HASH = (
-    "e95b9a13fe79183e7c9ca1ceea0db96338c4561749904858222ca791b245cd71"
+    "b0065ca42fc04dd13933fe684ecbf30183d06366b4751adc949a921a2a088bc5"
 )
 
 

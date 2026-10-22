@@ -22,17 +22,13 @@ from typing import Any
 
 import httpx
 
+from review_bot.adapters.byte_budget import precheck_byte_budget as _shared_precheck
 from review_bot.application.architecture_review import PermanentModelError, TransientModelError
 
 OPENROUTER_BASE_URL = "https://openrouter.ai"
 _MODELS_PATH = "/api/v1/models"
 _TRANSPORT_BYTES = 16 * 1024 * 1024
 _METADATA_SECONDS = 60
-
-# Fixed conservative cover for provider-side framing (chat template and
-# request envelope) that is not part of our wire bytes. A post-send usage
-# check fails closed if real framing ever exceeds it.
-FRAMING_RESERVE_TOKENS = 8192
 
 
 def _positive(value: Any) -> bool:
@@ -68,22 +64,14 @@ def base_url(value: str | None) -> str:
 
 
 def precheck_byte_budget(wire_len: int, max_output_tokens: int, *, app_input_tokens: int,
-        app_output_tokens: int, model_context_tokens: int, role: str) -> None:
-    """Fail-closed pre-send gate. Raises PermanentModelError on any exceed.
-
-    ``wire_len`` is UTF-8 bytes of the exact request body. Since every
-    token spans >= 1 byte, ``wire_len + FRAMING_RESERVE_TOKENS`` is a
-    proven input-token upper bound, never an estimate.
-    """
-    if not _positive(max_output_tokens):
-        raise PermanentModelError(f"Invalid {role} output reservation")
-    total_cap = min(app_input_tokens + app_output_tokens, model_context_tokens)
-    if wire_len + FRAMING_RESERVE_TOKENS + max_output_tokens > total_cap:
-        raise PermanentModelError(f"{role} input exceeds byte-upper-bound budget; truncation is forbidden")
-    if wire_len + FRAMING_RESERVE_TOKENS > app_input_tokens:
-        raise PermanentModelError(f"{role} input exceeds byte-upper-bound budget; truncation is forbidden")
+        app_output_tokens: int, model_context_tokens: int, role: str,
+        framing_reserve_tokens: int = 8192) -> None:
+    """Fail-closed pre-send gate; delegates to the shared byte_budget module."""
     if wire_len > _TRANSPORT_BYTES:
         raise PermanentModelError(f"{role} input exceeds transport byte limit")
+    return _shared_precheck(wire_len, max_output_tokens, app_input_tokens=app_input_tokens,
+        app_output_tokens=app_output_tokens, model_context_tokens=model_context_tokens, role=role,
+        framing_reserve_tokens=framing_reserve_tokens)
 
 
 def check_response_usage(usage: Any, *, app_input_tokens: int, app_output_tokens: int,

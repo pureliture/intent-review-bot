@@ -156,17 +156,24 @@ def test_granite_port_posts_chat_schema_and_128k(mock_http: Any, main_request: M
     assert 0 < requests[-1].extensions["timeout"]["read"] <= 10
 
 
-def test_token_preflight_returns_native_count_not_byte_estimate(mock_http: Any, main_request: ModelRequest) -> None:
+def test_no_count_only_probe_and_complete_uses_full_budget(mock_http: Any, main_request: ModelRequest) -> None:
     from review_bot.adapters.ollama import OllamaModelClient
 
-    requests = mock_http(lambda request: httpx.Response(200, json=chat_response(
-        "{", eval_count=1, done_reason="length",
-    )))
+    requests = mock_http(lambda request: httpx.Response(200, json=chat_response()))
     client = OllamaModelClient()
 
-    assert client.count_input_tokens(main_request) == 42
+    assert client.admission_bytes(main_request) is None
+    assert requests == []
+    assert not hasattr(client, "count_input_tokens")
+    assert not hasattr(client, "token_count_receipt")
+
+    response = client.complete(main_request)
+    assert json.loads(response.text) == {"ok": True}
+    assert response.usage == {"input_tokens": 42, "output_tokens": 5}
+    assert [r.url.path for r in requests] == ["/api/show", "/api/chat"]
+    assert sum(r.url.path == "/api/chat" for r in requests) == 1
     payload = json.loads(requests[-1].content)
-    assert payload["options"]["num_predict"] == 1
+    assert payload["options"]["num_predict"] == 32
     assert payload["options"]["num_ctx"] == 131072
     assert payload["format"] == main_request.response_schema
     assert client.profile.max_input_tokens == 126976
@@ -183,11 +190,7 @@ def test_granite_pipeline_preserves_token_gate_and_validates_review(mock_http: A
     })
 
     def handler(request: httpx.Request) -> httpx.Response:
-        count_only = json.loads(request.content)["options"]["num_predict"] == 1
-        return httpx.Response(200, json=chat_response(
-            "{" if count_only else body, eval_count=1 if count_only else 100,
-            done_reason="length" if count_only else "stop",
-        ))
+        return httpx.Response(200, json=chat_response(body, eval_count=100))
 
     requests = mock_http(handler)
     result = run_review_a_pipeline(task, OllamaModelClient())
@@ -195,7 +198,8 @@ def test_granite_pipeline_preserves_token_gate_and_validates_review(mock_http: A
     assert result.status == "completed", result.validation_errors
     assert result.model["provider"] == "ollama"
     assert result.model["model"] == MAIN
-    assert [r.url.path for r in requests] == ["/api/show", "/api/chat", "/api/chat"]
+    assert [r.url.path for r in requests] == ["/api/show", "/api/chat"]
+    assert sum(r.url.path == "/api/chat" for r in requests) == 1
 
 
 def test_granite_oversized_input_never_reaches_http(mock_http: Any, main_request: ModelRequest) -> None:
@@ -203,12 +207,14 @@ def test_granite_oversized_input_never_reaches_http(mock_http: Any, main_request
 
     requests = mock_http(lambda request: pytest.fail("Oversized input must not be sent"))
     client = OllamaModelClient()
+    assert client.admission_bytes(replace(main_request, user_content="x")) is None
+    assert requests == []
     oversized = replace(main_request, user_content="한" * 50000)
-    with pytest.raises(PermanentModelError, match="input"):
-        client.count_input_tokens(oversized)
-    with pytest.raises(PermanentModelError, match="input"):
+    with pytest.raises(PermanentModelError, match="byte budget"):
         client.complete(oversized)
     assert requests == []
+    assert not hasattr(client, "count_input_tokens")
+    assert not hasattr(client, "token_count_receipt")
 
 
 @pytest.mark.parametrize("response", [
@@ -624,11 +630,7 @@ def test_cli_profile_wires_client_without_changing_offline_default(
     })
 
     def handler(request: httpx.Request) -> httpx.Response:
-        count_only = json.loads(request.content)["options"]["num_predict"] == 1
-        return httpx.Response(200, json=chat_response(
-            "{" if count_only else result_body, eval_count=1 if count_only else 100,
-            done_reason="length" if count_only else "stop",
-        ))
+        return httpx.Response(200, json=chat_response(result_body, eval_count=100))
 
     requests = mock_http(handler)
     args = ["review", "--repo", str(repo), "--base", "a" * 40, "--format", "json"]
@@ -646,4 +648,5 @@ def test_cli_profile_wires_client_without_changing_offline_default(
     else:
         assert result["status"] == "completed", result["validation_errors"]
         assert result["model"]["model"] == MAIN
-        assert [r.url.path for r in requests] == ["/api/show", "/api/chat", "/api/chat"]
+        assert [r.url.path for r in requests] == ["/api/show", "/api/chat"]
+        assert sum(r.url.path == "/api/chat" for r in requests) == 1

@@ -35,6 +35,7 @@ def test_review_guidance_reaches_multi_page_review_but_not_tev_or_factual_contro
 
         review = PartitionModelClient(counter=count, transform=force_one_factual_correction)
         review.profile = replace(review.profile, max_input_tokens=350, max_output_tokens=512)
+        assert not hasattr(review, "token_count_receipt")
         tev = PartitionModelClient()
         result = run_partition_review(task, "intent", review, tev,
             limits=PartitionReviewLimits(max_calls=128, max_total_tokens=1000000),
@@ -43,6 +44,13 @@ def test_review_guidance_reaches_multi_page_review_but_not_tev_or_factual_contro
         assert len(result.partition["integration_pages"]) > 1
         assert result.partition["global_review"]["attempts"]
         assert rewritten
+        # Zero-measurement contract: admission via admission_bytes (counter),
+        # no metering calls; usage is generation-only.
+        assert result.usage["token_measurements"] == 0
+        assert result.usage["metering_input_tokens"] == 0
+        assert result.usage["metering_output_tokens"] == 0
+        assert all(record.token_measurement == "not_attempted" or record.measured_input_tokens is not None
+            for record in result.stages)
         validate_partition_result(result, task)
         return review, tev
 

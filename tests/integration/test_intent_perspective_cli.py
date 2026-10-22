@@ -89,12 +89,8 @@ def test_actual_adapters_use_closed_choices_native_measurement_and_shared_admiss
             return httpx.Response(200, json={"total_slots": 1 if local else 2, "chat_template": "synthetic-intent-template",
                 "default_generation_settings": {"n_ctx": 32768 if local else 131072 if selector else 131072}})
         payload = json.loads(request.content)
-        if request.url.path == "/apply-template":
-            if selector:
-                assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-            return httpx.Response(200, json={"prompt": json.dumps(payload["messages"])})
-        if request.url.path == "/tokenize":
-            return httpx.Response(200, json={"tokens": list(range(100))})
+        if request.url.path in ("/apply-template", "/tokenize"):
+            raise AssertionError(f"measurement endpoint must never be called: {request.url.path}")
         assert request.url.path == "/v1/chat/completions"
         task = json.loads(payload["messages"][1]["content"])
         assert set(payload["response_format"]) == {"type", "json_schema"}
@@ -121,18 +117,35 @@ def test_actual_adapters_use_closed_choices_native_measurement_and_shared_admiss
     state = tmp_path / "admission"
     monkeypatch.setenv("REVIEW_BOT_MACBOOK_MODEL_STATE_DIR" if local else "REVIEW_BOT_MODEL_STATE_DIR", str(state))
     out = tmp_path / "native-result"
+    # me707 (128K budget) completes; macbook (32K budget) stops fail-closed
+    # at final_review when the byte-upper-bound exceeds its input budget.
+    # No measurement call exists on either profile.
+    expected_exit = 0 if not local else 1
     assert cli.main(["intent", "--input", str(fixed_input(tmp_path)), "--output", str(out),
-        "--pipeline", "perspectives-v1", "--model-profile", profile]) == 0
+        "--pipeline", "perspectives-v1", "--model-profile", profile]) == expected_exit
     generations = [request for request in requests if request.url.path == "/v1/chat/completions"]
-    assert [request.url.port for request in generations] == [18137] * 8 + [18135] * 2
+    assert not any(request.url.path in ("/apply-template", "/tokenize") for request in requests)
     result = json.loads((out / "B/result.json").read_text())
-    assert result["usage"]["calls"] == result["usage"]["model_calls"] == 10
-    assert (result["usage"]["input_tokens"], result["usage"]["output_tokens"]) == (1000, 240)
-    assert result["usage"]["usage_complete"] is True
     assert result["model"]["is_mock"] is False
+    assert all(row["token_measurement"] == "not_attempted" for row in result["stages"])
     assert all(row["token_measurement_model_calls"] == 0 for row in result["stages"])
     assert all(row["decision"] == "undetermined" for row in result["selection"])
-    assert all(row["decision"] == "apply" for row in result["perspectives"])
+    if local:
+        completed = [row for row in result["stages"] if row["attempts"]]
+        assert [request.url.port for request in generations] == [18137] * 8 + [18135] * 1
+        assert result["status"] == "not_run" and result["reason"] == "input_limit_exceeded"
+        assert result["usage"]["calls"] == len(completed) == 9
+        # The refused admission leaves no attempt, so known usage stays exact.
+        assert result["usage"]["input_tokens"] == 900
+        assert result["usage"]["usage_complete"] is True
+        assert result["stages"][-1]["stage"] == "final_review"
+        assert result["stages"][-1]["reason"] == "input_limit_exceeded"
+    else:
+        assert [request.url.port for request in generations] == [18137] * 8 + [18135] * 2
+        assert result["usage"]["calls"] == result["usage"]["model_calls"] == 10
+        assert (result["usage"]["input_tokens"], result["usage"]["output_tokens"]) == (1000, 240)
+        assert result["usage"]["usage_complete"] is True
+        assert all(row["decision"] == "apply" for row in result["perspectives"])
     with sqlite3.connect(state / "requests.sqlite") as db:
         assert db.execute("SELECT COUNT(*) FROM model_admission").fetchone()[0] == 0
 

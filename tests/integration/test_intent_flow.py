@@ -352,6 +352,12 @@ def test_b_not_run_is_explicit_and_does_not_shrink_scope(intent_flow, case, monk
         use_modes(flow, ("intent",), context_paths=["tests/test_app.py", "tests/missing.py"])
         expected = "incomplete_code_input"
     elif case == "overflow":
+        # The overflow budget must bind the planning path: a 100-byte
+        # transport cap refuses every admission probe without any client
+        # call, and single-character probes still exceed the envelope, so
+        # partitioning fails closed with the fixed budget reason.
+        small = flow.planning_model.profile.__class__("mock", "small-profile", 100, is_mock=True)
+        flow.planning_model.profile = small
         flow.model.profile = flow.model.profile.__class__("mock", "small-profile", 100, is_mock=True)
         expected = "fixed_request_exceeds_input_budget"
     else:

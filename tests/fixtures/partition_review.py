@@ -55,6 +55,15 @@ class PartitionModelClient:
         self.count_requests.append(request)
         return self.counter(request) if self.counter else 100
 
+    def admission_bytes(self, request):
+        """Zero-measurement admission bound: exact-wire byte upper bound."""
+        if type(self).count_input_tokens is not PartitionModelClient.count_input_tokens:
+            return self.count_input_tokens(request)
+        self.count_requests.append(request)
+        if self.counter is not None:
+            return self.counter(request)
+        return 100
+
     def complete(self, request):
         self.requests.append(request)
         payload = json.loads(request.user_content)
@@ -178,3 +187,4 @@ class PartitionModelClient:
             body = self.transform(payload, body)
         return body if isinstance(body, ModelResponse) else ModelResponse(json.dumps(body, ensure_ascii=False),
             {"input_tokens": self.count_input_tokens(request), "output_tokens": 10})
+

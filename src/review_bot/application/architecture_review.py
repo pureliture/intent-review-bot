@@ -77,7 +77,7 @@ class UnconfiguredModelClient:
     def complete(self, request: ModelRequest) -> ModelResponse:
         raise PermanentModelError("No model connection is configured")
 
-    def count_input_tokens(self, request: ModelRequest) -> int:
+    def admission_bytes(self, request: ModelRequest) -> int:
         raise NotImplementedError("No model-specific tokenizer is configured")
 
 
@@ -109,10 +109,14 @@ class MockModelClient:
             raise resp
         return resp
 
-    def count_input_tokens(self, request: ModelRequest) -> int:
-        if self.input_tokens is None:
-            raise NotImplementedError("Mock token counting requires an explicit fixture count")
-        return self.input_tokens
+    def admission_bytes(self, request: ModelRequest) -> int:
+        """Test-only admission bound: canonical request bytes, no reserve.
+
+        Production adapters return exact wire bytes plus their framing
+        reserve. Mocks return bare canonical size so tests control exact
+        admission behavior. No HTTP, no measurement call.
+        """
+        return len(_json(asdict(request)).encode("utf-8"))
 
 
 def _hash_json(value: object) -> str:
@@ -701,24 +705,14 @@ def run_review_a_pipeline(
     if not review_signals:
         return _make_result(task_input, "not_run", "no_review_targets", profile=active_profile)
 
-    # 4. Request limits check
+    # 4. Request limits check. No measurement call exists: the byte gate
+    # below admits transport-feasible requests and the adapter's
+    # exact-wire byte-upper-bound gate inside complete() proves the
+    # input-token budget pre-send. Response usage is validated post-send.
     request = build_model_request(task_input, active_profile)
     req_bytes = len(_json(asdict(request)).encode("utf-8"))
     if req_bytes > active_profile.max_input_bytes:
         return _make_result(task_input, "not_run", "input_limit_exceeded", profile=active_profile)
-
-    if active_profile.max_input_tokens is not None:
-        if hasattr(client, "count_input_tokens"):
-            try:
-                tokens = client.count_input_tokens(request)
-                if not isinstance(tokens, int) or tokens < 0:
-                    raise ValueError("Invalid token count")
-                if tokens > active_profile.max_input_tokens:
-                    return _make_result(task_input, "not_run", "input_limit_exceeded", profile=active_profile)
-            except (RuntimeError, ValueError, TypeError, NotImplementedError, OSError):
-                return _make_result(task_input, "not_run", "token_count_unavailable", profile=active_profile)
-        else:
-            return _make_result(task_input, "not_run", "token_count_unavailable", profile=active_profile)
 
     prompt_hash = _hash_json({"system": request.system_prompt, "response_schema": request.response_schema})
 
@@ -728,6 +722,15 @@ def run_review_a_pipeline(
         try:
             response = client.complete(request)
             break
+        except ModelInputCapacityError as exc:
+            return _make_result(
+                task_input,
+                "not_run",
+                "input_limit_exceeded",
+                errors=(str(exc),),
+                profile=active_profile,
+                prompt_hash=prompt_hash,
+            )
         except TimeoutError:
             if attempt + 1 == active_profile.max_attempts:
                 return _make_result(task_input, "failed", "model_timeout", profile=active_profile, prompt_hash=prompt_hash)
@@ -749,6 +752,15 @@ def run_review_a_pipeline(
 
     if not isinstance(response, ModelResponse):
         return _make_result(task_input, "failed", "invalid_model_response", profile=active_profile, prompt_hash=prompt_hash)
+
+    # Post-send usage guard: the adapter proves the input budget pre-send,
+    # but a bypassed or misbehaving transport must still fail closed here.
+    usage = response.usage
+    if isinstance(usage, dict) and type(usage.get("input_tokens")) is int:
+        cap = active_profile.max_input_tokens
+        if cap is not None and usage["input_tokens"] > cap:
+            return _make_result(task_input, "failed", "usage_limit_exceeded", profile=active_profile,
+                usage=usage, prompt_hash=prompt_hash)
 
     if len(response.text.encode("utf-8")) > active_profile.max_output_bytes:
         return _make_result(

@@ -4,14 +4,13 @@ from __future__ import annotations
 import ipaddress
 import json
 import math
-import threading
 import time
-from copy import deepcopy
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 
+from review_bot.adapters.byte_budget import FRAMING_RESERVE_TOKENS, precheck_byte_budget
 from review_bot.adapters.model_http import mark_model_request_sent, model_request_slot
 from review_bot.application.architecture_review import ModelProfile, PermanentModelError, TransientModelError, ModelOutputLimitError
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
@@ -192,13 +191,8 @@ class _LlamaCppClient:
             raise TimeoutError("llama.cpp request timed out")
         return remaining
 
-    def _record_delivery(self, delivery: str) -> None:
-        self._receipts.value = {
-            "delivery": delivery, "model_calls": 0, "usage": {"input_tokens": 0, "output_tokens": 0},
-        }
-
     def _request(
-        self, method: str, path: str, deadline: float, payload: dict[str, Any] | None = None, *, measurement: bool = False,
+        self, method: str, path: str, deadline: float, payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         content = _encode(payload) if payload is not None else None
         if content is not None and len(content) > _MAX_INPUT_BYTES:
@@ -211,12 +205,8 @@ class _LlamaCppClient:
                 try:
                     with httpx.Client(trust_env=False, follow_redirects=False, timeout=self._remaining(deadline)) as client:
                         timeout = self._remaining(deadline)
-                        if measurement:
-                            self._record_delivery("unknown")
                         mark_model_request_sent(ticket)
                         with client.stream(method, self._origin + path, content=content, headers=headers, timeout=timeout) as response:
-                            if measurement:
-                                self._record_delivery("sent")
                             status = response.status_code
                             self._remaining(deadline)
                             length = response.headers.get("Content-Length")
@@ -318,28 +308,13 @@ class _LlamaCppClient:
             raise PermanentModelError("llama.cpp input exceeds transport byte limit")
         return _json_object(encoded)
 
-    def _measure(self, payload: dict[str, Any], deadline: float, *, measurement: bool = False) -> int:
-        """The server template supplies framing; response_format constrains sampling, not prompt text.
+    def admission_bytes(self, request: ModelRequest) -> int:
+        """Exact chat-payload bytes plus framing reserve: a proven token upper bound.
 
-        No tools or template overrides are used. Native string-prompt tokenization
-        uses model special-token insertion and parses the template's special tokens.
-        Unsupported formatting/tokenization fails closed; counts are never cached.
+        Pure local computation; no HTTP, no measurement call.
         """
-        template_input = {"messages": payload["messages"]}
-        if "chat_template_kwargs" in payload:
-            template_input["chat_template_kwargs"] = payload["chat_template_kwargs"]
-        formatted = self._request("POST", "/apply-template", deadline, template_input, measurement=measurement)
-        prompt = formatted.get("prompt")
-        if not isinstance(prompt, str) or not prompt:
-            raise PermanentModelError("Unsupported llama.cpp chat template response")
-        tokenization = self._request("POST", "/tokenize", deadline, {
-            "content": prompt, "add_special": True, "parse_special": True, "with_pieces": False,
-        }, measurement=measurement)
-        tokens = tokenization.get("tokens")
-        if not isinstance(tokens, list) or not tokens or any(type(token) is not int or token < 0 for token in tokens):
-            raise PermanentModelError("Unsupported llama.cpp native tokenization response")
-        self._remaining(deadline)
-        return len(tokens)
+        payload = self._chat_payload(request)
+        return len(_encode(payload)) + FRAMING_RESERVE_TOKENS
 
     def _check_output(self, value: dict[str, Any], payload: dict[str, Any]) -> None:
         try:
@@ -347,7 +322,7 @@ class _LlamaCppClient:
         except RecursionError:
             raise PermanentModelError("Invalid llama.cpp model output nesting") from None
 
-    def _response(self, data: dict[str, Any], payload: dict[str, Any], measured: int) -> ModelResponse:
+    def _response(self, data: dict[str, Any], payload: dict[str, Any]) -> ModelResponse:
         choices = data.get("choices")
         if data.get("model") != self.model or not isinstance(choices, list) or len(choices) != 1:
             raise PermanentModelError("Invalid llama.cpp chat response model or choices")
@@ -383,9 +358,9 @@ class _LlamaCppClient:
             raise error
         value = _json_object(text)
         self._check_output(value, payload)
-        return ModelResponse(text, self._validated_usage(data, payload, measured))
+        return ModelResponse(text, self._validated_usage(data, payload))
 
-    def _validated_usage(self, data, payload, measured):
+    def _validated_usage(self, data, payload):
         choices = data.get("choices")
         if data.get("model") != self.model or not isinstance(choices, list) or len(choices) != 1 or (
             not isinstance(choices[0], dict) or type(choices[0].get("index")) is not int or choices[0]["index"] != 0):
@@ -397,12 +372,12 @@ class _LlamaCppClient:
         output_tokens = _count(usage.get("completion_tokens"))
         total_tokens = _count(usage.get("total_tokens"))
         if (
-            input_tokens != measured or input_tokens > self._max_input_tokens
+            input_tokens > self._max_input_tokens
             or output_tokens > payload["max_tokens"] or total_tokens != input_tokens + output_tokens
             or ("truncated" in data and data["truncated"] is not False)
-            or ("tokens_evaluated" in data and _count(data["tokens_evaluated"]) != measured)
+            or ("tokens_evaluated" in data and _count(data["tokens_evaluated"]) != input_tokens)
         ):
-            raise PermanentModelError("llama.cpp usage or truncation does not match native token preflight")
+            raise PermanentModelError("llama.cpp usage exceeds budget or truncation was detected")
         details = usage.get("prompt_tokens_details")
         if details is not None:
             if not isinstance(details, dict) or _count(details.get("cached_tokens")) > input_tokens:
@@ -410,7 +385,7 @@ class _LlamaCppClient:
         if "timings" in data:
             timings = data["timings"]
             if (
-                not isinstance(timings, dict) or _count(timings.get("cache_n")) + _count(timings.get("prompt_n")) != measured
+                not isinstance(timings, dict) or _count(timings.get("cache_n")) + _count(timings.get("prompt_n")) != input_tokens
                 or _count(timings.get("predicted_n")) != output_tokens
             ):
                 raise PermanentModelError("llama.cpp timings do not match model usage")
@@ -420,12 +395,14 @@ class _LlamaCppClient:
         deadline = self._deadline(request)
         payload = self._chat_payload(request)
         self._verify(deadline)
-        measured = self._measure(payload, deadline)
-        if measured > self._max_input_tokens:
-            raise PermanentModelError("llama.cpp input exceeds native token budget; truncation is forbidden")
+        # Fail-closed byte-upper-bound pre-gate. No measurement call exists.
+        precheck_byte_budget(len(_encode(payload)), payload["max_tokens"],
+            app_input_tokens=self._max_input_tokens, app_output_tokens=self._max_output_tokens,
+            model_context_tokens=self._context_tokens, role="llama.cpp",
+            framing_reserve_tokens=FRAMING_RESERVE_TOKENS)
         data = self._request("POST", "/v1/chat/completions", deadline, payload)
         try:
-            response = self._response(data, payload, measured)
+            response = self._response(data, payload)
             self._remaining(deadline)
             return response
         except (PermanentModelError, TimeoutError) as error:
@@ -433,7 +410,7 @@ class _LlamaCppClient:
             # validated resource receipt when HTTP completed, instead of turning
             # known consumption into an unknown-delivery event.
             try:
-                usage = self._validated_usage(data, payload, measured)
+                usage = self._validated_usage(data, payload)
             except PermanentModelError:
                 pass
             else:
@@ -469,19 +446,7 @@ class LlamaCppModelClient(_LlamaCppClient):
             timeout_seconds=timeout_seconds, max_attempts=max_attempts, max_input_tokens=self._max_input_tokens,
             max_output_tokens=self._role_max_output_tokens,
         )
-        self._receipts = threading.local()
-
-    @property
-    def token_count_receipt(self) -> dict[str, Any] | None:
-        """A caller-local receipt for tokenizer transport, never a generation or usage receipt."""
-        return deepcopy(getattr(self._receipts, "value", None))
-
-    def count_input_tokens(self, request: ModelRequest) -> int:
-        self._record_delivery("not_sent")
-        deadline = self._deadline(request)
-        payload = self._chat_payload(request)
-        self._verify(deadline)
-        return self._measure(payload, deadline, measurement=True)
+        pass
 
 
 class LlamaCppDecisionClient(_LlamaCppClient):

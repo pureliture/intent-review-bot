@@ -642,13 +642,13 @@ def run_code_first_review(
     if not task.reviewed_paths:
         return finish("not_run", "no_review_targets")
     output = profile.max_output_tokens
-    call_reservation = 1 if profile.is_mock else 2
+    call_reservation = 2
     joint = _joint_plan(task)
     request, _ = _request(task, "observe_group", profile, limits, group=joint["groups"][0],
         supplied=_material(task, list(task.reviewed_paths)))
-    count, index = budget.measure(request, model_client, profile, label="full_input_admission",
+    admitted, index = budget.measure(request, model_client, profile, label="full_input_admission",
         reserve_calls=3 * call_reservation, reserve_tokens=2 * output, generate=False)
-    full_fits = count is not None
+    full_fits = admitted
     if not full_fits and budget.records[index].reason != "input_limit_exceeded":
         return stopped(index)
     if planning_client is not None and planner_profile is not None:

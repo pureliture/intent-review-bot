@@ -77,7 +77,10 @@ def build_review_client(profile: str | None, settings: ModelConfig | None = None
         client = OpenRouterReviewClient(api_key=_openrouter_key(profile), origin=_openrouter_origin(),
             model=_openrouter_model("OPENROUTER_REVIEW_MODEL", OPENROUTER_REVIEW_MODEL_DEFAULT, profile),
             timeout_seconds=settings.call_timeout_seconds, max_output_bytes=settings.max_output_bytes,
-            max_attempts=settings.max_attempts)
+            max_attempts=settings.max_attempts, app_input_tokens=settings.review_input_tokens,
+            app_output_tokens=settings.review_output_tokens,
+            framing_reserve_tokens=settings.framing_reserve_tokens,
+            max_transport_bytes=settings.max_transport_bytes)
     elif profile == LLAMACPP_PROFILE:
         client = LlamaCppModelClient(api_url=_endpoint("ME707_BONSAI_BASE_URL"), **options)
     elif profile == MACBOOK_LLAMACPP_PROFILE:
@@ -106,7 +109,10 @@ def build_selector_client(profile: str | None, settings: ModelConfig | None = No
     elif profile == OPENROUTER_DECISION_PROFILE:
         client = OpenRouterDecisionClient(api_key=_openrouter_key(profile), origin=_openrouter_origin(),
             model=_openrouter_model("OPENROUTER_DECISION_MODEL", OPENROUTER_DECISION_MODEL_DEFAULT, profile),
-            timeout_seconds=settings.call_timeout_seconds)
+            timeout_seconds=settings.call_timeout_seconds, app_input_tokens=settings.decision_input_tokens,
+            app_output_tokens=settings.decision_output_tokens,
+            framing_reserve_tokens=settings.framing_reserve_tokens,
+            max_transport_bytes=settings.max_transport_bytes)
     elif profile == LLAMACPP_PROFILE:
         client = LlamaCppDecisionClient(
             api_url=_endpoint("ME707_TEV1_BASE_URL"), timeout_seconds=settings.call_timeout_seconds,
@@ -142,7 +148,10 @@ def build_planning_client(profile: str | None, settings: ModelConfig | None = No
         return OpenRouterReviewClient(api_key=_openrouter_key(profile), origin=_openrouter_origin(),
             model=_openrouter_model("OPENROUTER_REVIEW_MODEL", OPENROUTER_REVIEW_MODEL_DEFAULT, profile),
             timeout_seconds=settings.call_timeout_seconds, max_output_bytes=settings.max_output_bytes,
-            max_attempts=settings.max_attempts)
+            max_attempts=settings.max_attempts, app_input_tokens=settings.review_input_tokens,
+            app_output_tokens=settings.review_output_tokens,
+            framing_reserve_tokens=settings.framing_reserve_tokens,
+            max_transport_bytes=settings.max_transport_bytes)
     options = dict(api_url=_endpoint(variable, profile), timeout_seconds=settings.call_timeout_seconds,
         max_output_bytes=settings.max_output_bytes, max_attempts=settings.max_attempts)
     if profile == BEAM_CLOUD_TEV4B_PROFILE:
@@ -169,7 +178,10 @@ def build_intent_selection_client(profile: str | None, settings: ModelConfig | N
         client = _IntentReviewClient(api_key=_openrouter_key(profile), origin=_openrouter_origin(),
             model=_openrouter_model("OPENROUTER_REVIEW_MODEL", OPENROUTER_REVIEW_MODEL_DEFAULT, profile),
             timeout_seconds=settings.call_timeout_seconds, max_output_bytes=min(settings.max_output_bytes, 512),
-            max_attempts=1)
+            max_attempts=1, app_input_tokens=settings.review_input_tokens,
+            app_output_tokens=settings.review_output_tokens,
+            framing_reserve_tokens=settings.framing_reserve_tokens,
+            max_transport_bytes=settings.max_transport_bytes)
         client.request_admission = default_model_admission(settings.max_concurrency)
         return client
     if profile not in (LLAMACPP_PROFILE, *MACBOOK_PROFILES):

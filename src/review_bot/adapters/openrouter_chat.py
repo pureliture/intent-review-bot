@@ -45,6 +45,7 @@ from review_bot.application.architecture_review import (
     PermanentModelError,
     TransientModelError,
 )
+from review_bot.application.model_wire_contract import compact_schema
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 
 OPENROUTER_REVIEW_PROFILE = "openrouter-review"
@@ -61,6 +62,34 @@ def _positive(value: Any) -> bool:
     return type(value) is int and value > 0
 
 
+def review_wire_payload(request: ModelRequest) -> tuple[dict[str, Any], int]:
+    """Pure OpenRouter chat wire builder shared by transport and fingerprinting.
+
+    No HTTP. Raises PermanentModelError on contract violations.
+    Returns (payload, max_output_tokens).
+    """
+    if (not isinstance(request, ModelRequest) or not isinstance(request.model, str)
+            or not isinstance(request.system_prompt, str) or not isinstance(request.user_content, str)
+            or not isinstance(request.response_schema, dict) or request.reasoning_budget_tokens is not None):
+        raise PermanentModelError("Invalid OpenRouter review request contract")
+    maximum = request.max_output_tokens if request.max_output_tokens is not None else APP_OUTPUT_TOKENS
+    if type(maximum) is not int or not 0 < maximum <= APP_OUTPUT_TOKENS:
+        raise PermanentModelError("Invalid OpenRouter review output reservation")
+    schema = compact_schema(request.response_schema)
+    contract = ("\n\nReturn exactly one JSON object matching this entire response schema. "
+        "Do not add prose or fields.\n"
+        + encode(schema).decode("utf-8"))
+    payload = {"model": request.model, "messages": [
+            {"role": "system", "content": request.system_prompt + contract},
+            {"role": "user", "content": request.user_content}],
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "review_bot", "strict": True, "schema": schema}},
+        "stream": False, "temperature": 0, "max_tokens": maximum}
+    # Canonicalize through the shared encoder so the fingerprinted bytes
+    # equal the transmitted bytes.
+    return json.loads(encode(payload).decode("utf-8")), maximum
+
+
 class OpenRouterReviewClient:
     """Validation-phase review LLM; one generation per complete, never metered."""
 
@@ -69,6 +98,8 @@ class OpenRouterReviewClient:
             max_output_bytes: int = 32768, max_attempts: int = 1,
             app_input_tokens: int = APP_INPUT_TOKENS,
             app_output_tokens: int = APP_OUTPUT_TOKENS,
+            framing_reserve_tokens: int = 8192,
+            max_transport_bytes: int = _TRANSPORT_BYTES,
     ) -> None:
         if not isinstance(model, str) or not model.strip() or len(model) > 256:
             raise ValueError("An explicit OpenRouter review model is required")
@@ -76,15 +107,21 @@ class OpenRouterReviewClient:
             raise ValueError("OPENROUTER_API_KEY must be set for openrouter-review")
         if not _positive(timeout_seconds) or not math.isfinite(timeout_seconds):
             raise ValueError("OpenRouter review timeout must be positive and finite")
-        if not _positive(max_output_bytes) or max_output_bytes > _TRANSPORT_BYTES or not _positive(max_attempts):
+        if not _positive(max_output_bytes) or max_output_bytes > max_transport_bytes or not _positive(max_attempts):
             raise ValueError("OpenRouter review output and attempt limits must be positive and bounded")
         if not _positive(app_input_tokens) or not _positive(app_output_tokens):
             raise ValueError("OpenRouter review app budget must be positive")
+        if type(framing_reserve_tokens) is not int or framing_reserve_tokens < 0:
+            raise ValueError("OpenRouter review framing reserve must be a non-negative integer")
+        if type(max_transport_bytes) is not int or max_transport_bytes <= 0:
+            raise ValueError("OpenRouter review transport byte limit must be positive")
         self.model = model
         self._api_key = api_key.strip()
         self.origin = base_url(origin)
         self.timeout_seconds = timeout_seconds
-        self.profile = ModelProfile("openrouter", model, max_input_bytes=_TRANSPORT_BYTES,
+        self._framing_reserve_tokens = framing_reserve_tokens
+        self._max_transport_bytes = max_transport_bytes
+        self.profile = ModelProfile("openrouter", model, max_input_bytes=max_transport_bytes,
             max_output_bytes=max_output_bytes, timeout_seconds=timeout_seconds, max_attempts=max_attempts,
             max_input_tokens=app_input_tokens, max_output_tokens=app_output_tokens)
         self._verified_until = 0.0
@@ -129,27 +166,19 @@ class OpenRouterReviewClient:
         self.verify()
 
     def _payload(self, request: ModelRequest) -> tuple[dict[str, Any], int]:
-        if (not isinstance(request, ModelRequest) or request.model != self.model
-                or not isinstance(request.system_prompt, str) or not isinstance(request.user_content, str)
-                or not isinstance(request.response_schema, dict) or request.reasoning_budget_tokens is not None):
+        if not isinstance(request, ModelRequest) or request.model != self.model:
             raise PermanentModelError("Invalid OpenRouter review request contract")
-        maximum = request.max_output_tokens if request.max_output_tokens is not None else APP_OUTPUT_TOKENS
-        if type(maximum) is not int or not 0 < maximum <= APP_OUTPUT_TOKENS:
-            raise PermanentModelError("Invalid OpenRouter review output reservation")
-        contract = ("\n\nReturn exactly one JSON object matching this entire response schema. "
-            "Do not add prose or fields.\n"
-            + encode(request.response_schema).decode("utf-8"))
-        payload = {"model": self.model, "messages": [
-                {"role": "system", "content": request.system_prompt + contract},
-                {"role": "user", "content": request.user_content}],
-            "response_format": {"type": "json_schema", "json_schema": {
-                "name": "review_bot", "strict": True, "schema": request.response_schema}},
-            "stream": False, "temperature": 0, "max_tokens": maximum}
-        try:
-            body = encode(payload)
-        except PermanentModelError:
-            raise PermanentModelError("Invalid OpenRouter review JSON") from None
-        return payload, maximum
+        return review_wire_payload(request)
+
+    def admission_bytes(self, request: ModelRequest) -> int:
+        """Exact chat wire bytes plus framing reserve: a proven token upper bound.
+
+        Pure local computation; no HTTP, no measurement call.
+        """
+        if not isinstance(request, ModelRequest) or request.model != self.model:
+            raise PermanentModelError("Invalid OpenRouter review request contract")
+        payload, _ = review_wire_payload(request)
+        return len(encode(payload)) + self._framing_reserve_tokens
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         deadline = self._deadline(request)
@@ -157,10 +186,12 @@ class OpenRouterReviewClient:
             model_context = self._verify(deadline)
         payload, maximum = self._payload(request)
         body = encode(payload)
+        if len(body) > self._max_transport_bytes:
+            raise PermanentModelError("OpenRouter review input exceeds transport byte limit")
         # Fail-closed byte-upper-bound pre-gate. No measurement call exists.
         precheck_byte_budget(len(body), maximum, app_input_tokens=self.profile.max_input_tokens,
             app_output_tokens=self.profile.max_output_tokens, model_context_tokens=model_context,
-            role="OpenRouter review")
+            framing_reserve_tokens=self._framing_reserve_tokens, role="OpenRouter review")
         data = self._post(payload, body, deadline)
         message = data.get("choices", [{}])[0].get("message") if isinstance(data.get("choices"), list) and len(data.get("choices")) == 1 else None
         if data.get("model") != self.model or not isinstance(message, dict):
@@ -205,7 +236,7 @@ class OpenRouterReviewClient:
                             chunks = bytearray()
                             for chunk in response.iter_bytes():
                                 self._remaining(deadline)
-                                if len(chunks) + len(chunk) > _TRANSPORT_BYTES:
+                                if len(chunks) + len(chunk) > self._max_transport_bytes:
                                     raise PermanentModelError("OpenRouter review response exceeds byte limit")
                                 chunks.extend(chunk)
                             self._remaining(deadline)

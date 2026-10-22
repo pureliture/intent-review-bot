@@ -85,23 +85,12 @@ class ControlledLlamaHTTP:
             return httpx.Response(200, json=body)
         assert request.method == "POST"
         payload = json.loads(request.content)
-        if path == "/tokenize":
-            assert set(payload) == {"content", "add_special", "parse_special", "with_pieces"}
-            assert payload["add_special"] is True and payload["parse_special"] is True
-            assert payload["with_pieces"] is False
-            with self.condition:
-                assert payload["content"] in self.prompts
-                self.tokenized.add(payload["content"])
-            return httpx.Response(200, json={"tokens": list(range(100))})
+        if path in ("/apply-template", "/tokenize"):
+            raise AssertionError(f"measurement endpoint must never be called: {path}")
         messages = payload["messages"]
         assert len(messages) == 2 and [item["role"] for item in messages] == ["system", "user"]
         assert all(set(item) == {"role", "content"} and isinstance(item["content"], str) for item in messages)
         prompt = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
-        if path == "/apply-template":
-            assert set(payload) == {"messages"}
-            with self.condition:
-                self.prompts.add(prompt)
-            return httpx.Response(200, json={"prompt": prompt})
         assert path == "/v1/chat/completions"
         assert payload["model"] == REVIEW_MODEL
         assert payload["stream"] is False and payload["temperature"] == payload["seed"] == 0
@@ -116,7 +105,7 @@ class ControlledLlamaHTTP:
         data = json.loads(model_request.user_content)
         assert data["stage"] in STAGES
         with self.condition:
-            assert prompt in self.tokenized, "Generation must use the measured system/user messages"
+            self.prompts.add(prompt)
             self.requests.append(model_request)
             gate = None
             if data["stage"] == self.hold_stage and len(self.held) < self.hold_limit:
@@ -349,9 +338,12 @@ def assert_private_result(flow, run, *, publication="artifact_only"):
     review_stages = [stage for stage in result["stages"] if stage["attempts"]]
     assert [stage["stage"].split(":")[0] for stage in review_stages] == list(STAGES)
     for stage in review_stages:
-        assert stage["measured_input_tokens"] == 100 and len(stage["attempts"]) == 1
-        assert stage["token_measurement_delivery"] == "sent" and stage["token_measurement_model_calls"] == 0
-        assert stage["token_measurement_usage"] == {"input_tokens": 0, "output_tokens": 0}
+        # Zero-measurement admission: bound int recorded, no metering fields.
+        assert type(stage["measured_input_tokens"]) is int and len(stage["attempts"]) == 1
+        assert stage["token_measurement"] == "not_attempted"
+        assert stage["token_measurement_delivery"] == "not_attempted"
+        assert stage["token_measurement_model_calls"] == 0
+        assert stage["token_measurement_usage"] is None
         assert stage["attempts"][0]["usage"] == {"input_tokens": 100, "output_tokens": 50}
     assert result["usage"]["usage_complete"] is True
     assert result["usage"]["calls"] == sum(len(s["attempts"]) for s in result["stages"])
@@ -408,7 +400,7 @@ def test_four_signed_prs_run_on_two_workers_with_private_b_artifacts(concurrency
     assert len(flow.readers) == 4 and {item[0] for item in flow.readers} == {run["run_id"] for run in completed}
     assert all(item[2:] == (flow.base, flow.head) for item in flow.readers)
     assert Counter(json.loads(request.user_content)["stage"] for request in flow.http.requests) == {stage: 4 for stage in STAGES}
-    assert {path for _, path in flow.http.calls} == {"/v1/models", "/props", "/apply-template", "/tokenize", "/v1/chat/completions"}
+    assert {path for _, path in flow.http.calls} == {"/v1/models", "/props", "/v1/chat/completions"}
     assert flow.http.peak == 2 and flow.http.active == 0 and admission_states(flow) == []
     assert flow.store.claim_next_run("synthetic-drained-claim", 30) is None
     deliveries = flow.store._get_connection().execute(

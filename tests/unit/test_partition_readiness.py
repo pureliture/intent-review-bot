@@ -45,7 +45,7 @@ def test_readiness_checks_rootless_analysis_and_two_bounded_model_requests(tmp_p
     def client_factory(*args):
         client = Mock()
         client.profile = ModelProfile("llamacpp", "bounded-probe", max_output_tokens=32678)
-        client.count_input_tokens.return_value = 20
+        client.admission_bytes.return_value = 20
         client.complete.side_effect = lambda request: ModelResponse(
             '{"choice":"A"}' if "choice" in request.response_schema["properties"] else '{"ok":true}',
             {"input_tokens": 20, "output_tokens": 4})

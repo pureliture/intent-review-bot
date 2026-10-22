@@ -17,7 +17,7 @@ from review_bot.application.delta import build_delta
 from review_bot.application.intent_context import build_intent_task_input
 from review_bot.application.architecture_review import ModelProfile, build_system_prompt, run_review_a_pipeline
 from review_bot.application.model_execution import ModelExecutionBudget
-from review_bot.application.model_wire_contract import beam_wire_payload
+from review_bot.adapters.openrouter_chat import review_wire_payload
 from review_bot.application.partition_choices import plan_candidates
 from review_bot.application.partition_integration import native_integration_pages
 from review_bot.application.review_fact_check import run as run_fact_verification
@@ -52,7 +52,7 @@ def architecture_input_fingerprint(snapshot, classification, config, client, *, 
             return hash_json({"schema": "partition-evaluation/architecture", "snapshot": asdict(snapshot),
                 "classification": asdict(classification), "config": config.config_hash, "model": _profile(client),
                 "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, resolve_quote_citations, native_integration_pages, run_fact_verification, is_gradle_java_path,
-                    LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient, beam_wire_payload)})
+                    LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient, review_wire_payload)})
         architecture = config.architecture.model_dump(mode="json")
         ruleset = Path(architecture["ruleset_resource"])
         rules = ruleset.read_bytes() if ruleset.is_file() else resources.files("review_bot.resources").joinpath(architecture["ruleset_resource"]).read_bytes()
@@ -95,7 +95,7 @@ def intent_input_fingerprint(task, config, client, *, planning_client=None, sele
                 "trial": config.partition_evaluation.model_dump(mode="json"),
                 "language": config.output.language,
                 "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, resolve_quote_citations, native_integration_pages, run_fact_verification, is_gradle_java_path,
-                    LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient, beam_wire_payload)})
+                    LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient, review_wire_payload)})
         if config.intent.pipeline == "perspectives-v1":
             from review_bot.adapters.markdown.intent_perspective_formatter import format_intent_perspective_markdown
             from review_bot.application.intent_perspective_review import (
