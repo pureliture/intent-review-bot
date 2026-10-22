@@ -88,7 +88,7 @@ _STATUS_REASONS = {
         "The review material exceeds the available input capacity."),
     "model_output_limit": ("리뷰 응답이 길이 한도에 걸려 완전한 결과를 받지 못했습니다.",
         "The review response reached its length limit before a complete result was received."),
-    "usage_unavailable": ("모델 처리량을 확인할 수 없어 검토를 계속하지 못했습니다.",
+    "usage_unavailable": ("모델 요청의 토큰 사용량을 확인할 수 없어 검토를 계속하지 못했습니다.",
         "The review could not continue because model usage could not be confirmed."),
     "model_cancelled": ("모델 요청이 취소되어 검토를 마치지 못했습니다.",
         "The model request was cancelled before the review finished."),
@@ -106,6 +106,12 @@ _STATUS_REASONS = {
 
 def status_sections(result, *, ko=True, unreviewed=()) -> dict[str, str]:
     reason = _STATUS_REASONS.get(result.reason)
+    prefix = "partition_planning_failed:"
+    if reason is None and isinstance(result.reason, str) and result.reason.startswith(prefix):
+        known = _STATUS_REASONS.get(result.reason[len(prefix):])
+        if known is not None:
+            reason = ("초기 리뷰 계획을 확정하지 못했습니다. " + known[0],
+                "The initial review plan could not be established. " + known[1])
     if reason is None:
         # Pipeline error text may include provider responses or internal details.
         reason = ("리뷰를 완료하지 못했습니다. 실행 기록을 확인한 뒤 다시 검토해야 합니다.",
