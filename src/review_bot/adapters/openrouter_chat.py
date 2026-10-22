@@ -208,7 +208,17 @@ class OpenRouterReviewClient:
         if finish == "length" or text is None:
             error = ModelOutputLimitError("OpenRouter review reached its output limit")
             error.rejected_output = {"finish_reason": finish, "content": text}
-            error.delivery, error.usage = "sent", dict(_ZERO_USAGE)
+            # Preserve the real usage for accounting/diagnosis instead of
+            # zeroing it: a length truncation still consumed the reservation.
+            try:
+                error.usage = check_response_usage(data.get("usage"),
+                    app_input_tokens=self.profile.max_input_tokens,
+                    app_output_tokens=self.profile.max_output_tokens,
+                    model_context_tokens=model_context,
+                    max_output_tokens=maximum, role="OpenRouter review")
+            except PermanentModelError:
+                error.usage = dict(_ZERO_USAGE)
+            error.delivery = "sent"
             raise error
         if (finish != "stop" or message.get("role") != "assistant" or not isinstance(text, str)
                 or message.get("refusal") is not None):
