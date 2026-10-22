@@ -78,6 +78,7 @@ class BeamCloudModelClient:
 
     def __init__(self, model: str = BEAM_CLOUD_MODEL, *, api_url: str = "http://127.0.0.1:11434",
         timeout_seconds: int = 60, max_output_bytes: int = 32768, max_attempts: int = 1,
+        context_tokens: int = BEAM_CONTEXT_TOKENS,
     ) -> None:
         if model != BEAM_CLOUD_MODEL:
             raise ValueError("The explicit beam:cloud model is required")
@@ -85,11 +86,16 @@ class BeamCloudModelClient:
             raise ValueError("Beam cloud timeout must be positive and finite")
         if not _positive(max_output_bytes) or max_output_bytes > _TRANSPORT_BYTES or not _positive(max_attempts):
             raise ValueError("Beam cloud output and attempt limits must be positive and bounded")
+        if not _positive(context_tokens) or not BEAM_MAX_OUTPUT_TOKENS < context_tokens <= BEAM_CONTEXT_TOKENS:
+            raise ValueError("Beam cloud context cap must exceed the output reservation and fit native context")
         self.model, self.api_url = model, _endpoint(api_url)
         self.timeout_seconds = timeout_seconds
+        # This conservative application cap does not alter the native wire or
+        # paid full-prompt measurement on the verified 1M backend.
+        self.context_tokens = context_tokens
         self.profile = ModelProfile("ollama-cloud", model, max_input_bytes=_TRANSPORT_BYTES,
             max_output_bytes=max_output_bytes, timeout_seconds=timeout_seconds, max_attempts=max_attempts,
-            max_input_tokens=BEAM_CONTEXT_TOKENS - BEAM_MAX_OUTPUT_TOKENS,
+            max_input_tokens=context_tokens - BEAM_MAX_OUTPUT_TOKENS,
             max_output_tokens=BEAM_MAX_OUTPUT_TOKENS)
         self._verified_until = 0.0
         self._memo = {}

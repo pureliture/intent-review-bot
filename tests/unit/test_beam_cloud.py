@@ -136,12 +136,63 @@ def test_construction_is_offline_and_identity_is_explicit(monkeypatch):
     assert client.supports_native_input_measurement is True
     assert client.supports_bounded_reasoning is False
     assert (client.profile.provider, client.profile.model) == ("ollama-cloud", "beam:cloud")
+    assert client.context_tokens == BEAM_CONTEXT_TOKENS == 1048576
     assert client.profile.max_input_tokens == 1048576 - 32678
     assert client.profile.max_output_tokens == 32678 and client.profile.max_input_bytes == 16 * 1024 * 1024
     for options in ({"model": "beam"}, {"model": "other:cloud"}, {"api_url": "https://ollama.com"},
             {"api_url": "http://user:secret@localhost:11434"}, {"timeout_seconds": 0}, {"max_output_bytes": True}):
         with pytest.raises(ValueError):
             BeamCloudModelClient(**options)
+
+
+@pytest.mark.parametrize("cap", [None, True, False, 0, -1, BEAM_MAX_OUTPUT_TOKENS,
+    BEAM_MAX_OUTPUT_TOKENS - 1, BEAM_CONTEXT_TOKENS + 1, 131072.0, "131072"])
+def test_simulated_context_cap_rejects_invalid_or_unbounded_values_offline(monkeypatch, cap):
+    monkeypatch.setattr(httpx, "Client", lambda **kw: pytest.fail("Invalid cap must not access HTTP"))
+    with pytest.raises(ValueError, match="context cap"):
+        BeamCloudModelClient(context_tokens=cap)
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_simulated_128k_cap_preserves_native_metering_and_enforces_generation_boundary(transport, overflow):
+    calls, changes, _ = transport
+    client = BeamCloudModelClient(context_tokens=131072)
+    assert client.context_tokens == 131072
+    assert client.profile.max_input_tokens == 98394
+    assert client.profile.max_output_tokens == BEAM_MAX_OUTPUT_TOKENS == 32678
+    task = request(max_output_tokens=BEAM_MAX_OUTPUT_TOKENS)
+    # The simulated application cap never changes the true native 1M wire.
+    assert client._payload(task) == BeamCloudModelClient()._payload(task)
+    changes["prompt"] = client.profile.max_input_tokens + int(overflow)
+    assert client.count_input_tokens(task) == changes["prompt"]
+    meter_receipt = client.token_count_receipt
+    assert meter_receipt == {"delivery": "sent", "model_calls": 1,
+        "usage": {"input_tokens": changes["prompt"], "output_tokens": 1}}
+    if overflow:
+        with pytest.raises(PermanentModelError, match="actual token reservation") as caught:
+            client.complete(task)
+        assert caught.value.delivery == "not_sent" and caught.value.usage == {"input_tokens": 0, "output_tokens": 0}
+        assert client.token_count_receipt == meter_receipt  # paid meter usage is retained
+    else:
+        assert client.complete(task).usage == {"input_tokens": changes["prompt"], "output_tokens": 4}
+    chats = [payload for _, path, payload in calls if path == "/api/chat"]
+    assert len(chats) == (1 if overflow else 2)
+    assert [payload["options"]["num_predict"] for payload in chats] == ([1] if overflow else [1, BEAM_MAX_OUTPUT_TOKENS])
+    assert all(payload["options"]["num_ctx"] == BEAM_CONTEXT_TOKENS for payload in chats)
+    assert all(payload["messages"] == chats[0]["messages"] and payload["format"] == chats[0]["format"] for payload in chats)
+    assert all(payload["truncate"] is False and payload["shift"] is False for payload in chats)
+
+
+def test_simulated_128k_cap_still_requires_the_pinned_native_1m_metadata(transport):
+    calls, changes, _ = transport
+    def fake_native_cap(req, payload, data):
+        if req.url.path == "/api/show":
+            data["model_info"]["beam.context_length"] = 131072
+        return data
+    changes["handler"] = fake_native_cap
+    with pytest.raises(PermanentModelError, match="metadata or context"):
+        BeamCloudModelClient(context_tokens=131072).count_input_tokens(request())
+    assert all(path != "/api/chat" for _, path, _ in calls)
 
 
 def test_effective_full_schema_prompt_metering_memo_and_reasoning_success(transport):

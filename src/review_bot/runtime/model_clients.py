@@ -41,7 +41,10 @@ def build_review_client(profile: str | None, settings: ModelConfig | None = None
     )
     if profile == BEAM_CLOUD_TEV4B_PROFILE:
         from review_bot.adapters.beam_cloud import BeamCloudModelClient
-        client = BeamCloudModelClient(api_url=_endpoint("MACBOOK_BEAM_BASE_URL", profile), **options)
+        context = os.environ.get("MACBOOK_BEAM_CONTEXT_TOKENS")
+        context_options = {} if context is None else {"context_tokens": int(context)}
+        client = BeamCloudModelClient(api_url=_endpoint("MACBOOK_BEAM_BASE_URL", profile),
+            **options, **context_options)
     elif profile == LLAMACPP_PROFILE:
         client = LlamaCppModelClient(api_url=_endpoint("ME707_BONSAI_BASE_URL"), **options)
     elif profile == MACBOOK_LLAMACPP_PROFILE:

@@ -17,6 +17,7 @@ from tests.fixtures.intent_review import make_task
 
 @pytest.fixture(autouse=True)
 def offline_macbook(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACBOOK_BEAM_CONTEXT_TOKENS", raising=False)
     monkeypatch.setenv("MACBOOK_LFM_BASE_URL", "http://127.0.0.1:18135/v1")
     monkeypatch.setenv("MACBOOK_TEV1_BASE_URL", "http://127.0.0.1:18137/v1")
     monkeypatch.setenv("REVIEW_BOT_MACBOOK_MODEL_STATE_DIR", str(tmp_path / "mac-admission"))
@@ -156,3 +157,32 @@ def test_explicit_beam_tev4b_profile_composes_distinct_models_without_http(monke
     assert model_clients.build_planning_client(profile) is None
     with pytest.raises(ValueError, match="MACBOOK_TEV4B_BASE_URL"):
         model_clients.build_selector_client(profile)
+
+
+def test_beam_operating_context_cap_reaches_worker_and_fingerprint_without_lowering_tev(monkeypatch, valid_config_yaml):
+    monkeypatch.setenv("MACBOOK_BEAM_BASE_URL", "http://127.0.0.1:11434")
+    monkeypatch.setenv("MACBOOK_TEV4B_BASE_URL", "http://127.0.0.1:18139/v1")
+    profile = model_clients.BEAM_CLOUD_TEV4B_PROFILE
+    native = model_clients.build_review_client(profile)
+    monkeypatch.setenv("MACBOOK_BEAM_CONTEXT_TOKENS", "131072")
+    limited = model_clients.build_review_client(profile)
+    planner = model_clients.build_planning_client(profile)
+    assert limited.profile.max_input_tokens == 98394
+    assert limited.profile.max_output_tokens == 32678
+    assert planner.profile.max_input_tokens == 126976
+    assert planner.profile.max_output_tokens == 4096
+    config, _ = load_review_config_from_str(valid_config_yaml.replace("profile: null", "profile: " + profile))
+    worker = WorkerLoop(config, Mock(spec=JobStore))
+    assert worker.model_client.profile == limited.profile
+    task = make_task()
+    native_key = intent_input_fingerprint(task, config, native, planning_client=planner)
+    limited_key = intent_input_fingerprint(task, config, limited, planning_client=planner)
+    assert native_key is not None and limited_key is not None and native_key != limited_key
+
+
+@pytest.mark.parametrize("value", ["", "not-an-integer", "32678", "1048577"])
+def test_invalid_beam_operating_context_never_silently_uses_native_capacity(monkeypatch, value):
+    monkeypatch.setenv("MACBOOK_BEAM_BASE_URL", "http://127.0.0.1:11434")
+    monkeypatch.setenv("MACBOOK_BEAM_CONTEXT_TOKENS", value)
+    with pytest.raises(ValueError):
+        model_clients.build_review_client(model_clients.BEAM_CLOUD_TEV4B_PROFILE)
