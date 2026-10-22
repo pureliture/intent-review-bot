@@ -196,3 +196,62 @@ def test_missing_api_key_fails_before_http(ledger):
     with pytest.raises(ValueError):
         OpenRouterDecisionClient(api_key="   ")
     assert calls == []
+
+
+def test_decisions_retry_transient_flake_then_succeeds(ledger):
+    calls, _ = ledger
+    import httpx as _httpx_mod
+    orig = _httpx_mod.Client
+    attempts = []
+
+    def handler(req):
+        attempts.append((req.method, req.url.path))
+        if req.url.path == "/api/v1/models":
+            return _httpx_mod.Response(200, json={"data": [
+                {"id": DECISION_MODEL, "context_length": 262144,
+                    "architecture": {"output_modalities": ["decisions"]}}]})
+        if len([a for a in attempts if a[1] == "/api/alpha/decisions"]) < 3:
+            return _httpx_mod.Response(404, json={"error": {"message": "Not Found", "code": 404}})
+        return _httpx_mod.Response(200, json={
+            "id": "gen-dec-ok", "model": DECISION_MODEL,
+            "answers": {"review_mode": {"type": "choice", "choice": "architecture_and_intent",
+                "probabilities": {"architecture": 0.2, "intent": 0.2,
+                    "architecture_and_intent": 0.59, "not_applicable": 0.01}}},
+            "usage": {"input_tokens": 32, "output_tokens": 2}})
+
+    def client(**options):
+        return HTTP_CLIENT(transport=_httpx_mod.MockTransport(handler), **options)
+
+    _httpx_mod.Client = client
+    try:
+        customer = OpenRouterDecisionClient(api_key="test-key")
+        response = customer.complete(selection_request())
+        import json
+        assert json.loads(response.text) == {"selected_modes": ["architecture", "intent"]}
+    finally:
+        _httpx_mod.Client = orig
+    assert [p for _, p in attempts if p == "/api/alpha/decisions"].__len__() == 3
+
+
+def test_decisions_persistent_flake_fails_closed(ledger):
+    calls, _ = ledger
+    import httpx as _httpx_mod
+    orig = _httpx_mod.Client
+
+    def handler(req):
+        if req.url.path == "/api/v1/models":
+            return _httpx_mod.Response(200, json={"data": [
+                {"id": DECISION_MODEL, "context_length": 262144,
+                    "architecture": {"output_modalities": ["decisions"]}}]})
+        return _httpx_mod.Response(404, json={"error": {"message": "Not Found", "code": 404}})
+
+    def client(**options):
+        return HTTP_CLIENT(transport=_httpx_mod.MockTransport(handler), **options)
+
+    _httpx_mod.Client = client
+    try:
+        customer = OpenRouterDecisionClient(api_key="test-key")
+        with pytest.raises(PermanentModelError):
+            customer.complete(selection_request())
+    finally:
+        _httpx_mod.Client = orig

@@ -331,7 +331,15 @@ class OpenRouterDecisionClient:
         state = {key: metadata[key] for key in ("title", "body", "changed_files")}
         return self._decide(state, request.timeout_seconds, tuple(metadata["available_modes"]))
 
-    def _post(self, body: bytes, deadline: float) -> dict[str, Any]:
+    # Decisions calls are side-effect free judgments. The alpha endpoint
+    # intermittently answers 404/429/5xx on an otherwise valid request
+    # (observed live), so retry those statuses inside the same admission
+    # slot with a bounded backoff instead of failing the whole review.
+    # Anything else, or deadline exhaustion, fails closed as before.
+    _RETRYABLE_STATUSES = (404, 408, 429, 500, 502, 503, 504)
+    _RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+
+    def _single_post(self, body: bytes, deadline: float) -> dict[str, Any]:
         try:
             with model_request_slot(self, deadline, generates=False) as (ticket, deadline):
                 try:
@@ -372,3 +380,22 @@ class OpenRouterDecisionClient:
         if not isinstance(data, dict) or "answers" not in data:
             raise PermanentModelError("Invalid OpenRouter decision response shape")
         return data
+
+    def _post(self, body: bytes, deadline: float) -> dict[str, Any]:
+        """Bounded retry on infra-flaky statuses; config/auth errors fail fast.
+
+        Decisions calls are side-effect free judgments, so a bounded retry
+        is safe and keeps one flaky transport from failing a whole review.
+        """
+        attempt = 0
+        while True:
+            try:
+                return self._single_post(body, deadline)
+            except (TimeoutError, TransientModelError, PermanentModelError) as error:
+                retryable = isinstance(error, (TimeoutError, TransientModelError)) or any(
+                    f"HTTP {code}" in str(error) for code in self._RETRYABLE_STATUSES)
+                if not retryable or attempt >= len(self._RETRY_BACKOFF_SECONDS):
+                    raise
+                time.sleep(self._RETRY_BACKOFF_SECONDS[attempt])
+                attempt += 1
+                continue
