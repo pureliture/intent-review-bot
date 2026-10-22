@@ -323,3 +323,35 @@ def test_catalog_hang_past_deadline_fails_closed(ledger):
                 _time.monotonic() - 1)
     finally:
         _httpx_mod.Client, _time.sleep = orig_client, orig_sleep
+
+
+def test_post_slices_deadline_per_attempt(monkeypatch):
+    import time as _time
+    now = [1000.0]
+    monkeypatch.setattr(_time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(_time, "sleep", lambda s: None)
+    seen_deadlines = []
+    customer = OpenRouterDecisionClient(api_key="test-key")
+
+    def fake_single(body, deadline):
+        seen_deadlines.append(deadline - now[0])
+        if len(seen_deadlines) == 1:
+            # Burn the whole first quantum, the way a real hang would:
+            # httpx enforces the sub-deadline, so the clock can only
+            # advance this far before TimeoutError surfaces.
+            now[0] = deadline
+            raise TimeoutError("first attempt hung")
+        return {"answers": {"review_mode": {"type": "choice", "choice": "architecture_and_intent",
+            "probabilities": {"architecture": 0.2, "intent": 0.2,
+                "architecture_and_intent": 0.59, "not_applicable": 0.01}}},
+            "usage": {"input_tokens": 32, "output_tokens": 2}}
+
+    monkeypatch.setattr(customer, "_single_post", fake_single)
+    data = customer._post(b"x", now[0] + 90)
+    assert data["answers"]["review_mode"]["choice"] == "architecture_and_intent"
+    assert len(seen_deadlines) == 2
+    # First attempt got a ~30s quantum of the 90s budget, not the whole thing;
+    # the retry got a fresh ~30s slice instead of 10s of crumbs.
+    assert 25.0 < seen_deadlines[0] <= 30.0
+    assert 25.0 < seen_deadlines[1] <= 30.0
+

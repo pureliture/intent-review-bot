@@ -131,11 +131,21 @@ _CATALOG_RETRYABLE_STATUSES = (404, 408, 429, 500, 502, 503, 504)
 _CATALOG_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
 
 
+def attempt_quantum(deadline: float, slices: int) -> float:
+    """Fair time slice so one hung attempt cannot eat the whole budget."""
+    return max((deadline - time.monotonic()) / max(slices, 1), 0)
+
+
 def fetch_models_catalog_resilient(api_key: str, origin: str, deadline: float, *, query: str = "") -> list[dict[str, Any]]:
-    """Bounded retry for flaky catalog reads; auth/config errors fail fast."""
+    """Bounded retry for flaky catalog reads; auth/config errors fail fast.
+
+    Each attempt gets a fair time quantum so one hung GET cannot eat the
+    whole budget and starve the retries.
+    """
+    quantum = attempt_quantum(deadline, 1 + len(_CATALOG_RETRY_BACKOFF_SECONDS))
     attempt = 0
     while True:
-        remaining = deadline - time.monotonic()
+        remaining = min(deadline - time.monotonic(), quantum)
         if remaining <= 0:
             raise TimeoutError("OpenRouter catalog request timed out")
         try:

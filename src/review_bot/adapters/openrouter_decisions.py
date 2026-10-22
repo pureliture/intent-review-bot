@@ -386,11 +386,16 @@ class OpenRouterDecisionClient:
 
         Decisions calls are side-effect free judgments, so a bounded retry
         is safe and keeps one flaky transport from failing a whole review.
+        Each attempt gets a fair time quantum so one hung POST cannot eat
+        the whole budget and starve the retries.
         """
+        from review_bot.adapters.openrouter_common import attempt_quantum
+        quantum = attempt_quantum(deadline, 1 + len(self._RETRY_BACKOFF_SECONDS))
         attempt = 0
         while True:
             try:
-                return self._single_post(body, deadline)
+                attempt_deadline = min(deadline, time.monotonic() + quantum)
+                return self._single_post(body, attempt_deadline)
             except (TimeoutError, TransientModelError, PermanentModelError) as error:
                 retryable = isinstance(error, (TimeoutError, TransientModelError)) or any(
                     f"HTTP {code}" in str(error) for code in self._RETRYABLE_STATUSES)
