@@ -147,9 +147,9 @@ def test_explicit_beam_tev4b_profile_composes_distinct_models_without_http(monke
     selector = model_clients.build_selector_client(profile, settings)
     perspectives = model_clients.build_intent_selection_client(profile, settings)
     assert isinstance(review, OpenRouterReviewClient)
-    assert review.model == "recursive/flint-v1.0:free"
+    assert review.model == "google/gemma-4-31b-it:free"
     assert review.profile.provider == "openrouter"
-    assert review.profile.model == "recursive/flint-v1.0:free"
+    assert review.profile.model == "google/gemma-4-31b-it:free"
     assert (review.profile.max_input_tokens, review.profile.max_output_tokens) == (98394, 32678)
     assert review.profile.timeout_seconds == 17
     assert review.profile.max_output_bytes == 1048576
@@ -168,7 +168,7 @@ def test_explicit_beam_tev4b_profile_composes_distinct_models_without_http(monke
     budgeted = model_clients.build_review_client(
         profile, ModelConfig(review_input_tokens=50000, review_output_tokens=10000))
     assert (budgeted.profile.max_input_tokens, budgeted.profile.max_output_tokens) == (50000, 10000)
-    assert budgeted.model == "recursive/flint-v1.0:free"
+    assert budgeted.model == "google/gemma-4-31b-it:free"
     for client in (planning, selector, perspectives):
         assert client.model == "tev1-4b-q8_0"
         assert client._context_tokens == 131072 and client._server_generation_slots == 1
@@ -180,13 +180,13 @@ def test_explicit_beam_tev4b_profile_composes_distinct_models_without_http(monke
     config, _ = load_review_config_from_str(valid_config_yaml.replace("profile: null", "profile: " + profile))
     worker = WorkerLoop(config, Mock(spec=JobStore))
     assert isinstance(worker.model_client, OpenRouterReviewClient)
-    assert worker.model_client.model == "recursive/flint-v1.0:free"
+    assert worker.model_client.model == "google/gemma-4-31b-it:free"
     assert worker.model_client.profile.max_input_tokens == 98394
     assert worker.model_client.profile.max_output_tokens == 32678
     assert worker.model_client.request_cancelled == worker._stop_event.is_set
     # Retired Beam context cap never silently builds; the legacy base URL is ignored.
     monkeypatch.setenv("MACBOOK_BEAM_BASE_URL", "http://127.0.0.1:11434")
-    assert model_clients.build_review_client(profile, settings).model == "recursive/flint-v1.0:free"
+    assert model_clients.build_review_client(profile, settings).model == "google/gemma-4-31b-it:free"
     monkeypatch.delenv("MACBOOK_BEAM_BASE_URL")
     monkeypatch.setenv("MACBOOK_BEAM_CONTEXT_TOKENS", "131072")
     with pytest.raises(ValueError, match="MACBOOK_BEAM_CONTEXT_TOKENS"):
@@ -212,7 +212,7 @@ def test_beam_operating_context_cap_reaches_worker_and_fingerprint_without_lower
     profile = model_clients.BEAM_CLOUD_TEV4B_PROFILE
     default = model_clients.build_review_client(profile)
     assert isinstance(default, OpenRouterReviewClient)
-    assert default.model == "recursive/flint-v1.0:free"
+    assert default.model == "google/gemma-4-31b-it:free"
     assert default.profile.provider == "openrouter"
     assert default.profile.max_input_tokens == 98394
     assert default.profile.max_output_tokens == 32678
@@ -228,7 +228,7 @@ def test_beam_operating_context_cap_reaches_worker_and_fingerprint_without_lower
     config, _ = load_review_config_from_str(valid_config_yaml.replace("profile: null", "profile: " + profile))
     worker = WorkerLoop(config, Mock(spec=JobStore))
     assert worker.model_client.profile == default.profile
-    assert worker.model_client.model == "recursive/flint-v1.0:free"
+    assert worker.model_client.model == "google/gemma-4-31b-it:free"
     task = make_task()
     default_key = intent_input_fingerprint(task, config, default, planning_client=planner)
     custom_key = intent_input_fingerprint(task, config, custom, planning_client=planner)

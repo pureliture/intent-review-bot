@@ -447,7 +447,7 @@ Quit and reopen the existing Ollama app after setting them. They affect all mode
 
 | Role | Validation (OpenRouter) | Production | 128K envelope |
 | --- | --- | --- | --- |
-| Review llm | `recursive/flint-v1.0:free` (`src/review_bot/adapters/openrouter_chat.py`, `POST /api/v1/chat/completions`) | `bonsai2-27b` (128K) | input 98,394 + output 32,678 |
+| Review llm | `google/gemma-4-31b-it:free` (`src/review_bot/adapters/openrouter_chat.py`, `POST /api/v1/chat/completions`) | `bonsai2-27b` (128K) | input 98,394 + output 32,678 |
 | decision1 | `perplexity/pplx-decider-flash-v1.2` (`src/review_bot/adapters/openrouter_decisions.py`, `POST /api/alpha/decisions`) | `tev1:4b` (128K) | input 126,976 + output 4,096 |
 
 - Shared fail-closed byte-upper-bound gate (`src/review_bot/adapters/byte_budget.py`, `FRAMING_RESERVE_TOKENS=8192`, tokens<=bytes proof, no estimation). `ModelExecutionBudget.measure()` admits locally with no client calls; clients expose pure `admission_bytes()` (exact wire bytes + framing reserve) or `None`. A bound over the limit is `input_limit_exceeded` → split/replan; an adapter over-budget refusal is `input_limit_exceeded` with no retry. Response usage is recorded post-send; over-budget usage fails closed as `usage_limit_exceeded`. Stored legacy native-capacity packets fail closed on replay.
