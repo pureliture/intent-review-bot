@@ -310,9 +310,14 @@ def test_markdown_formatter_templates_reorder_whole_sections_without_execution()
 
 def test_markdown_formatter_truncation_does_not_publish_partial_conclusions() -> None:
     result, task = _build_test_fixtures(findings_count=150, quote_text="A" * 600)
+    original = asdict(result)
     markdown = format_review_markdown(result, task, max_length=60000)
     assert len(markdown) <= 60000
     assert markdown.splitlines()[0] == "<!-- review-bot:architecture:v1 -->"
-    assert "comment_limit_exceeded" in markdown
+    assert "댓글 길이 한도를 초과했습니다" in markdown
+    assert "미게시 범위: 전체 판단, 발견사항, 관점별 검토와 인용 원문을 포함한 리뷰 본문 전체" in markdown
+    assert "comment_limit_exceeded" not in markdown
     assert "Complex method logic" not in markdown
+    assert "A" * 600 not in markdown
     assert len(re.findall(r"<pre><code>", markdown)) == len(re.findall(r"</code></pre>", markdown))
+    assert asdict(result) == original

@@ -67,7 +67,7 @@ def finish(marker: str, title: str, sections: Mapping[str, str], *, scope: str,
         rendered += "\n\n" + footer
     if len(rendered) + 1 > max_length:
         # Never publish a shortened subset of conclusions as a complete review.
-        rendered = intro + "> 리뷰 본문 표시 보류: comment_limit_exceeded. 전체 결과는 저장된 산출물을 확인하세요.\n\n" + scope
+        rendered = intro + "> 리뷰 본문 표시 보류: 댓글 길이 한도를 초과했습니다.\n\n미게시 범위: 전체 판단, 발견사항, 관점별 검토와 인용 원문을 포함한 리뷰 본문 전체. 전체 결과는 저장된 산출물을 확인하세요.\n\n" + scope
     if len(rendered) + 1 > max_length:
         raise ValueError("comment_notice_too_large")
     return rendered + "\n"

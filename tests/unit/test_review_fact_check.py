@@ -118,7 +118,7 @@ def test_program_callable_gap_carries_frozen_source_through_existing_rewrite_and
         validate_partition_result(changed, task)
 
 
-def _capacity_review_client():
+def _capacity_review_client(*, context_tokens=1048576, output_tokens=512):
     from dataclasses import asdict
     from hashlib import sha256
     from review_bot.adapters.beam_cloud import BeamCloudModelClient
@@ -143,6 +143,9 @@ def _capacity_review_client():
                     "completed": True, "request_hash": hash_json(asdict(request)),
                     "source_input_hash": capacity_input_hash(request.system_prompt, request.user_content,
                         request.response_schema, request.model, request.max_output_tokens)}
+                if not hasattr(self, "capacity_requests"):
+                    self.capacity_requests = {}
+                self.capacity_requests[proof["request_hash"]] = request
                 raise ModelInputCapacityError("Beam cloud HTTP 400", proof)
             count = super().count_input_tokens(request)
             self.token_count_receipt = {"delivery": "sent", "model_calls": 1,
@@ -150,15 +153,20 @@ def _capacity_review_client():
             return count
 
     client = CapacityClient(name="beam:cloud")
-    client.profile = replace(client.profile, provider="ollama-cloud", max_input_tokens=1048576 - 512, is_mock=False)
+    factory = BeamCloudModelClient(context_tokens=context_tokens).profile
+    client.profile = replace(client.profile, provider=factory.provider,
+        max_input_tokens=context_tokens - output_tokens, max_output_tokens=output_tokens, is_mock=False)
+    if output_tokens == factory.max_output_tokens:
+        assert client.profile.max_input_tokens == factory.max_input_tokens
     return client
 
 
+@pytest.mark.parametrize("context_tokens,output_tokens", [(1048576, 512), (131072, 32678)])
 @pytest.mark.parametrize("fits", [True, False])
-def test_native_capacity_rejection_reserves_unknown_usage_before_lossless_batch_split(fits):
+def test_native_capacity_rejection_reserves_unknown_usage_before_lossless_batch_split(fits, context_tokens, output_tokens):
     import time
     from review_bot.application.model_execution import ModelExecutionBudget
-    task, client = make_task(), _capacity_review_client()
+    task, client = make_task(), _capacity_review_client(context_tokens=context_tokens, output_tokens=output_tokens)
     settings = PartitionReviewLimits(max_calls=256, max_total_tokens=24000000 if fits else 1000000)
     budget = ModelExecutionBudget(settings, time.monotonic() + settings.task_timeout_seconds, None)
     result = run_partition_review(task, "intent", client, PartitionModelClient(), limits=settings, shared_budget=budget)
@@ -174,11 +182,16 @@ def test_native_capacity_rejection_reserves_unknown_usage_before_lossless_batch_
     assert effective_calls == actual_calls + result.usage["reserved_model_calls"]
     assert effective_tokens == actual_tokens + result.usage["reserved_tokens"]
     assert all(result.stages[item["stage_index"]].token_measurement_usage is None for item in rejected)
+    assert all(item["capacity_rejection"]["context_tokens"] == 1048576 for item in rejected)
+    assert client.profile.max_input_tokens == context_tokens - output_tokens
+    assert all(result.stages[item["stage_index"]].token_measurement_delivery == "unknown" for item in rejected)
     if fits:
         assert result.status == "completed", result.reason
         checks = [json.loads(req.user_content) for req in client.requests if json.loads(req.user_content)["stage"] == "fact_check"]
         assert [row["item_id"] for call in checks for row in call["items"]] == [row["id"] for row in facts.items(result.partition["pre_verification_final"])]
         assert all(len(call["items"]) <= 4 for call in checks)
+        assert all(stage.measured_input_tokens <= client.profile.max_input_tokens
+            and stage.reason == "validated" for stage in result.stages if stage.stage == "fact_check" and stage.attempts)
         for mutation in ("reservation", "body", "wire_hash", "missing", "source_input"):
             changed = deepcopy(result)
             item = changed.partition["native_capacity_rejections"][0]
@@ -197,6 +210,92 @@ def test_native_capacity_rejection_reserves_unknown_usage_before_lossless_batch_
         assert result.partition["fact_verification"]["interruption_reason"] == "task_token_limit_exceeded"
         assert not any(json.loads(req.user_content)["stage"] == "fact_check" for req in client.requests)
     validate_partition_result(result, task)
+
+
+def _capacity_authority_witness(*, context_tokens=131072, output_tokens=32678):
+    from dataclasses import asdict
+    from review_bot.application.architecture_review import ModelInputCapacityError
+    from review_bot.domain.intent_models import IntentStageRecord
+    from review_bot.domain.models_v1 import ModelRequest
+    client = _capacity_review_client(context_tokens=context_tokens, output_tokens=output_tokens)
+    request = ModelRequest(1, "beam:cloud", "Fixed complete prompt.",
+        json.dumps({"stage": "fact_check", "items": [{} for _ in range(5)]}), 20, output_tokens,
+        {"type": "object", "properties": {}, "required": [], "additionalProperties": False})
+    with pytest.raises(ModelInputCapacityError) as caught:
+        client.count_input_tokens(request)
+    proof = caught.value.capacity_rejection
+    packet = {"capacity_rejection": proof, "witness_hash": hash_json(proof),
+        "budget_reservation": {"model_calls": 1, "total_tokens": proof["input_tokens"] + 1}}
+    record = IntentStageRecord("fact_check:complete_originals:admission", request_hash=hash_json(asdict(request)),
+        measured_input_tokens=proof["input_tokens"], token_measurement="measured",
+        token_measurement_request_hash=hash_json(asdict(request)), token_measurement_delivery="unknown",
+        token_measurement_usage=None, token_measurement_model_calls=None)
+    return record, packet, client.profile, request
+
+
+@pytest.mark.parametrize("context_tokens,output_tokens", [(1048576, 32678), (1048576, 512), (131072, 32678)])
+def test_capacity_authority_keeps_native_wire_separate_from_supported_operating_profiles(context_tokens, output_tokens):
+    from review_bot.application.model_execution import capacity_reservation
+    from review_bot.application.model_wire_contract import beam_wire_payload
+    record, packet, profile, request = _capacity_authority_witness(context_tokens=context_tokens, output_tokens=output_tokens)
+    snapshot = deepcopy((record, packet, profile, request))
+    assert beam_wire_payload(request)["options"]["num_ctx"] == 1048576
+    assert profile.max_input_tokens + profile.max_output_tokens == context_tokens
+    assert capacity_reservation(record, packet, profile, request) == {"model_calls": 1, "total_tokens": 1524759}
+    assert (record, packet, profile, request) == snapshot
+    assert record.token_measurement_usage is None and record.token_measurement_delivery == "unknown" and not record.attempts
+
+
+@pytest.mark.parametrize("changes", [
+    {"max_input_tokens": None}, {"max_input_tokens": True}, {"max_input_tokens": 0}, {"max_input_tokens": -1},
+    {"max_input_tokens": 1048576}, {"max_output_tokens": None}, {"max_output_tokens": True},
+    {"max_output_tokens": 0}, {"max_output_tokens": 32679}, {"provider": "other"}, {"model": "other"},
+])
+def test_capacity_authority_rejects_invalid_operating_profiles(changes):
+    from review_bot.application.model_execution import capacity_reservation
+    record, packet, profile, request = _capacity_authority_witness()
+    with pytest.raises(ValueError, match="invalid_native_capacity_profile"):
+        capacity_reservation(record, packet, replace(profile, **changes), request)
+
+
+@pytest.mark.parametrize("mutation", ["physical_context", "wire", "source_input", "reservation",
+    "unknown_usage", "extra_body_field", "foreign_request_model"])
+def test_capacity_authority_keeps_strict_evidence_and_wire_tamper_rejection(mutation):
+    from dataclasses import asdict
+    from hashlib import sha256
+    from review_bot.application.model_execution import capacity_reservation, capacity_input_hash
+    from review_bot.application.model_wire_contract import beam_meter_wire_sha256, beam_wire_payload
+    record, packet, profile, request = _capacity_authority_witness()
+    proof = packet["capacity_rejection"]
+    if mutation == "physical_context":
+        proof["context_tokens"] = 131072
+        proof["response_body"] = proof["response_body"].replace("1048576", "131072")
+        proof["response_sha256"] = sha256(proof["response_body"].encode()).hexdigest()
+    elif mutation == "wire":
+        wire = beam_wire_payload(request)
+        wire["options"].update(num_predict=1, num_ctx=131072)
+        proof["wire_sha256"] = sha256(json.dumps(wire, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    elif mutation == "source_input":
+        proof["source_input_hash"] = "0" * 64
+    elif mutation == "reservation":
+        packet["budget_reservation"]["total_tokens"] -= 1
+    elif mutation == "unknown_usage":
+        record = replace(record, token_measurement_usage={"input_tokens": 0, "output_tokens": 0},
+            token_measurement_delivery="sent", token_measurement_model_calls=1)
+    elif mutation == "extra_body_field":
+        body = json.loads(proof["response_body"])
+        body["eval_count"] = 0
+        proof["response_body"] = json.dumps(body)
+        proof["response_sha256"] = sha256(proof["response_body"].encode()).hexdigest()
+    else:
+        request = replace(request, model="foreign:cloud")
+        proof.update(wire_sha256=beam_meter_wire_sha256(request), request_hash=hash_json(asdict(request)),
+            source_input_hash=capacity_input_hash(request.system_prompt, request.user_content,
+                request.response_schema, request.model, request.max_output_tokens))
+        record = replace(record, request_hash=proof["request_hash"], token_measurement_request_hash=proof["request_hash"])
+    packet["witness_hash"] = hash_json(proof)  # forged hashes must not grant authority
+    with pytest.raises(ValueError, match="invalid_native_capacity_"):
+        capacity_reservation(record, packet, profile, request)
 
 
 @pytest.mark.parametrize("mode", ["architecture", "intent"])

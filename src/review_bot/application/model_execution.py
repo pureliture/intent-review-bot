@@ -23,6 +23,7 @@ from review_bot.application.intent_context import MAX_INPUT_BYTES, IntentInputEr
 from review_bot.domain.intent_models import IntentModelAttempt, IntentStageRecord
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 from review_bot.ports import ModelClient
+from review_bot.application.model_wire_contract import BEAM_CLOUD_MODEL, BEAM_CONTEXT_TOKENS, BEAM_MAX_OUTPUT_TOKENS
 
 MAX_OUTPUT_BYTES = 65536
 MAX_ATTEMPTS = 3
@@ -40,7 +41,7 @@ def native_capacity_count(body, context):
         match = _NATIVE_CAPACITY.fullmatch(value["error"])
         if match is not None:
             count, maximum = map(int, match.groups())
-            if context == maximum == 1048576 and maximum < count <= 10**9:
+            if context == maximum == BEAM_CONTEXT_TOKENS and maximum < count <= 10**9:
                 return count
     except (ValueError, TypeError, OverflowError, RecursionError):
         pass
@@ -62,7 +63,7 @@ def capacity_reservation(record, packet, profile=None, request=None):
         raise ValueError("invalid_native_capacity_evidence")
     count = native_capacity_count(proof["response_body"], proof["context_tokens"])
     if (count is None or proof["input_tokens"] != count or type(proof["input_tokens"]) is not int
-            or proof["provider"] != "ollama-cloud" or proof["model"] != "beam:cloud"
+            or proof["provider"] != "ollama-cloud" or proof["model"] != BEAM_CLOUD_MODEL
             or proof["status"] != 400 or type(proof["status"]) is not int or proof["completed"] is not True
             or type(proof["context_tokens"]) is not int or proof["output_tokens_reserved"] != 1
             or type(proof["output_tokens_reserved"]) is not int
@@ -77,12 +78,18 @@ def capacity_reservation(record, packet, profile=None, request=None):
             or record.attempts or record.token_measurement_usage is not None
             or record.token_measurement_delivery != "unknown" or record.token_measurement_model_calls is not None):
         raise ValueError("invalid_native_capacity_evidence")
+    # Physical context authority comes from the pinned native error protocol
+    # and exact Beam meter wire, not from an application's stricter role cap.
+    # Keep supported lower output reservations (e.g. 512) while rejecting an
+    # operating profile that exceeds either native capacity or output limits.
     if profile is not None and (profile.provider != proof["provider"] or profile.model != proof["model"]
-            or (profile.max_input_tokens or 0) + profile.max_output_tokens != proof["context_tokens"]):
+            or type(profile.max_input_tokens) is not int or profile.max_input_tokens <= 0
+            or type(profile.max_output_tokens) is not int or not 0 < profile.max_output_tokens <= BEAM_MAX_OUTPUT_TOKENS
+            or profile.max_input_tokens + profile.max_output_tokens > BEAM_CONTEXT_TOKENS):
         raise ValueError("invalid_native_capacity_profile")
     if request is not None:
         from review_bot.application.model_wire_contract import beam_meter_wire_sha256
-        if (proof["wire_sha256"] != beam_meter_wire_sha256(request)
+        if (request.model != BEAM_CLOUD_MODEL or proof["wire_sha256"] != beam_meter_wire_sha256(request)
                 or proof["source_input_hash"] != capacity_input_hash(request.system_prompt,
                     request.user_content, request.response_schema, request.model, request.max_output_tokens)):
             raise ValueError("invalid_native_capacity_wire")
