@@ -22,7 +22,11 @@ from typing import Any
 
 import httpx
 
-from review_bot.adapters.byte_budget import ADMISSION_OUTPUT_FLOOR_TOKENS
+from review_bot.adapters.byte_budget import (
+    ADMISSION_OUTPUT_FLOOR_TOKENS,
+    CHOICE_WIRE_FLOOR_TOKENS,
+    _CHOICE_REQUEST_CEILING_TOKENS,
+)
 from review_bot.adapters.llamacpp import _check_output_fields, _json_object
 from review_bot.adapters.model_http import mark_model_request_sent, model_request_slot
 from review_bot.adapters.openrouter_common import (
@@ -81,6 +85,8 @@ def review_wire_payload(request: ModelRequest) -> tuple[dict[str, Any], int]:
     # plus content, so the wire reservation is floored. The floor participates
     # in the same byte-bound pre-gate and post-send usage check.
     floored = max(maximum, ADMISSION_OUTPUT_FLOOR_TOKENS)
+    if maximum <= _CHOICE_REQUEST_CEILING_TOKENS:
+        floored = max(floored, CHOICE_WIRE_FLOOR_TOKENS)
     schema = compact_schema(request.response_schema)
     contract = ("\n\nReturn exactly one JSON object matching this entire response schema. "
         "Do not add prose or fields.\n"

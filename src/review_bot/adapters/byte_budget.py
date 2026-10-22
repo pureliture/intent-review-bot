@@ -17,6 +17,13 @@ from review_bot.application.architecture_review import PermanentModelError
 # reasoning plus content fits. Validators must allow choice-sized outputs
 # up to this floor; the response schema still bounds actual content.
 ADMISSION_OUTPUT_FLOOR_TOKENS = 512
+# Closed choices are tiny requests (<= 64 output tokens) answered by
+# mandatory-reasoning models. Reasoning alone burns hundreds of tokens, so
+# choice wires get a larger floor. Content stays schema-bound to one small
+# object; usage is still validated post-send. Long-term, closed choices
+# belong on a decisions API, not a generative model.
+_CHOICE_REQUEST_CEILING_TOKENS = 64
+CHOICE_WIRE_FLOOR_TOKENS = 2048
 
 # Fixed conservative cover for server-side framing (chat templates and
 # request envelopes) that is not part of our wire bytes. A post-send usage
