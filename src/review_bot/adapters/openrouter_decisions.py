@@ -30,7 +30,7 @@ from review_bot.adapters.openrouter_common import (
     check_decisions_entry,
     classify_http_error,
     encode,
-    fetch_models_catalog,
+    fetch_models_catalog_resilient,
     find_model_entry,
     fresh,
     precheck_byte_budget,
@@ -237,10 +237,10 @@ class OpenRouterDecisionClient:
         with self._lock:
             if fresh(deadline, self._verified_until):
                 return self._model_context
-            catalog = fetch_models_catalog(self._api_key, self.origin, self._remaining(deadline))
+            catalog = fetch_models_catalog_resilient(self._api_key, self.origin, deadline)
             if not any(entry.get("id") == self.model for entry in catalog):
-                catalog = fetch_models_catalog(self._api_key, self.origin,
-                    self._remaining(deadline), query="?output_modalities=decisions")
+                catalog = fetch_models_catalog_resilient(self._api_key, self.origin, deadline,
+                    query="?output_modalities=decisions")
             entry = find_model_entry(catalog, self.model)
             context = check_decisions_entry(entry, self.model,
                 minimum_context=APP_INPUT_TOKENS + APP_OUTPUT_TOKENS)

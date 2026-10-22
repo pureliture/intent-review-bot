@@ -38,7 +38,7 @@ from review_bot.adapters.openrouter_common import (
     check_text_entry,
     classify_http_error,
     encode,
-    fetch_models_catalog,
+    fetch_models_catalog_resilient,
     find_model_entry,
     fresh,
     precheck_byte_budget,
@@ -169,7 +169,7 @@ class OpenRouterReviewClient:
         with self._lock:
             if fresh(deadline, self._verified_until):
                 return self._model_context
-            catalog = fetch_models_catalog(self._api_key, self.origin, self._remaining(deadline))
+            catalog = fetch_models_catalog_resilient(self._api_key, self.origin, deadline)
             try:
                 entry = find_model_entry(catalog, self.model)
             except PermanentModelError:

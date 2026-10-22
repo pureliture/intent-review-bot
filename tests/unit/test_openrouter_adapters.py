@@ -273,3 +273,53 @@ def test_review_payload_rejects_invalid_reasoning_cap():
     from review_bot.adapters.openrouter_chat import review_wire_payload
     with pytest.raises(PermanentModelError):
         review_wire_payload(review_request(model=REVIEW_MODEL), reasoning_max_tokens=0)
+
+
+def test_catalog_retry_recovers_from_hung_get(ledger):
+    calls, _ = ledger
+    import httpx as _httpx_mod
+    import time as _time
+    orig_client, orig_sleep = _httpx_mod.Client, _time.sleep
+    attempts = []
+
+    def handler(req):
+        attempts.append(req.url.path)
+        if len(attempts) < 3:
+            raise _httpx_mod.TimeoutException("hung", request=req)
+        return _httpx_mod.Response(200, json={"data": [
+            {"id": DECISION_MODEL, "context_length": 262144,
+                "architecture": {"output_modalities": ["decisions"]}}]})
+
+    def client(**options):
+        return HTTP_CLIENT(transport=_httpx_mod.MockTransport(handler), **options)
+
+    _httpx_mod.Client, _time.sleep = client, lambda s: None
+    try:
+        from review_bot.adapters.openrouter_common import fetch_models_catalog_resilient
+        catalog = fetch_models_catalog_resilient("test-key", "https://openrouter.ai",
+            _time.monotonic() + 60)
+        assert any(entry.get("id") == DECISION_MODEL for entry in catalog)
+    finally:
+        _httpx_mod.Client, _time.sleep = orig_client, orig_sleep
+    assert len(attempts) == 3
+
+
+def test_catalog_hang_past_deadline_fails_closed(ledger):
+    import httpx as _httpx_mod
+    import time as _time
+    orig_client, orig_sleep = _httpx_mod.Client, _time.sleep
+
+    def handler(req):
+        raise _httpx_mod.TimeoutException("hung", request=req)
+
+    def client(**options):
+        return HTTP_CLIENT(transport=_httpx_mod.MockTransport(handler), **options)
+
+    _httpx_mod.Client, _time.sleep = client, lambda s: None
+    try:
+        from review_bot.adapters.openrouter_common import fetch_models_catalog_resilient
+        with pytest.raises(TimeoutError):
+            fetch_models_catalog_resilient("test-key", "https://openrouter.ai",
+                _time.monotonic() - 1)
+    finally:
+        _httpx_mod.Client, _time.sleep = orig_client, orig_sleep

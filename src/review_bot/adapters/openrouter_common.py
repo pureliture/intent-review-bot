@@ -123,6 +123,33 @@ def fetch_models_catalog(api_key: str, origin: str, timeout: float, *, query: st
     return [entry for entry in data["data"] if isinstance(entry, dict)]
 
 
+# Catalog GETs are idempotent metadata reads. The alpha/beta endpoints
+# intermittently hang or flake (observed live: 300s hangs, 404 storms),
+# so verification retries them inside the caller's deadline instead of
+# letting one hung GET fail the whole review.
+_CATALOG_RETRYABLE_STATUSES = (404, 408, 429, 500, 502, 503, 504)
+_CATALOG_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+
+
+def fetch_models_catalog_resilient(api_key: str, origin: str, deadline: float, *, query: str = "") -> list[dict[str, Any]]:
+    """Bounded retry for flaky catalog reads; auth/config errors fail fast."""
+    attempt = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("OpenRouter catalog request timed out")
+        try:
+            return fetch_models_catalog(api_key, origin, remaining, query=query)
+        except (TimeoutError, TransientModelError, PermanentModelError) as error:
+            retryable = isinstance(error, (TimeoutError, TransientModelError)) or any(
+                f"HTTP {code}" in str(error) for code in _CATALOG_RETRYABLE_STATUSES)
+            if not retryable or attempt >= len(_CATALOG_RETRY_BACKOFF_SECONDS):
+                raise
+            time.sleep(_CATALOG_RETRY_BACKOFF_SECONDS[attempt])
+            attempt += 1
+            continue
+
+
 def find_model_entry(catalog: list[dict[str, Any]], model: str) -> dict[str, Any]:
     for entry in catalog:
         if entry.get("id") == model:
