@@ -79,6 +79,12 @@ def plan_candidates(units, fits):
     units = list(units)
     if not units or len({u.unit_id for u in units}) != len(units):
         raise PartitionError("invalid_candidate_inventory")
+    feasibility = {}
+    def fits_once(group):
+        key = tuple(unit.unit_id for unit in group)
+        if key not in feasibility:
+            feasibility[key] = fits(group)
+        return feasibility[key]
     paired = sorted(units, key=lambda u: (u.path, u.start_byte, u.version, u.evidence_id))
     strategies = [("paired_pack", "Pack related base/head ranges together where native request limits allow.", paired, False),
         ("per_original", "Keep source versions and originals in separate bounded groups.", units, True),
@@ -89,11 +95,11 @@ def plan_candidates(units, fits):
         for unit in order:
             candidate = [*active, unit]
             split = active and (isolate is None or isolate and active[-1].evidence_id != unit.evidence_id)
-            if split or len(candidate) > MAX_GROUP_UNITS or not fits(candidate):
+            if split or len(candidate) > MAX_GROUP_UNITS or not fits_once(candidate):
                 if active:
                     groups.append(active)
                 active = [unit]
-                if not fits(active):
+                if not fits_once(active):
                     raise PartitionError("candidate_unit_exceeds_consumer_limit")
             else:
                 active = candidate
