@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, replace
+from copy import deepcopy
 
 import pytest
 
@@ -259,7 +260,7 @@ def test_measure_only_prepares_native_fitted_spans_without_generation():
     result = run_partition_review(task, "intent", review, tev, limits=limits(measure_only=True))
     assert result.status == "measured" and result.reason == "native_input_prepared"
     assert result.usage["calls"] == 0 and not review.requests and not tev.requests
-    assert review.count_requests and tev.count_requests
+    assert not review.count_requests and tev.count_requests
     assert result.partition["native_unit_measurements"]
     validate_partition_result(result, task)
 
@@ -417,11 +418,20 @@ def test_architecture_uses_same_executor_and_keeps_analysis_as_evidence():
     delta = compute_delta(base_findings=[], head_findings=[{"rule": "CognitiveComplexity", "path": "src/A.java", "metric": 20, "method": "run"}],
         base_sha=snapshot.base.sha, head_sha=snapshot.head.sha)
     task = build_task_input(snapshot, delta, Classification("general"))
-    result = run_partition_review(task, "architecture", PartitionModelClient(), PartitionModelClient(), limits=limits())
+    review = PartitionModelClient()
+    instructions = "Inspect the bounded behavior."
+    result = run_partition_review(task, "architecture", review, PartitionModelClient(), limits=limits(), review_instructions=instructions)
     assert result.status == "completed", result.reason
     assert result.review_type == "A" and not result.perspectives
     validate_partition_result(result, task)
 
+    from review_bot.application import partition_review as contract
+    from review_bot.application.review_output_contract import render_output_contract
+    request = next(req for req in review.requests if json.loads(req.user_content)["stage"] == "review_partition")
+    assert request.system_prompt.count(contract.PMD_METRIC_REFERENCE) == 1
+    assert request.system_prompt == (contract.OBSERVE_PROMPT + "\nRepository review judgment and explanation guidance:\n" + instructions
+        + contract.PMD_METRIC_REFERENCE + contract.REVIEW_GROUNDING_RULE + render_output_contract(request.response_schema)
+        + "\nWrite every prose value in Korean.")
 
 def test_raw_pmd_member_and_class_findings_survive_observation_final_and_global_requests():
     from tests.unit.test_context_and_architecture_review import _make_snapshot
@@ -1932,4 +1942,260 @@ def test_initial_perspective_exclusions_are_provisional_and_final_review_account
     assert seen and len(result.perspectives) == 8
     assert all(row["verdict"] == "aligned" for row in result.perspectives)
     assert all(row["decision"] == "not_apply" for row in result.partition["scope_selection"]["perspectives"])
+    validate_partition_result(result, task)
+
+
+
+def test_planning_uses_tev_only_and_never_probes_or_generates_with_review_client():
+    class ForbiddenReview(PartitionModelClient):
+        def count_input_tokens(self, request):
+            pytest.fail("Initial planning must not meter the review model")
+        def complete(self, request):
+            pytest.fail("Initial planning must not generate with the review model")
+    review, tev = ForbiddenReview(), PartitionModelClient(group_all=True)
+    review.profile = replace(review.profile, max_input_tokens=1)
+    task = make_task()
+    result = run_partition_review(task, "planning", review, tev, limits=limits(), available_modes=("intent",))
+    assert result.status == "planned", result.reason
+    assert not review.requests and not review.count_requests
+    assert result.partition["execution_plan"]["version"] == 3
+    assert result.partition["consumer_admission_contract"] == result.partition["identity"]["consumer_admission_contract"]
+    assert all(set(values) == {"tev:review_scope", "tev:context_sufficiency"}
+        for values in result.partition["native_unit_measurements"].values())
+    assert not any("prepare_review_span" in event.stage or event.stage.endswith(":review") for event in result.stages)
+    validate_partition_result(result, task)
+    from review_bot.application.context import hash_json
+    changed = deepcopy(result)
+    changed.partition["execution_plan"].update(version=2)
+    changed.partition["execution_plan"].pop("consumer_admission_contract")
+    changed.partition["plan_id"] = hash_json(changed.partition["execution_plan"])
+    with pytest.raises(PartitionError, match="incompatible_shared_plan_protocol"):
+        validate_partition_result(changed, task)
+
+
+def test_actual_consumer_admits_selected_complete_requests_without_unit_or_candidate_review_probes():
+    task = make_task()
+    review, tev = PartitionModelClient(), PartitionModelClient(group_all=True)
+    plan = run_partition_review(task, "planning", review, tev, limits=limits(), available_modes=("intent",))
+    assert not review.count_requests and not review.requests
+    result = run_partition_review(task, "intent", review, tev, limits=limits(), prepared_plan=plan)
+    assert result.status == "completed", result.reason
+    assert not any(event.stage.startswith("prepare_review_span:") or event.stage == "candidate_group_admission:review" for event in result.stages)
+    delivery = result.partition["consumer_delivery"]
+    assert delivery["complete"] and delivery["initial_groups"] == delivery["groups"]
+    assert len(delivery["measurements"]) == len(result.partition["groups"])
+    generated = [r for r in review.requests if json.loads(r.user_content)["stage"] == "review_partition"]
+    assert len(generated) == len(delivery["measurements"])
+    from review_bot.application.context import hash_json
+    for request, measured in zip(generated, delivery["measurements"]):
+        assert "request" not in measured  # original text is not copied into every meter receipt
+        assert measured["prompt_hash"] == hash_json(request.system_prompt)
+        assert measured["schema_hash"] == hash_json(request.response_schema)
+        actual = replace(request, timeout_seconds=measured["timeout_seconds"])
+        assert hash_json(asdict(actual)) == measured["request_hash"]
+        assert result.stages[measured["stage_index"]].reason == "input_measured"
+    validate_partition_result(result, task)
+
+
+def _selected_consumer_large_task():
+    from tests.fixtures.intent_review import digest
+    from review_bot.application.intent_context import build_intent_task_input
+    task = make_task()
+    text = "\n".join(f"def unique_{index}(value):\n    return value + {index}\n" for index in range(12))
+    def extend(snapshot):
+        files = tuple(replace(file, content=text, content_hash=digest(text)) if file.path == "src/value.py" else file for file in snapshot.files)
+        inventory = digest(":".join(f"{file.path}:{file.content_hash}" for file in sorted(files, key=lambda file: file.path)))
+        return replace(snapshot, files=files, inventory_hash=inventory)
+    return build_intent_task_input(task.snapshot, extend(task.base), extend(task.head), related_paths=task.reviewed_paths)
+
+
+def test_selected_consumer_refines_only_after_known_overflow_and_keeps_large_unit_and_all_original_bytes():
+    from review_bot.application.partition_review import prepare_originals
+    task = _selected_consumer_large_task()
+    def count(request):
+        payload = json.loads(request.user_content)
+        if payload["stage"] != "review_partition":
+            return 100
+        return 100 + sum(len(block["text"].encode()) for source in payload["originals"] for block in source["blocks"])
+    review = PartitionModelClient(counter=count)
+    review.profile = replace(review.profile, max_input_tokens=300)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status in ("completed", "partial_review"), result.reason
+    delivery = result.partition["consumer_delivery"]
+    assert delivery["complete"] and delivery["initial_groups"] != delivery["groups"]
+    assert delivery["decision_id"] and any(node.get("kind") == "group_split" for node in delivery["roots"])
+    def nodes(node):
+        yield node
+        for child in node.get("children", []):
+            yield from nodes(child)
+    all_nodes = [node for root in delivery["roots"] for node in nodes(root)]
+    assert any(node["kind"] == "unit_split" for node in all_nodes)
+    for node in all_nodes:
+        measured = delivery["measurements"][node["measurement"]]
+        event = result.stages[measured["stage_index"]]
+        assert event.reason == ("input_measured" if node["kind"] == "accepted" else "input_limit_exceeded")
+    originals, _ = prepare_originals(task, "intent")
+    for source in originals:
+        rows = [u for u in result.partition["units"] if u["evidence_id"] == source.evidence_id]
+        assert rows[0]["start_byte"] == 0 and rows[-1]["end_byte"] == len(source.raw)
+        assert all(a["end_byte"] == b["start_byte"] for a, b in zip(rows, rows[1:]))
+    assert all(count(r) <= 300 for r in review.requests if json.loads(r.user_content)["stage"] == "review_partition")
+    validate_partition_result(result, task)
+    for field in ("measurement", "unit_ids"):
+        changed = deepcopy(result)
+        root = changed.partition["consumer_delivery"]["roots"][0]
+        root[field] = 999999 if field == "measurement" else []
+        with pytest.raises(PartitionError):
+            validate_partition_result(changed, task)
+
+
+def test_unknown_selected_native_measurement_stops_without_source_refinement_or_review_generation():
+    class UnknownReview(PartitionModelClient):
+        supports_native_input_measurement = True
+        token_count_receipt = None
+        def count_input_tokens(self, request):
+            self.count_requests.append(request)
+            self.token_count_receipt = {"delivery": "unknown", "model_calls": None, "usage": None}
+            raise TimeoutError("Unknown measurement consumption")
+    review = UnknownReview()
+    review.profile = replace(review.profile, provider="ollama-cloud", is_mock=False)
+    task = make_task()
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.reason == "usage_unavailable" and not review.requests
+    delivery = result.partition["consumer_delivery"]
+    assert not delivery["complete"] and len(delivery["measurements"]) == 1
+    assert all("children" not in root for root in delivery["roots"])
+    assert result.usage["usage_complete"] is False
+    validate_partition_result(result, task)
+
+
+
+@pytest.mark.parametrize("fits_budget", [True, False])
+def test_selected_consumer_native400_keeps_unknown_reservation_and_fresh_children_or_stops_budget(fits_budget):
+    from hashlib import sha256
+    import time
+    from review_bot.application.architecture_review import ModelInputCapacityError
+    from review_bot.application.model_execution import ModelExecutionBudget, capacity_input_hash
+    from review_bot.application.context import hash_json
+    from review_bot.application.model_wire_contract import beam_meter_wire_sha256
+    class CapacityReview(PartitionModelClient):
+        supports_native_input_measurement = True
+        token_count_receipt = None
+        def count_input_tokens(self, request):
+            self.count_requests.append(request)
+            payload = json.loads(request.user_content)
+            size = sum(len(block["text"].encode()) for source in payload.get("originals", []) for block in source["blocks"])
+            if payload["stage"] == "review_partition" and size > 400:
+                self.token_count_receipt = {"delivery": "unknown", "model_calls": None, "usage": None}
+                body = json.dumps({"error": "The prompt is too long: 1524758, model maximum context length: 1048576 (ref: d7fc51b7-fe86-4bfa-99c6-b70cf9701bb1)"})
+                proof = {"provider": "ollama-cloud", "model": "beam:cloud", "status": 400,
+                    "response_body": body, "response_sha256": sha256(body.encode()).hexdigest(),
+                    "wire_sha256": beam_meter_wire_sha256(request), "input_tokens": 1524758,
+                    "context_tokens": 1048576, "output_tokens_reserved": 1, "completed": True,
+                    "request_hash": hash_json(asdict(request)), "source_input_hash": capacity_input_hash(
+                        request.system_prompt, request.user_content, request.response_schema, request.model, request.max_output_tokens)}
+                raise ModelInputCapacityError("Beam cloud HTTP 400", proof)
+            self.token_count_receipt = {"delivery": "sent", "model_calls": 1, "usage": {"input_tokens": 100, "output_tokens": 1}}
+            return 100
+    task = _selected_consumer_large_task()
+    review = CapacityReview(name="beam:cloud")
+    review.profile = replace(review.profile, provider="ollama-cloud", max_input_tokens=98394, max_output_tokens=32678, is_mock=False)
+    tev = PartitionModelClient(group_all=True)
+    settings = PartitionReviewLimits(max_calls=256, max_total_tokens=50000000 if fits_budget else 1000000)
+    plan = run_partition_review(task, "planning", review, tev, limits=settings, available_modes=("intent",))
+    assert plan.status == "planned" and not review.count_requests and not review.requests
+    budget = ModelExecutionBudget(settings, time.monotonic() + settings.task_timeout_seconds, None)
+    result = run_partition_review(task, "intent", review, tev, limits=settings, prepared_plan=plan, shared_budget=budget)
+    assert result.partition["native_capacity_rejections"]
+    assert budget.totals()[2] is True and budget.operational_totals()[2] is False
+    assert result.usage["usage_complete"] is False and result.usage["unknown_usage_attempts"] > 0
+    assert all(row["budget_reservation"] == {"model_calls": 1, "total_tokens": 1524759}
+        for row in result.partition["native_capacity_rejections"])
+    delivery = result.partition["consumer_delivery"]
+    if fits_budget:
+        assert result.status in ("completed", "partial_review"), result.reason
+        assert delivery["complete"] and delivery["initial_groups"] != delivery["groups"]
+        assert result.partition["amended_plan"]["parent_plan_id"] == plan.partition["plan_id"]
+        assert review.requests and all(event.measured_input_tokens == 100 for event in result.stages
+            if event.stage.startswith("review_partition:G") and event.attempts)
+    else:
+        assert result.reason == "task_token_limit_exceeded" and not review.requests
+        assert not delivery["complete"] and len(delivery["measurements"]) == 1
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("mutation", ["contract", "overflow_reason", "request"])
+def test_selected_consumer_delivery_marker_and_actual_native_request_tampering_reject(mutation):
+    from review_bot.application.context import hash_json
+    task = make_task()
+    result = run_partition_review(task, "intent", PartitionModelClient(), PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed", result.reason
+    changed = deepcopy(result)
+    if mutation == "contract":
+        changed.partition.pop("consumer_admission_contract")
+        changed.partition["identity"].pop("consumer_admission_contract")
+        changed = replace(changed, run_key=hash_json(changed.partition["identity"]))
+    elif mutation == "overflow_reason":
+        node = changed.partition["consumer_delivery"]["roots"][0]
+        node["kind"] = "group_split"
+        node["children"] = []
+    else:
+        changed.partition["consumer_delivery"]["measurements"][0]["request_hash"] = "0" * 64
+    with pytest.raises(PartitionError):
+        validate_partition_result(changed, task)
+
+
+def test_selected_admission_contract_keeps_markerless_legacy_raw_and_strict_tamper_validation():
+    from pathlib import Path
+    from pydantic import TypeAdapter
+    from review_bot.domain.models_v1 import TaskInput
+    from review_bot.domain.partition_review import PartitionReviewResult
+    from review_bot.application.context import hash_json
+    packet = json.loads((Path(__file__).parents[1] / "fixtures/fact_review_v3_interrupted.json").read_text())
+    task = TypeAdapter(TaskInput).validate_python(packet["task"])
+    result = TypeAdapter(PartitionReviewResult).validate_python(packet["result"])
+    assert "consumer_admission_contract" not in result.partition
+    snapshot = deepcopy(result)
+    validate_partition_result(result, task)
+    assert result == snapshot and result.status == "partial_review"
+    note = result.partition["review_observations"][0]
+    note["raw_response"]["citations"] = [{"reference_id": "Q-forged"}]
+    note["raw_response_hash"] = hash_json(note["raw_response"])
+    with pytest.raises(PartitionError):
+        validate_partition_result(result, task)
+
+
+
+def test_selected_consumer_refinement_keeps_cpd_partner_details_and_both_head_sources():
+    from tests.unit.test_context_and_architecture_review import _make_snapshot
+    from review_bot.application.context import build_task_input
+    from review_bot.domain.models_v1 import AnalysisDelta, Classification, DeltaSignal, CpdDuplication, CpdOccurrence
+    paths = ("src/A.java", "src/B.java")
+    code = {path: "class " + path[4] + " {\n  void work() {\n    int distinct = 1;\n  }\n}\n" for path in paths}
+    snapshot = _make_snapshot(code, code)
+    finding = CpdDuplication(3, 120, tuple(CpdOccurrence(path, path, 2, 4,
+        code_fragment=code[path]) for path in paths), code[paths[0]])
+    signal = DeltaSignal("cpd-fixed-partners", "cpd", "new", (), (finding,), paths, "fixture_version_pair")
+    task = build_task_input(snapshot, AnalysisDelta(1, snapshot.base.sha, snapshot.head.sha, "same", True, (signal,)), Classification("general"))
+    def count(request):
+        payload = json.loads(request.user_content)
+        if payload["stage"] == "review_partition":
+            return 100 + sum(len(block["text"].encode()) for source in payload["originals"] for block in source["blocks"])
+        return 100
+    review = PartitionModelClient(counter=count)
+    review.profile = replace(review.profile, max_input_tokens=300)
+    result = run_partition_review(task, "architecture", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status in ("completed", "partial_review"), result.reason
+    delivered = set()
+    for request in review.requests:
+        payload = json.loads(request.user_content)
+        if payload["stage"] != "review_partition":
+            continue
+        delivered.update(source["path"] for source in payload["originals"] if source["version"] == "head")
+        for target in payload["review_target_details"]:
+            if target["target_id"] == signal.signal_id:
+                assert target["paths"] == list(paths)
+                assert target["head_findings"] == json.loads(json.dumps([asdict(finding)]))
+    assert set(paths) <= delivered
+    assert result.partition["consumer_delivery"]["decision_id"]
     validate_partition_result(result, task)

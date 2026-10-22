@@ -209,7 +209,7 @@ def test_cli_measure_only_uses_native_counter_without_generating_reviews(tmp_pat
         "--partition-evaluation", "--measure-only", "--max-total-tokens", "131072", "--max-calls", "1"]) == 0
     assert "measured/native_input_prepared" in capsys.readouterr().out
     assert not review.requests and not tev.requests
-    assert review.count_requests and tev.count_requests
+    assert not review.count_requests and tev.count_requests
     result = json.loads((output / "B/result.json").read_text())
     assert result["status"] == "measured" and result["usage"]["calls"] == 0
     assert json.loads((output / "manifest.json").read_text())["status"] == "succeeded"

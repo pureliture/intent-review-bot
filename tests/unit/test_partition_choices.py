@@ -12,7 +12,7 @@ def _uncached_candidates(units, fits):
     """Original candidate construction, independent of predicate memoization."""
     paired = sorted(units, key=lambda u: (u.path, u.start_byte, u.version, u.evidence_id))
     strategies = [
-        ("paired_pack", "Pack related base/head ranges together where native request limits allow.", paired, False),
+        ("paired_pack", "Pack related base/head ranges together where the planning tokenizer permits.", paired, False),
         ("per_original", "Keep source versions and originals in separate bounded groups.", units, True),
         ("individual_units", "Read one validated AST/fallback source unit in each request.", units, None),
     ]

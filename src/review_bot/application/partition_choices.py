@@ -75,7 +75,7 @@ PERSPECTIVE_OPTIONS = label_options([
 
 
 def plan_candidates(units, fits):
-    """Each offered candidate is complete, unique and fits BOTH actual consumers."""
+    """Each offered candidate is complete, unique and admitted by the supplied planner fits contract."""
     units = list(units)
     if not units or len({u.unit_id for u in units}) != len(units):
         raise PartitionError("invalid_candidate_inventory")
@@ -86,7 +86,7 @@ def plan_candidates(units, fits):
             feasibility[key] = fits(group)
         return feasibility[key]
     paired = sorted(units, key=lambda u: (u.path, u.start_byte, u.version, u.evidence_id))
-    strategies = [("paired_pack", "Pack related base/head ranges together where native request limits allow.", paired, False),
+    strategies = [("paired_pack", "Pack related base/head ranges together where the planning tokenizer permits.", paired, False),
         ("per_original", "Keep source versions and originals in separate bounded groups.", units, True),
         ("individual_units", "Read one validated AST/fallback source unit in each request.", units, None)]
     candidates, seen = [], set()

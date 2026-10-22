@@ -44,6 +44,13 @@ PROMPT_VERSION = "partitioned-review/v17-shared-service-batched-facts"
 MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
 MAX_MODEL_CITATIONS = 32
+CONSUMER_ADMISSION_CONTRACT = "selected-review-native/v1"
+REVIEW_GROUNDING_RULE = ("\nDraft concern and conditional_risk require BOTH a nonempty concrete failure_condition "
+                "and at least one citation to supplied HEAD code with a nonempty file path. PR prose, static reports "
+                "and base-only code cannot establish a HEAD failure. Keep every original and cite only supplied "
+                "references. On source_recheck, reconsider the unchanged original response against these same "
+                "sources and choices; explain the evidence faithfully without inventing support or automatically "
+                "downgrading a verdict to pass validation.")
 PERSPECTIVE_IDS = tuple(p.id for p in PERSPECTIVES)
 
 OBSERVE_PROMPT = """Read the actual original spans for the selected code review.
@@ -587,6 +594,46 @@ def _attach_common_context(originals, plan):
     return sorted(by_id.values(), key=lambda original: (original.path, original.version, original.evidence_id))
 
 
+def _unit_record(span):
+    return {key: value for key, value in asdict(span).items() if key != "text"}
+
+
+def _review_observation_spec(group, originals, meta, mode, *, anchors=(), previous=None, planning_intent=False):
+    relevant = _relevant_targets(group, meta)
+    supplied = _review_group_sources(group, originals)
+    known = {o.evidence_id: o for o in originals}
+    refs = citation_spans(supplied, known, anchors)
+    intent = mode == "intent" or planning_intent
+    draft_keys = PERSPECTIVE_IDS if intent else [d["target_id"] for d in relevant]
+    payload = {"originals": source_blocks([s for s in supplied if s.kind != "pr_text"], known),
+        "citation_catalog": citation_catalog(supplied, known, anchors),
+        "pr_purpose": source_blocks([s for s in supplied if s.kind == "pr_text"], known),
+        "review_target_details": relevant, "draft_assessment_keys": list(draft_keys),
+        "original_byte_sizes": {o.evidence_id: len(o.raw) for o in originals if o.evidence_id in {u.evidence_id for u in supplied}},
+        "perspective_catalog": [asdict(p) for p in PERSPECTIVES] if intent else [],
+        **({"source_recheck": previous} if previous is not None else {})}
+    schema = _note_schema(tuple(refs), draft_keys, architecture=mode == "architecture",
+        has_head_code=any(span.path and span.version == "head" for span in supplied),
+        head_reference_ids=[ref for ref, span in refs.items() if span.path and span.version == "head"])
+    return payload, schema
+
+
+def _consumer_parent_id(partition):
+    delivery = partition["consumer_delivery"]
+    return hash_json({"shared_plan_id": partition.get("shared_plan_id"), "plan_pages": partition["plan_pages"],
+        "units": delivery["initial_units"], "groups": delivery["initial_groups"]})
+
+
+def _consumer_delivery_choice(delivery):
+    options = choices.label_options([{"key": "preserve_selected_source_delivery",
+        "description": "Keep the selected source coverage in the measured consumer delivery; no original or judgement is removed.",
+        "groups": delivery["groups"]}])
+    state = {"field": "consumer_delivery", "parent_selection_id": delivery["parent_selection_id"],
+        "reason": "native_selected_review_request_exceeds_context", "initial_groups": delivery["initial_groups"],
+        "groups": delivery["groups"], "refinement_roots": delivery["roots"]}
+    return state, options
+
+
 def run_partition_review(task, mode, review_client, planning_client, *, limits: PartitionReviewLimits,
     language="ko", before_stage: Callable[[], bool] | None = None,
     shared_budget: ModelExecutionBudget | None = None,
@@ -618,7 +665,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     decisions, plan_pages, routing_reductions = [], [], []
     partitions = {"units": [], "observations": notes, "reductions": reductions,
         "observation_tracking_version": 1, "excluded_observations": exclusions,
-        "tev_protocol": choices.VERSION, "decisions": decisions, "plan_pages": plan_pages,
+        "tev_protocol": choices.VERSION, "consumer_admission_contract": CONSUMER_ADMISSION_CONTRACT,
+        "decisions": decisions, "plan_pages": plan_pages,
         "routing_reductions": routing_reductions,
         "mode_selection_under_evaluation": True, "operator_selected_mode": mode,
         "request_input_target_tokens": limits.input_target_tokens}
@@ -659,12 +707,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             global_review.PROMPT + (PMD_METRIC_REFERENCE if mode == "architecture" else "") + guidance
             if stage == "global_review" else prompts["final" if stage == "final_review" else "observe"])
         if stage == "review_partition":
-            prompt += ("\nDraft concern and conditional_risk require BOTH a nonempty concrete failure_condition "
-                "and at least one citation to supplied HEAD code with a nonempty file path. PR prose, static reports "
-                "and base-only code cannot establish a HEAD failure. Keep every original and cite only supplied "
-                "references. On source_recheck, reconsider the unchanged original response against these same "
-                "sources and choices; explain the evidence faithfully without inventing support or automatically "
-                "downgrading a verdict to pass validation.")
+            prompt += REVIEW_GROUNDING_RULE
         prompt += render_output_contract(schema)
         prompt += "\nWrite every prose value in Korean." if language == "ko" else "\nWrite every prose value in English."
         return ModelRequest(1, current.model, prompt,
@@ -737,22 +780,12 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     def observation_request(group, current, stage, previous=None):
         if stage == "observe_partition":
             return routing_request(group, "review_scope")
-        relevant = _relevant_targets(group, meta)
-        supplied = _review_group_sources(group, originals)
-        known = {o.evidence_id: o for o in originals}
-        draft_keys = PERSPECTIVE_IDS if mode == "intent" or mode == "planning" and "intent" in available_modes else [d["target_id"] for d in relevant]
-        return request(stage, {"originals": source_blocks([s for s in supplied if s.kind != "pr_text"], known),
-            "citation_catalog": quote_catalog(supplied),
-            "pr_purpose": source_blocks([s for s in supplied if s.kind == "pr_text"], known),
-            "review_target_details": relevant,
-            "draft_assessment_keys": list(draft_keys),
-            "original_byte_sizes": {o.evidence_id: len(o.raw) for o in originals if o.evidence_id in {u.evidence_id for u in supplied}},
-            "perspective_catalog": [asdict(p) for p in PERSPECTIVES] if mode == "intent" or mode == "planning" and "intent" in available_modes else [],
-            **({"source_recheck": previous} if previous is not None else {})},
-            _note_schema(tuple(quote_choices(supplied)), draft_keys, architecture=mode == "architecture",
-                has_head_code=any(s.path and s.version == "head" for s in supplied),
-                head_reference_ids=[ref for ref, span in quote_choices(supplied).items()
-                    if span.path and span.version == "head"]), current)
+        # Independent observations do not consume earlier observation results.
+        # Their original bytes/catalog stay stable between selected admission
+        # and execution. Earlier anchors remain intact in final integration.
+        payload, schema = _review_observation_spec(group, originals, meta, mode, previous=previous,
+            planning_intent=mode == "planning" and "intent" in available_modes)
+        return request(stage, payload, schema, current)
 
     def group_fits(group, label):
         if len(group) > choices.MAX_GROUP_UNITS:
@@ -760,7 +793,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         for field in ("review_scope", "context_sufficiency"):
             if not measure(routing_request(group, field), planning_client, planner, label + ":" + field):
                 return False
-        return measure(observation_request(group, profile, "review_partition"), review_client, profile, label + ":review")
+        return True
 
     def measure(req, client, current, label, *, for_generation=False):
         count, index = budget.measure(req, client, current, label=label,
@@ -1001,7 +1034,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             raise Stop("partition_model_profile_unset")
         if any(p.provider != "llamacpp" and not p.is_mock
             and getattr(client, "supports_native_input_measurement", False) is not True
-            for p, client in ((profile, review_client), (planner, planning_client))):
+            for p, client in (((planner, planning_client),) if mode == "planning" else
+                ((profile, review_client), (planner, planning_client)))):
             raise Stop("partition_requires_native_token_measurement")
         essential = 3 if mode == "planning" else 2 if prepared_plan is not None else 5
         if not limits.measure_only and budget.totals()[0] + essential > limits.max_calls:
@@ -1015,10 +1049,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                 unit_measurements.setdefault(span.unit_id, {})["tev:" + field] = budget.records[-1].measured_input_tokens
                 if not fit:
                     return False
-            review = observation_request([span], profile, "review_partition")
-            review_fit = measure(review, review_client, profile, "prepare_review_span:" + span.unit_id)
-            unit_measurements[span.unit_id]["bonsai"] = budget.records[-1].measured_input_tokens
-            return review_fit
+            return True
         for original in originals:
             if not original.text:
                 partitions.setdefault("empty_original_ids", []).append(original.evidence_id)
@@ -1080,7 +1111,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     state.update(parent_plan=prepared_plan.partition["execution_plan"],
                         amendment_reasons=deepcopy(partitions["plan_reuse"]["amendments"]),
                         analysis_relations=meta.get("target_details", []))
-                question = "Select one already validated reading plan. Prefer useful joint base/head context and fewer calls; never invent or edit groups."
+                question = "Select one TEV-tokenizer-admitted reading plan. The selected review requests receive separate native consumer admission. Prefer useful joint base/head context; never invent or edit groups."
                 req = choice_request("plan_partitions", state, candidates, question)
                 if len(candidates) == 1 or measure(req, planning_client, planner, "plan_inventory_admission"):
                     break
@@ -1094,11 +1125,107 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             plan_pages.append({"unit_ids": [u.unit_id for u in page], "candidates": candidates,
                 "decision_id": decision_id, "selected_key": selected["key"]})
             cursor += len(page)
+        if mode != "planning":
+            delivery = {"version": 1, "initial_units": [_unit_record(u) for u in units],
+                "initial_groups": [[u.unit_id for u in group] for group in groups],
+                "measurements": [], "roots": [], "complete": False}
+            partitions["consumer_delivery"] = delivery
+            delivery["parent_selection_id"] = _consumer_parent_id(partitions)
+            probe_cache = {}
+            def consumer_fits(group):
+                guard()
+                req = observation_request(group, profile, "review_partition")
+                key = (hash_json(asdict(req)), tuple(u.unit_id for u in group))
+                if key in probe_cache:
+                    return probe_cache[key]
+                index = len(budget.records)
+                measured = {"units": [_unit_record(u) for u in group], "stage_index": index - first_record}
+                delivery["measurements"].append(measured)
+                try:
+                    accepted = measure(req, review_client, profile, "selected_review_admission", for_generation=True)
+                finally:
+                    if len(budget.records) > index:
+                        witness = _note_request_witness(req, budget.records[index])
+                        measured.update(request_hash=budget.records[index].request_hash,
+                            prompt_hash=hash_json(req.system_prompt), schema_hash=hash_json(req.response_schema),
+                            timeout_seconds=witness["timeout_seconds"])
+                event = budget.records[index]
+                if not accepted and (event.token_measurement != "measured" or type(event.measured_input_tokens) is not int
+                        or event.measured_input_tokens <= min(profile.max_input_tokens or limits.max_input_tokens, limits.max_input_tokens)):
+                    raise Stop("selected_review_input_limit_unverified")
+                probe_cache[key] = (accepted, len(delivery["measurements"]) - 1)
+                return probe_cache[key]
+            def refine_selected(group, node):
+                node["unit_ids"] = [u.unit_id for u in group]
+                accepted, probe = consumer_fits(group)
+                node["measurement"] = probe
+                if accepted:
+                    node["kind"] = "accepted"
+                    return [group]
+                node["kind"] = "group_split" if len(group) > 1 else "unit_split"
+                node["children"] = []
+                if len(group) > 1:
+                    middle = len(group) // 2
+                    parts = [group[:middle], group[middle:]]
+                else:
+                    parent = group[0]
+                    original = next(o for o in originals if o.evidence_id == parent.evidence_id)
+                    local = SourceOriginal(original.evidence_id, parent.text, original.kind, original.path, original.version, original.sha)
+                    def absolute(part):
+                        return make_span(original, parent.start_byte + part.start_byte, parent.start_byte + part.end_byte, part.boundary)
+                    def fits_child(part):
+                        child = absolute(part)
+                        return fits(child) and consumer_fits([child])[0]
+                    refined = partition_original(local, fits_child, before_step=guard)
+                    parts = [[absolute(part)] for part in refined]
+                    if len(parts) < 2:
+                        raise Stop("selected_review_refinement_without_progress")
+                result = []
+                for part in parts:
+                    child = {}
+                    node["children"].append(child)
+                    result.extend(refine_selected(part, child))
+                return result
+            selected_groups = []
+            for group in groups:
+                node = {}
+                delivery["roots"].append(node)
+                selected_groups.extend(refine_selected(group, node))
+            groups = selected_groups
+            order = {original.evidence_id: i for i, original in enumerate(originals)}
+            units = sorted((unit for group in groups for unit in group), key=lambda u: (order[u.evidence_id], u.start_byte))
+            for original in originals:
+                if original.text:
+                    verify_partition(original, tuple(u for u in units if u.evidence_id == original.evidence_id))
+            delivery.update(complete=True, groups=[[u.unit_id for u in group] for group in groups])
+            changed = delivery["initial_groups"] != delivery["groups"]
+            if changed:
+                state, options = _consumer_delivery_choice(delivery)
+                _, decision_id = choose("plan_consumer_delivery", state, options,
+                    "Retain the selected original source coverage in the only native-admitted delivery amendment.",
+                    covered=[u.unit_id for u in units])
+                delivery["decision_id"] = decision_id
+                if prepared_plan is not None:
+                    partitions["plan_reuse"]["amendments"].append({"reason": state["reason"],
+                        "parent_selection_id": delivery["parent_selection_id"], "decision_id": decision_id})
+            partitions["units"] = [_unit_record(u) for u in units]
+            partitions["native_unit_measurements"] = {u.unit_id: unit_measurements[u.unit_id] for u in units}
+        partitions["groups"] = [{"group_id": f"G{i + 1}", "unit_ids": [u.unit_id for u in group]}
+            for i, group in enumerate(groups)]
+        if prepared_plan is not None:
+            partitions["scope_selection"] = deepcopy(prepared_plan.partition["scope_selection"])
+            if partitions["plan_reuse"]["amendments"]:
+                amended = {"version": 3, "parent_plan_id": partitions["shared_plan_id"],
+                    "base_sha": meta["base_sha"], "head_sha": meta["head_sha"],
+                    "source_hashes": partitions["source_hashes"], "units": partitions["units"],
+                    "groups": partitions["groups"], "selection": partitions["scope_selection"],
+                    "reasons": deepcopy(partitions["plan_reuse"]["amendments"]),
+                    "analysis_relations": meta.get("target_details", []),
+                    "decision_ids": [page["decision_id"] for page in plan_pages]}
+                partitions["amended_plan"], partitions["amended_plan_id"] = amended, hash_json(amended)
         minimum_calls = (2 * len(groups) + 1) if mode == "planning" else (len(groups) + 1) if prepared_plan is not None else (3 * len(groups) + 2)
         if budget.totals()[0] + minimum_calls > limits.max_calls:
             raise Stop("call_limit_exceeded")
-        partitions["groups"] = [{"group_id": f"G{i + 1}", "unit_ids": [u.unit_id for u in group]}
-            for i, group in enumerate(groups)]
         if prepared_plan is None:
             # Two fixed categorical fields per group, each selected with one label.
             for i, group in enumerate(groups):
@@ -1170,7 +1297,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                 if len(set(chosen)) != len(chosen) or any(m not in available_modes for m in chosen):
                     raise PartitionError("invalid_global_mode_selection")
                 partitions["selected_modes"] = [m for m in available_modes if m in chosen]
-                plan = {"version": 2, "tev_protocol": choices.VERSION, "input_hash": meta["input_hash"], "base_sha": meta["base_sha"], "head_sha": meta["head_sha"],
+                plan = {"version": 3, "tev_protocol": choices.VERSION,
+                    "consumer_admission_contract": CONSUMER_ADMISSION_CONTRACT, "input_hash": meta["input_hash"], "base_sha": meta["base_sha"], "head_sha": meta["head_sha"],
                     "available_modes": list(available_modes), "selected_modes": partitions["selected_modes"],
                     "units": partitions["units"], "groups": partitions["groups"],
                     "source_hashes": partitions["source_hashes"], "selection": partitions["scope_selection"],
@@ -1181,17 +1309,6 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                         for o in originals if o.kind == "pr_text"])}
                 partitions["execution_plan"], partitions["plan_id"] = plan, hash_json(plan)
                 raise Planned
-        else:
-            partitions["scope_selection"] = deepcopy(prepared_plan.partition["scope_selection"])
-            if partitions["plan_reuse"]["amendments"]:
-                amended = {"version": 3, "parent_plan_id": partitions["shared_plan_id"],
-                    "base_sha": meta["base_sha"], "head_sha": meta["head_sha"],
-                    "source_hashes": partitions["source_hashes"], "units": partitions["units"],
-                    "groups": partitions["groups"], "selection": partitions["scope_selection"],
-                    "reasons": deepcopy(partitions["plan_reuse"]["amendments"]),
-                    "analysis_relations": meta.get("target_details", []),
-                    "decision_ids": [page["decision_id"] for page in plan_pages]}
-                partitions["amended_plan"], partitions["amended_plan_id"] = amended, hash_json(amended)
         # Review code in Bonsai as well: TEV observations are interpretations,
         # never a replacement for a Bonsai read of every actual original unit.
         review_notes = []
@@ -1759,6 +1876,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         "input_hash": meta.get("input_hash", ""), "limits": asdict(limits),
         "prompts": hashes, "models": {"review": asdict(profile) if profile else None,
         "planner": asdict(planner) if planner else None}}
+    identity["consumer_admission_contract"] = CONSUMER_ADMISSION_CONTRACT
     identity["implementation"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
         for name in ("partition_review.py", "source_partition.py", "model_execution.py", "model_wire_contract.py", "partition_choices.py", "source_citations.py", "source_quote_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py", "review_fact_check.py", "selection.py")}
     identity["implementation"].update({"adapters/" + name: hashlib.sha256(
@@ -1807,7 +1925,12 @@ def validate_execution_plan(result):
         raise PartitionError("shared_plan_not_completed")
     p = result.partition
     plan = p.get("execution_plan", {})
-    if plan.get("version") != 2 or plan.get("tev_protocol") != choices.VERSION:
+    version = plan.get("version")
+    if (version not in (2, 3) or plan.get("tev_protocol") != choices.VERSION or
+            version == 2 and any("consumer_admission_contract" in value for value in (plan, p, p.get("identity", {}))) or
+            version == 3 and (plan.get("consumer_admission_contract") != CONSUMER_ADMISSION_CONTRACT or
+                p.get("consumer_admission_contract") != CONSUMER_ADMISSION_CONTRACT or
+                p.get("identity", {}).get("consumer_admission_contract") != CONSUMER_ADMISSION_CONTRACT)):
         raise PartitionError("incompatible_shared_plan_protocol")
     if p.get("plan_id") != hash_json(plan) or plan.get("input_hash") != result.input_hash or (
         plan.get("base_sha"), plan.get("head_sha")) != (result.base_sha, result.head_sha):
@@ -1898,15 +2021,17 @@ def _validate_deferred_intent_selection(result, selected, records, rows):
         raise PartitionError("stored_deferred_perspective_failure_mismatch")
 
 
-def _validate_closed_trace(result, known_units):
+def _validate_closed_trace(result, known_units, planning_units=None):
     partition = result.partition
     records = choices.validate_decisions(partition, result.stages)
     used = []
     pages = []
-    actual_groups = [g["unit_ids"] for g in partition.get("groups", [])]
+    planning_units = known_units if planning_units is None else planning_units
+    delivery = partition.get("consumer_delivery")
+    actual_groups = delivery["initial_groups"] if delivery else [g["unit_ids"] for g in partition.get("groups", [])]
     for page in partition.get("plan_pages", []):
         ids = page["unit_ids"]
-        if not ids or len(set(ids)) != len(ids) or any(u not in known_units for u in ids):
+        if not ids or len(set(ids)) != len(ids) or any(u not in planning_units for u in ids):
             raise PartitionError("stored_candidate_inventory_mismatch")
         pages.extend(ids)
         record = records.get(page["decision_id"])
@@ -1923,7 +2048,7 @@ def _validate_closed_trace(result, known_units):
     if len(set(pages)) != len(pages):
         raise PartitionError("stored_candidate_page_overlap")
     if not partition.get("shared_plan_id"):
-        if sorted(pages) != sorted(known_units):
+        if sorted(pages) != sorted(planning_units):
             raise PartitionError("stored_candidate_pages_incomplete")
         eligible = tuple(partition["execution_plan"]["available_modes"]) if result.review_type == "PLAN" else ("intent" if result.review_type == "B" else "architecture",)
         for row, group in zip(partition.get("observations", []), partition.get("groups", [])):
@@ -1975,6 +2100,8 @@ def _validate_closed_trace(result, known_units):
             if choices.accept_choice({"choice": decision["choice"]}, decision["options"])["key"] != row["decision"]:
                 raise PartitionError("stored_perspective_choice_mismatch")
             used.append(decision["decision_id"])
+    if delivery and delivery.get("decision_id"):
+        used.append(delivery["decision_id"])
     if partition.get("integration_plan"):
         plan = partition["integration_plan"]
         decision = records.get(plan["decision_id"])
@@ -2412,7 +2539,8 @@ def _validate_review_validation_history(result, known_units, originals, meta):
             keys = PERSPECTIVE_IDS if result.review_type == "B" else [d["target_id"] for d in _relevant_targets(sources, meta)]
             request_packet = item["request"]
             payload = json.loads(request_packet["user_content"])
-            anchors = [citation for row in notes if row["stage_index"] < index for citation in row["citations"]]
+            anchors = ([] if partition.get("consumer_admission_contract") == CONSUMER_ADMISSION_CONTRACT else
+                [citation for row in notes if row["stage_index"] < index for citation in row["citations"]])
             if (payload["originals"] != source_blocks([span for span in sources if span.kind != "pr_text"], originals)
                     or payload["pr_purpose"] != source_blocks([span for span in sources if span.kind == "pr_text"], originals)
                     or payload["citation_catalog"] != citation_catalog(sources, originals, anchors)):
@@ -2505,6 +2633,165 @@ def _validate_capacity_rejections(result):
         raise PartitionError("stored_native_capacity_reservation_changed")
 
 
+def _validate_consumer_delivery(result, originals, meta, known_units):
+    partition = result.partition
+    marker = partition.get("consumer_admission_contract")
+    identity_marker = partition.get("identity", {}).get("consumer_admission_contract")
+    if marker is None and identity_marker is None:
+        if "consumer_delivery" in partition:
+            raise PartitionError("stored_consumer_contract_missing")
+        return known_units  # unmodified strict legacy trace
+    if marker != CONSUMER_ADMISSION_CONTRACT or identity_marker != marker:
+        raise PartitionError("stored_consumer_contract_changed")
+    delivery = partition.get("consumer_delivery")
+    if result.review_type == "PLAN":
+        if delivery is not None or any(event.stage.startswith("prepare_review_span:")
+                or event.stage in ("candidate_group_admission:review", "selected_review_admission")
+                or event.stage.startswith("review_partition") for event in result.stages):
+            raise PartitionError("stored_planning_review_probe_forbidden")
+        return known_units
+    if delivery is None:
+        if result.status in ("completed", "partial_review"):
+            raise PartitionError("stored_consumer_delivery_missing")
+        return known_units
+    by_id = originals
+    def restore(value):
+        original = by_id[value["evidence_id"]]
+        span = make_span(original, value["start_byte"], value["end_byte"], value["boundary"])
+        if _unit_record(span) != value:
+            raise PartitionError("stored_consumer_unit_changed")
+        return span
+    initial = [restore(value) for value in delivery["initial_units"]]
+    initial_by_id = {u.unit_id: u for u in initial}
+    if len(initial_by_id) != len(initial) or delivery.get("version") != 1 or delivery.get("parent_selection_id") != _consumer_parent_id(partition):
+        raise PartitionError("stored_consumer_parent_changed")
+    for original in by_id.values():
+        if original.text:
+            verify_partition(original, tuple(u for u in initial if u.evidence_id == original.evidence_id))
+    initial_groups = delivery["initial_groups"]
+    if sorted(u for group in initial_groups for u in group) != sorted(initial_by_id):
+        raise PartitionError("stored_consumer_initial_coverage_changed")
+    profile = ModelProfile(**partition["identity"]["models"]["review"])
+    limits = PartitionReviewLimits(**partition["identity"]["limits"])
+    mode = "intent" if result.review_type == "B" else "architecture"
+    instructions = partition.get("review_instructions", "")
+    measured, measured_units, canonical = [], [], dict(initial_by_id)
+    for item in delivery["measurements"]:
+        spans = [restore(value) for value in item["units"]]
+        index = item["stage_index"]
+        if type(index) is not int or not 0 <= index < len(result.stages):
+            raise PartitionError("stored_consumer_stage_changed")
+        event = result.stages[index]
+        payload, schema = _review_observation_spec(spans, list(by_id.values()), meta, mode)
+        guidance = "\nRepository review judgment and explanation guidance:\n" + instructions if instructions else ""
+        prompt = OBSERVE_PROMPT + guidance + (PMD_METRIC_REFERENCE if mode == "architecture" else "")
+        prompt += REVIEW_GROUNDING_RULE + render_output_contract(schema)
+        prompt += "\nWrite every prose value in Korean." if result.language == "ko" else "\nWrite every prose value in English."
+        output = min(profile.max_output_tokens, limits.observation_output_tokens) if limits.observation_output_tokens is not None else profile.max_output_tokens
+        expected = asdict(ModelRequest(1, profile.model, prompt,
+            json.dumps({"stage": "review_partition", "mode": mode, "language": result.language, **payload},
+                ensure_ascii=False, separators=(",", ":"), allow_nan=False), profile.timeout_seconds, output, schema))
+        timeout = item.get("timeout_seconds")
+        if type(timeout) is not int or not 0 < timeout <= expected["timeout_seconds"]:
+            raise PartitionError("stored_consumer_timeout_changed")
+        expected["timeout_seconds"] = timeout
+        if (hash_json(expected) != item.get("request_hash") or item.get("request_hash") != event.request_hash
+                or item.get("prompt_hash") != hash_json(expected["system_prompt"])
+                or item.get("schema_hash") != hash_json(expected["response_schema"])
+                or event.stage != "selected_review_admission" or event.prompt_hash != hash_json({
+                    "system": expected["system_prompt"], "schema": expected["response_schema"]}) or event.attempts):
+            raise PartitionError("stored_consumer_request_changed")
+        count = event.measured_input_tokens
+        fit = event.reason == "input_measured" and event.status == "completed"
+        overflow = event.reason == "input_limit_exceeded" and event.token_measurement == "measured" and type(count) is int and count > min(
+            profile.max_input_tokens or limits.max_input_tokens, limits.max_input_tokens)
+        capacity = next((value for value in partition.get("native_capacity_rejections", []) if value["stage_index"] == index), None)
+        if overflow and event.token_measurement_delivery == "unknown":
+            if capacity is None:
+                raise PartitionError("stored_consumer_unbounded_overflow")
+            try:
+                capacity_reservation(event, {k: v for k, v in capacity.items() if k != "stage_index"}, profile, ModelRequest(**expected))
+            except (ValueError, TypeError, KeyError):
+                raise PartitionError("stored_consumer_capacity_changed") from None
+        if fit and (type(count) is not int or count < 0 or count > min(profile.max_input_tokens or limits.max_input_tokens, limits.max_input_tokens)):
+            raise PartitionError("stored_consumer_admission_changed")
+        measured.append(True if fit else False if overflow else None)
+        measured_units.append([u.unit_id for u in spans])
+        canonical.update({u.unit_id: u for u in spans})
+    if not delivery.get("complete"):
+        if result.status in ("completed", "partial_review") or "decision_id" in delivery:
+            raise PartitionError("stored_consumer_delivery_incomplete")
+        return initial_by_id
+    visited, leaves, refined_parents = set(), [], []
+    def visit(node, ids):
+        if node.get("unit_ids") != ids:
+            raise PartitionError("stored_consumer_split_coverage_changed")
+        probe = node.get("measurement")
+        if type(probe) is not int or not 0 <= probe < len(measured) or measured_units[probe] != ids:
+            raise PartitionError("stored_consumer_split_measurement_changed")
+        visited.add(probe)
+        if node.get("kind") == "accepted":
+            if measured[probe] is not True or "children" in node:
+                raise PartitionError("stored_consumer_unadmitted_child")
+            leaves.append(ids)
+            return
+        if measured[probe] is not False:
+            raise PartitionError("stored_consumer_split_without_overflow")
+        children = node.get("children", [])
+        if node.get("kind") == "group_split":
+            middle = len(ids) // 2
+            if not middle or len(children) != 2:
+                raise PartitionError("stored_consumer_invalid_group_split")
+            expected = [ids[:middle], ids[middle:]]
+        elif node.get("kind") == "unit_split" and len(ids) == 1:
+            if len(children) < 2:
+                raise PartitionError("stored_consumer_invalid_unit_split")
+            parent = canonical[ids[0]]
+            refined_parents.append((parent, probe))
+            child_ids = [u for child in children for u in child.get("unit_ids", [])]
+            if len(child_ids) != len(children):
+                raise PartitionError("stored_consumer_invalid_unit_split")
+            parts = [canonical[u] for u in child_ids]
+            cursor = parent.start_byte
+            for part in parts:
+                if part.evidence_id != parent.evidence_id or part.source_hash != parent.source_hash or part.start_byte != cursor or part.end_byte <= cursor:
+                    raise PartitionError("stored_consumer_unit_cover_changed")
+                cursor = part.end_byte
+            if cursor != parent.end_byte:
+                raise PartitionError("stored_consumer_unit_cover_changed")
+            expected = [[u] for u in child_ids]
+        else:
+            raise PartitionError("stored_consumer_split_kind_changed")
+        for child, child_ids in zip(children, expected):
+            visit(child, child_ids)
+    if len(delivery["roots"]) != len(initial_groups):
+        raise PartitionError("stored_consumer_roots_changed")
+    for node, ids in zip(delivery["roots"], initial_groups):
+        visit(node, ids)
+    if leaves != delivery.get("groups") or leaves != [g["unit_ids"] for g in partition["groups"]] or sorted(u for ids in leaves for u in ids) != sorted(known_units):
+        raise PartitionError("stored_consumer_final_coverage_changed")
+    indices = [item["stage_index"] for item in delivery["measurements"]]
+    if indices != sorted(set(indices)):
+        raise PartitionError("stored_consumer_measurement_order_changed")
+    for number, ids in enumerate(measured_units):
+        if number in visited:
+            continue
+        if measured[number] is None or len(ids) != 1 or not any(
+                number > probe and canonical[ids[0]].evidence_id == parent.evidence_id
+                and parent.start_byte <= canonical[ids[0]].start_byte < canonical[ids[0]].end_byte <= parent.end_byte
+                for parent, probe in refined_parents):
+            raise PartitionError("stored_consumer_unselected_probe")
+    changed = initial_groups != leaves
+    if changed:
+        state, options = _consumer_delivery_choice(delivery)
+        decision = next((row for row in partition["decisions"] if row["decision_id"] == delivery.get("decision_id")), None)
+        if decision is None or decision["stage"] != "plan_consumer_delivery" or decision["state"] != state or decision["options"] != options or decision["covered_unit_ids"] != sorted(known_units):
+            raise PartitionError("stored_consumer_amendment_changed")
+    elif "decision_id" in delivery:
+        raise PartitionError("stored_consumer_unnecessary_amendment")
+    return initial_by_id
+
+
 def validate_partition_result(result: PartitionReviewResult, task) -> None:
     """Recheck immutable originals, coverage and extracted quotes before output."""
     if type(result) is not PartitionReviewResult or result.schema_version != 13 or result.review_type not in ("A", "B", "PLAN"):
@@ -2567,12 +2854,13 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
     if result.partition.get("units_prepared"):
         for original in originals:
             verify_partition(original, tuple(u for u in units if u.evidence_id == original.evidence_id))
+    planning_units = _validate_consumer_delivery(result, by_id, meta, known_units)
     if result.status == "measured" and (not result.partition.get("units_prepared") or
         result.reason != "native_input_prepared" or any(r.attempts for r in result.stages)):
         raise PartitionError("invalid_measurement_only_result")
     if result.status == "planned":
         validate_execution_plan(result)
-        _validate_closed_trace(result, known_units)
+        _validate_closed_trace(result, known_units, planning_units)
         _validate_observation_tracking(result.partition, known_units, by_id, planning_only=True)
     if result.partition.get("shared_plan_id"):
         plan = result.partition.get("shared_plan", {})
@@ -2596,14 +2884,15 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
         if reuse.get("reused_group_ids") != [g["group_id"] for g in projections] or len({
             g["group_id"] for g in projections}) != len(projections):
             raise PartitionError("stored_shared_plan_reuse_mismatch")
-        actual_groups = [g["unit_ids"] for g in result.partition.get("groups", [])]
+        delivery = result.partition.get("consumer_delivery")
+        actual_groups = delivery["initial_groups"] if delivery else [g["unit_ids"] for g in result.partition.get("groups", [])]
         for group in projections:
             previous = common_groups.get(group["group_id"])
-            if previous is None or group["unit_ids"] != [u for u in previous if u in known_units] or (
-                group["omitted_unit_ids"] != [u for u in previous if u not in known_units]) or group["unit_ids"] not in actual_groups:
+            if previous is None or group["unit_ids"] != [u for u in previous if u in planning_units] or (
+                group["omitted_unit_ids"] != [u for u in previous if u not in planning_units]) or group["unit_ids"] not in actual_groups:
                 raise PartitionError("stored_shared_group_projection_mismatch")
     if result.status in ("completed", "partial_review"):
-        _validate_closed_trace(result, known_units)
+        _validate_closed_trace(result, known_units, planning_units)
         _validate_observation_tracking(result.partition, known_units, by_id,
             signal_spans=signal_context_spans(originals, meta.get("target_details", [])), target_paths=meta["target_paths"], review_meta=meta)
         _validate_global_review(result, originals, meta)
@@ -2631,7 +2920,7 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
     originals_by_id = {o.evidence_id: o for o in originals}
     _validate_review_validation_history(result, known_units, originals_by_id, meta)
     if result.status in ("failed", "not_run") and "global_review" in result.partition:
-        _validate_closed_trace(result, known_units)
+        _validate_closed_trace(result, known_units, planning_units)
         _validate_observation_tracking(result.partition, known_units, by_id,
             signal_spans=signal_context_spans(originals, meta.get("target_details", [])), target_paths=meta["target_paths"], review_meta=meta)
         _validate_global_review(result, originals, meta)
