@@ -22,7 +22,7 @@ from typing import Any
 
 import httpx
 
-from review_bot.adapters.byte_budget import precheck_byte_budget as _shared_precheck
+from review_bot.adapters.byte_budget import FRAMING_RESERVE_TOKENS, precheck_byte_budget as _shared_precheck
 from review_bot.application.architecture_review import PermanentModelError, TransientModelError
 
 OPENROUTER_BASE_URL = "https://openrouter.ai"
@@ -65,13 +65,13 @@ def base_url(value: str | None) -> str:
 
 def precheck_byte_budget(wire_len: int, max_output_tokens: int, *, app_input_tokens: int,
         app_output_tokens: int, model_context_tokens: int, role: str,
-        framing_reserve_tokens: int = 8192) -> None:
+        framing_reserve_tokens: int | None = None) -> None:
     """Fail-closed pre-send gate; delegates to the shared byte_budget module."""
     if wire_len > _TRANSPORT_BYTES:
         raise PermanentModelError(f"{role} input exceeds transport byte limit")
     return _shared_precheck(wire_len, max_output_tokens, app_input_tokens=app_input_tokens,
         app_output_tokens=app_output_tokens, model_context_tokens=model_context_tokens, role=role,
-        framing_reserve_tokens=framing_reserve_tokens)
+        framing_reserve_tokens=FRAMING_RESERVE_TOKENS if framing_reserve_tokens is None else framing_reserve_tokens)
 
 
 def check_response_usage(usage: Any, *, app_input_tokens: int, app_output_tokens: int,

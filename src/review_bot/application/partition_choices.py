@@ -198,7 +198,9 @@ def validate_decisions(partition, stages):
                 raise PartitionError("stored_choice_response_mismatch")
             if stage.prompt_hash != hash_json({"system": SYSTEM, "schema": choice_schema(options)}) or not stage.attempts or stage.status != "completed":
                 raise PartitionError("stored_choice_protocol_mismatch")
-            if any(a.usage is None or a.usage["output_tokens"] > CHOICE_OUTPUT_TOKENS for a in stage.attempts):
+            from review_bot.adapters.byte_budget import ADMISSION_OUTPUT_FLOOR_TOKENS
+            if any(a.usage is None or a.usage["output_tokens"] > max(
+                    CHOICE_OUTPUT_TOKENS, ADMISSION_OUTPUT_FLOOR_TOKENS) for a in stage.attempts):
                 raise PartitionError("stored_choice_usage_mismatch")
         else:
             raise PartitionError("invalid_choice_method")

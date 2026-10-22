@@ -12,6 +12,12 @@ from __future__ import annotations
 
 from review_bot.application.architecture_review import PermanentModelError
 
+# Adapters whose models mandate reasoning (or other per-call overhead) may
+# floor tiny per-request output reservations up to this wire cap so that
+# reasoning plus content fits. Validators must allow choice-sized outputs
+# up to this floor; the response schema still bounds actual content.
+ADMISSION_OUTPUT_FLOOR_TOKENS = 512
+
 # Fixed conservative cover for server-side framing (chat templates and
 # request envelopes) that is not part of our wire bytes. A post-send usage
 # check fails closed if real framing ever exceeds it.

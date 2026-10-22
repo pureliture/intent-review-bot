@@ -22,6 +22,7 @@ from typing import Any
 
 import httpx
 
+from review_bot.adapters.byte_budget import ADMISSION_OUTPUT_FLOOR_TOKENS
 from review_bot.adapters.llamacpp import _check_output_fields, _json_object
 from review_bot.adapters.model_http import mark_model_request_sent, model_request_slot
 from review_bot.adapters.openrouter_common import (
@@ -54,8 +55,6 @@ REVIEW_CONTEXT_TOKENS = 1000000
 # Production 128K envelope from the agreed app budget: input + output.
 APP_INPUT_TOKENS = 98394
 APP_OUTPUT_TOKENS = 32678
-# Minimax always reasons; the wire output reservation never goes below this.
-_MINIMAX_WIRE_FLOOR_TOKENS = 512
 _CHAT_PATH = "/api/v1/chat/completions"
 _ZERO_USAGE = {"input_tokens": 0, "output_tokens": 0}
 
@@ -81,7 +80,7 @@ def review_wire_payload(request: ModelRequest) -> tuple[dict[str, Any], int]:
     # legacy reservations (e.g. 16-token closed choices) cannot fit reasoning
     # plus content, so the wire reservation is floored. The floor participates
     # in the same byte-bound pre-gate and post-send usage check.
-    floored = max(maximum, _MINIMAX_WIRE_FLOOR_TOKENS)
+    floored = max(maximum, ADMISSION_OUTPUT_FLOOR_TOKENS)
     schema = compact_schema(request.response_schema)
     contract = ("\n\nReturn exactly one JSON object matching this entire response schema. "
         "Do not add prose or fields.\n"
