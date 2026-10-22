@@ -58,6 +58,27 @@ def _count(value: Any) -> int:
     return value
 
 
+def _choice_envelope(request: ModelRequest, model: str) -> dict[str, Any] | None:
+    """Parse a partition/framework closed-choice envelope, or None.
+
+    Distinct from mode-selection metadata by top-level keys; never guessed.
+    """
+    if (not isinstance(request, ModelRequest) or request.model != model
+            or not _positive(request.timeout_seconds)):
+        return None
+    try:
+        body = json.loads(request.user_content)
+    except (ValueError, TypeError):
+        return None
+    if (
+        not isinstance(body, dict) or set(body) != {"stage", "mode", "language", "state", "question", "options"}
+        or not isinstance(body["state"], dict) or not isinstance(body["question"], str) or not body["question"]
+        or not isinstance(body["options"], list) or not body["options"]
+    ):
+        return None
+    return body
+
+
 def _selection_metadata(request: ModelRequest, model: str) -> dict[str, Any]:
     if (not isinstance(request, ModelRequest) or request.model != model
             or not _positive(request.timeout_seconds)):
@@ -109,6 +130,38 @@ def decision_wire_payload(model: str, state: dict[str, Any],
         }},
     }
     return payload, choices
+
+
+def choice_wire_payload(model: str, state: dict[str, Any], instructions: str,
+        options: list[dict[str, str]]) -> tuple[dict[str, Any], dict[str, str]]:
+    """Pure closed-choice wire builder for partition/framework choices.
+
+    Criteria keys are the option keys; the answer choice maps back to the
+    option label. No HTTP, no inference.
+    """
+    criteria = {}
+    key_to_label = {}
+    for option in options:
+        if not isinstance(option, dict) or set(option) != {"label", "key", "description"}:
+            raise PermanentModelError("Invalid closed-choice options")
+        label, key, description = option["label"], option["key"], option["description"]
+        if (not isinstance(label, str) or not label or not isinstance(key, str) or not key
+                or not isinstance(description, str) or not description
+                or key in criteria):
+            raise PermanentModelError("Invalid closed-choice options")
+        criteria[key] = description
+        key_to_label[key] = label
+    if not criteria:
+        raise PermanentModelError("Invalid closed-choice options")
+    payload = {
+        "model": model, "state": state,
+        "questions": {"choice": {
+            "type": "choice",
+            "instructions": instructions,
+            "criteria": criteria,
+        }},
+    }
+    return payload, key_to_label
 
 
 def _validate_decision_answer(answer: Any, choices: dict[str, tuple[str, ...]],
@@ -208,16 +261,20 @@ class OpenRouterDecisionClient:
 
         Pure local computation; no HTTP, no measurement call.
         """
+        envelope = _choice_envelope(request, self.model)
+        if envelope is not None:
+            payload, _ = choice_wire_payload(self.model, envelope["state"],
+                request.system_prompt + "\n" + envelope["question"], envelope["options"])
+            return len(encode(payload)) + self._framing_reserve_tokens
         metadata = _selection_metadata(request, self.model)
         state = {key: metadata[key] for key in ("title", "body", "changed_files")}
         payload, _ = decision_wire_payload(self.model, state, tuple(metadata["available_modes"]))
         return len(encode(payload)) + self._framing_reserve_tokens
 
-    def _decide(self, state: dict[str, Any], timeout_seconds: int,
-            available_modes: tuple[str, ...] = ("architecture",),
-    ) -> ModelResponse:
-        payload, choices = decision_wire_payload(self.model, state, available_modes)
-        body = encode(payload)
+    def _send_decision(self, body: bytes, timeout_seconds: int,
+            answer_key: str, criteria_keys: set[str], choices: dict[str, Any],
+    ) -> tuple[str, dict[str, int]]:
+        """One decisions POST with usage-validated answer. Shared by both roles."""
         if len(body) > _MAX_DECISION_BYTES:
             raise PermanentModelError("OpenRouter decision input exceeds 64 KiB; truncation is forbidden")
         deadline = time.monotonic() + timeout_seconds
@@ -231,10 +288,9 @@ class OpenRouterDecisionClient:
             framing_reserve_tokens=self._framing_reserve_tokens)
         data = self._post(body, deadline)
         answers = data.get("answers")
-        if not isinstance(answers, dict) or set(answers) != {"review_mode"}:
+        if not isinstance(answers, dict) or set(answers) != {answer_key}:
             raise PermanentModelError("Invalid OpenRouter decision answers")
-        criteria_keys = set(payload["questions"]["review_mode"]["criteria"])
-        choice = _validate_decision_answer(answers["review_mode"], choices, criteria_keys)
+        choice = _validate_decision_answer(answers[answer_key], choices, criteria_keys)
         usage = data.get("usage")
         if not isinstance(usage, dict):
             raise PermanentModelError("Invalid OpenRouter decision usage")
@@ -243,9 +299,33 @@ class OpenRouterDecisionClient:
         if (checked["input_tokens"] > self.profile.max_input_tokens
                 or checked["input_tokens"] + checked["output_tokens"] > model_context):
             raise PermanentModelError("OpenRouter decision usage exceeds budget; result is discarded")
+        return choice, checked
+
+    def _decide(self, state: dict[str, Any], timeout_seconds: int,
+            available_modes: tuple[str, ...] = ("architecture",),
+    ) -> ModelResponse:
+        payload, choices = decision_wire_payload(self.model, state, available_modes)
+        criteria_keys = set(payload["questions"]["review_mode"]["criteria"])
+        choice, checked = self._send_decision(encode(payload), timeout_seconds,
+            "review_mode", criteria_keys, choices)
         return ModelResponse(json.dumps({"selected_modes": [mode for mode in available_modes if mode in choices[choice]]}), checked)
 
+    def _complete_choice(self, envelope: dict[str, Any], system_prompt: str, timeout_seconds: int) -> ModelResponse:
+        """Partition/framework closed choice through the Decisions API."""
+        payload, key_to_label = choice_wire_payload(self.model, envelope["state"],
+            system_prompt + "\n" + envelope["question"], envelope["options"])
+        criteria_keys = set(payload["questions"]["choice"]["criteria"])
+        pseudo = {key: (key,) for key in key_to_label}
+        choice, checked = self._send_decision(encode(payload), timeout_seconds,
+            "choice", criteria_keys, pseudo)
+        return ModelResponse(json.dumps({"choice": key_to_label[choice]}), checked)
+
     def complete(self, request: ModelRequest) -> ModelResponse:
+        envelope = _choice_envelope(request, self.model)
+        if envelope is not None:
+            if not isinstance(request.system_prompt, str) or not request.system_prompt:
+                raise PermanentModelError("Invalid OpenRouter decision choice contract")
+            return self._complete_choice(envelope, request.system_prompt, request.timeout_seconds)
         metadata = _selection_metadata(request, self.model)
         state = {key: metadata[key] for key in ("title", "body", "changed_files")}
         return self._decide(state, request.timeout_seconds, tuple(metadata["available_modes"]))

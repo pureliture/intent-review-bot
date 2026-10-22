@@ -43,16 +43,20 @@ def _profile(client):
         "endpoint": getattr(client, "api_url", None)}
 
 
-def architecture_input_fingerprint(snapshot, classification, config, client, *, title: str, body: str) -> str | None:
+def architecture_input_fingerprint(snapshot, classification, config, client, *, title: str, body: str,
+    decision_client=None) -> str | None:
     """Fixed Git objects and trusted analysis recipe identify A before tool initialization."""
     try:
         if shared_plan_enabled(config):
+            from review_bot.adapters.openrouter_decisions import OpenRouterDecisionClient, decision_wire_payload
             from review_bot.application.partition_review import run_partition_review
             from review_bot.application.source_partition import partition_original
             return hash_json({"schema": "partition-evaluation/architecture", "snapshot": asdict(snapshot),
                 "classification": asdict(classification), "config": config.config_hash, "model": _profile(client),
+                "decider": _profile(decision_client),
                 "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, resolve_quote_citations, native_integration_pages, run_fact_verification, is_gradle_java_path,
-                    LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient, review_wire_payload)})
+                    LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient, review_wire_payload,
+                    OpenRouterDecisionClient, decision_wire_payload)})
         architecture = config.architecture.model_dump(mode="json")
         ruleset = Path(architecture["ruleset_resource"])
         rules = ruleset.read_bytes() if ruleset.is_file() else resources.files("review_bot.resources").joinpath(architecture["ruleset_resource"]).read_bytes()
@@ -74,7 +78,8 @@ def architecture_input_fingerprint(snapshot, classification, config, client, *, 
         return None
 
 
-def intent_input_fingerprint(task, config, client, *, planning_client=None, selection_client=None) -> str | None:
+def intent_input_fingerprint(task, config, client, *, planning_client=None, selection_client=None,
+    decision_client=None) -> str | None:
     """Hash full effective material/profile/prompts, not retrieval clocks or remaining deadline."""
     try:
         material = asdict(task)
@@ -88,14 +93,17 @@ def intent_input_fingerprint(task, config, client, *, planning_client=None, sele
             if item["kind"] == "pr_text":
                 item["locator"].pop("updated_at", None)
         if shared_plan_enabled(config):
+            from review_bot.adapters.openrouter_decisions import OpenRouterDecisionClient, decision_wire_payload
             from review_bot.application.partition_review import run_partition_review
             from review_bot.application.source_partition import partition_original
             return hash_json({"schema": "partition-evaluation/intent", "material": material,
                 "model": _profile(client), "planner": _profile(planning_client),
+                "decider": _profile(decision_client),
                 "trial": config.partition_evaluation.model_dump(mode="json"),
                 "language": config.output.language,
                 "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, resolve_quote_citations, native_integration_pages, run_fact_verification, is_gradle_java_path,
-                    LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient, review_wire_payload)})
+                    LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient, review_wire_payload,
+                    OpenRouterDecisionClient, decision_wire_payload)})
         if config.intent.pipeline == "perspectives-v1":
             from review_bot.adapters.markdown.intent_perspective_formatter import format_intent_perspective_markdown
             from review_bot.application.intent_perspective_review import (

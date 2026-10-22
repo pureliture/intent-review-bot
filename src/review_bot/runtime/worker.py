@@ -100,6 +100,7 @@ class WorkerLoop:
         stop_event: threading.Event | None = None,
         planning_client: ModelClient | None = None,
         intent_selection_client: ModelClient | None = None,
+        decision_client: ModelClient | None = None,
         repository_settings_factory: Callable[..., SettingsResolution] | None = None,
     ) -> None:
         self.config = config
@@ -119,6 +120,7 @@ class WorkerLoop:
         self.model_client = model_client if model_client is not None else build_review_client(profile, model_settings)
         self.planning_client = planning_client
         self.intent_selection_client = intent_selection_client
+        self.decision_client = decision_client
         self.github_client = github_client
         self._ollama_selector_client: ModelClient | None = None
         self._models_prepared = False
@@ -200,6 +202,10 @@ class WorkerLoop:
             self.planning_client = build_planning_client(self.config.model.profile, self.config.model)
             if isinstance(self.planning_client, LlamaCppModelClient):
                 self.planning_client.request_cancelled = self._stop_event.is_set
+        if self.decision_client is None:
+            from review_bot.runtime.model_clients import OPENROUTER_PROFILES
+            if self.config.model.profile in OPENROUTER_PROFILES:
+                self.decision_client = build_selector_client(self.config.model.profile, self.config.model)
 
     def _review_partitioned(self, task_input, mode, run, deadline, language, *, available_modes=()):
         from review_bot.application.partition_review import run_partition_review
@@ -220,7 +226,8 @@ class WorkerLoop:
             limits=limits, language=language, before_stage=lambda: self._active(run, deadline),
             shared_budget=self._partition_budget, available_modes=available_modes,
             prepared_plan=getattr(self, "_partition_plan", None) if mode != "planning" else None,
-            review_instructions=self._repository_settings.bundle.instructions_for(mode) if mode != "planning" else "")
+            review_instructions=self._repository_settings.bundle.instructions_for(mode) if mode != "planning" else "",
+            decision_client=self.decision_client)
 
     def _plan_partitioned(self, task_input, available_modes, run, deadline):
         from review_bot.application.partition_review import validate_partition_result
@@ -544,7 +551,8 @@ class WorkerLoop:
                     artifacts.write_json("planning-input.json", planning_task)
                     self._prepare_partition_planner()
                     self._generation_keys["planning"] = shared_review_generation_key(planning_task, self.config,
-                        self.model_client, self.planning_client, self._repository_settings.bundle, "planning")
+                        self.model_client, self.planning_client, self._repository_settings.bundle, "planning",
+                        decision_client=self.decision_client)
                     try:
                         cached_plan = self._cached_review(run, "planning")
                         if cached_plan is None:
@@ -562,7 +570,8 @@ class WorkerLoop:
                             artifacts.save_execution_plan(self._partition_planning_result)
                     for selected_mode in plan.partition["selected_modes"]:
                         base_key = shared_review_generation_key(planning_task, self.config, self.model_client,
-                            self.planning_client, self._repository_settings.bundle, selected_mode)
+                            self.planning_client, self._repository_settings.bundle, selected_mode,
+                            decision_client=self.decision_client)
                         self._generation_keys[selected_mode] = hashlib.sha256(json.dumps(
                             {"generation": base_key, "plan_id": plan.partition["plan_id"]}, sort_keys=True).encode()).hexdigest()
                     mode_sel = record_planned_modes(review_snap, available_modes,
@@ -835,7 +844,8 @@ class WorkerLoop:
                 and classify_pr(current_branch, current_labels, title=current.get("title") or "").review_mode == classification.review_mode
                 and (current.get("draft") is not True or self.config.publish.draft_comments))
 
-        input_fingerprint = self._publication_input_key("architecture", architecture_input_fingerprint(review_snap, classification, self.config, self.model_client, title=title, body=body))
+        input_fingerprint = self._publication_input_key("architecture", architecture_input_fingerprint(review_snap, classification, self.config, self.model_client, title=title, body=body,
+            decision_client=self.decision_client))
         if not (draft and not self.config.publish.draft_comments):
             reused = self._reuse_publication(run, "architecture", review_snap, mode_sel, input_fingerprint, deadline, context_guard=context_guard)
             if reused is not None:
@@ -1041,14 +1051,15 @@ class WorkerLoop:
             else:
                 self._prepare_intent_selector()
             input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client,
-                selection_client=self.intent_selection_client, planning_client=self.planning_client)
+                selection_client=self.intent_selection_client, planning_client=self.planning_client,
+                decision_client=self.decision_client)
         elif code_first:
             if self.planning_client is None and self.model_client is not None:
                 self.planning_client = build_planning_client(self.config.model.profile, self.config.model)
                 if isinstance(self.planning_client, LlamaCppModelClient):
                     self.planning_client.request_cancelled = self._stop_event.is_set
             input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client,
-                planning_client=self.planning_client)
+                planning_client=self.planning_client, decision_client=self.decision_client)
         else:
             input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client)
 

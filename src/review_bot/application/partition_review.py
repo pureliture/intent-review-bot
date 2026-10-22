@@ -639,11 +639,14 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     shared_budget: ModelExecutionBudget | None = None,
     available_modes: tuple[str, ...] = (), prepared_plan: PartitionReviewResult | None = None,
     review_instructions: str = "",
+    decision_client: ModelClient | None = None,
 ) -> PartitionReviewResult:
     """Native measurements and every generation share one finite, fenced budget."""
     fallback_input = IntentReviewLimits().max_input_tokens
     probe_limits = replace(limits, max_input_tokens=fallback_input) if limits.max_input_tokens is None else limits
     profile, planner = model_profile(review_client, probe_limits), model_profile(planning_client, probe_limits)
+    decider = model_profile(decision_client, probe_limits) if decision_client is not None else None
+    choice_client, choice_profile = (decision_client, decider) if decider is not None else (planning_client, planner)
     shared_input = shared_budget.limits.max_input_tokens if shared_budget is not None else None
     input_conflict = (limits.max_input_tokens is not None and shared_input is not None
         and limits.max_input_tokens != shared_input)
@@ -716,12 +719,12 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             current.timeout_seconds, output, schema)
 
     def choice_request(stage, state, options, question):
-        return ModelRequest(1, planner.model, choices.SYSTEM,
+        return ModelRequest(1, choice_profile.model, choices.SYSTEM,
             json.dumps({"stage": stage, "mode": mode, "language": language,
                 "state": state, "question": question,
                 "options": [{k: row[k] for k in ("label", "key", "description")} for row in options]},
                 ensure_ascii=False, separators=(",", ":"), allow_nan=False),
-            planner.timeout_seconds, min(planner.max_output_tokens, choices.CHOICE_OUTPUT_TOKENS),
+            choice_profile.timeout_seconds, min(choice_profile.max_output_tokens, choices.CHOICE_OUTPUT_TOKENS),
             choices.choice_schema(options))
 
     def choose(stage, state, options, question, *, covered=(), observed=()):
@@ -730,7 +733,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             selected, index, raw = options[0], None, None
         else:
             for retry in range(2):
-                raw, index = execute(req, planning_client, planner, stage + ":" + state.get("field", "choice"))
+                raw, index = execute(req, choice_client, choice_profile, stage + ":" + state.get("field", "choice"))
                 try:
                     selected = choices.accept_choice(raw, options)
                 except PartitionError as error:
@@ -1896,19 +1899,23 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             "validation_is_not_semantic_accuracy", *meta.get("limitations", [])))
 
 
-def run_planned_partition_review(task, mode, review_client, planning_client, *, limits, language="ko", before_stage=None):
+def run_planned_partition_review(task, mode, review_client, planning_client, *, limits, language="ko", before_stage=None,
+    decision_client: ModelClient | None = None,
+):
     """CLI/offline equivalent of the durable worker's plan-then-execute flow."""
     if limits.measure_only:
         return None, run_partition_review(task, mode, review_client, planning_client,
-            limits=limits, language=language, before_stage=before_stage)
+            limits=limits, language=language, before_stage=before_stage, decision_client=decision_client)
     budget = ModelExecutionBudget(limits, time.monotonic() + limits.task_timeout_seconds, before_stage)
     plan = run_partition_review(task, "planning", review_client, planning_client, limits=limits,
-        available_modes=(mode,), language=language, before_stage=before_stage, shared_budget=budget)
+        available_modes=(mode,), language=language, before_stage=before_stage, shared_budget=budget,
+        decision_client=decision_client)
     validate_partition_result(plan, task)
     if plan.status != "planned":
         return plan, None
     result = run_partition_review(task, mode, review_client, planning_client, limits=limits,
-        language=language, before_stage=before_stage, shared_budget=budget, prepared_plan=plan)
+        language=language, before_stage=before_stage, shared_budget=budget, prepared_plan=plan,
+        decision_client=decision_client)
     return plan, result
 
 

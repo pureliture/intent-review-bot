@@ -75,7 +75,8 @@ def decode_stored_partition_review(packet):
     return task, result
 
 
-def shared_review_generation_key(task, config, review_client, planning_client, bundle, mode):
+def shared_review_generation_key(task, config, review_client, planning_client, bundle, mode,
+    decision_client=None):
     """Presentation and retrieval clocks never invalidate unchanged model work."""
     value = asdict(task)
     value.pop("input_hash", None)
@@ -106,6 +107,7 @@ def shared_review_generation_key(task, config, review_client, planning_client, b
         "material": value, "available_modes": config.execution.available_modes,
         "review_instructions": bundle.instructions_for(mode) if mode != "planning" else "",
         "model": profile(review_client), "planner": profile(planning_client),
+        "decider": profile(decision_client),
         "language": config.output.language, "analysis": config.architecture.model_dump(mode="json"),
         "limits": {"calls": config.partition_evaluation.max_calls or config.execution.max_model_calls,
             "tokens": config.partition_evaluation.max_total_tokens or config.execution.max_total_tokens,

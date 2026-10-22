@@ -628,8 +628,12 @@ def run_offline_review(args: argparse.Namespace) -> int:
             input_target_tokens=trial.input_target_tokens, observation_output_tokens=trial.observation_output_tokens,
             task_timeout_seconds=config.execution.task_timeout_seconds)
         private_artifacts = IntentArtifacts(Path(args.output), mode="architecture")
+        from review_bot.runtime.model_clients import OPENROUTER_PROFILES, build_selector_client
+        decider = (build_selector_client(profile, config.model)
+            if profile in OPENROUTER_PROFILES else None)
         plan, result = run_planned_partition_review(task_input, "architecture", model_client,
-            build_planning_client(profile, config.model), limits=limits, language=config.output.language)
+            build_planning_client(profile, config.model), limits=limits, language=config.output.language,
+            decision_client=decider)
         if plan is not None:
             private_artifacts.save_execution_plan(task_input, plan)
         if result is None:
@@ -718,8 +722,12 @@ def run_intent(args: argparse.Namespace) -> int:
                 from review_bot.application.partition_review import run_planned_partition_review
                 from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
                 planner = build_planning_client(args.model_profile, settings)
+                from review_bot.runtime.model_clients import OPENROUTER_PROFILES, build_selector_client
+                idecider = (build_selector_client(args.model_profile, settings)
+                    if args.model_profile in OPENROUTER_PROFILES else None)
                 plan, result = run_planned_partition_review(task_input, "intent", model_client, planner,
-                    limits=partition_limits, language=getattr(args, "language", "ko"))
+                    limits=partition_limits, language=getattr(args, "language", "ko"),
+                    decision_client=idecider)
                 if plan is not None:
                     artifacts.save_execution_plan(task_input, plan)
                 if result is None:
