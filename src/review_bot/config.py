@@ -203,6 +203,13 @@ class ModelConfig(BaseModel):
     max_concurrency: int = Field(ge=1, le=2, default=1)
     call_timeout_seconds: int = Field(ge=1, default=60)
     max_attempts: int = Field(ge=1, default=1)
+    # Slow model classes (e.g. diffusion reviewers) need longer per-call
+    # budgets than fast choice models. None means use call_timeout_seconds.
+    review_call_timeout_seconds: int | None = Field(ge=1, default=None)
+    # Optional cap on reasoning/thinking tokens for burn-heavy models.
+    # None means uncapped (current behavior). Bounds latency and cost;
+    # content budget is unchanged.
+    reasoning_max_tokens: int | None = Field(ge=1, default=None)
     max_output_bytes: int = Field(ge=1, default=32768)
     # Operator-owned token budgets. Changing these needs no code deploy,
     # only a config change. The byte-upper-bound gate enforces them.

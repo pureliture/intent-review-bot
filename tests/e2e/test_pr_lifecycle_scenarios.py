@@ -346,7 +346,7 @@ class TestScenario5GuardedConcurrentPublicationRace:
                 body = github.comments[comment_id]["body"]
                 assert body.startswith(config.publish.a_marker)
                 assert "### PMD/CPD 아키텍처 리뷰 A" in body
-                assert "#### 전체 판단" in body and "#### LLM 리뷰" in body
+                assert "#### 전체 판단" in body and "#### 리뷰 의견" in body
                 assert "이 검토 범위에서 추가로 조치할 발견사항은 없습니다" in body
                 assert f"Architecture pass {generation}" in body
                 assert f"고정된 HEAD `{head}`" in body

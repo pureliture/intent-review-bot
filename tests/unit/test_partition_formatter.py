@@ -101,7 +101,7 @@ def test_partition_template_cannot_drop_required_completed_sections():
     markdown = format_partition_review_markdown(result, task, publication_mode="comment",
         comment_template="{{llm_review}}\n{{summary}}\n{{perspectives}}", presentation={"title_b": "팀 의도 리뷰"})
     assert "### 팀 의도 리뷰" in markdown
-    assert markdown.index("#### LLM 리뷰") < markdown.index("#### 전체 판단")
+    assert markdown.index("#### 리뷰 의견") < markdown.index("#### 전체 판단")
 
 
 @pytest.mark.parametrize("verdict,label,other_label", [

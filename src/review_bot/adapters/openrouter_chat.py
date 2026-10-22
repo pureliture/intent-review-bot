@@ -67,7 +67,7 @@ def _positive(value: Any) -> bool:
     return type(value) is int and value > 0
 
 
-def review_wire_payload(request: ModelRequest) -> tuple[dict[str, Any], int]:
+def review_wire_payload(request: ModelRequest, *, reasoning_max_tokens: int | None = None) -> tuple[dict[str, Any], int]:
     """Pure OpenRouter chat wire builder shared by transport and fingerprinting.
 
     No HTTP. Raises PermanentModelError on contract violations.
@@ -91,13 +91,18 @@ def review_wire_payload(request: ModelRequest) -> tuple[dict[str, Any], int]:
     contract = ("\n\nReturn exactly one JSON object matching this entire response schema. "
         "Do not add prose or fields.\n"
         + encode(schema).decode("utf-8"))
+    reasoning: dict[str, Any] = {"effort": "low"}
+    if reasoning_max_tokens is not None:
+        if type(reasoning_max_tokens) is not int or reasoning_max_tokens < 1:
+            raise PermanentModelError("Invalid reasoning token cap")
+        reasoning["max_tokens"] = reasoning_max_tokens
     payload = {"model": request.model, "messages": [
             {"role": "system", "content": request.system_prompt + contract},
             {"role": "user", "content": request.user_content}],
         "response_format": {"type": "json_schema", "json_schema": {
             "name": "review_bot", "strict": True, "schema": schema}},
         "stream": False, "temperature": 0, "max_tokens": floored,
-        "reasoning": {"effort": "low"}}
+        "reasoning": reasoning}
     # Canonicalize through the shared encoder so the fingerprinted bytes
     # equal the transmitted bytes.
     return json.loads(encode(payload).decode("utf-8")), floored
@@ -113,6 +118,7 @@ class OpenRouterReviewClient:
             app_output_tokens: int = APP_OUTPUT_TOKENS,
             framing_reserve_tokens: int = 8192,
             max_transport_bytes: int = _TRANSPORT_BYTES,
+            reasoning_max_tokens: int | None = None,
     ) -> None:
         if not isinstance(model, str) or not model.strip() or len(model) > 256:
             raise ValueError("An explicit OpenRouter review model is required")
@@ -128,6 +134,8 @@ class OpenRouterReviewClient:
             raise ValueError("OpenRouter review framing reserve must be a non-negative integer")
         if type(max_transport_bytes) is not int or max_transport_bytes <= 0:
             raise ValueError("OpenRouter review transport byte limit must be positive")
+        if reasoning_max_tokens is not None and (type(reasoning_max_tokens) is not int or reasoning_max_tokens < 1):
+            raise ValueError("OpenRouter review reasoning cap must be a positive integer")
         self.model = model
         self._api_key = api_key.strip()
         self.origin = base_url(origin)
@@ -137,6 +145,7 @@ class OpenRouterReviewClient:
         self.profile = ModelProfile("openrouter", model, max_input_bytes=max_transport_bytes,
             max_output_bytes=max_output_bytes, timeout_seconds=timeout_seconds, max_attempts=max_attempts,
             max_input_tokens=app_input_tokens, max_output_tokens=app_output_tokens)
+        self._reasoning_max_tokens = reasoning_max_tokens
         self._verified_until = 0.0
         self._model_context = 0
         self._lock = threading.RLock()
@@ -181,7 +190,7 @@ class OpenRouterReviewClient:
     def _payload(self, request: ModelRequest) -> tuple[dict[str, Any], int]:
         if not isinstance(request, ModelRequest) or request.model != self.model:
             raise PermanentModelError("Invalid OpenRouter review request contract")
-        return review_wire_payload(request)
+        return review_wire_payload(request, reasoning_max_tokens=self._reasoning_max_tokens)
 
     def admission_bytes(self, request: ModelRequest) -> int:
         """Exact chat wire bytes plus framing reserve: a proven token upper bound.
@@ -190,7 +199,7 @@ class OpenRouterReviewClient:
         """
         if not isinstance(request, ModelRequest) or request.model != self.model:
             raise PermanentModelError("Invalid OpenRouter review request contract")
-        payload, _ = review_wire_payload(request)
+        payload, _ = review_wire_payload(request, reasoning_max_tokens=self._reasoning_max_tokens)
         return len(encode(payload)) + self._framing_reserve_tokens
 
     def complete(self, request: ModelRequest) -> ModelResponse:

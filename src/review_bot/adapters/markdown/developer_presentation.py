@@ -238,12 +238,17 @@ def citation_links(citations, task) -> str:
     return " · ".join(links)
 
 
-def quotes(citations, task) -> str:
+def quotes(citations, task, seen=None) -> str:
     blocks = []
     for raw in citations:
         cite = row(raw)
         if not cite.get("quote"):
             continue
+        key = cite.get("quote")
+        if seen is not None:
+            if key in seen:
+                continue
+            seen.add(key)
         preview = html.escape(cite["quote"], quote=False).replace("@", "@\u200b")
         preview = preview.translate({ord(c): f"&#{ord(c)};" for c in "`*_[]{}|#+"})
         blocks.append(citation_links([cite], task) + "\n\n<pre><code>" + preview + "</code></pre>")
@@ -300,6 +305,8 @@ def walkthrough(task, findings, questions=(), *, signals=()) -> str:
             path = row(raw).get("path")
             if path in counts:
                 counts[path] += 1
+    if sum(counts.values()) == 0 and not signals:
+        return ""
     flagged = set()
     for signal in signals:
         for path in getattr(signal, "paths", ()):
@@ -317,9 +324,10 @@ def walkthrough(task, findings, questions=(), *, signals=()) -> str:
 def findings_section(findings, questions, task, *, signals=(), target_reviews=None, presentation=None) -> str:
     from review_bot.adapters.markdown.formatter import _a_link
 
-    lines = ["#### " + label(presentation, "llm_section", "LLM 리뷰"), ""]
+    lines = ["#### " + label(presentation, "llm_section", "리뷰 의견"), ""]
     actionable = [row(item) for item in findings if row(item).get("judgement", row(item).get("verdict")) != "acceptable_with_evidence"]
     actionable.sort(key=_severity_rank)
+    seen_quotes: set = set()
     if not actionable and not questions:
         lines.append("이 검토 범위에서 추가로 조치할 발견사항은 없습니다.")
     by_id = {signal.signal_id: signal for signal in signals}
@@ -352,7 +360,7 @@ def findings_section(findings, questions, task, *, signals=(), target_reviews=No
         if links:
             lines.extend(["", "코드·기준: " + links])
         if citations:
-            lines.extend(["", quotes(citations, task)])
+            lines.extend(["", quotes(citations, task, seen_quotes)])
         lines.append("")
     if questions:
         lines.extend(["##### 작성자 확인 질문", ""])
@@ -392,6 +400,7 @@ def findings_section(findings, questions, task, *, signals=(), target_reviews=No
 def perspective_section(perspectives, task, presentation=None) -> str:
     names = {p.id: p.name_ko for p in PERSPECTIVES}
     blocks = []
+    seen_quotes: set = set()
     for item in perspectives:
         title = names.get(item.get("perspective_id"), item.get("perspective_id", "관점"))
         for assessment in item.get("assessments", [item]):
@@ -400,5 +409,21 @@ def perspective_section(perspectives, task, presentation=None) -> str:
                 escape(assessment["statement"]), "", escape(assessment["reasoning"])])
             if assessment.get("failure_condition"):
                 blocks.extend(["", "성립 조건: " + escape(assessment["failure_condition"])])
-            blocks.extend(["", citation_links(assessment.get("citations", []), task), "", quotes(assessment.get("citations", []), task), ""])
+            quoted = quotes(assessment.get("citations", []), task, seen_quotes)
+            blocks.extend(["", citation_links(assessment.get("citations", []), task), "", quoted, ""])
     return details(label(presentation, "details_label", "8개 관점별 검토 근거"), "\n".join(blocks)) if blocks else ""
+
+
+def intent_lead(perspectives) -> str:
+    """One verdict-first sentence linking PR purpose to implementation.
+
+    Deterministic from validated verdicts; the model summary below carries detail.
+    """
+    verdicts = [a.get("verdict") for item in perspectives
+        for a in item.get("assessments", [item])]
+    if not verdicts:
+        return ""
+    flagged = [v for v in verdicts if v not in ("aligned", "not_apply")]
+    if not flagged:
+        return "> 이 PR의 목적과 구현이 부합한다는 판단입니다."
+    return f"> 목적과 구현의 불일치 또는 확인이 필요한 점 {len(flagged)}건을 제기합니다."

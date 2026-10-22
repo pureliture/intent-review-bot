@@ -86,7 +86,7 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
     if publication_mode != "comment" or result.review_type not in ("A", "B"):
         raise ValueError("invalid_partition_formatter_options")
     from review_bot.adapters.markdown.developer_presentation import (
-        actionable_intent_findings, findings_section, finish, label, perspective_section, review_summary, walkthrough,
+        actionable_intent_findings, findings_section, finish, intent_lead, label, perspective_section, review_summary, walkthrough,
         selected_signals, static_analysis, status_sections,
     )
     from review_bot.domain.markers import DEFAULT_B_MARKER
@@ -116,6 +116,9 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
             signals=signals, target_reviews=target_reviews, presentation=presentation)
     else:
         findings = actionable_intent_findings(result.findings, result.perspectives)
+        lead = intent_lead(result.perspectives)
+        if lead:
+            summary = lead + "\n\n" + summary
         walk = walkthrough(task, findings, result.questions)
         if walk:
             sections["summary"] = summary + "\n\n" + walk

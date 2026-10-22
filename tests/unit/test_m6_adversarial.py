@@ -124,7 +124,9 @@ def _build_stress_fixtures(
                 reason=f"Detailed reason for finding {i + 1}: " + ("R" * 200),
                 recommendation=f"Refactoring recommendation {i + 1}: " + ("REC" * 100),
                 evidence_ids=(f"ev-stress-{i + 1}",),
-                citations=(cit,),
+                citations=(Citation(evidence_id=cit.evidence_id, version=cit.version, sha=cit.sha,
+                    path=cit.path, begin_line=cit.begin_line, end_line=cit.end_line,
+                    quote=f"{quote_text} // finding {i + 1}"),),
             )
         )
 

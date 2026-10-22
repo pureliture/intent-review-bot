@@ -109,7 +109,7 @@ def _build_test_fixtures(
                 reason="Complexity metric exceeded threshold",
                 recommendation="Extract helper methods",
                 evidence_ids=(f"ev-{i + 1}",),
-                citations=(cit,),
+                citations=(replace(cit, quote=f"{quote_text} #{i + 1}"),),
             )
         )
 
@@ -198,7 +198,7 @@ def test_markdown_formatter_selected_static_template_and_llm_sections() -> None:
     assert "| 측정 영역 | 이번 PR 검토 범위 |" in markdown
     assert "CognitiveComplexity" in markdown
     assert "5 → 15" in markdown
-    assert "#### LLM 리뷰" in markdown
+    assert "#### 리뷰 의견" in markdown
     assert "관련 정적 신호:" in markdown
     assert "https://github.com/owner/repo/blob/" + "b" * 40 in markdown
     assert "#L10-L20" in markdown
@@ -302,7 +302,7 @@ def test_markdown_formatter_templates_reorder_whole_sections_without_execution()
     markdown = format_review_markdown(result, task, comment_template="<script>@admin</script>\n{{llm_review}}\n{{summary}}\n{{static_analysis}}")
     assert markdown.splitlines()[0] == "<!-- review-bot:architecture:v1 -->"
     assert "&lt;script&gt;@\u200badmin&lt;/script&gt;" in markdown
-    assert markdown.index("#### LLM 리뷰") < markdown.index("#### 전체 판단") < markdown.index("#### 정적 분석")
+    assert markdown.index("#### 리뷰 의견") < markdown.index("#### 전체 판단") < markdown.index("#### 정적 분석")
     for invalid in ("{{summary}}", "{{summary}}{{summary}}{{static_analysis}}{{llm_review}}", "{{summary}}{{static_analysis}}{{llm_review}}{{danger}}"):
         with pytest.raises(ValueError, match="invalid_comment_template"):
             format_review_markdown(result, task, comment_template=invalid)

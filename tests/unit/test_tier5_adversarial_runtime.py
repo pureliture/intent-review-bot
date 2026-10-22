@@ -670,14 +670,6 @@ class TestMarkdownFormatterAdversarialHardening:
             base_findings=(v,), head_findings=(v,), paths=("src/Huge.java",),
             matching="sig", measurements=(),
         )
-        citations = tuple(
-            Citation(
-                evidence_id=f"ev-{i}", version="head", sha="b" * 40,
-                path="src/Huge.java", begin_line=1, end_line=100,
-                quote=f"public void massiveMethod_{i}() {{\n" + ("    // long comment\n" * 50) + "}",
-            )
-            for i in range(8)
-        )
         findings = tuple(
             ReviewFinding(
                 signal_id="sig-huge",
@@ -688,7 +680,14 @@ class TestMarkdownFormatterAdversarialHardening:
                 reason=f"Detailed reason explanation for finding {i} with massive analysis",
                 recommendation="Split into smaller components",
                 evidence_ids=("ev-0",),
-                citations=citations,
+                citations=tuple(
+                    Citation(
+                        evidence_id=f"ev-{j}", version="head", sha="b" * 40,
+                        path="src/Huge.java", begin_line=1, end_line=100,
+                        quote=f"public void massiveMethod_{i}_{j}() {{\n" + ("    // long comment\n" * 50) + "}",
+                    )
+                    for j in range(8)
+                ),
             )
             for i in range(20)
         )
@@ -719,13 +718,6 @@ class TestMarkdownFormatterAdversarialHardening:
             signal_id="sig-1", tool="pmd", change="new",
             base_findings=(), head_findings=(v,), paths=("src/A.java",), matching="m", measurements=(),
         )
-        citations = (
-            Citation(
-                evidence_id="ev-code", version="head", sha="b" * 40,
-                path="src/A.java", begin_line=1, end_line=10,
-                quote="```java\nclass CodeSnippet {\n" + ("    int padding = 1;\n" * 300) + "}\n```",
-            ),
-        )
         findings = tuple(
             ReviewFinding(
                 signal_id="sig-1",
@@ -736,7 +728,11 @@ class TestMarkdownFormatterAdversarialHardening:
                 reason="reason " * 50,
                 recommendation="rec",
                 evidence_ids=("ev-code",),
-                citations=citations,
+                citations=(Citation(
+                    evidence_id="ev-code", version="head", sha="b" * 40,
+                    path="src/A.java", begin_line=1, end_line=10,
+                    quote="```java\nclass CodeSnippet {\n" + ("    int padding = 1;\n" * 300) + "}\n```\n// finding " + str(i),
+                ),),
             )
             for i in range(15)
         )

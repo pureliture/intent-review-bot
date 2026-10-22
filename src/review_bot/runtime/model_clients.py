@@ -79,11 +79,13 @@ def build_review_client(profile: str | None, settings: ModelConfig | None = None
             raise ValueError("MACBOOK_BEAM_CONTEXT_TOKENS is retired with the Beam bridge; use the OpenRouter app budget")
         client = OpenRouterReviewClient(api_key=_openrouter_key(profile), origin=_openrouter_origin(),
             model=_openrouter_model("OPENROUTER_REVIEW_MODEL", OPENROUTER_REVIEW_MODEL_DEFAULT, profile),
-            timeout_seconds=settings.call_timeout_seconds, max_output_bytes=settings.max_output_bytes,
+            timeout_seconds=settings.review_call_timeout_seconds or settings.call_timeout_seconds,
+            max_output_bytes=settings.max_output_bytes,
             max_attempts=settings.max_attempts, app_input_tokens=settings.review_input_tokens,
             app_output_tokens=settings.review_output_tokens,
             framing_reserve_tokens=settings.framing_reserve_tokens,
-            max_transport_bytes=settings.max_transport_bytes)
+            max_transport_bytes=settings.max_transport_bytes,
+            reasoning_max_tokens=settings.reasoning_max_tokens)
     elif profile == LLAMACPP_PROFILE:
         client = LlamaCppModelClient(api_url=_endpoint("ME707_BONSAI_BASE_URL"), **options)
     elif profile == MACBOOK_LLAMACPP_PROFILE:
@@ -150,11 +152,13 @@ def build_planning_client(profile: str | None, settings: ModelConfig | None = No
     if profile in OPENROUTER_PROFILES:
         return OpenRouterReviewClient(api_key=_openrouter_key(profile), origin=_openrouter_origin(),
             model=_openrouter_model("OPENROUTER_REVIEW_MODEL", OPENROUTER_REVIEW_MODEL_DEFAULT, profile),
-            timeout_seconds=settings.call_timeout_seconds, max_output_bytes=settings.max_output_bytes,
+            timeout_seconds=settings.review_call_timeout_seconds or settings.call_timeout_seconds,
+            max_output_bytes=settings.max_output_bytes,
             max_attempts=settings.max_attempts, app_input_tokens=settings.review_input_tokens,
             app_output_tokens=settings.review_output_tokens,
             framing_reserve_tokens=settings.framing_reserve_tokens,
-            max_transport_bytes=settings.max_transport_bytes)
+            max_transport_bytes=settings.max_transport_bytes,
+            reasoning_max_tokens=settings.reasoning_max_tokens)
     options = dict(api_url=_endpoint(variable, profile), timeout_seconds=settings.call_timeout_seconds,
         max_output_bytes=settings.max_output_bytes, max_attempts=settings.max_attempts)
     if profile == BEAM_CLOUD_TEV4B_PROFILE:
