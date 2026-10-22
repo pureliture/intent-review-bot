@@ -97,7 +97,7 @@ def test_program_callable_gap_carries_frozen_source_through_existing_rewrite_and
         elif payload["stage"] == "fact_rewrite":
             body = {"replacement": payload["items"][0]["original_item"],
                 "correction_reason": "Read the missing fixed implementation; preserve the original assertion.",
-                "correction_citations": [{"reference_id": _reference(payload, path)}]}
+                "correction_citations": [_fact_citation(payload, _reference(payload, path))]}
         return body
     review = PartitionModelClient(counter=count, transform=transform, group_all=True)
     review.profile = replace(review.profile, max_input_tokens=500)
@@ -227,6 +227,8 @@ def test_wire_reference_definitions_preserve_complete_a_b_fact_response_contract
             if isinstance(value, dict):
                 if set(value) == {"reference_id"}:
                     yield value["reference_id"]
+                elif set(value) == {"source_id", "quote"}:
+                    yield value["source_id"]
                 for child in value.values():
                     yield from reference_ids(child)
             elif isinstance(value, list):
@@ -254,6 +256,30 @@ def _reference(payload, path=None):
         for block in source["blocks"])
 
 
+def _fact_citation(payload, reference):
+    """Construct a test response from a deliberately selected delivered range.
+
+    This is not applied after transforms: malformed outputs remain malformed.
+    """
+    if payload["canonical_facts"]["version"] == facts.LEGACY_VERSION:
+        return {"reference_id": reference}
+    for source in facts.materialize_source_texts(payload):
+        choices = [entry for catalog in payload["citation_catalog"] if catalog["evidence_id"] == source["evidence_id"]
+            for entry in catalog["ranges"] if entry["reference_id"] == reference]
+        cursor = source["start_byte"]
+        for block in source["blocks"]:
+            end = cursor + len(block["text"].encode("utf-8"))
+            if block["reference_id"] == reference:
+                choices.append({"start_byte": cursor, "end_byte": end})
+            cursor = end
+        raw = "".join(block["text"] for block in source["blocks"]).encode("utf-8")
+        for choice in choices:
+            if source["start_byte"] <= choice["start_byte"] < choice["end_byte"] <= source["end_byte"]:
+                return {"source_id": source["evidence_id"],
+                    "quote": raw[choice["start_byte"] - source["start_byte"]:choice["end_byte"] - source["start_byte"]].decode("utf-8")}
+    raise AssertionError("The selected fixture range is not delivered")
+
+
 def _metric_task():
     from tests.unit.test_context_and_architecture_review import _make_snapshot
     snapshot = _make_snapshot({"src/A.java": "class A {}\n"},
@@ -278,7 +304,7 @@ def _metric_run(*, incorrect_rewrite=False, corrupt=None):
             replacement = deepcopy(payload["items"][0]["original_item"])
             replacement["reasoning"] = ("Low TCC means coupling is not severe." if incorrect_rewrite else
                 "Low TCC means low cohesion; it cannot establish low coupling.")
-            replacement["citations"] = [{"reference_id": _reference(payload, "src/A.java")}]
+            replacement["citations"] = [_fact_citation(payload, _reference(payload, "src/A.java"))]
             body = {"replacement": replacement, "correction_reason": "Correct the metric category against its canonical definition.",
                 "correction_citations": replacement["citations"]}
         return corrupt(payload, body) if corrupt else body
@@ -338,7 +364,7 @@ def test_intent_fact_check_corrects_false_execution_claim_and_rechecks_without_c
         elif stage == "fact_rewrite":
             body = {"replacement": "Static test source was reviewed; target tests were not executed.",
                 "correction_reason": "Do not claim runtime success from static assertions.",
-                "correction_citations": [{"reference_id": _reference(payload)}]}
+                "correction_citations": [_fact_citation(payload, _reference(payload))]}
         return body
     task = make_task()
     result = run_partition_review(task, "intent", PartitionModelClient(transform=transform), PartitionModelClient(), limits=limits())
@@ -358,7 +384,7 @@ def test_source_check_rewrites_only_the_failing_item_and_preserves_all_other_res
         if payload["stage"] == "fact_rewrite":
             item = deepcopy(payload["items"][0]["original_item"])
             item["reasoning"] = "Explicit limitation remains; this cannot be established."
-            item["citations"] = [{"reference_id": _reference(payload)}]
+            item["citations"] = [_fact_citation(payload, _reference(payload))]
             body = {"replacement": item, "correction_reason": "Preserve the limitation.", "correction_citations": item["citations"]}
         return body
     task = make_task()
@@ -486,25 +512,25 @@ def test_invalid_checker_reference_is_retained_in_readable_partial_result():
         if payload["stage"] == "fact_check":
             item = payload["items"][0]["item_id"]
             field = next(iter(body["items"][item]))
-            body["items"][item][field]["citations"] = [{"reference_id": "Q-forged"}]
+            body["items"][item][field]["citations"] = [{"source_id": "S-forged", "quote": "Not supplied."}]
         return body
     task = make_task()
     result = run_partition_review(task, "intent", PartitionModelClient(transform=corrupt), PartitionModelClient(), limits=limits())
     assert result.status == "partial_review" and result.reason == "factual_verification_incomplete"
     ledger = result.partition["fact_verification"]
-    assert ledger["interruption_reason"] == "fact_check_unknown_reference"
-    assert result.stages[-1].status == "failed" and result.stages[-1].reason == "fact_check_unknown_reference"
+    assert ledger["interruption_reason"] == "citation_quote_unknown_source"
+    assert result.stages[-1].status == "failed" and result.stages[-1].reason == "citation_quote_unknown_source"
     assert ledger["items"][0]["attempts"][0]["check"]["response"]["items"]
     assert result.partition["final"] == result.partition["pre_verification_final"]
     validate_partition_result(result, task)
 
 
-@pytest.mark.parametrize("component", ["facts", "eligibility", "wire"])
+@pytest.mark.parametrize("component", ["facts", "eligibility", "wire", "quotes"])
 def test_worker_mode_fingerprints_include_verification_and_eligibility_implementations(valid_config_yaml, tmp_path, monkeypatch, component):
     from review_bot.config import load_review_config_from_str
     from review_bot.runtime.mode_fingerprints import architecture_input_fingerprint, intent_input_fingerprint
     from review_bot.application import selection
-    from review_bot.application import model_wire_contract
+    from review_bot.application import model_wire_contract, source_quote_citations
     config, _ = load_review_config_from_str(valid_config_yaml)
     config = config.model_copy(update={"partition_evaluation": config.partition_evaluation.model_copy(update={"enabled": True})})
     task = make_task()
@@ -517,7 +543,7 @@ def test_worker_mode_fingerprints_include_verification_and_eligibility_implement
     assert all(before)
     changed = tmp_path / "changed_fact_check.py"
     changed.write_text("# a different factual verification implementation\n")
-    monkeypatch.setattr({"facts": facts, "eligibility": selection, "wire": model_wire_contract}[component], "__file__", str(changed))
+    monkeypatch.setattr({"facts": facts, "eligibility": selection, "wire": model_wire_contract, "quotes": source_quote_citations}[component], "__file__", str(changed))
     after = fingerprints()
     assert all(after) and all(left != right for left, right in zip(before, after))
 
@@ -551,9 +577,11 @@ def test_checker_receives_literal_prose_and_exact_claim_rules_without_repairing_
     assert "choose unverifiable and request its exact frozen evidence_id" in request.system_prompt
     assert "source_requests from fixed_original_inventory" in request.system_prompt
     namespace_rule = "For citations[].reference_id, copy an allowed reference_id from citation_catalog exactly; never substitute a source-level evidence_id (including S-prefixed IDs), even for whole-file or test-presence claims. The evidence_id namespace is used for source_requests from fixed_original_inventory, not for citations."
-    assert namespace_rule in request.system_prompt
-    assert request.system_prompt.index(namespace_rule) < request.system_prompt.index("Program output contract")
-    assert namespace_rule not in facts.REWRITE_PROMPT
+    assert namespace_rule in facts.LEGACY_CHECK_PROMPT
+    assert namespace_rule not in request.system_prompt
+    assert facts.QUOTE_OUTPUT_CONTRACT in request.system_prompt
+    assert request.system_prompt.index(facts.QUOTE_OUTPUT_CONTRACT) < request.system_prompt.index("Program output contract")
+    assert "source_id" in request.system_prompt and "verbatim" in request.system_prompt
     assert "keep the unresolved limitation explicit for the factual recheck" in facts.REWRITE_PROMPT
     assert "silently remove the disputed assertion" in facts.REWRITE_PROMPT
     assert result.partition["identity"]["prompts"]["fact_check"] == hash_json(facts.CHECK_PROMPT)
@@ -606,7 +634,7 @@ def _fixed_test_repair(*, no_suitable=False, cap=128, corrupt_request=None, asse
             source = path if payload.get("recheck", {}).get("source_requests") else "src/A.java"
             body = {"replacement": payload["items"][0]["original_item"],
                 "correction_reason": "Re-read the requested fixed original; keep the item when its premise is supported.",
-                "correction_citations": [{"reference_id": _reference(payload, source)}]}
+                "correction_citations": [_fact_citation(payload, _reference(payload, source))]}
         return body
     review = PartitionModelClient(counter=counter, transform=transform, group_all=True)
     review.profile = replace(review.profile, max_input_tokens=500)
@@ -678,24 +706,19 @@ def test_fact_source_request_without_any_factual_gap_still_rejects(state):
 
 @pytest.mark.parametrize("mutation", [None, "validation_error", "unknown_reference", "delivered_ranges", "later_generation"])
 def test_historical_contradicted_source_request_replays_only_exact_terminal_failure(monkeypatch, mutation):
-    current_accept = facts.accept_check
-    def old_accept(raw, rows, refs, source_ids=()):
-        accepted = current_accept(raw, rows, refs, source_ids)
-        if raw["source_requests"] and not any(v["state"] == "unverifiable" for item in raw["items"].values() for v in item.values()):
-            raise PartitionError("fact_source_request_without_gap")
-        return accepted
-    with monkeypatch.context() as patch:
-        patch.setattr(facts, "accept_check", old_accept)
-        task, result, _, _, _ = _fixed_test_repair(assessment_state="contradicted")
+    from pathlib import Path
+    from pydantic import TypeAdapter
+    from review_bot.domain.models_v1 import TaskInput
+    from review_bot.domain.partition_review import PartitionReviewResult
+    packet = json.loads((Path(__file__).parents[1] / "fixtures/fact_review_v3_interrupted.json").read_text())
+    task = TypeAdapter(TaskInput).validate_python(packet["task"])
+    result = TypeAdapter(PartitionReviewResult).validate_python(packet["result"])
     ledger = result.partition["fact_verification"]
+    assert ledger["version"] == facts.LEGACY_VERSION
     assert result.status == "partial_review" and ledger["interruption_reason"] == "fact_source_request_without_gap"
     record = ledger["items"][0]["attempts"][0]["check"]
     stage_index = record["stage_index"]
-    assert result.stages[stage_index].status == "failed"
-    assert result.stages[stage_index].reason == record["validation_error"]
-    # Reproduce the old stage accounting exactly, without promoting this run.
-    result = replace(result, stages=tuple(replace(stage, status="completed", reason="input_measured")
-        if index == stage_index else stage for index, stage in enumerate(result.stages)))
+    assert result.stages[stage_index].status == "completed" and result.stages[stage_index].reason == "input_measured"
     if mutation == "validation_error":
         record["validation_error"] = "another_failure"
     elif mutation == "unknown_reference":
@@ -829,7 +852,13 @@ def _small_source_page_counter(req, *, stage):
 
 
 def test_single_oversized_fixed_source_is_losslessly_paged_without_promoting_cross_page_support():
-    client = PartitionModelClient(counter=lambda req: _small_source_page_counter(req, stage="fact_check"))
+    def partial_page(payload, body):
+        if payload["stage"] == "fact_check" and "source_page" in payload:
+            for fields in body["items"].values():
+                for assessment in fields.values():
+                    assessment.update(state="unverifiable", reason="This tiny source piece does not establish the complete assertion.", citations=[])
+        return body
+    client = PartitionModelClient(counter=lambda req: _small_source_page_counter(req, stage="fact_check"), transform=partial_page)
     client.profile = replace(client.profile, max_input_tokens=250)
     task = _metric_task()
     result = run_partition_review(task, "architecture", client, PartitionModelClient(), limits=limits(max_rechecks=0))
@@ -925,7 +954,7 @@ def test_two_factual_errors_share_rewrite_and_batch_recheck_with_id_coverage(rew
             for row in payload["items"]:
                 item = deepcopy(row["original_item"])
                 item["reasoning"] = corrected
-                item["citations"] = [{"reference_id": _reference(payload)}]
+                item["citations"] = [_fact_citation(payload, _reference(payload))]
                 replacements[row["item_id"]] = {"replacement": item,
                     "correction_reason": "Correct this item's premise with frozen evidence.", "correction_citations": item["citations"]}
             return {"items": replacements} if len(replacements) > 1 else next(iter(replacements.values()))
@@ -979,7 +1008,7 @@ def test_oversized_original_requires_direct_whole_claim_recheck_after_complete_d
             field = body["items"]["summary"]["text"]
             field.update(state="supported" if proof else "unverifiable",
                 reason="The exact HEAD declaration supports the complete literal assertion." if proof else "This page has no evidence of the declaration.",
-                citations=[{"reference_id": proof["reference_id"]}] if proof else [])
+                citations=[_fact_citation(payload, proof["reference_id"])] if proof else [])
         return body
     client = PartitionModelClient(counter=count, transform=transform)
     client.profile = replace(client.profile, max_input_tokens=250)
@@ -1047,7 +1076,7 @@ def test_known_native_batch_output_limit_splits_items_after_bounded_recovery_onl
         if payload["stage"] == "fact_rewrite":
             item = deepcopy(payload["items"][0]["original_item"])
             item["reasoning"] = corrected
-            item["citations"] = [{"reference_id": _reference(payload)}]
+            item["citations"] = [_fact_citation(payload, _reference(payload))]
             return {"replacement": item, "correction_reason": "Keep this correction with exact frozen evidence.",
                 "correction_citations": item["citations"]}
         return body
@@ -1120,7 +1149,7 @@ def test_fixed_perspective_scope_premises_use_existing_four_item_rewrite_batch()
                     item = deepcopy(row["original_item"])
                     item.update(verdict="aligned", statement="The fixed perspective was independently reviewed against the complete PR originals.",
                         reasoning="The PR purpose and actual HEAD behavior support this judgement, independently of the initial focus hint.",
-                        citations=[{"reference_id": _reference(payload)}])
+                        citations=[_fact_citation(payload, _reference(payload))])
                     replacements[row["item_id"]] = {"replacement": item,
                         "correction_reason": "Correct the unsupported page-focus exclusion using the fixed catalog and original source.",
                         "correction_citations": item["citations"]}
@@ -1233,7 +1262,7 @@ def test_true_test_claim_with_header_citation_uses_existing_rewrite_to_repair_bi
                         if (entry["start_byte"], entry["end_byte"]) == (original_cite["start_byte"], original_cite["end_byte"]))
                     for field, assessment in body["items"][row["item_id"]].items():
                         if assessment["state"] == "supported" and row["fields"][field]:
-                            assessment["citations"] = [{"reference_id": own_reference}]
+                            assessment["citations"] = [_fact_citation(payload, own_reference)]
                 if isinstance(item, dict) and item.get("perspective_id") == "supporting_evidence":
                     assert item["failure_condition"] == "" and row["fields"]["failure_condition"] == ""
                     assert body["items"][row["item_id"]]["failure_condition"]["state"] == "non_factual"
@@ -1243,11 +1272,11 @@ def test_true_test_claim_with_header_citation_uses_existing_rewrite_to_repair_bi
                         for field in ("statement", "reasoning"):
                             body["items"][row["item_id"]][field].update(state="supported",
                                 reason="The claim is true in the full HEAD test; the checker selected the actual assertion range.",
-                                citations=[{"reference_id": reference(payload, assertion.strip())}])
+                                citations=[_fact_citation(payload, reference(payload, assertion.strip()))])
         elif stage == "fact_rewrite":
             item = deepcopy(payload["items"][0]["original_item"])
             assert item["perspective_id"] == "supporting_evidence"
-            item["citations"] = [{"reference_id": reference(payload, assertion.strip())}]
+            item["citations"] = [_fact_citation(payload, reference(payload, assertion.strip()))]
             return {"replacement": item, "correction_reason": "Replace the import-only citation with the exact test assertion range; keep the supported prose.",
                 "correction_citations": item["citations"]}
         return body
@@ -1316,7 +1345,8 @@ def test_citation_binding_distinct_evidence_identity_remains_a_conservative_gap(
 
 
 
-def test_architecture_rewrite_declares_existing_concern_guard_and_analysis_attribution():
+@pytest.mark.parametrize("protocol_version", [facts.LEGACY_VERSION, facts.VERSION])
+def test_architecture_rewrite_declares_existing_concern_guard_and_analysis_attribution(protocol_version):
     from review_bot.application.source_partition import SourceOriginal, make_span
     base = SourceOriginal("S-base", "class A {}\n", "source", "A.java", "base", "a" * 40)
     head = SourceOriginal("S-head", "class A { void lookup() {} }\n", "source", "A.java", "head", "b" * 40)
@@ -1328,7 +1358,7 @@ def test_architecture_rewrite_declares_existing_concern_guard_and_analysis_attri
     row = facts.items(final)[1]
     details = [{"target_id": "pmd-lookup", "tool": "pmd", "change": "new", "paths": ["A.java"],
         "measurements": [{"name": "CognitiveComplexity", "base": None, "head": 17}]}]
-    payload, schema, refs, _ = facts.request_spec("fact_rewrite", [row], final, [base, head], {"target_details": details}, kind="complete_originals")
+    payload, schema, refs, _ = facts.request_spec("fact_rewrite", [row], final, [base, head], {"target_details": details}, kind="complete_originals", protocol_version=protocol_version)
     assert payload["canonical_facts"]["analysis_targets"] == details
     rule = payload["canonical_facts"]["architecture_analysis_grounding_rule"]
     assert "owning member" in rule and "newly reported analysis signal" in rule
@@ -1339,8 +1369,9 @@ def test_architecture_rewrite_declares_existing_concern_guard_and_analysis_attri
     assert conditional["if"]["properties"]["verdict"]["const"] == "concern"
     assert conditional["then"]["properties"]["failure_condition"] == {"type": "string", "minLength": 1, "pattern": r"\S"}
     head_refs = [key for key, value in refs.items() if value.path and value.version == "head"]
-    assert conditional["then"]["properties"]["citations"]["contains"]["properties"]["reference_id"]["enum"] == head_refs
-    cite = [{"reference_id": head_refs[0]}]
+    key = "reference_id" if protocol_version == facts.LEGACY_VERSION else "source_id"
+    assert conditional["then"]["properties"]["citations"]["contains"]["properties"][key]["enum"] == (head_refs if key == "reference_id" else [head.evidence_id])
+    cite = [{"reference_id": head_refs[0]}] if key == "reference_id" else [{"source_id": head.evidence_id, "quote": head.text}]
     raw = {"replacement": {**item, "verdict": "concern", "citations": cite}, "correction_reason": "Source-based correction.", "correction_citations": cite}
     for empty in ("", "   "):
         raw["replacement"]["failure_condition"] = empty
@@ -1349,7 +1380,8 @@ def test_architecture_rewrite_declares_existing_concern_guard_and_analysis_attri
     raw["replacement"]["failure_condition"] = "When lookup receives an unbounded input, HEAD cannot complete the operation."
     assert facts.accept_rewrite(raw, row, refs, "architecture")["verdict"] == "concern"
     base_ref = next(key for key, value in refs.items() if value.version == "base")
-    raw["replacement"]["citations"] = [{"reference_id": base_ref}]
+    raw["replacement"]["citations"] = ([{"reference_id": base_ref}] if key == "reference_id" else
+        [{"source_id": base.evidence_id, "quote": base.text}])
     with pytest.raises(PartitionError, match="fact_rewrite_concern_without_head_condition"):
         facts.accept_rewrite(raw, row, refs, "architecture")
     for verdict in ("improvement", "insufficient_context"):
@@ -1394,7 +1426,7 @@ def test_original_support_reference_ids_use_exact_union_and_gate_only_supported_
     rows = facts.items(final)
     for start, end, has_support in ((0, 8, True), (8, 10, False)):
         payload, schema, refs, _ = facts.request_spec("fact_check", rows, final, [source], {}, kind="cited_ranges",
-            ranges=[{"evidence_id": source.evidence_id, "start_byte": start, "end_byte": end}])
+            ranges=[{"evidence_id": source.evidence_id, "start_byte": start, "end_byte": end}], protocol_version=facts.LEGACY_VERSION)
         summary, finding = payload["items"]
         assert "original_support_reference_ids" not in summary and finding["original_item"] == item
         ids = finding["original_support_reference_ids"]
@@ -1520,3 +1552,131 @@ def test_prepared_analysis_finding_owners_and_raw_details_reach_fact_requests(fi
                 assert "matchesContentHashFragment" not in evidence["message"]
             else:
                 assert evidence["method"] is None
+
+
+
+def _v4_fact_packet():
+    from review_bot.application.source_partition import SourceOriginal, make_span
+    head = SourceOriginal("S-head", "first unique assertion\nsecond distinct assertion\n", "source", "src/check.py", "head", "a" * 40)
+    span = make_span(head, 0, len("first unique assertion\n".encode()), "fixture")
+    quote = {"evidence_id": head.evidence_id, "sha": head.sha, "path": head.path, "version": head.version,
+        "start_byte": span.start_byte, "end_byte": span.end_byte, "begin_line": span.begin_line,
+        "end_line": span.end_line, "quote": span.text}
+    item = {"verdict": "improvement", "basis": "observed_structure", "target_ids": ["target"],
+        "statement": "The first assertion is present.", "reasoning": "Inspect the exact source.",
+        "failure_condition": "", "citations": [quote]}
+    final = {"summary": "Frozen summary.", "findings": [item], "perspectives": [], "questions": [], "supplied_quotes": []}
+    row = {"id": "findings:0", "kind": "findings", "item": item}
+    return head, final, row
+
+
+def test_v4_exact_quote_output_and_original_union_are_explicit_without_legacy_q_output():
+    head, final, row = _v4_fact_packet()
+    payload, schema, refs, spans = facts.request_spec("fact_check", [row], final, [head], {}, kind="complete_originals")
+    assert refs.protocol_version == facts.VERSION == "fact-review/v4-exact-source-quotes"
+    assert refs.originals == {head.evidence_id: head}
+    assert payload["items"][0]["original_item"] == row["item"]
+    support = payload["items"][0]["original_support_quotes"]
+    assert support[0]["source_id"] == head.evidence_id and support[0]["quote"] == "first unique assertion\n"
+    assert "original_support_reference_ids" not in payload["items"][0]
+    assert payload["citation_sources"][0]["source_id"] == head.evidence_id
+    fields = schema["properties"]["items"]["properties"][row["id"]]["properties"]
+    assert set(fields["statement"]["properties"]["citations"]["items"]["properties"]) == {"source_id", "quote"}
+    assert fields["statement"]["allOf"][0]["then"]["properties"]["citations"]["items"]["properties"]["source_id"]["enum"] == [head.evidence_id]
+    with pytest.raises(PartitionError, match="citation_quote_invalid_object"):
+        facts.decode_citations([{"reference_id": next(iter(refs))}], refs)
+    with pytest.raises(PartitionError, match="fact_protocol_version_unknown"):
+        facts.request_spec("fact_check", [row], final, [head], {}, kind="complete_originals", protocol_version="v999")
+    assert spans[0].text == head.text
+
+
+@pytest.mark.parametrize("outside", [False, True])
+def test_v4_supported_quote_retains_exact_own_citation_union_guard_and_raw_verdict(outside):
+    head, final, row = _v4_fact_packet()
+    _, _, refs, _ = facts.request_spec("fact_check", [row], final, [head], {}, kind="complete_originals")
+    quote = "second distinct assertion" if outside else "first unique assertion"
+    citation = {"source_id": head.evidence_id, "quote": quote}
+    assessments = {key: {"state": "supported" if value else "non_factual", "reason": "Exact unchanged model assessment.",
+        "citations": [citation] if value else []} for key, value in facts.fields(row).items()}
+    raw = {"items": {row["id"]: assessments}, "source_requests": []}
+    original = deepcopy(raw)
+    cited = facts.response_citations(raw, refs)
+    checked = facts.accept_check(raw, [row], refs)
+    issues = facts.issues(checked[row["id"]], [], row=row, originals=[head], cited_evidence=cited,
+        delivered_ranges=[{"evidence_id": head.evidence_id, "start_byte": 0, "end_byte": len(head.raw)}])
+    assert bool(issues) is outside and raw == original
+    if outside:
+        assert all(issue["state"] == "unverifiable" and issue["binding_gap_ranges"] for issue in issues)
+        assert checked[row["id"]]["statement"]["state"] == "supported"
+    assert len(cited) == 1  # identical quotes in different field arrays are legal
+    raw["items"][row["id"]]["statement"]["citations"].append(deepcopy(citation))
+    with pytest.raises(PartitionError, match="citation_quote_duplicate"):
+        facts.response_citations(raw, refs)
+
+
+def test_v4_source_page_and_whole_claim_context_merges_keep_exact_delivered_coverage():
+    head, final, _ = _v4_fact_packet()
+    row = {"id": "summary", "kind": "summary", "item": "Both source assertions hold together."}
+    cut = len("first unique assertion\n".encode())
+    children, contexts = [], []
+    for index, (begin, end) in enumerate(((0, cut), (cut, len(head.raw)))):
+        ranges = [{"evidence_id": head.evidence_id, "start_byte": begin, "end_byte": end}]
+        _, _, refs, spans = facts.request_spec("fact_check", [row], final, [head], {}, kind="cited_ranges", ranges=ranges)
+        raw = {"items": {"summary": {"text": {"state": "supported", "reason": "Page-local assertion only.",
+            "citations": [{"source_id": head.evidence_id, "quote": head.raw[begin:end].decode()}]}}}, "source_requests": []}
+        contexts.append(refs)
+        children.append({"call_stage": "fact_check", "rows": [row], "stage_index": index,
+            "response": raw, "response_hash": hash_json(raw), "delivered_ranges": ranges,
+            "cited_evidence": facts.response_citations(raw, refs)})
+    merged = facts.merge_reference_contexts(contexts)
+    assert facts.decode_citations([{"source_id": head.evidence_id, "quote": head.text}], merged)[0]["end_byte"] == len(head.raw)
+    with pytest.raises(PartitionError, match="citation_quote_undelivered"):
+        facts.decode_citations([{"source_id": head.evidence_id, "quote": head.text}], contexts[0])
+    assembled = facts.assemble_checks([row], children)
+    assert assembled["items"]["summary"]["text"]["state"] == "unverifiable"
+    ranges, discovery = facts.whole_claim_packet({"children": children}, [row], [head])
+    assert len(discovery["pages"]) == 2 and discovery["pages"][0]["response"] == children[0]["response"]
+    _, _, whole_refs, _ = facts.request_spec("fact_check", [row], final, [head], {}, kind="cited_ranges", ranges=ranges, whole_claim=discovery)
+    assert facts.decode_citations([{"source_id": head.evidence_id, "quote": head.text}], whole_refs)
+    with pytest.raises(PartitionError, match="fact_reference_protocol_changed"):
+        facts.merge_reference_contexts([merged, {"Qold": None}])
+
+
+@pytest.mark.parametrize("mutation", ["quote", "source_id", "resolved_range", "resolved_sha"])
+def test_v4_stored_replay_rejects_quote_identity_and_resolved_byte_tampering(mutation):
+    task = make_task()
+    result = run_partition_review(task, "intent", PartitionModelClient(), PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    validate_partition_result(result, task)
+    changed = deepcopy(result)
+    call = changed.partition["fact_verification"]["items"][0]["attempts"][0]["check"]
+    assert changed.partition["fact_verification"]["version"] == facts.VERSION
+    if mutation in ("quote", "source_id"):
+        cite = call["response"]["items"]["summary"]["text"]["citations"][0]
+        cite[mutation] = "not an original source or quote"
+        call["response_hash"] = hash_json(call["response"])
+    elif mutation == "resolved_range":
+        call["cited_evidence"][0]["end_byte"] -= 1
+    else:
+        call["cited_evidence"][0]["sha"] = "f" * 40
+    with pytest.raises(PartitionError):
+        validate_partition_result(changed, task)
+
+
+def test_v3_q_schema_and_decode_stay_strict_explicit_legacy_only():
+    head, final, row = _v4_fact_packet()
+    payload, schema, refs, _ = facts.request_spec("fact_check", [row], final, [head], {}, kind="complete_originals",
+        protocol_version=facts.LEGACY_VERSION)
+    assert refs.protocol_version == facts.LEGACY_VERSION
+    assert "citation_output_contract" not in payload and "citation_sources" not in payload
+    assert "original_support_reference_ids" in payload["items"][0]
+    field = schema["properties"]["items"]["properties"][row["id"]]["properties"]["statement"]
+    assert set(field["properties"]["citations"]["items"]["properties"]) == {"reference_id"}
+    ref = next(iter(refs))
+    assert facts.decode_citations([{"reference_id": ref}], refs)
+    with pytest.raises(PartitionError, match="fact_check_unknown_reference"):
+        facts.decode_citations([{"reference_id": "Qforged"}], refs)
+    with pytest.raises(PartitionError, match="fact_check_unknown_reference"):
+        facts.decode_citations([{"source_id": head.evidence_id, "quote": head.text}], refs)
+    assert facts.prompt_for("fact_check", facts.LEGACY_VERSION) == facts.LEGACY_CHECK_PROMPT
+    assert facts.prompt_for("fact_rewrite", facts.LEGACY_VERSION) == facts.LEGACY_REWRITE_PROMPT

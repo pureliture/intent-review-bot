@@ -18,7 +18,7 @@ from review_bot.domain.partition_review import PartitionReviewResult
 _GENERATION_IMPLEMENTATION = (
     "application/partition_review.py", "application/source_partition.py", "application/partition_choices.py",
     "application/partition_integration.py", "application/partition_global_review.py", "application/review_fact_check.py",
-    "application/source_citations.py", "application/model_execution.py", "application/model_wire_contract.py", "application/selection.py",
+    "application/source_citations.py", "application/source_quote_citations.py", "application/model_execution.py", "application/model_wire_contract.py", "application/selection.py",
     "application/review_output_contract.py", "application/context.py", "application/intent_context.py",
     "application/delta.py", "application/architecture_review.py",
     "adapters/llamacpp.py", "adapters/llamacpp_macbook.py", "adapters/intent_planner.py",

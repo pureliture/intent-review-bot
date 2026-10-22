@@ -23,6 +23,7 @@ from review_bot.application.partition_integration import native_integration_page
 from review_bot.application.review_fact_check import run as run_fact_verification
 from review_bot.application.selection import is_gradle_java_path
 from review_bot.application.source_citations import citation_spans
+from review_bot.application.source_quote_citations import resolve_quote_citations
 from review_bot.application.declared_intent_review import PROMPT_VERSION, SYSTEM_PROMPTS, response_schema, run_review_b_pipeline
 from review_bot.domain.intent_models import IntentReviewLimits
 from review_bot.config import shared_plan_enabled
@@ -50,7 +51,7 @@ def architecture_input_fingerprint(snapshot, classification, config, client, *, 
             from review_bot.application.source_partition import partition_original
             return hash_json({"schema": "partition-evaluation/architecture", "snapshot": asdict(snapshot),
                 "classification": asdict(classification), "config": config.config_hash, "model": _profile(client),
-                "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, native_integration_pages, run_fact_verification, is_gradle_java_path,
+                "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, resolve_quote_citations, native_integration_pages, run_fact_verification, is_gradle_java_path,
                     LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient, beam_wire_payload)})
         architecture = config.architecture.model_dump(mode="json")
         ruleset = Path(architecture["ruleset_resource"])
@@ -93,7 +94,7 @@ def intent_input_fingerprint(task, config, client, *, planning_client=None, sele
                 "model": _profile(client), "planner": _profile(planning_client),
                 "trial": config.partition_evaluation.model_dump(mode="json"),
                 "language": config.output.language,
-                "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, native_integration_pages, run_fact_verification, is_gradle_java_path,
+                "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, resolve_quote_citations, native_integration_pages, run_fact_verification, is_gradle_java_path,
                     LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient, beam_wire_payload)})
         if config.intent.pipeline == "perspectives-v1":
             from review_bot.adapters.markdown.intent_perspective_formatter import format_intent_perspective_markdown

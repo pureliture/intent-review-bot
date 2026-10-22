@@ -9,11 +9,47 @@ from review_bot.domain.intent_perspectives import PERSPECTIVES
 from review_bot.domain.models_v1 import ModelResponse
 
 
+def _quote_citation_schema(value):
+    if isinstance(value, dict):
+        return set(value.get("properties", {})) == {"source_id", "quote"} or any(
+            _quote_citation_schema(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_quote_citation_schema(child) for child in value)
+    return False
+
+
+def _fact_citation_encoder(payload, schema, ambiguities):
+    if not _quote_citation_schema(schema):
+        return lambda reference: {"reference_id": reference}
+    from hashlib import sha256
+    from review_bot.application.review_fact_check import materialize_source_texts
+
+    sources = materialize_source_texts(payload)
+    refs = {entry["reference_id"]: (source["evidence_id"], entry)
+        for source in payload["citation_catalog"] for entry in source["ranges"]}
+
+    def encode(reference):
+        source_id, span = refs[reference]
+        source = next(source for source in sources if source["evidence_id"] == source_id
+            and source["start_byte"] <= span["start_byte"] < span["end_byte"] <= source["end_byte"])
+        raw = "".join(block["text"] for block in source["blocks"]).encode()
+        start, end = span["start_byte"] - source["start_byte"], span["end_byte"] - source["start_byte"]
+        literal = raw[start:end]
+        if raw.find(literal, raw.find(literal) + 1) >= 0:
+            ambiguities.append({"source_id": source_id, "path": source["path"],
+                "start_byte": span["start_byte"], "end_byte": span["end_byte"],
+                "quote_sha256": sha256(literal).hexdigest()})
+        return {"source_id": source_id, "quote": literal.decode()}
+
+    return encode
+
+
 class PartitionModelClient:
     def __init__(self, *, name="partition-fixture", counter=None, transform=None, group_all=False):
         self.profile = ModelProfile("mock", name, max_input_tokens=50000, max_output_tokens=512, is_mock=True)
         self.counter, self.transform, self.group_all = counter, transform, group_all
         self.requests, self.count_requests = [], []
+        self.quote_ambiguities = []
 
     def count_input_tokens(self, request):
         self.count_requests.append(request)
@@ -58,6 +94,7 @@ class PartitionModelClient:
             return body if isinstance(body, ModelResponse) else ModelResponse(json.dumps(body, ensure_ascii=False),
                 {"input_tokens": self.count_input_tokens(request), "output_tokens": 10})
         elif stage == "fact_check":
+            encode_citation = _fact_citation_encoder(payload, request.response_schema, self.quote_ambiguities)
             fallback = next(block["reference_id"] for source in payload["originals"] for block in source["blocks"])
             def default_reference(row):
                 item = row["original_item"]
@@ -79,14 +116,19 @@ class PartitionModelClient:
                 body["items"][row["item_id"]] = {field: {"state": "non_factual" if not value else "supported" if ref else "unverifiable",
                     "reason": "Synthetic factual check; not evidence of native semantic quality." if ref or not value else
                         "This exact source page does not deliver the item's own cited range.",
-                    "citations": [{"reference_id": ref}] if value and ref else []} for field, value in row["fields"].items()}
+                    "citations": [encode_citation(ref)] if value and ref else []} for field, value in row["fields"].items()}
         elif stage == "fact_rewrite":
-            replacement = deepcopy(payload["items"][0]["original_item"])
+            encode_citation = _fact_citation_encoder(payload, request.response_schema, self.quote_ambiguities)
             ref = next(block["reference_id"] for source in payload["originals"] for block in source["blocks"])
-            if isinstance(replacement, dict):
-                replacement["citations"] = [{"reference_id": ref}]
-            body = {"replacement": replacement, "correction_reason": "Synthetic complete replacement for contract checks.",
-                "correction_citations": [{"reference_id": ref}]}
+            def rewrite(row):
+                replacement = deepcopy(row["original_item"])
+                if isinstance(replacement, dict):
+                    replacement["citations"] = [encode_citation(ref)]
+                return {"replacement": replacement, "correction_reason": "Synthetic complete replacement for contract checks.",
+                    "correction_citations": [encode_citation(ref)]}
+            body = ({"items": {row["item_id"]: rewrite(row) for row in payload["items"]}}
+                if _quote_citation_schema(request.response_schema) and set(request.response_schema["properties"]) == {"items"}
+                else rewrite(payload["items"][0]))
         else:
             spans = [*payload.get("originals", payload.get("original_quotes", [])), *payload.get("pr_purpose", [])]
             spans = [{**s, "text": "".join(b["text"] for b in s["blocks"])} if "blocks" in s else s for s in spans]

@@ -655,7 +655,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             output = min(output, limits.observation_output_tokens)
         if stage not in ("final_review", "review_partition", "global_review", "fact_check", "fact_rewrite"):
             raise PartitionError("free_form_tev_request_forbidden")
-        prompt = (fact_check.CHECK_PROMPT if stage == "fact_check" else fact_check.REWRITE_PROMPT if stage == "fact_rewrite" else
+        prompt = (fact_check.prompt_for(stage) if stage in ("fact_check", "fact_rewrite") else
             global_review.PROMPT + (PMD_METRIC_REFERENCE if mode == "architecture" else "") + guidance
             if stage == "global_review" else prompts["final" if stage == "final_review" else "observe"])
         if stage == "review_partition":
@@ -1553,7 +1553,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                         child_rows = [{**packet_rows[0], "item": replacement}]
                         child_stage = "fact_check"
                     child_results.append(execute_packet(child, child_rows, child_ranges, child_stage))
-                combined_refs = {key: value for _, child_refs, _, _ in child_results for key, value in child_refs.items()}
+                combined_refs = fact_check.merge_reference_contexts(
+                    child_refs for _, child_refs, _, _ in child_results)
                 combined_spans = list({(span.evidence_id, span.start_byte, span.end_byte): span
                     for _, _, child_spans, _ in child_results for span in child_spans}.values())
                 if active_stage == "fact_check":
@@ -1579,7 +1580,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                             packet["whole_claim"], packet_rows, focused_ranges, "fact_check", history)
                         if focused is not None:
                             raw = focused
-                            combined_refs.update(focused_refs)
+                            combined_refs = fact_check.merge_reference_contexts((combined_refs, focused_refs))
                             combined_spans = list({(span.evidence_id, span.start_byte, span.end_byte): span
                                 for span in [*combined_spans, *focused_spans]}.values())
                             packet["cited_evidence"].extend(packet["whole_claim"]["cited_evidence"])
@@ -1759,7 +1760,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         "prompts": hashes, "models": {"review": asdict(profile) if profile else None,
         "planner": asdict(planner) if planner else None}}
     identity["implementation"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-        for name in ("partition_review.py", "source_partition.py", "model_execution.py", "model_wire_contract.py", "partition_choices.py", "source_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py", "review_fact_check.py", "selection.py")}
+        for name in ("partition_review.py", "source_partition.py", "model_execution.py", "model_wire_contract.py", "partition_choices.py", "source_citations.py", "source_quote_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py", "review_fact_check.py", "selection.py")}
     identity["implementation"].update({"adapters/" + name: hashlib.sha256(
         (Path(__file__).parents[1] / "adapters" / name).read_bytes()).hexdigest()
         for name in ("llamacpp.py", "llamacpp_macbook.py", "intent_planner.py")})
