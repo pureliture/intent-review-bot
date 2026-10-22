@@ -8,7 +8,7 @@ endpoint, and no memo of measured counts. Each ``complete`` performs
 exactly one ``POST /api/v1/chat/completions`` after a fail-closed
 byte-upper-bound pre-gate, and validates the response usage post-send.
 
-Default model: ``google/gemma-4-31b-it:free`` (262K context, public Gemma tokenizer). The
+Default model: ``minimax/minimax-m3.1-flash:free`` (1M context). Gemma variants stay available via OPENROUTER_REVIEW_MODEL. The
 128K production envelope (input 98,394 + output 32,678) still binds
 through ``min(app_budget, model_context)``.
 """
@@ -54,8 +54,8 @@ from review_bot.application.model_wire_contract import compact_schema
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 
 OPENROUTER_REVIEW_PROFILE = "openrouter-review"
-REVIEW_MODEL = "google/gemma-4-31b-it:free"
-REVIEW_CONTEXT_TOKENS = 262144
+REVIEW_MODEL = "minimax/minimax-m3.1-flash:free"
+REVIEW_CONTEXT_TOKENS = 1000000
 # Production 128K envelope from the agreed app budget: input + output.
 APP_INPUT_TOKENS = 98394
 APP_OUTPUT_TOKENS = 32678

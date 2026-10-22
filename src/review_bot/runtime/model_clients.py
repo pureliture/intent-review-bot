@@ -29,7 +29,7 @@ from review_bot.ports import ModelClient
 
 BEAM_CLOUD_TEV4B_PROFILE = "macbook-beam-cloud-tev4b"
 MACBOOK_PROFILES = (MACBOOK_LLAMACPP_PROFILE, MACBOOK_GRANITE_PROFILE, BEAM_CLOUD_TEV4B_PROFILE)
-# Deployment profile: review/planning/gemma-chat and decision/pplx-decisions
+# Deployment profile: review/planning/minimax-chat and decision/pplx-decisions
 # under one name, mirroring me707-llamacpp (bonsai review + tev1 selection).
 OPENROUTER_PROFILE = "openrouter"
 OPENROUTER_PROFILES = (OPENROUTER_PROFILE, OPENROUTER_REVIEW_PROFILE, OPENROUTER_DECISION_PROFILE)

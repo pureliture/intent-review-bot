@@ -20,7 +20,7 @@ from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 HTTP_CLIENT = httpx.Client
 SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}},
     "required": ["ok"], "additionalProperties": False}
-REVIEW_MODEL = "google/gemma-4-31b-it:free"
+REVIEW_MODEL = "minimax/minimax-m3.1-flash:free"
 DECISION_MODEL = "perplexity/pplx-decider-flash-v1.2"
 
 

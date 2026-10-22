@@ -9,7 +9,7 @@ reserve is caught post-send by the response usage check and fails
 closed; it is never reinterpreted as a fitting request.
 
 Exact local tokenizers are unavailable for the validation models
-(gemma tokenizer is public; pplx decider tokenizer unreleased),
+(validation review tokenizer is provider-side; pplx decider tokenizer unreleased),
 so this conservative bound is the interim proof. It is fail-closed, not
 an estimate: it can only refuse, never wrongly admit.
 """
