@@ -719,12 +719,12 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             current.timeout_seconds, output, schema)
 
     def choice_request(stage, state, options, question):
-        return ModelRequest(1, choice_profile.model, choices.SYSTEM,
+        return ModelRequest(1, planner.model, choices.SYSTEM,
             json.dumps({"stage": stage, "mode": mode, "language": language,
                 "state": state, "question": question,
                 "options": [{k: row[k] for k in ("label", "key", "description")} for row in options]},
                 ensure_ascii=False, separators=(",", ":"), allow_nan=False),
-            choice_profile.timeout_seconds, min(choice_profile.max_output_tokens, choices.CHOICE_OUTPUT_TOKENS),
+            planner.timeout_seconds, min(planner.max_output_tokens, choices.CHOICE_OUTPUT_TOKENS),
             choices.choice_schema(options))
 
     def choose(stage, state, options, question, *, covered=(), observed=()):
@@ -732,6 +732,11 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         if len(options) == 1:
             selected, index, raw = options[0], None, None
         else:
+            if decider is not None:
+                # Re-address the shared choice envelope to the decision
+                # client, which enforces its own exact model identity.
+                # Prompts, schemas, records and validators are model-free.
+                req = replace(req, model=decider.model, timeout_seconds=decider.timeout_seconds)
             for retry in range(2):
                 raw, index = execute(req, choice_client, choice_profile, stage + ":" + state.get("field", "choice"))
                 try:
