@@ -19,8 +19,9 @@ from review_bot.application.source_citations import citation_spans, citation_cat
 
 LEGACY_VERSION = "fact-review/v3-capacity-batches"
 QUOTE_VERSION = "fact-review/v4-exact-source-quotes"
-VERSION = "fact-review/v5-line-boundary-support"
-SUPPORTED_VERSIONS = (VERSION, QUOTE_VERSION, LEGACY_VERSION)
+LINE_BOUNDARY_VERSION = "fact-review/v5-line-boundary-support"
+VERSION = "fact-review/v6-diff-quote-choices"
+SUPPORTED_VERSIONS = (VERSION, LINE_BOUNDARY_VERSION, QUOTE_VERSION, LEGACY_VERSION)
 PMD_REFERENCE = "https://github.com/pmd/pmd/blob/pmd_releases/7.3.0/pmd-java/src/main/java/net/sourceforge/pmd/lang/java/metrics/JavaMetrics.java"
 METRICS = {
     "TCC": ("cohesion", "Tight Class Cohesion: related method pairs sharing direct attribute access. Low TCC means low cohesion (응집도), and does not establish low coupling (결합도)."),
@@ -143,7 +144,7 @@ V4_REWRITE_PROMPT = LEGACY_REWRITE_PROMPT.replace("Select supplied reference IDs
     "Select exact supplied source quotations only.") + "\n" + QUOTE_OUTPUT_CONTRACT + "\n"
 
 
-CHECK_PROMPT = V4_CHECK_PROMPT + """
+V5_CHECK_PROMPT = V4_CHECK_PROMPT + """
 For a conditional claim, compare its exact accepted/rejected value sets with the
 actual predicate and every referenced constant/collection definition. A claim
 about all values except one is not supported by a guard accepting multiple values.
@@ -153,7 +154,7 @@ line breaks for range containment, retaining the complete exact quotation. Space
 indentation, interior gaps and additional source code are never exempt. Minimality
 and preservation claims need relevant base/head or diff evidence in own citations.
 """
-REWRITE_PROMPT = V4_REWRITE_PROMPT + """
+V5_REWRITE_PROMPT = V4_REWRITE_PROMPT + """
 Independently re-evaluate every retained literal clause, including clauses the
 previous checker labelled supported. Prior assessments can miss a false condition.
 Check the exact predicate and all referenced constant/collection definitions.
@@ -165,6 +166,17 @@ original source bytes and original items in the audit record.
 """
 
 
+DIFF_QUOTE_RULE = """
+For diff sources, the quote schema enumerates exact supplied source choices.
+Select only those literal strings; cite multiple choices when needed. Unified diff
+context lines begin with a literal space marker before any code indentation.
+Keep that marker and every newline exactly: never rewrite a diff as plain code.
+These choices restrict quotation spelling, not the review's factual verdict.
+"""
+CHECK_PROMPT = V5_CHECK_PROMPT + DIFF_QUOTE_RULE
+REWRITE_PROMPT = V5_REWRITE_PROMPT + DIFF_QUOTE_RULE
+
+
 def prompt_for(stage, protocol_version=VERSION):
     if protocol_version not in SUPPORTED_VERSIONS:
         raise PartitionError("fact_protocol_version_unknown")
@@ -174,6 +186,8 @@ def prompt_for(stage, protocol_version=VERSION):
         return LEGACY_CHECK_PROMPT if stage == "fact_check" else LEGACY_REWRITE_PROMPT
     if protocol_version == QUOTE_VERSION:
         return V4_CHECK_PROMPT if stage == "fact_check" else V4_REWRITE_PROMPT
+    if protocol_version == LINE_BOUNDARY_VERSION:
+        return V5_CHECK_PROMPT if stage == "fact_check" else V5_REWRITE_PROMPT
     return CHECK_PROMPT if stage == "fact_check" else REWRITE_PROMPT
 
 
@@ -214,9 +228,42 @@ def _quote_protocol(refs):
     return getattr(refs, "protocol_version", LEGACY_VERSION) != LEGACY_VERSION
 
 
-def _quote_object_schema(source_ids):
-    return obj({"source_id": {"type": "string", "enum": list(source_ids)},
+def _quote_object_schema(source_ids, refs=None):
+    source_ids = list(source_ids)
+    basic = obj({"source_id": {"type": "string", "enum": source_ids},
         "quote": {"type": "string", "minLength": 1}})
+    if refs is None or refs.protocol_version != VERSION:
+        return basic
+    choices, unrestricted = [], []
+    for source_id in source_ids:
+        original = refs.originals[source_id]
+        if original.version != "diff":
+            unrestricted.append(source_id)
+            continue
+        spans = [span for span in refs.delivered_spans if span.evidence_id == source_id]
+        # Existing deterministic catalog chunks plus unchanged anchors and the
+        # complete delivered span cover every supplied diff byte. Exact-only:
+        # never normalize or fuzzy-match a model's malformed quotation.
+        if any(not span.text.strip() or original.text.count(span.text) != 1 for span in spans):
+            unrestricted.append(source_id)
+            continue
+        candidates = [span.text for span in refs.values() if span.evidence_id == source_id]
+        candidates.extend(span.text for span in spans)
+        candidates = list(dict.fromkeys(value for value in candidates
+            if value.strip() and original.text.count(value) == 1))
+        if not candidates:
+            # Retain exact-source validation for a page repeated elsewhere;
+            # there is no unique quote choice to impose on this source page.
+            unrestricted.append(source_id)
+            continue
+        choices.append(obj({"source_id": {"type": "string", "enum": [source_id]},
+            "quote": {"type": "string", "enum": candidates}}))
+    if not choices:
+        return basic
+    if unrestricted:
+        choices.insert(0, obj({"source_id": {"type": "string", "enum": unrestricted},
+            "quote": {"type": "string", "minLength": 1}}))
+    return {"anyOf": choices}
 
 
 def obj(properties):
@@ -228,7 +275,7 @@ def text(empty=False):
 
 
 def cite_schema(refs, *, required=False):
-    allowed = (_quote_object_schema(dict.fromkeys(span.evidence_id for span in refs.delivered_spans))
+    allowed = (_quote_object_schema(dict.fromkeys(span.evidence_id for span in refs.delivered_spans), refs)
         if _quote_protocol(refs) else obj({"reference_id": {"type": "string", "enum": list(refs)}}))
     return {"type": "array", "items": allowed, "minItems": 1 if required else 0, "maxItems": 32}
 
@@ -351,7 +398,7 @@ def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version
             "For supported, select supporting checker references wholly contained in the ORIGINAL item's citation range union for the same evidence_id. If your supporting references extend outside that union, use unverifiable so the existing rewrite can correct the item's citation binding. "
             "Your own correct checker citations do not silently repair the unchanged original_item.citations or justify supported for that binding gap. Recheck the actual replacement citations after rewrite. "
             "This binding requirement does not apply to empty or non_factual fields; a summary without its own citations retains its existing source-check treatment. Preserve original fields, items, citation sets and all audit responses.")
-    if protocol_version == VERSION and "citation_grounding_rule" in payload["canonical_facts"]:
+    if protocol_version in (VERSION, LINE_BOUNDARY_VERSION) and "citation_grounding_rule" in payload["canonical_facts"]:
         payload["canonical_facts"]["citation_grounding_rule"] += (
             " For binding containment only, exclude leading/trailing CR/LF bytes from the checker support range. "
             "Keep exact quotes unchanged; spaces, indentation, interior gaps and added code are never exempt.")
@@ -470,6 +517,24 @@ def request_spec(stage, rows, final, originals, meta, *, kind, extra=None, range
     schema = check_schema(rows, refs, [o["evidence_id"] for o in inventory]) if stage == "fact_check" else (
         rewrite_schema(rows[0], refs, architecture=architecture_rewrite) if len(rows) == 1 else
         obj({"items": obj({row["id"]: rewrite_schema(row, refs, architecture=architecture_rewrite) for row in rows})}))
+    if protocol_version == VERSION:
+        # Cite choices recur in every assessment field. Define each exact
+        # object once so schema constraints do not repeatedly copy source text.
+        definitions = {}
+        def share_choices(node):
+            if isinstance(node, dict):
+                if (node.get("type") == "object" and "quote" in node.get("properties", {})
+                        and "enum" in node["properties"]["quote"]):
+                    name = "exact_diff_" + hash_json(node)[:24]
+                    definitions.setdefault(name, deepcopy(node))
+                    return {"$ref": "#/$defs/" + name}
+                return {key: share_choices(value) for key, value in node.items()}
+            if isinstance(node, list):
+                return [share_choices(value) for value in node]
+            return node
+        schema = share_choices(schema)
+        if definitions:
+            schema["$defs"] = definitions
     return payload, schema, refs, spans
 
 
@@ -589,7 +654,7 @@ def check_schema(rows, refs, source_ids=()):
         if _quote_protocol(refs):
             union = original_citation_union(row)
             support_ids = list(union) if union is not None else None
-            allowed = _quote_object_schema(support_ids) if support_ids else False
+            allowed = _quote_object_schema(support_ids, refs) if support_ids else False
         else:
             support_ids = original_support_reference_ids(row, refs)
             allowed = obj({"reference_id": {"type": "string", "enum": support_ids}}) if support_ids else False
@@ -850,7 +915,7 @@ def citation_binding_issues(row, assessments, originals, cited_evidence, *, prot
             if cite is None:
                 raise PartitionError("fact_check_support_evidence_missing")
             support_start, support_end = cite["start_byte"], cite["end_byte"]
-            if protocol_version == VERSION:
+            if protocol_version in (VERSION, LINE_BOUNDARY_VERSION):
                 # Retain exact quotes; only boundary CR/LF is exempt from containment.
                 raw = by_id[cite["evidence_id"]].raw
                 while support_start < support_end and raw[support_start] in (10, 13):

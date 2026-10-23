@@ -360,7 +360,8 @@ def test_wire_reference_definitions_preserve_complete_a_b_fact_response_contract
                 return {key: expand(child) for key, child in value.items() if key != "$defs"}
             return [expand(child) for child in value] if isinstance(value, list) else value
         restored = expand(compact)
-        assert restored == original == request.response_schema
+        assert restored == expand(original)
+        assert original == request.response_schema
         def reference_ids(value):
             if isinstance(value, dict):
                 if set(value) == {"reference_id"}:
@@ -1711,7 +1712,7 @@ def _v4_fact_packet():
 def test_v4_exact_quote_output_and_original_union_are_explicit_without_legacy_q_output():
     head, final, row = _v4_fact_packet()
     payload, schema, refs, spans = facts.request_spec("fact_check", [row], final, [head], {}, kind="complete_originals")
-    assert refs.protocol_version == facts.VERSION == "fact-review/v5-line-boundary-support"
+    assert refs.protocol_version == facts.VERSION == "fact-review/v6-diff-quote-choices"
     assert refs.originals == {head.evidence_id: head}
     assert payload["items"][0]["original_item"] == row["item"]
     support = payload["items"][0]["original_support_quotes"]
@@ -1868,3 +1869,23 @@ def test_v5_prompts_recheck_conditions_and_keep_historical_v4_prompt_exact():
     assert facts.prompt_for("fact_check", facts.QUOTE_VERSION) == facts.V4_CHECK_PROMPT
     assert facts.prompt_for("fact_rewrite", facts.QUOTE_VERSION) == facts.V4_REWRITE_PROMPT
     assert facts.CHECK_PROMPT.startswith(facts.V4_CHECK_PROMPT)
+
+
+def test_v6_diff_quote_choices_keep_context_markers_and_share_schema_definitions():
+    from review_bot.application.source_partition import SourceOriginal
+    original = SourceOriginal("S-diff", "@@ -1,2 +1,2 @@\n context_line()\n-old()\n+new()\n",
+        "diff", "src/value.py", "diff", "a" * 40)
+    final = {"summary": "The call changed.", "findings": [], "perspectives": [], "questions": [], "supplied_quotes": []}
+    row = {"id": "summary", "kind": "summary", "item": final["summary"]}
+    payload, schema, refs, _ = facts.request_spec("fact_check", [row], final, [original], {}, kind="complete_originals")
+    assert schema["$defs"]
+    choices = [q for definition in schema["$defs"].values() for q in definition["properties"]["quote"]["enum"]]
+    assert original.text in choices and all(original.text.count(q) == 1 for q in choices)
+    assert "@@ -1,2 +1,2 @@\ncontext_line()\n-old()\n+new()\n" not in choices
+    assert facts.decode_citations([{"source_id": original.evidence_id, "quote": original.text}], refs)
+    with pytest.raises(PartitionError, match="citation_quote_not_found"):
+        facts.decode_citations([{"source_id": original.evidence_id, "quote": original.text.replace(" context", "context")}], refs)
+    _, old_schema, _, _ = facts.request_spec("fact_check", [row], final, [original], {},
+        kind="complete_originals", protocol_version=facts.LINE_BOUNDARY_VERSION)
+    assert "$defs" not in old_schema
+    assert facts.prompt_for("fact_check", facts.LINE_BOUNDARY_VERSION) == facts.V5_CHECK_PROMPT
