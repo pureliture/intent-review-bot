@@ -1698,7 +1698,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                 final_index = child_results[-1][3]
                 if active_stage == "fact_check" and packet["split"] == "sources" and ranges is None:
                     packet["discovery_response"] = deepcopy(raw)
-                    focused_ranges, history = fact_check.whole_claim_packet(packet, packet_rows, originals, extra)
+                    focused_ranges, history = fact_check.whole_claim_packet(packet, packet_rows, originals, packet["extra"])
                     packet["discovery"] = deepcopy(history)
                     if focused_ranges:
                         packet["whole_claim"] = {}
@@ -1718,7 +1718,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
 
             def execute_packet(packet, packet_rows, ranges=None, packet_stage=None, whole_claim=None):
                 active_stage = packet_stage or stage
-                packet.update(rows=deepcopy(packet_rows), extra=deepcopy(extra), measurements=[], call_stage=active_stage)
+                packet_extra = fact_check.project_rewrite_context(extra, packet_rows)
+                packet.update(rows=deepcopy(packet_rows), extra=deepcopy(packet_extra), measurements=[], call_stage=active_stage)
                 if ranges is not None:
                     packet["source_ranges"] = deepcopy(ranges)
                 if whole_claim is not None:
@@ -1726,7 +1727,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                 for kind in (("cited_ranges",) if ranges is not None else
                         ("complete_originals", "cited_originals", "cited_ranges")):
                     payload, schema, refs, spans = fact_check.request_spec(active_stage, packet_rows, context,
-                        originals, meta, kind=kind, extra=extra, ranges=ranges, whole_claim=whole_claim)
+                        originals, meta, kind=kind, extra=packet_extra, ranges=ranges, whole_claim=whole_claim)
                     req = request(active_stage, payload, schema, profile)
                     packet["measurements"].append({"stage_index": len(budget.records) - first_record, "delivery": kind})
                     if measure(req, review_client, profile, active_stage + ":" + kind + ":admission", for_generation=True):
@@ -1747,7 +1748,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                             # Discovery covers the full initially attempted
                             # originals, including every requested fixed source.
                             _, _, _, spans = fact_check.request_spec(active_stage, packet_rows, context,
-                                originals, meta, kind="complete_originals", extra=extra)
+                                originals, meta, kind="complete_originals", extra=packet_extra)
                         cover = ranges if ranges is not None else [{"evidence_id": span.evidence_id,
                             "start_byte": span.start_byte, "end_byte": span.end_byte} for span in spans]
                         if not cover:
@@ -1780,6 +1781,11 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     middle = len(packet_rows) // 2
                     parts = [(packet_rows[:middle], ranges), (packet_rows[middle:], ranges)]
                     return execute_split(packet, packet_rows, ranges, active_stage, parts)
+                unique, citation_changes = fact_check.deduplicate_exact_citation_arrays(raw)
+                if citation_changes:
+                    packet.update(raw_response=deepcopy(raw), raw_response_hash=hash_json(raw),
+                        citation_deduplication=citation_changes)
+                    raw = unique
                 packet.update(response=deepcopy(raw), response_hash=hash_json(raw), stage_index=index - first_record)
                 try:
                     packet["cited_evidence"] = fact_check.response_citations(raw, refs)

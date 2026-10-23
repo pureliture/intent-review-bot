@@ -811,7 +811,10 @@ def test_contradicted_compound_fact_carries_explicit_source_through_rewrite_and_
     assert first["source_plan"]["gaps"] == [request["reason"] for request in first["check"]["response"]["source_requests"]]
     assert second["input_source_requests"] == first["check"]["response"]["source_requests"]
     rewrite = next(json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "fact_rewrite")
-    assert rewrite["recheck"]["original_check_response"] == first["check"]["response"]
+    assert rewrite["recheck"]["original_check_response"]["items"] == {
+        "summary": first["check"]["response"]["items"]["summary"]}
+    assert rewrite["recheck"]["original_check_response_hash"] == hash_json(first["check"]["response"])
+    assert rewrite["recheck"]["original_check_response"]["source_requests"] == first["check"]["response"]["source_requests"]
     assert any(source["path"] == path for source in rewrite["originals"])
     assert result.summary == result.partition["fact_verification"]["items"][0]["original"]
     assert [row["item_id"] for row in rewrite["items"]] == ["summary"]
@@ -1109,7 +1112,9 @@ def test_two_factual_errors_share_rewrite_and_batch_recheck_with_id_coverage(rew
     assert {row["item_id"] for payload in rewrites for row in payload["items"]} == failing
     assert len(rewrites[0]["recheck"]["checker_outputs"]) == 1
     assert set(next(iter(rewrites[0]["recheck"]["checker_outputs"].values()))["original_check_response"]["items"]) == {
-        row["item_id"] for row in checks[0]["items"]}
+        row["item_id"] for row in rewrites[0]["items"]}
+    full_output = result.partition["fact_verification"]["items"][0]["attempts"][0]["check"]["response"]
+    assert next(iter(rewrites[0]["recheck"]["checker_outputs"].values()))["original_check_response_hash"] == hash_json(full_output)
     assert len(checks) == 2 and {row["item_id"] for row in checks[1]["items"]} == failing
     assert all(row["original_item"]["reasoning"] == corrected for row in checks[1]["items"])
     ledger = result.partition["fact_verification"]
@@ -1362,7 +1367,7 @@ def test_empty_field_rule_preserves_original_field_and_strict_response_contract(
     assert assessment["properties"]["citations"]["minItems"] == 0
 
 
-def test_true_test_claim_with_header_citation_uses_existing_rewrite_to_repair_binding():
+def test_true_test_claim_with_header_citation_is_repaired_without_model_rewrite():
     from review_bot.application.intent_context import build_intent_task_input
     from tests.fixtures.intent_review import digest
     task = make_task()
@@ -1437,13 +1442,28 @@ def test_true_test_claim_with_header_citation_uses_existing_rewrite_to_repair_bi
     assert gap["state"] == "unverifiable" and gap["binding_gap_ranges"]
     assert any(assertion.strip() in cite["quote"] for cite in first["check"]["cited_evidence"])
     assert second["assessments"]["statement"]["state"] == "supported"
-    assert len([request for request in review.requests if json.loads(request.user_content)["stage"] == "fact_rewrite"]) == 1
+    assert not [request for request in review.requests if json.loads(request.user_content)["stage"] == "fact_rewrite"]
+    from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
+    assert "인용 보강 후 재검토" in format_partition_review_markdown(result, task)
+    assert first["citation_repair"]["origin"] == "program_citation_union"
+    assert first["citation_repair"]["replacement"] == second["item"]
+    assert first["citation_repair"]["replacement_hash"] == hash_json(second["item"])
+    assert original["citations"][0] in accepted["citations"]
     assert result.summary == result.partition["pre_verification_final"]["summary"]
     validate_partition_result(result, task)
     changed = deepcopy(result)
     changed_entry = next(value for value in changed.partition["fact_verification"]["items"] if value["item_id"] == entry["item_id"])
     changed_entry["attempts"][0]["issues"][0]["binding_gap_ranges"] = []
     with pytest.raises(PartitionError, match="stored_fact_assessment_changed"):
+        validate_partition_result(changed, task)
+    changed = deepcopy(result)
+    changed_entry = next(value for value in changed.partition["fact_verification"]["items"] if value["item_id"] == entry["item_id"])
+    changed_entry["attempts"][0]["citation_repair"]["replacement"]["statement"] = "Forged changed prose."
+    with pytest.raises(PartitionError, match="citation_repair_changed"):
+        validate_partition_result(changed, task)
+    changed = deepcopy(result)
+    changed.partition["fact_verification"]["execution_policy_version"] = 1
+    with pytest.raises(PartitionError):
         validate_partition_result(changed, task)
 
 
@@ -1889,3 +1909,158 @@ def test_v6_diff_quote_choices_keep_context_markers_and_share_schema_definitions
         kind="complete_originals", protocol_version=facts.LINE_BOUNDARY_VERSION)
     assert "$defs" not in old_schema
     assert facts.prompt_for("fact_check", facts.LINE_BOUNDARY_VERSION) == facts.V5_CHECK_PROMPT
+
+
+def test_projected_rewrite_context_preserves_exact_fields_sources_and_parent_hash():
+    response = {"items": {key: {"text": {"state": "unverifiable", "reason": key + " exact reason",
+        "citations": [{"source_id": "source", "quote": key + " exact quote"}]}}
+        for key in ("summary", "findings:0", "findings:1")},
+        "source_requests": [{"evidence_id": "source", "reason": "Shared required source."}]}
+    output = {"original_check_response": response, "check_cited_evidence": [{"evidence_id": "source", "quote": "unchanged source"}]}
+    extra = {"items": {key: {"checker_output_id": "parent", "discrepancies": [{"field": "text", "reason": key}]}
+        for key in response["items"]}, "checker_outputs": {"parent": output},
+        "source_requests": deepcopy(response["source_requests"]), "checker_output_contract": "Full parent."}
+    original = deepcopy(extra)
+    rows = [{"id": "findings:0", "kind": "findings", "item": "Unchanged target."}]
+    view = facts.project_rewrite_context(extra, rows)
+    assert extra == original
+    assert set(view["items"]) == {"findings:0"}
+    selected = view["checker_outputs"]["parent"]
+    assert selected["original_check_response"]["items"] == {"findings:0": response["items"]["findings:0"]}
+    assert selected["original_check_response_hash"] == hash_json(response)
+    assert selected["check_cited_evidence"] == output["check_cited_evidence"]
+    assert selected["original_check_response"]["source_requests"] == response["source_requests"]
+    assert view["source_requests"] == extra["source_requests"]
+    assert view["context_projection"]["parent_extra_hash"] == hash_json(extra)
+    assert facts.project_rewrite_context(extra, rows) == view
+    with pytest.raises(PartitionError, match="missing_rewrite_items"):
+        facts.project_rewrite_context(extra, [{"id": "unknown"}])
+
+
+def test_projected_children_keep_two_item_rewrites_admissible_and_cover_all_targets():
+    failing = {"perspectives:" + str(i) for i in range(4)}
+    corrected = "Corrected factual premise with its exact source retained."
+    def counter(request):
+        payload = json.loads(request.user_content)
+        if payload["stage"] != "fact_rewrite":
+            return 100
+        return 210 * len(payload["items"]) + 100 * len(payload["recheck"]["items"])
+    def transform(payload, body):
+        if payload["stage"] == "fact_check":
+            for row in payload["items"]:
+                if row["item_id"] in failing and row["original_item"]["reasoning"] != corrected:
+                    body["items"][row["item_id"]]["reasoning"].update(state="contradicted", reason="Correct this premise.")
+        if payload["stage"] == "fact_rewrite":
+            assert {row["item_id"] for row in payload["items"]} == set(payload["recheck"]["items"])
+            replacements = {}
+            for row in payload["items"]:
+                item = deepcopy(row["original_item"]); item["reasoning"] = corrected
+                item["citations"] = [_fact_citation(payload, _reference(payload))]
+                replacements[row["item_id"]] = {"replacement": item, "correction_reason": "Exact correction.",
+                    "correction_citations": item["citations"]}
+            return {"items": replacements} if len(replacements) > 1 else next(iter(replacements.values()))
+        return body
+    client = PartitionModelClient(counter=counter, transform=transform)
+    client.profile = replace(client.profile, max_input_tokens=650)
+    task = make_task()
+    result = run_partition_review(task, "intent", client, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    rewrites = [json.loads(r.user_content) for r in client.requests if json.loads(r.user_content)["stage"] == "fact_rewrite"]
+    assert len(rewrites) == 2 and all(len(p["items"]) == 2 for p in rewrites)
+    assert [r["item_id"] for p in rewrites for r in p["items"]] == sorted(failing)
+    assert 210 * 2 + 100 * 4 > 650  # full-parent context forced one-item calls
+    assert 210 * 2 + 100 * 2 <= 650
+    from review_bot.application.partition_review import prepare_originals
+    originals, _ = prepare_originals(task, "intent")
+    expected = {o.evidence_id: o.text for o in originals}
+    for packet in rewrites:
+        assert {o["evidence_id"]: "".join(b["text"] for b in o["blocks"])
+            for o in facts.materialize_source_texts(packet)} == expected
+    validate_partition_result(result, task)
+    modified = deepcopy(result)
+    entry = next(e for e in modified.partition["fact_verification"]["items"] if e["item_id"] in failing)
+    entry["attempts"][0]["rewrite"]["children"][0]["extra"]["context_projection"]["parent_extra_hash"] = "forged"
+    with pytest.raises(PartitionError, match="prior_response_changed"):
+        validate_partition_result(modified, task)
+
+
+@pytest.mark.parametrize("negative", [False, True])
+def test_program_citation_repair_preserves_prose_and_never_repairs_semantic_negatives(negative):
+    from review_bot.application.source_partition import SourceOriginal, make_span
+    original = SourceOriginal("S-repair", "header\nassert value == 1\n", "source", "src/value.py", "head", "a" * 40)
+    def cite(start, end):
+        span = make_span(original, start, end, "fixture")
+        return {key: getattr(span, key) for key in ("evidence_id", "start_byte", "end_byte", "sha", "path", "version", "begin_line", "end_line")} | {"quote": span.text}
+    item = {"statement": "The source asserts one.", "reasoning": "Inspect the assertion.", "failure_condition": "",
+        "verdict": "aligned", "citations": [cite(0, 7)]}
+    witness = cite(7, len(original.raw))
+    assessments = {key: {"state": "supported" if value else "non_factual", "reason": "Exact source support.",
+        "citations": [{"source_id": original.evidence_id, "quote": witness["quote"]}] if value else []}
+        for key, value in facts.fields({"item": item}).items()}
+    if negative:
+        assessments["reasoning"]["state"] = "contradicted"
+    row = {"id": "perspectives:0", "kind": "perspectives", "item": item}
+    check = {"response": {"items": {row["id"]: assessments}, "source_requests": []},
+        "cited_evidence": [witness], "delivered_ranges": [{"evidence_id": original.evidence_id, "start_byte": 0, "end_byte": len(original.raw)}]}
+    check["response_hash"] = hash_json(check["response"])
+    record = {"assessments": assessments, "issues": facts.issues(assessments, [], row=row, originals=[original],
+        cited_evidence=[witness], delivered_ranges=check["delivered_ranges"]), "check": check}
+    unchanged = deepcopy((row, record))
+    repair = facts.citation_only_repair(row, record, [original])
+    assert (row, record) == unchanged
+    if negative:
+        assert repair is None
+    else:
+        assert repair["replacement"]["citations"] == [*item["citations"], witness]
+        assert {k: v for k, v in repair["replacement"].items() if k != "citations"} == {k: v for k, v in item.items() if k != "citations"}
+        assert repair["replacement_hash"] == hash_json(repair["replacement"])
+        record["check"]["delivered_ranges"] = []
+        assert facts.citation_only_repair(row, record, [original]) is None
+
+
+def test_exact_citation_deduplication_preserves_raw_prose_identity_and_distinct_sources():
+    cite = {"source_id": "head", "quote": " exact source\n"}
+    other = {"source_id": "base", "quote": cite["quote"]}
+    raw = {"replacement": {"statement": "Unchanged judgement.", "reasoning": "Unchanged premise.",
+        "citations": [cite, deepcopy(cite), other, {"source_id": "head", "quote": "exact source\n"}]},
+        "correction_reason": "Unchanged correction.", "correction_citations": [deepcopy(cite), deepcopy(cite)]}
+    saved = deepcopy(raw)
+    unique, changes = facts.deduplicate_exact_citation_arrays(raw)
+    assert raw == saved and len(changes) == 2
+    assert unique["replacement"]["citations"] == [cite, other, {"source_id": "head", "quote": "exact source\n"}]
+    assert unique["replacement"]["statement"] == raw["replacement"]["statement"]
+    assert unique["replacement"]["reasoning"] == raw["replacement"]["reasoning"]
+    assert unique["correction_citations"] == [cite]
+    assert facts.deduplicate_exact_citation_arrays(unique) == (unique, [])
+    oversized = {"citations": [deepcopy(cite) for _ in range(33)]}
+    assert facts.deduplicate_exact_citation_arrays(oversized) == (oversized, [])
+
+
+def test_duplicate_native_citations_are_audited_and_corrected_candidate_is_rechecked():
+    corrected = "Corrected complete factual premise."
+    def transform(payload, body):
+        if payload["stage"] == "fact_check":
+            row = next((row for row in payload["items"] if row["item_id"] == "summary"), None)
+            if row and row["original_item"] != corrected:
+                body["items"]["summary"]["text"].update(state="contradicted", reason="Correct the factual premise.")
+        if payload["stage"] == "fact_rewrite":
+            cite = _fact_citation(payload, _reference(payload))
+            return {"replacement": corrected, "correction_reason": "Exact corrected premise.",
+                "correction_citations": [cite, deepcopy(cite)]}
+        return body
+    client = PartitionModelClient(transform=transform)
+    task = make_task()
+    result = run_partition_review(task, "intent", client, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    attempts = result.partition["fact_verification"]["items"][0]["attempts"]
+    call = attempts[0]["rewrite"]
+    assert len(call["raw_response"]["correction_citations"]) == 2
+    assert len(call["response"]["correction_citations"]) == 1
+    assert call["raw_response_hash"] == hash_json(call["raw_response"])
+    assert call["citation_deduplication"]
+    assert attempts[1]["item"] == corrected and result.summary == corrected
+    validate_partition_result(result, task)
+    changed = deepcopy(result)
+    changed.partition["fact_verification"]["items"][0]["attempts"][0]["rewrite"]["citation_deduplication"][0]["removed_index"] = 999
+    with pytest.raises(PartitionError, match="citation_deduplication_changed"):
+        validate_partition_result(changed, task)

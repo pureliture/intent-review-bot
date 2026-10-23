@@ -22,6 +22,7 @@ QUOTE_VERSION = "fact-review/v4-exact-source-quotes"
 LINE_BOUNDARY_VERSION = "fact-review/v5-line-boundary-support"
 VERSION = "fact-review/v6-diff-quote-choices"
 SUPPORTED_VERSIONS = (VERSION, LINE_BOUNDARY_VERSION, QUOTE_VERSION, LEGACY_VERSION)
+EXECUTION_POLICY_VERSION = 2
 PMD_REFERENCE = "https://github.com/pmd/pmd/blob/pmd_releases/7.3.0/pmd-java/src/main/java/net/sourceforge/pmd/lang/java/metrics/JavaMetrics.java"
 METRICS = {
     "TCC": ("cohesion", "Tight Class Cohesion: related method pairs sharing direct attribute access. Low TCC means low cohesion (응집도), and does not establish low coupling (결합도)."),
@@ -1095,9 +1096,137 @@ def rewrite_batch_extra(rows, records):
     return extra
 
 
+def project_rewrite_context(extra, rows):
+    """Select exact item records, retaining full source/citation deliveries.
+
+    The caller retains the full parent context in the audit record. A view is
+    derived again for each child from that parent, never from a lossy summary.
+    Global source requests and cited evidence remain unchanged because their
+    relevance is not mechanically attributable to one prose field.
+    """
+    if not extra or not ("original_check_response" in extra or "checker_outputs" in extra):
+        return deepcopy(extra)
+    identifiers = [row["id"] for row in rows]
+    if len(set(identifiers)) != len(identifiers):
+        raise PartitionError("fact_context_duplicate_item")
+    selected = set(identifiers)
+    result = deepcopy(extra)
+
+    def view(output):
+        response = output["original_check_response"]
+        if not selected.intersection(response["items"]):
+            raise PartitionError("fact_context_missing_checker_items")
+        output["original_check_response_hash"] = hash_json(response)
+        output["original_check_response"] = {
+            **deepcopy(response), "items": {key: deepcopy(value)
+                for key, value in response["items"].items() if key in selected}}
+
+    if "checker_outputs" in result:
+        if not selected <= set(result["items"]):
+            raise PartitionError("fact_context_missing_rewrite_items")
+        result["items"] = {key: value for key, value in result["items"].items() if key in selected}
+        needed = {value["checker_output_id"] for value in result["items"].values()}
+        if not needed <= set(result["checker_outputs"]):
+            raise PartitionError("fact_context_missing_checker_output")
+        result["checker_outputs"] = {key: value for key, value in result["checker_outputs"].items() if key in needed}
+        covered = set()
+        for output in result["checker_outputs"].values():
+            view(output)
+            covered.update(output["original_check_response"]["items"])
+        if not selected <= covered:
+            raise PartitionError("fact_context_missing_checker_items")
+        if any(key not in result["checker_outputs"][value["checker_output_id"]]["original_check_response"]["items"]
+                for key, value in result["items"].items()):
+            raise PartitionError("fact_context_checker_binding_changed")
+        result["checker_output_contract"] = (
+            "Each checker_output_id identifies the unchanged full parent output in the audit record. "
+            "original_check_response is an exact selected-item view of that response, identified by "
+            "original_check_response_hash. No selected assessment field or citation is summarized. "
+            "All global source requests and cited evidence are retained in this request.")
+    else:
+        view(result)
+        if not selected <= set(result["original_check_response"]["items"]):
+            raise PartitionError("fact_context_missing_checker_items")
+    result["context_projection"] = {"version": 1, "parent_extra_hash": hash_json(extra),
+        "item_ids": identifiers, "selected_fields_unchanged": True}
+    return result
+
+
+def citation_only_repair(row, record, originals):
+    """Append exact checker witnesses only; always recheck the candidate later."""
+    item, assessments, problems = row["item"], record["assessments"], record["issues"]
+    if (not isinstance(item, dict) or not item.get("citations") or not problems
+            or set(assessments) != set(fields(row))
+            or any(value["state"] not in ("supported", "non_factual") for value in assessments.values())
+            or any(problem.get("kind") != "source_assertion" or problem.get("state") != "unverifiable"
+                or not problem.get("binding_gap_ranges") for problem in problems)):
+        return None
+    by_id = {original.evidence_id: original for original in originals}
+    quote_spans(item["citations"], by_id)
+    check = record["check"]
+    witnesses = {(cite["evidence_id"], cite["start_byte"], cite["end_byte"]): cite
+        for cite in check["cited_evidence"]}
+    required = sorted({(gap["evidence_id"], gap["start_byte"], gap["end_byte"])
+        for problem in problems for gap in problem["binding_gap_ranges"]})
+    existing = {(cite["evidence_id"], cite["start_byte"], cite["end_byte"]) for cite in item["citations"]}
+    added = []
+    for identity in required:
+        if identity not in witnesses:
+            return None
+        cite = witnesses[identity]
+        if not any(r["evidence_id"] == identity[0] and r["start_byte"] <= identity[1] < identity[2] <= r["end_byte"]
+                for r in check["delivered_ranges"]):
+            return None
+        quote_spans([cite], by_id)
+        if identity not in existing:
+            added.append(deepcopy(cite))
+            existing.add(identity)
+    if not added:
+        return None
+    replacement = {**deepcopy(item), "citations": [*deepcopy(item["citations"]), *added]}
+    if citation_binding_issues({**row, "item": replacement}, assessments, originals, check["cited_evidence"]):
+        return None
+    return {"version": 1, "origin": "program_citation_union", "item_id": row["id"],
+        "original_item_hash": hash_json(item), "checker_response_hash": check["response_hash"],
+        "assessment_hash": hash_json(assessments), "added_citations": added,
+        "replacement": replacement, "replacement_hash": hash_json(replacement)}
+
+
+def deduplicate_exact_citation_arrays(raw):
+    """Keep the raw response; derive a view removing only identical citations."""
+    result, changes = deepcopy(raw), []
+
+    def visit(node, path):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("citations", "correction_citations") and isinstance(value, list):
+                    if len(value) > 32:
+                        continue  # A provider contract overflow still fails validation.
+                    seen, kept = {}, []
+                    for index, cite in enumerate(value):
+                        if isinstance(cite, dict) and set(cite) in ({"source_id", "quote"}, {"reference_id"}):
+                            identity = hash_json(cite)
+                            if identity in seen:
+                                changes.append({"path": [*path, key], "removed_index": index,
+                                    "first_index": seen[identity], "citation_hash": identity})
+                                continue
+                            seen[identity] = index
+                        kept.append(cite)
+                    node[key] = kept
+                else:
+                    visit(value, [*path, key])
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                visit(value, [*path, index])
+
+    visit(result, [])
+    return result, changes
+
+
 def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources, max_rewrites, ledger, language="en"):
     """Callbacks own native admission, usage, fencing and task budgets."""
-    ledger.update(version=VERSION, original_final=deepcopy(final), original_final_hash=hash_json(final),
+    ledger.update(version=VERSION, execution_policy_version=EXECUTION_POLICY_VERSION,
+        original_final=deepcopy(final), original_final_hash=hash_json(final),
         status="checking", items=[], model_assisted_is_not_proof=True, accepted_final=deepcopy(final))
     candidate = deepcopy(final)
     rows = items(final)
@@ -1149,15 +1278,28 @@ def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources
                     resolve_sources(current, candidate, record)
                 pending.append(state)
         if pending:
-            rewrite_rows = [state["row"] for state in pending]
+            model_pending = []
+            for state in pending:
+                row = state["row"]
+                repair = citation_only_repair(row, records[row["id"]], originals)
+                if repair is None:
+                    model_pending.append(state)
+                else:
+                    records[row["id"]]["citation_repair"] = repair
+                    retain_sources(candidate, quote_spans(repair["added_citations"],
+                        {original.evidence_id: original for original in originals}))
+            rewrite_rows = [state["row"] for state in model_pending]
             rewrite_records = {row["id"]: records[row["id"]] for row in rewrite_rows}
-            batch = {"batch_records": rewrite_records}
-            try:
-                replacements = rewrite(rewrite_rows, candidate, batch)
-            finally:
-                if "rewrite" in batch:
-                    for record in rewrite_records.values():
-                        record["rewrite"] = batch["rewrite"]
+            replacements = {state["row"]["id"]: records[state["row"]["id"]]["citation_repair"]["replacement"]
+                for state in pending if "citation_repair" in records[state["row"]["id"]]}
+            if rewrite_rows:
+                batch = {"batch_records": rewrite_records}
+                try:
+                    replacements.update(rewrite(rewrite_rows, candidate, batch))
+                finally:
+                    if "rewrite" in batch:
+                        for record in rewrite_records.values():
+                            record["rewrite"] = batch["rewrite"]
             for state in pending:
                 row = state["row"]
                 state["requested"] = requested_sources(records[row["id"]])
@@ -1174,6 +1316,9 @@ def validate(result, originals, meta):
     ledger = result.partition.get("fact_verification", {})
     original = result.partition.get("pre_verification_final")
     protocol_version = ledger.get("version")
+    execution_policy = ledger.get("execution_policy_version", 1)
+    if type(execution_policy) is not int or execution_policy not in (1, EXECUTION_POLICY_VERSION):
+        raise PartitionError("stored_fact_execution_policy_changed")
     if (protocol_version not in SUPPORTED_VERSIONS or ledger.get("original_final") != original or
             ledger.get("original_final_hash") != hash_json(original) or ledger.get("model_assisted_is_not_proof") is not True
             or ledger.get("status") not in ("unverified", "model_supported")):
@@ -1209,12 +1354,15 @@ def validate(result, originals, meta):
         return {"source_requests": [deepcopy(requests[key]) for key in sorted(requests)]} if requests else None
 
     def replay_call(stage, rows, record, extra=None, *, child_packet=False):
-        if record.get("extra") != extra or not rows or record.get("call_stage") != stage:
-            raise PartitionError("stored_fact_prior_response_changed")
         packet_rows = record.get("rows", rows)
         by_id = {row["id"]: row for row in packet_rows}
         if len(by_id) != len(packet_rows) or any(by_id.get(row["id"]) != row for row in rows):
             raise PartitionError("stored_fact_batch_rows_changed")
+        parent_extra = extra
+        if execution_policy == EXECUTION_POLICY_VERSION:
+            extra = project_rewrite_context(parent_extra, packet_rows)
+        if record.get("extra") != extra or not rows or record.get("call_stage") != stage:
+            raise PartitionError("stored_fact_prior_response_changed")
         # Every batched item is tied to its actual immutable attempt. An added
         # row cannot smuggle an unreviewed response into another item's call.
         if not child_packet:
@@ -1304,7 +1452,7 @@ def validate(result, originals, meta):
                     child_stage = "fact_check"
                 if child.get("rows") != child_rows or child.get("source_ranges") != child_ranges:
                     raise PartitionError("stored_fact_split_coverage_changed")
-                raw, child_refs, child_spans = replay_call(child_stage, child_rows, child, extra, child_packet=True)
+                raw, child_refs, child_spans = replay_call(child_stage, child_rows, child, parent_extra, child_packet=True)
                 if position == 0:
                     first_response, first_refs = raw, child_refs
                 contexts.append(child_refs)
@@ -1331,7 +1479,7 @@ def validate(result, originals, meta):
                     if not isinstance(focused, dict) or focused.get("source_ranges") != focused_ranges or focused.get("whole_claim_discovery") != history:
                         raise PartitionError("stored_fact_whole_claim_evidence_changed")
                     focused_raw, focused_refs, focused_spans = replay_call(
-                        "fact_check", packet_rows, focused, extra, child_packet=True)
+                        "fact_check", packet_rows, focused, parent_extra, child_packet=True)
                     if focused_raw is not None:
                         expected_raw = focused_raw
                         refs = merge_reference_contexts([refs, focused_refs])
@@ -1363,6 +1511,14 @@ def validate(result, originals, meta):
                 if not interrupted:
                     raise PartitionError("stored_fact_response_missing")
                 return None, refs, spans
+            if "raw_response" in record:
+                normalized, removed = deduplicate_exact_citation_arrays(record["raw_response"])
+                if (execution_policy != EXECUTION_POLICY_VERSION or not removed
+                        or record.get("raw_response_hash") != hash_json(record["raw_response"])
+                        or record.get("citation_deduplication") != removed or record["response"] != normalized):
+                    raise PartitionError("stored_fact_citation_deduplication_changed")
+            elif any(key in record for key in ("raw_response_hash", "citation_deduplication")):
+                raise PartitionError("stored_fact_citation_deduplication_changed")
             if (record.get("delivery") != kind or record.get("payload_hash") != hash_json(payload)
                     or record.get("schema_hash") != hash_json(schema) or record.get("response_hash") != hash_json(record["response"])):
                 raise PartitionError("stored_fact_response_or_input_changed")
@@ -1456,7 +1612,7 @@ def validate(result, originals, meta):
             if attempt.get("assessments") != checked or attempt.get("issues") != expected_issues:
                 raise PartitionError("stored_fact_assessment_changed")
             if not expected_issues or number == limit - 1:
-                if "source_plan" in attempt:
+                if any(key in attempt for key in ("source_plan", "citation_repair", "rewrite")):
                     raise PartitionError("stored_unnecessary_fact_source_plan")
                 expected_status = "model_supported" if not expected_issues else "unverified"
                 if number != len(attempts) - 1 or entry.get("status") != expected_status or entry.get("accepted") != current["item"]:
@@ -1480,6 +1636,17 @@ def validate(result, originals, meta):
                     raise PartitionError("stored_fact_source_plan_changed")
             elif "source_plan" in attempt:
                 raise PartitionError("stored_unnecessary_fact_source_plan")
+            repair = citation_only_repair(current, attempt, originals) if execution_policy == EXECUTION_POLICY_VERSION else None
+            if "citation_repair" in attempt:
+                if repair is None or attempt["citation_repair"] != repair or "rewrite" in attempt:
+                    raise PartitionError("stored_fact_citation_repair_changed")
+                retain_sources(candidate, quote_spans(repair["added_citations"],
+                    {original.evidence_id: original for original in originals}))
+                requested = requested_sources(attempt)
+                current = {**current, "item": repair["replacement"]}
+                continue
+            if repair is not None and not terminal:
+                raise PartitionError("stored_fact_citation_repair_missing")
             if "rewrite" not in attempt:
                 if not terminal:
                     raise PartitionError("stored_fact_rewrite_omitted")

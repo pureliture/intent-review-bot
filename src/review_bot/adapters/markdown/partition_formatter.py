@@ -47,8 +47,12 @@ def _format_private_partition_markdown(result: PartitionReviewResult, task, **_o
             "- Code claims were checked by a model against originals; this is not a proof of accuracy."])
         for entry in verification["items"]:
             corrected = len(entry["attempts"]) > 1
+            citation_only = (corrected and any("citation_repair" in attempt for attempt in entry["attempts"])
+                and not any("rewrite" in attempt for attempt in entry["attempts"]))
+            correction = ((" · 인용 보강 후 재검토" if ko else " · citations supplemented and rechecked")
+                if citation_only else (" · 재작성 후 재검토" if ko else " · rewritten and rechecked") if corrected else "")
             lines.append(f"- {_escape(entry['item_id'])}: {_escape(entry['status'])}" +
-                (" · 재작성 후 재검토" if ko and corrected else " · rewritten and rechecked" if corrected else ""))
+                correction)
         if verification["status"] != "model_supported":
             lines.append("- 미검증 항목이 남아 있으므로 완료된 리뷰가 아닙니다." if ko else
                 "- Unverified items remain; this is not a completed review.")
