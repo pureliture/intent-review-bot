@@ -16,16 +16,17 @@ class LlamaCppPlanClient(LlamaCppModelClient):
     def __init__(
         self, model: str = SELECTOR_MODEL, *, api_url: str, timeout_seconds: int = 60,
         max_output_bytes: int = 32768, max_attempts: int = 1,
+        allowed_hosts: tuple[str, ...] | list[str] = (),
     ) -> None:
         super().__init__(model, api_url=api_url, timeout_seconds=timeout_seconds,
-                         max_output_bytes=max_output_bytes, max_attempts=max_attempts)
+                         max_output_bytes=max_output_bytes, max_attempts=max_attempts, allowed_hosts=allowed_hosts)
 
     def _chat_payload(self, request: ModelRequest) -> dict:
         payload = super()._chat_payload(request)
         properties = request.response_schema.get("properties")
         if isinstance(properties, dict) and set(properties) == {"choice"}:
             # The closed label allowance must not be spent on hidden reasoning.
-            # _measure forwards these same kwargs to native /apply-template.
+            # Keep the closed-choice wire free of hidden reasoning.
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         return payload
 

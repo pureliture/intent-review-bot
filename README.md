@@ -257,13 +257,14 @@ provides its MacBook role configuration. `openrouter_chat.py` and
 | Existing System 1 mode selection | `tev1-4b-q8_0` | 131,072 tokens | `ME707_TEV1_BASE_URL` |
 | Separate code-first B planning | `tev1-4b-q8_0` | 131,072 tokens | `ME707_TEV1_BASE_URL` |
 
-Endpoints must be uncredentialed HTTP `/v1` URLs and pass the adapter's endpoint validation. Set actual hostnames from the deployment's private connection context. The bot calls the model API directly; any private-network forwarding is configured by the operator. Proxy environment variables and redirects are not used. Neither the service nor CLI infers a node IP, downloads a model or falls back to Ollama. Keep model APIs on the approved private network; the webhook forwarding path is not model authentication.
+Endpoints must be uncredentialed HTTP `/v1` URLs. Loopback is allowed by default; remote hosts must be listed exactly in the operator-owned `LLAMA_CPP_ALLOWED_HOSTS` environment variable (comma-separated, no wildcards or URL paths). Set actual hostnames from the deployment's private connection context. The bot calls the model API directly; any private-network forwarding is configured by the operator. Proxy environment variables and redirects are not used. Neither the service nor CLI infers a node IP, downloads a model or falls back to Ollama. Keep model APIs on the approved private network; the webhook forwarding path is not model authentication.
 
 For example, prepare these environment references in the process environment (not a committed secret/config file):
 
 ```bash
 export ME707_BONSAI_BASE_URL="http://<private-model-host>:11435/v1"
 export ME707_TEV1_BASE_URL="http://<private-model-host>:11437/v1"
+export LLAMA_CPP_ALLOWED_HOSTS="<private-model-host>"
 export REVIEW_BOT_MODEL_STATE_DIR=/home/review-bot/private-model-admission
 ```
 

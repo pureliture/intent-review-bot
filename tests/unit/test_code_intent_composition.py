@@ -35,7 +35,7 @@ def test_unknown_pipeline_cannot_silently_select_a_different_review(valid_config
 def offline_profiles(monkeypatch, tmp_path):
     monkeypatch.setenv("MACBOOK_LFM_BASE_URL", "http://127.0.0.1:18135/v1")
     monkeypatch.setenv("MACBOOK_TEV1_BASE_URL", "http://127.0.0.1:18137/v1")
-    monkeypatch.setenv("ME707_TEV1_BASE_URL", "http://ubuntu-ms-7e07:11437/v1")
+    monkeypatch.setenv("ME707_TEV1_BASE_URL", "http://localhost:11437/v1")
     monkeypatch.setenv("REVIEW_BOT_MACBOOK_MODEL_STATE_DIR", str(tmp_path / "macbook-admission"))
     monkeypatch.setenv("REVIEW_BOT_MODEL_STATE_DIR", str(tmp_path / "ubuntu-admission"))
     monkeypatch.setattr(httpx, "Client", lambda **_: pytest.fail("Composition must not make an HTTP request"))

@@ -185,7 +185,7 @@ def test_only_loopback_endpoints_are_canonicalized(api_url: str) -> None:
 
 
 @pytest.mark.parametrize("api_url", [
-    "http://ubuntu-ms-7e07:8080/v1", "http://example.com/v1", "http://100.64.0.1/v1",
+    "http://remote-model.internal:8080/v1", "http://example.com/v1", "http://100.64.0.1/v1",
     "http://192.168.0.2/v1", "http://[::]/v1", "http://[fe80::1]/v1", "https://localhost/v1",
     "http://localhost.example.com/v1", "http://127.0.0.1.example.com/v1", "http://localhost./v1",
     "http://user:secret@localhost/v1", "http://@localhost/v1", "http://localhost/v1?secret",

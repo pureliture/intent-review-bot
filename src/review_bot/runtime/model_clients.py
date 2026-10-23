@@ -64,6 +64,11 @@ def _openrouter_origin() -> str | None:
     return value or None
 
 
+def _llama_cpp_hosts() -> tuple[str, ...]:
+    value = os.environ.get("LLAMA_CPP_ALLOWED_HOSTS", "").strip()
+    return tuple(host.strip() for host in value.split(",")) if value else ()
+
+
 def build_review_client(profile: str | None, settings: ModelConfig | None = None) -> ModelClient | None:
     if profile is None:
         return None
@@ -87,7 +92,8 @@ def build_review_client(profile: str | None, settings: ModelConfig | None = None
             max_transport_bytes=settings.max_transport_bytes,
             reasoning_max_tokens=settings.reasoning_max_tokens)
     elif profile == LLAMACPP_PROFILE:
-        client = LlamaCppModelClient(api_url=_endpoint("ME707_BONSAI_BASE_URL"), **options)
+        client = LlamaCppModelClient(api_url=_endpoint("ME707_BONSAI_BASE_URL"),
+            allowed_hosts=_llama_cpp_hosts(), **options)
     elif profile == MACBOOK_LLAMACPP_PROFILE:
         client = MacBookLlamaCppModelClient(api_url=_endpoint("MACBOOK_LFM_BASE_URL", profile), **options)
     elif profile == MACBOOK_GRANITE_PROFILE:
@@ -121,6 +127,7 @@ def build_selector_client(profile: str | None, settings: ModelConfig | None = No
     elif profile == LLAMACPP_PROFILE:
         client = LlamaCppDecisionClient(
             api_url=_endpoint("ME707_TEV1_BASE_URL"), timeout_seconds=settings.call_timeout_seconds,
+            allowed_hosts=_llama_cpp_hosts(),
         )
     elif profile in MACBOOK_PROFILES:
         client = MacBookLlamaCppDecisionClient(
@@ -161,6 +168,8 @@ def build_planning_client(profile: str | None, settings: ModelConfig | None = No
             reasoning_max_tokens=settings.reasoning_max_tokens)
     options = dict(api_url=_endpoint(variable, profile), timeout_seconds=settings.call_timeout_seconds,
         max_output_bytes=settings.max_output_bytes, max_attempts=settings.max_attempts)
+    if profile == LLAMACPP_PROFILE:
+        options["allowed_hosts"] = _llama_cpp_hosts()
     if profile == BEAM_CLOUD_TEV4B_PROFILE:
         from review_bot.adapters.tev4b import MacBookTev4bPlanClient
         client = MacBookTev4bPlanClient(**options)
@@ -206,7 +215,8 @@ def build_intent_selection_client(profile: str | None, settings: ModelConfig | N
         cls = MacBookTev4bIntentSelectionClient
     else:
         cls = MacBookIntentSelectionClient if local else LlamaCppIntentSelectionClient
-    client = cls(api_url=_endpoint(variable, profile), timeout_seconds=settings.call_timeout_seconds)
+    options = {"allowed_hosts": _llama_cpp_hosts()} if not local else {}
+    client = cls(api_url=_endpoint(variable, profile), timeout_seconds=settings.call_timeout_seconds, **options)
     client.request_admission = (macbook_model_admission(settings.max_concurrency) if local
         else default_model_admission(settings.max_concurrency))
     return client

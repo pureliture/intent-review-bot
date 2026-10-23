@@ -18,6 +18,7 @@ from tests.fixtures.intent_review import make_task
 
 @pytest.fixture(autouse=True)
 def offline_macbook(monkeypatch, tmp_path):
+    monkeypatch.delenv("LLAMA_CPP_ALLOWED_HOSTS", raising=False)
     monkeypatch.delenv("MACBOOK_BEAM_CONTEXT_TOKENS", raising=False)
     monkeypatch.delenv("MACBOOK_BEAM_BASE_URL", raising=False)
     monkeypatch.delenv("MACBOOK_TEV4B_BASE_URL", raising=False)
@@ -26,8 +27,8 @@ def offline_macbook(monkeypatch, tmp_path):
     monkeypatch.setenv("MACBOOK_LFM_BASE_URL", "http://127.0.0.1:18135/v1")
     monkeypatch.setenv("MACBOOK_TEV1_BASE_URL", "http://127.0.0.1:18137/v1")
     monkeypatch.setenv("REVIEW_BOT_MACBOOK_MODEL_STATE_DIR", str(tmp_path / "mac-admission"))
-    monkeypatch.setenv("ME707_BONSAI_BASE_URL", "http://ubuntu-ms-7e07:11435/v1")
-    monkeypatch.setenv("ME707_TEV1_BASE_URL", "http://ubuntu-ms-7e07:11437/v1")
+    monkeypatch.setenv("ME707_BONSAI_BASE_URL", "http://localhost:11435/v1")
+    monkeypatch.setenv("ME707_TEV1_BASE_URL", "http://localhost:11437/v1")
     monkeypatch.setattr(httpx, "Client", lambda **_: pytest.fail("Construction must remain offline"))
     monkeypatch.setattr(WorkerLoop, "_setup_signals", lambda self: None)
 
@@ -80,7 +81,7 @@ def test_macbook_requires_own_endpoints_without_remote_fallback(monkeypatch, rol
 @pytest.mark.parametrize("role,variable", [
     ("review", "MACBOOK_LFM_BASE_URL"), ("selector", "MACBOOK_TEV1_BASE_URL"),
 ])
-@pytest.mark.parametrize("url", ["http://ubuntu-ms-7e07:11435/v1", "http://example.com/v1", "http://192.0.2.1/v1"])
+@pytest.mark.parametrize("url", ["http://remote-model.internal:11435/v1", "http://example.com/v1", "http://192.0.2.1/v1"])
 def test_macbook_rejects_remote_endpoints(monkeypatch, role, variable, url):
     monkeypatch.setenv(variable, url)
     with pytest.raises(ValueError):
@@ -93,6 +94,21 @@ def test_macbook_environment_cannot_change_me707_roles(monkeypatch):
     assert model_clients.build_review_client("me707-llamacpp").model == "bonsai2-27b"
     assert model_clients.build_selector_client("me707-llamacpp").model == "tev1-4b-q8_0"
     assert model_clients.build_review_client("ollama-local-128k").model == "granite4.2:128k"
+
+
+def test_me707_factories_apply_operator_hosts_to_every_role(monkeypatch):
+    monkeypatch.setenv("ME707_BONSAI_BASE_URL", "http://model-api.internal:11435/v1")
+    monkeypatch.setenv("ME707_TEV1_BASE_URL", "http://model-api.internal:11437/v1")
+    monkeypatch.setenv("LLAMA_CPP_ALLOWED_HOSTS", "model-api.internal")
+    factories = (model_clients.build_review_client, model_clients.build_selector_client,
+        model_clients.build_planning_client, model_clients.build_intent_selection_client)
+    for factory in factories:
+        client = factory("me707-llamacpp")
+        assert client.api_url.startswith("http://model-api.internal:")
+    monkeypatch.delenv("LLAMA_CPP_ALLOWED_HOSTS")
+    for factory in factories:
+        with pytest.raises(ValueError):
+            factory("me707-llamacpp")
 
 
 @pytest.mark.parametrize("command", ["review", "offline", "intent"])

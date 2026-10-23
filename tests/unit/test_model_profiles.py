@@ -15,8 +15,8 @@ from review_bot.runtime.worker import WorkerLoop
 
 @pytest.fixture(autouse=True)
 def offline_profiles(monkeypatch):
-    monkeypatch.setenv("ME707_BONSAI_BASE_URL", "http://ubuntu-ms-7e07:11435/v1")
-    monkeypatch.setenv("ME707_TEV1_BASE_URL", "http://ubuntu-ms-7e07:11437/v1")
+    monkeypatch.setenv("ME707_BONSAI_BASE_URL", "http://localhost:11435/v1")
+    monkeypatch.setenv("ME707_TEV1_BASE_URL", "http://localhost:11437/v1")
     monkeypatch.setattr(httpx, "Client", lambda **_: pytest.fail("Construction must remain offline"))
     monkeypatch.setattr(WorkerLoop, "_setup_signals", lambda self: None)
 
@@ -32,13 +32,13 @@ def test_me707_review_and_selector_use_distinct_explicit_roles():
     review = model_clients.build_review_client("me707-llamacpp", settings)
     selector = model_clients.build_selector_client("me707-llamacpp", settings)
     assert review.model == "bonsai2-27b"
-    assert review.api_url == "http://ubuntu-ms-7e07:11435/v1"
+    assert review.api_url == "http://localhost:11435/v1"
     assert review.profile.provider == "llamacpp"
     assert review.profile.timeout_seconds == 17
     assert review.profile.max_output_bytes == 12000
     assert review.profile.max_attempts == 2
     assert selector.model == "tev1-4b-q8_0"
-    assert selector.api_url == "http://ubuntu-ms-7e07:11437/v1"
+    assert selector.api_url == "http://localhost:11437/v1"
     assert selector.timeout_seconds == 17
 
 

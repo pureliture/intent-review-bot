@@ -4,6 +4,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import math
+import re
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -98,8 +99,29 @@ def _valid_timeout(value: Any) -> bool:
         return False
 
 
-def _endpoint(api_url: str) -> str:
+def _allowed_hosts(values: tuple[str, ...] | list[str]) -> frozenset[str]:
+    message = "llama.cpp allowed hosts must be explicit hostnames or IP addresses"
+    if not isinstance(values, (tuple, list)) or len(values) > 64:
+        raise ValueError(message)
+    normalized = set()
+    for value in values:
+        if not isinstance(value, str) or not value.isascii() or not 1 <= len(value) <= 253:
+            raise ValueError(message)
+        try:
+            host = ipaddress.ip_address(value).compressed
+        except ValueError:
+            labels = value.split(".")
+            if any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                    for label in labels):
+                raise ValueError(message) from None
+            host = value.lower()
+        normalized.add(host)
+    return frozenset(normalized)
+
+
+def _endpoint(api_url: str, allowed_hosts: tuple[str, ...] | list[str] = ()) -> str:
     message = "llama.cpp endpoint must be an approved uncredentialed HTTP /v1 endpoint"
+    configured_hosts = _allowed_hosts(allowed_hosts)
     if (
         not isinstance(api_url, str) or not api_url.isascii()
         or any(ord(char) <= 32 or ord(char) == 127 for char in api_url)
@@ -110,10 +132,11 @@ def _endpoint(api_url: str) -> str:
         parts = urlsplit(api_url)
         host = parts.hostname
         port = parts.port
-        approved = host in ("localhost", "ubuntu-ms-7e07")
+        approved = host == "localhost" or host in configured_hosts
         if not approved and host:
             try:
-                approved = ipaddress.ip_address(host).is_loopback
+                address = ipaddress.ip_address(host)
+                approved = address.is_loopback or address.compressed in configured_hosts
             except ValueError:
                 approved = False
         if (
@@ -148,12 +171,14 @@ class _LlamaCppClient:
     def __init__(
         self, model: str, api_url: str, timeout_seconds: int, *, role_model: str,
         context_tokens: int, max_output_tokens: int, max_output_bytes: int,
+        allowed_hosts: tuple[str, ...] | list[str] = (),
     ) -> None:
         if model != role_model or not isinstance(model, str):
             raise ValueError("An exact llama.cpp role model is required")
         if not _valid_timeout(timeout_seconds):
             raise ValueError("llama.cpp timeout must be positive and finite")
         self._model = model
+        self._allowed_hosts = tuple(_allowed_hosts(allowed_hosts))
         self._api_url = self._validate_endpoint(api_url)
         self._origin = self._api_url[:-len("/v1")]
         self.timeout_seconds = timeout_seconds
@@ -163,7 +188,7 @@ class _LlamaCppClient:
         self._max_output_bytes = max_output_bytes
 
     def _validate_endpoint(self, api_url: str) -> str:
-        return _endpoint(api_url)
+        return _endpoint(api_url, self._allowed_hosts)
 
     @property
     def supports_bounded_reasoning(self) -> bool:
@@ -433,6 +458,7 @@ class LlamaCppModelClient(_LlamaCppClient):
     def __init__(
         self, model: str = REVIEW_MODEL, *, api_url: str, timeout_seconds: int = 60,
         max_output_bytes: int = 32768, max_attempts: int = 1,
+        allowed_hosts: tuple[str, ...] | list[str] = (),
     ) -> None:
         if not _positive_integer(max_output_bytes) or max_output_bytes > _MAX_RESPONSE_BYTES:
             raise ValueError("llama.cpp output byte limit must be positive and bounded")
@@ -440,7 +466,7 @@ class LlamaCppModelClient(_LlamaCppClient):
             raise ValueError("llama.cpp attempts must be positive")
         super().__init__(model, api_url, timeout_seconds, role_model=self._role_model,
                          context_tokens=self._role_context_tokens, max_output_tokens=self._role_max_output_tokens,
-                         max_output_bytes=max_output_bytes)
+                         max_output_bytes=max_output_bytes, allowed_hosts=allowed_hosts)
         self.profile = ModelProfile(
             provider="llamacpp", model=model, max_input_bytes=_MAX_INPUT_BYTES, max_output_bytes=max_output_bytes,
             timeout_seconds=timeout_seconds, max_attempts=max_attempts, max_input_tokens=self._max_input_tokens,
@@ -455,10 +481,11 @@ class LlamaCppDecisionClient(_LlamaCppClient):
     _role_model = SELECTOR_MODEL
     _role_context_tokens = _SELECTOR_CONTEXT_TOKENS
 
-    def __init__(self, model: str = SELECTOR_MODEL, *, api_url: str, timeout_seconds: int = 60) -> None:
+    def __init__(self, model: str = SELECTOR_MODEL, *, api_url: str, timeout_seconds: int = 60,
+        allowed_hosts: tuple[str, ...] | list[str] = ()) -> None:
         super().__init__(model, api_url, timeout_seconds, role_model=self._role_model,
                          context_tokens=self._role_context_tokens, max_output_tokens=_SELECTOR_OUTPUT_TOKENS,
-                         max_output_bytes=_MAX_SELECTOR_OUTPUT_BYTES)
+                         max_output_bytes=_MAX_SELECTOR_OUTPUT_BYTES, allowed_hosts=allowed_hosts)
 
     def _chat_payload(self, request: ModelRequest) -> dict[str, Any]:
         payload = super()._chat_payload(request)

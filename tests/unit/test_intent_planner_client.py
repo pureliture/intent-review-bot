@@ -23,7 +23,7 @@ from review_bot.domain.models_v1 import ModelRequest
 from review_bot.ports import ModelClient
 
 ROLES = [
-    ("LlamaCppPlanClient", "tev1-4b-q8_0", 131072, "http://ubuntu-ms-7e07:8080/v1", common.LlamaCppModelClient),
+    ("LlamaCppPlanClient", "tev1-4b-q8_0", 131072, "http://localhost:8080/v1", common.LlamaCppModelClient),
     ("MacBookLlamaCppPlanClient", "tev1-0.8b-q8_0", 32768, "http://localhost:8080/v1", macbook.MacBookLlamaCppModelClient),
 ]
 STATE_ENV = "REVIEW_BOT_MACBOOK_MODEL_STATE_DIR"
@@ -94,7 +94,7 @@ def mock_http(monkeypatch: pytest.MonkeyPatch) -> Any:
 
         def dispatch(request: httpx.Request) -> httpx.Response:
             requests.append(request)
-            assert request.url.host == ("localhost" if role.is_macbook else "ubuntu-ms-7e07")
+            assert request.url.host == ("localhost" if role.is_macbook else "localhost")
             if handler is not None:
                 response = handler(request)
                 if response is not None:
@@ -127,7 +127,12 @@ def test_plan_contracts_and_constructors_are_offline(adapter: Any, tmp_path: Pat
     for name, model, context, api_url, base in ROLES:
         client_type = getattr(adapter, name)
         signature = inspect.signature(client_type)
-        assert list(signature.parameters) == ["model", "api_url", "timeout_seconds", "max_output_bytes", "max_attempts"]
+        expected = ["model", "api_url", "timeout_seconds", "max_output_bytes", "max_attempts"]
+        if name == "LlamaCppPlanClient":
+            expected.append("allowed_hosts")
+            assert signature.parameters["allowed_hosts"].default == ()
+            assert signature.parameters["allowed_hosts"].kind == inspect.Parameter.KEYWORD_ONLY
+        assert list(signature.parameters) == expected
         assert signature.parameters["model"].default == model
         assert signature.parameters["model"].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
         assert signature.parameters["api_url"].default == inspect.Parameter.empty
@@ -186,7 +191,7 @@ def test_plan_configuration_uses_common_validation(role: Any, kwargs: Any) -> No
         role.client_type(api_url=role.api_url, **kwargs)
 
 
-@pytest.mark.parametrize("api_url", ["http://ubuntu-ms-7e07:8080/v1", "http://100.64.0.1/v1"])
+@pytest.mark.parametrize("api_url", ["http://remote-model.internal:8080/v1", "http://100.64.0.1/v1"])
 def test_macbook_planning_never_accepts_remote_endpoints(adapter: Any, api_url: str) -> None:
     with pytest.raises(ValueError):
         adapter.MacBookLlamaCppPlanClient(api_url=api_url)

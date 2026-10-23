@@ -55,7 +55,7 @@ def test_macbook_cli_preserves_validated_results_and_never_falls_back(tmp_path, 
 
     monkeypatch.setattr(httpx, "Client", client)
     monkeypatch.setenv("MACBOOK_LFM_BASE_URL", "http://127.0.0.1:18135/v1")
-    monkeypatch.setenv("ME707_BONSAI_BASE_URL", "http://ubuntu-ms-7e07:11435/v1")
+    monkeypatch.setenv("ME707_BONSAI_BASE_URL", "http://localhost:11435/v1")
     state = tmp_path / "mac-admission"
     monkeypatch.setenv("REVIEW_BOT_MACBOOK_MODEL_STATE_DIR", str(state))
     monkeypatch.setattr(cli, "PmdRunner", lambda: pytest.fail("B must not initialize PMD"))

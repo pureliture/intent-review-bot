@@ -23,7 +23,7 @@ from tests.unit.test_ollama_client import selection_inputs
 
 MAIN = "bonsai2-27b"
 SELECTOR = "tev1-4b-q8_0"
-API_URL = "http://ubuntu-ms-7e07:8080/v1"
+API_URL = "http://localhost:8080/v1"
 
 
 def chat_response(
@@ -216,7 +216,7 @@ def test_role_contracts_are_explicit_and_construction_is_offline(adapter: Any, m
 
 @pytest.mark.parametrize("api_url", [
     "http://localhost:8080/v1", "http://127.0.0.1:8080/v1/", "http://[::1]:8080/v1",
-    "http://ubuntu-ms-7e07/v1/",
+    "http://localhost/v1/",
 ])
 def test_approved_endpoints_are_canonicalized(adapter: Any, mock_http: Any, api_url: str) -> None:
     requests = mock_http()
@@ -227,8 +227,34 @@ def test_approved_endpoints_are_canonicalized(adapter: Any, mock_http: Any, api_
     assert len({request.url.host for request in requests}) == 1
 
 
+@pytest.mark.parametrize("client_type", ["LlamaCppModelClient", "LlamaCppDecisionClient"])
+def test_remote_endpoint_requires_exact_operator_host_allowlist(adapter, mock_http, client_type):
+    requests = mock_http(model=SELECTOR if client_type == "LlamaCppDecisionClient" else MAIN)
+    cls = getattr(adapter, client_type)
+    endpoint = "http://model-api.internal:11435/v1"
+    with pytest.raises(ValueError):
+        cls(api_url=endpoint)
+    assert requests == []
+    client = cls(api_url=endpoint, allowed_hosts=("model-api.internal",))
+    client.verify()
+    assert [request.url.path for request in requests] == ["/v1/models", "/props"]
+    assert all(request.url.host == "model-api.internal" for request in requests)
+    with pytest.raises(ValueError):
+        cls(api_url="http://model-api.internal.attacker.invalid/v1", allowed_hosts=("model-api.internal",))
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize("hosts", ["model-api.internal", ("*",), ("http://model-api.internal",),
+    ("model-api.internal/path",), ("model-api.internal:11435",), ("",), ("a..internal",)])
+def test_invalid_operator_host_allowlist_is_rejected_before_http(adapter, mock_http, hosts):
+    requests = mock_http(lambda request: pytest.fail("Invalid host configuration must not connect"))
+    with pytest.raises(ValueError):
+        adapter.LlamaCppModelClient(api_url=API_URL, allowed_hosts=hosts)
+    assert requests == []
+
+
 @pytest.mark.parametrize("api_url", [
-    "https://ubuntu-ms-7e07/v1", "http://example.com/v1", "http://ubuntu-ms-7e07.example.com/v1",
+    "https://localhost/v1", "http://example.com/v1", "http://localhost.example.com/v1",
     "http://127.0.0.1.example.com/v1", "http://100.64.0.1/v1", "http://192.168.0.2/v1",
     "http://user:secret@localhost/v1", "http://@localhost/v1", "http://localhost/v1?token=secret",
     "http://localhost/v1?", "http://localhost/v1#fragment", "http://localhost/v1#",
@@ -551,7 +577,7 @@ def test_http_error_mapping_redirect_rejection_and_safe_messages(
     trace = "".join(traceback.format_exception(caught.value))
     assert "secret-token" not in trace and API_URL not in str(caught.value)
     assert [request.url.path for request in requests] == ["/v1/models", "/props", "/v1/chat/completions"]
-    assert len(requests) == 3 and all(r.url.host == "ubuntu-ms-7e07" for r in requests)
+    assert len(requests) == 3 and all(r.url.host == "localhost" for r in requests)
 
 
 @pytest.mark.parametrize("exception,error", [

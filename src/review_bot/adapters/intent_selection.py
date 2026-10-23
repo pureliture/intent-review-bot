@@ -11,9 +11,10 @@ class LlamaCppIntentSelectionClient(LlamaCppModelClient):
     _role_max_output_tokens = 4096
 
     def __init__(self, model: str = SELECTOR_MODEL, *, api_url: str,
-        timeout_seconds: int = 60, max_output_bytes: int = 512, max_attempts: int = 1):
+        timeout_seconds: int = 60, max_output_bytes: int = 512, max_attempts: int = 1,
+        allowed_hosts: tuple[str, ...] | list[str] = ()):
         super().__init__(model, api_url=api_url, timeout_seconds=timeout_seconds,
-            max_output_bytes=min(max_output_bytes, 512), max_attempts=1)
+            max_output_bytes=min(max_output_bytes, 512), max_attempts=1, allowed_hosts=allowed_hosts)
 
     def _chat_payload(self, request):
         payload = super()._chat_payload(request)

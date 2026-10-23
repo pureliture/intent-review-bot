@@ -85,8 +85,8 @@ def test_review_selector_and_metering_share_exactly_two_http_slots(monkeypatch):
                 active -= 1
 
     _install_http(monkeypatch, handler)
-    monkeypatch.setenv("ME707_BONSAI_BASE_URL", "http://ubuntu-ms-7e07:11435/v1")
-    monkeypatch.setenv("ME707_TEV1_BASE_URL", "http://ubuntu-ms-7e07:11437/v1")
+    monkeypatch.setenv("ME707_BONSAI_BASE_URL", "http://localhost:11435/v1")
+    monkeypatch.setenv("ME707_TEV1_BASE_URL", "http://localhost:11437/v1")
     settings = ModelConfig(max_concurrency=2)
     review = model_clients.build_review_client("me707-llamacpp", settings)
     selector = model_clients.build_selector_client("me707-llamacpp", settings)
@@ -136,7 +136,7 @@ def test_only_unknown_sent_generation_retains_capacity(monkeypatch, tmp_path, fa
 
     _install_http(monkeypatch, handler)
     admission = SQLiteModelAdmission(tmp_path / "slots" / "requests.sqlite", max_concurrency=1)
-    client = LlamaCppModelClient(api_url="http://ubuntu-ms-7e07:11435/v1", timeout_seconds=1)
+    client = LlamaCppModelClient(api_url="http://localhost:11435/v1", timeout_seconds=1)
     client.request_admission = admission
     error = TimeoutError if failure == "timeout" else (TransientModelError if failure in ("http_error", "connect_error") else PermanentModelError)
     with pytest.raises(error) as caught:
@@ -167,7 +167,7 @@ def test_queued_selector_inherits_worker_fence_and_never_sends_after_cancellatio
                 yield ticket
 
     _install_http(monkeypatch, lambda request: requests.append(request) or _response(request))
-    client = LlamaCppDecisionClient(api_url="http://ubuntu-ms-7e07:11437/v1", timeout_seconds=2)
+    client = LlamaCppDecisionClient(api_url="http://localhost:11437/v1", timeout_seconds=2)
     client.request_admission = RecordingAdmission()
     selector = DeadlineModeSelector(ModelModeSelector(client, model="tev1-4b-q8_0"), timeout_seconds=0.75)
     snapshot, pr = selection_inputs(("config/custom.settings",))
@@ -206,7 +206,7 @@ def test_slot_wait_reduces_the_actual_http_timeout(monkeypatch, tmp_path):
         return _response(request)
 
     _install_http(monkeypatch, handler)
-    client = LlamaCppModelClient(api_url="http://ubuntu-ms-7e07:11435/v1", timeout_seconds=2)
+    client = LlamaCppModelClient(api_url="http://localhost:11435/v1", timeout_seconds=2)
     client.request_admission = RecordingAdmission()
     with ThreadPoolExecutor(max_workers=1) as pool:
         with admission.request(deadline=time.monotonic() + 5, generates=False):
@@ -230,7 +230,7 @@ def test_cancel_at_send_fence_does_not_poison_capacity_without_an_http_send(monk
             raise ModelAdmissionCancelled("Model request cancelled before HTTP")
 
     monkeypatch.setattr(admission, "_mark_sent", cancel_after_committed_send_fence)
-    client = LlamaCppModelClient(api_url="http://ubuntu-ms-7e07:11435/v1", timeout_seconds=1)
+    client = LlamaCppModelClient(api_url="http://localhost:11435/v1", timeout_seconds=1)
     client.request_admission = admission
     with pytest.raises(ModelAdmissionCancelled):
         client.complete(_request(timeout=1))

@@ -47,7 +47,7 @@ def test_me707_cli_saves_validated_results_without_posting(tmp_path, monkeypatch
 
     def handler(request):
         requests.append(request)
-        assert request.url.host == "ubuntu-ms-7e07"
+        assert request.url.host == "localhost"
         assert request.url.port == 11435
         if request.url.path == "/v1/models":
             return httpx.Response(200, json={"object": "list", "data": [{"id": "bonsai2-27b", "object": "model"}]})
@@ -83,7 +83,7 @@ def test_me707_cli_saves_validated_results_without_posting(tmp_path, monkeypatch
         return client_type(transport=httpx.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr(httpx, "Client", client)
-    monkeypatch.setenv("ME707_BONSAI_BASE_URL", "http://ubuntu-ms-7e07:11435/v1")
+    monkeypatch.setenv("ME707_BONSAI_BASE_URL", "http://localhost:11435/v1")
     monkeypatch.setattr(cli, "PmdRunner", lambda: pytest.fail("B must not initialize PMD"))
     monkeypatch.setattr(cli, "GitRepositoryReader", lambda *_: pytest.fail("Fixed input must not read a repository"))
     source = tmp_path / "input.json"
