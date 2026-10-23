@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="910" viewBox="0 0 1280 910" role="img" aria-labelledby="title desc">
+<title id="title">대상 CI 바깥의 리뷰봇 노드에서 분석합니다</title><desc id="desc">Worker와 정적 분석 컨테이너는 같은 실행 노드에 둡니다. 모델 서버는 별도로 연결할 수 있습니다.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto-start-reverse"><path d="M0 0L8 4L0 8" fill="none" stroke="#8093a6" stroke-width="1.5"/></marker></defs>
+<rect x="1" y="1" width="1278" height="908" rx="12" fill="#fcfdff" stroke="#dce4ec"/>
+<g font-family="sans-serif">
+<text x="32" y="42" font-size="27" fill="#17354b" font-weight="700">대상 CI 바깥의 리뷰봇 노드에서 분석합니다</text>
+<text x="32" y="72" font-size="15" fill="#5c7283" font-weight="400">Worker와 정적 분석 컨테이너는 같은 실행 노드에 둡니다. 모델 서버는 별도로 연결할 수 있습니다.</text>
+<rect x="32" y="91" width="220" height="26" rx="5" fill="#fff1dc" stroke="#bd792e"/>
+<text x="44" y="109" font-size="13" fill="#704214" font-weight="700">Decision1 · 선택 역할</text>
+<rect x="264" y="91" width="206" height="26" rx="5" fill="#e5f4ed" stroke="#278270"/>
+<text x="276" y="109" font-size="13" fill="#185b4d" font-weight="700">Bonsai2 · 검토·설명</text>
+<rect x="482" y="91" width="230" height="26" rx="5" fill="#edf3fa" stroke="#486c96"/>
+<text x="494" y="109" font-size="13" fill="#294a70" font-weight="700">프로그램 · 실행·근거·게시</text>
+<rect x="322" y="153" width="600" height="675" rx="10" fill="#f0f5fa" stroke="#a8bdce"/>
+<text x="346" y="186" font-size="19" fill="#294a70" font-weight="700">리뷰봇 실행 노드 · Worker + 정적 분석</text>
+<rect x="32" y="234" width="238" height="196" rx="9" fill="white" stroke="#486c96"/>
+<path d="M42 235H260" stroke="#486c96" stroke-width="3"/>
+<rect x="48" y="248" width="206" height="26" rx="5" fill="#edf3fa" stroke="#486c96"/>
+<text x="60" y="266" font-size="13" fill="#294a70" font-weight="700">외부 서비스</text>
+<text x="50" y="303" font-size="21" fill="#17354b" font-weight="700">GitHub</text>
+<text x="50" y="329" font-size="15" fill="#526a7b" font-weight="400">PR · 이슈 · 팀 설정</text>
+<text x="50" y="351" font-size="15" fill="#526a7b" font-weight="400">원문 제공 · 리뷰 댓글 확인</text>
+<text x="50" y="373" font-size="15" fill="#526a7b" font-weight="400">CI 분석 작업 추가 없음</text>
+<rect x="346" y="211" width="528" height="142" rx="9" fill="white" stroke="#486c96"/>
+<path d="M356 212H864" stroke="#486c96" stroke-width="3"/>
+<rect x="362" y="225" width="208" height="26" rx="5" fill="#edf3fa" stroke="#486c96"/>
+<text x="374" y="243" font-size="13" fill="#294a70" font-weight="700">PROGRAM · 실행 책임</text>
+<text x="364" y="280" font-size="21" fill="#17354b" font-weight="700">요청 수신 · 검토 흐름 관리</text>
+<text x="364" y="306" font-size="15" fill="#526a7b" font-weight="400">고정 원문 수집 → 계획 후보 → 선택 결과 검증</text>
+<text x="364" y="328" font-size="15" fill="#526a7b" font-weight="400">리뷰 모드에 따라 분석과 모델 요청을 실행</text>
+<rect x="346" y="400" width="528" height="172" rx="9" fill="white" stroke="#486c96"/>
+<path d="M356 401H864" stroke="#486c96" stroke-width="3"/>
+<rect x="362" y="414" width="208" height="26" rx="5" fill="#edf3fa" stroke="#486c96"/>
+<text x="374" y="432" font-size="13" fill="#294a70" font-weight="700">PROGRAM · 실행 책임</text>
+<text x="364" y="469" font-size="21" fill="#17354b" font-weight="700">근거 · 작업 상태 · 게시 관리</text>
+<text x="364" y="495" font-size="15" fill="#526a7b" font-weight="400">같은 원문과 공통 계획으로 결과 추적</text>
+<text x="364" y="517" font-size="15" fill="#526a7b" font-weight="400">코드 인용 연결 · 완료 여부 · 현재 PR 상태 확인</text>
+<text x="364" y="539" font-size="15" fill="#526a7b" font-weight="400">리뷰 종류별로 봇 댓글을 갱신</text>
+<rect x="960" y="153" width="288" height="167" rx="9" fill="white" stroke="#bd792e"/>
+<path d="M970 154H1238" stroke="#bd792e" stroke-width="3"/>
+<rect x="976" y="167" width="208" height="26" rx="5" fill="#fff1dc" stroke="#bd792e"/>
+<text x="988" y="185" font-size="13" fill="#704214" font-weight="700">Decision1 · 기준 TEV1</text>
+<text x="978" y="222" font-size="21" fill="#17354b" font-weight="700">검토 계획과 선택</text>
+<text x="978" y="248" font-size="15" fill="#526a7b" font-weight="400">묶음 · 리뷰 모드 · 관점 선택</text>
+<text x="978" y="270" font-size="15" fill="#526a7b" font-weight="400">입력: 후보 / 출력: 선택 결과</text>
+<text x="978" y="292" font-size="15" fill="#526a7b" font-weight="400">이 그림의 기준 모델: TEV1</text>
+<rect x="960" y="399" width="288" height="172" rx="9" fill="white" stroke="#278270"/>
+<path d="M970 400H1238" stroke="#278270" stroke-width="3"/>
+<rect x="976" y="413" width="208" height="26" rx="5" fill="#e5f4ed" stroke="#278270"/>
+<text x="988" y="431" font-size="13" fill="#185b4d" font-weight="700">Bonsai2 · 검토 모델</text>
+<text x="978" y="468" font-size="21" fill="#17354b" font-weight="700">코드 검토와 설명</text>
+<text x="978" y="494" font-size="15" fill="#526a7b" font-weight="400">원문 검토 → 최종 정리</text>
+<text x="978" y="516" font-size="15" fill="#526a7b" font-weight="400">문장과 원문의 사실 대조</text>
+<text x="978" y="538" font-size="15" fill="#526a7b" font-weight="400">입력: 코드 / 출력: 근거 있는 판단</text>
+<rect x="346" y="672" width="250" height="135" rx="9" fill="white" stroke="#486c96"/>
+<path d="M356 673H586" stroke="#486c96" stroke-width="3"/>
+<rect x="362" y="686" width="208" height="26" rx="5" fill="#edf3fa" stroke="#486c96"/>
+<text x="374" y="704" font-size="13" fill="#294a70" font-weight="700">PROGRAM · 실행 책임</text>
+<text x="364" y="741" font-size="21" fill="#17354b" font-weight="700">검토 기록 보존</text>
+<text x="364" y="767" font-size="15" fill="#526a7b" font-weight="400">고정 원문 · 모델 원응답</text>
+<text x="364" y="789" font-size="15" fill="#526a7b" font-weight="400">작업 상태와 실행 이력</text>
+<rect x="644" y="672" width="254" height="135" rx="9" fill="white" stroke="#7762a5"/>
+<path d="M654 673H888" stroke="#7762a5" stroke-width="3"/>
+<rect x="660" y="686" width="208" height="26" rx="5" fill="#eeeafa" stroke="#7762a5"/>
+<text x="672" y="704" font-size="13" fill="#504177" font-weight="700">PROGRAM · PMD / CPD</text>
+<text x="662" y="741" font-size="21" fill="#17354b" font-weight="700">정적 분석 컨테이너</text>
+<text x="662" y="767" font-size="15" fill="#526a7b" font-weight="400">리뷰봇과 같은 실행 노드</text>
+<text x="662" y="789" font-size="15" fill="#526a7b" font-weight="400">원문을 받아 PMD · CPD 실행</text>
+<path d="M270 283L346 283" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="277" y="268" font-size="13" fill="#5c7283" font-weight="600">요청·원문</text>
+<path d="M346 486L296 486L296 378L270 378" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="274" y="475" font-size="13" fill="#5c7283" font-weight="600">댓글</text>
+<text x="960" y="139" font-size="14" fill="#5c7283" font-weight="600">모델 API · 별도 노드 연결 가능</text>
+<path d="M874 272L922 272L922 237L960 237" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<path d="M874 486L960 486" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<path d="M610 353L610 400" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M471 572L471 672" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<path d="M771 572L771 672" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<text x="33" y="874" font-size="13" fill="#5c7283" font-weight="400">Decision1은 선택 역할명이며 TEV1과 모든 프로필의 모델이 동일하다는 뜻은 아닙니다. 기준 조합의 책임을 표시한 그림입니다.</text>
+</g></svg>

@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1138" viewBox="0 0 1280 1138" role="img" aria-labelledby="title desc">
+<title id="title">실행 순서마다 담당 모델과 프로그램을 표시합니다</title><desc id="desc">각 상자는 개념 단계입니다. 같은 색의 단계도 서로 다른 요청이며, 공통 계획을 재사용합니다.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto-start-reverse"><path d="M0 0L8 4L0 8" fill="none" stroke="#8093a6" stroke-width="1.5"/></marker></defs>
+<rect x="1" y="1" width="1278" height="1136" rx="12" fill="#fcfdff" stroke="#dce4ec"/>
+<g font-family="sans-serif">
+<text x="32" y="42" font-size="27" fill="#17354b" font-weight="700">실행 순서마다 담당 모델과 프로그램을 표시합니다</text>
+<text x="32" y="72" font-size="15" fill="#5c7283" font-weight="400">각 상자는 개념 단계입니다. 같은 색의 단계도 서로 다른 요청이며, 공통 계획을 재사용합니다.</text>
+<rect x="32" y="91" width="220" height="26" rx="5" fill="#fff1dc" stroke="#bd792e"/>
+<text x="44" y="109" font-size="13" fill="#704214" font-weight="700">Decision1 · 선택 역할</text>
+<rect x="264" y="91" width="206" height="26" rx="5" fill="#e5f4ed" stroke="#278270"/>
+<text x="276" y="109" font-size="13" fill="#185b4d" font-weight="700">Bonsai2 · 검토·설명</text>
+<rect x="482" y="91" width="230" height="26" rx="5" fill="#edf3fa" stroke="#486c96"/>
+<text x="494" y="109" font-size="13" fill="#294a70" font-weight="700">프로그램 · 실행·근거·게시</text>
+<rect x="24" y="138" width="1232" height="213" rx="8" fill="#f2f6fa" stroke="#e3eaf0"/>
+<text x="42" y="164" font-size="15" fill="#506d85" font-weight="700">1  입력과 읽기 계획</text>
+<rect x="48" y="185" width="360" height="139" rx="9" fill="white" stroke="#486c96"/>
+<path d="M58 186H398" stroke="#486c96" stroke-width="3"/>
+<rect x="64" y="199" width="208" height="26" rx="5" fill="#edf3fa" stroke="#486c96"/>
+<text x="76" y="217" font-size="13" fill="#294a70" font-weight="700">PROGRAM · 실행 책임</text>
+<text x="393" y="220" font-size="15" fill="#788da0" font-weight="700" text-anchor="end">01</text>
+<text x="66" y="254" font-size="21" fill="#17354b" font-weight="700">검토 원문 고정</text>
+<text x="66" y="280" font-size="15" fill="#526a7b" font-weight="400">PR 목적 · 코드 · 테스트 수집</text>
+<text x="66" y="302" font-size="15" fill="#526a7b" font-weight="400">검토 커밋과 범위를 고정</text>
+<rect x="460" y="185" width="360" height="139" rx="9" fill="white" stroke="#486c96"/>
+<path d="M470 186H810" stroke="#486c96" stroke-width="3"/>
+<rect x="476" y="199" width="208" height="26" rx="5" fill="#edf3fa" stroke="#486c96"/>
+<text x="488" y="217" font-size="13" fill="#294a70" font-weight="700">PROGRAM · 실행 책임</text>
+<text x="805" y="220" font-size="15" fill="#788da0" font-weight="700" text-anchor="end">02</text>
+<text x="478" y="254" font-size="21" fill="#17354b" font-weight="700">전송 가능한 묶음 후보</text>
+<text x="478" y="280" font-size="15" fill="#526a7b" font-weight="400">함수·클래스 경계로 나누기</text>
+<text x="478" y="302" font-size="15" fill="#526a7b" font-weight="400">요청 크기 한도는 프로그램이 확인</text>
+<rect x="872" y="185" width="360" height="139" rx="9" fill="white" stroke="#bd792e"/>
+<path d="M882 186H1222" stroke="#bd792e" stroke-width="3"/>
+<rect x="888" y="199" width="208" height="26" rx="5" fill="#fff1dc" stroke="#bd792e"/>
+<text x="900" y="217" font-size="13" fill="#704214" font-weight="700">Decision1 · 기준 TEV1</text>
+<text x="1217" y="220" font-size="15" fill="#788da0" font-weight="700" text-anchor="end">03</text>
+<text x="890" y="254" font-size="21" fill="#17354b" font-weight="700">읽기 계획 선택</text>
+<text x="890" y="280" font-size="15" fill="#526a7b" font-weight="400">준비된 후보 중 하나를 선택</text>
+<text x="890" y="302" font-size="15" fill="#526a7b" font-weight="400">원문을 요약·수정하지 않음</text>
+<path d="M408 255L460 255" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M820 255L872 255" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="24" y="382" width="1232" height="213" rx="8" fill="#fff9ee" stroke="#eee2ca"/>
+<text x="42" y="408" font-size="15" fill="#8a5a26" font-weight="700">2  Decision1의 선택 · 기준 모델 TEV1</text>
+<rect x="48" y="429" width="360" height="139" rx="9" fill="white" stroke="#bd792e"/>
+<path d="M58 430H398" stroke="#bd792e" stroke-width="3"/>
+<rect x="64" y="443" width="208" height="26" rx="5" fill="#fff1dc" stroke="#bd792e"/>
+<text x="76" y="461" font-size="13" fill="#704214" font-weight="700">Decision1 · 기준 TEV1</text>
+<text x="393" y="464" font-size="15" fill="#788da0" font-weight="700" text-anchor="end">04</text>
+<text x="66" y="498" font-size="21" fill="#17354b" font-weight="700">묶음별 관측</text>
+<text x="66" y="524" font-size="15" fill="#526a7b" font-weight="400">관련 리뷰 모드와 문맥 충분성을</text>
+<text x="66" y="546" font-size="15" fill="#526a7b" font-weight="400">각각 별도 요청으로 판단</text>
+<rect x="460" y="429" width="360" height="139" rx="9" fill="white" stroke="#bd792e"/>
+<path d="M470 430H810" stroke="#bd792e" stroke-width="3"/>
+<rect x="476" y="443" width="208" height="26" rx="5" fill="#fff1dc" stroke="#bd792e"/>
+<text x="488" y="461" font-size="13" fill="#704214" font-weight="700">Decision1 · 기준 TEV1</text>
+<text x="805" y="464" font-size="15" fill="#788da0" font-weight="700" text-anchor="end">05</text>
+<text x="478" y="498" font-size="21" fill="#17354b" font-weight="700">PR 전체 리뷰 모드 선택</text>
+<text x="478" y="524" font-size="15" fill="#526a7b" font-weight="400">모든 묶음 관측을 함께 판단</text>
+<text x="478" y="546" font-size="15" fill="#526a7b" font-weight="400">아키텍처 / 개발 의도 / 둘 다 / 없음</text>
+<rect x="872" y="429" width="360" height="139" rx="9" fill="white" stroke="#bd792e"/>
+<path d="M882 430H1222" stroke="#bd792e" stroke-width="3"/>
+<rect x="888" y="443" width="208" height="26" rx="5" fill="#fff1dc" stroke="#bd792e"/>
+<text x="900" y="461" font-size="13" fill="#704214" font-weight="700">Decision1 · 기준 TEV1</text>
+<text x="1217" y="464" font-size="15" fill="#788da0" font-weight="700" text-anchor="end">06</text>
+<text x="890" y="498" font-size="21" fill="#17354b" font-weight="700">필요한 N개 관점 선택</text>
+<text x="890" y="524" font-size="15" fill="#526a7b" font-weight="400">개발 의도 리뷰가 선택된 경우</text>
+<text x="890" y="546" font-size="15" fill="#526a7b" font-weight="400">8개 중 N개를 목록 1회로 선택</text>
+<path d="M1052 324L1052 365L228 365L228 429" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M408 499L460 499" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M820 499L872 499" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="24" y="626" width="1232" height="213" rx="8" fill="#eff8f3" stroke="#dae9df"/>
+<text x="42" y="652" font-size="15" fill="#236956" font-weight="700">3  공통 계획 저장·재사용 → 실제 코드 검토</text>
+<rect x="48" y="673" width="267" height="139" rx="9" fill="white" stroke="#7762a5" stroke-dasharray="6 5"/>
+<path d="M58 674H305" stroke="#7762a5" stroke-width="3"/>
+<rect x="64" y="687" width="208" height="26" rx="5" fill="#eeeafa" stroke="#7762a5"/>
+<text x="76" y="705" font-size="13" fill="#504177" font-weight="700">PROGRAM · PMD / CPD</text>
+<text x="66" y="742" font-size="21" fill="#17354b" font-weight="700">선택된 구조 분석</text>
+<text x="66" y="768" font-size="15" fill="#526a7b" font-weight="400">리뷰봇 노드의 분석 컨테이너</text>
+<text x="66" y="790" font-size="15" fill="#526a7b" font-weight="400">아키텍처 선택 시에만 실행</text>
+<rect x="353" y="673" width="267" height="139" rx="9" fill="white" stroke="#278270"/>
+<path d="M363 674H610" stroke="#278270" stroke-width="3"/>
+<rect x="369" y="687" width="208" height="26" rx="5" fill="#e5f4ed" stroke="#278270"/>
+<text x="381" y="705" font-size="13" fill="#185b4d" font-weight="700">Bonsai2 · 검토 모델</text>
+<text x="605" y="708" font-size="15" fill="#788da0" font-weight="700" text-anchor="end">07</text>
+<text x="371" y="742" font-size="21" fill="#17354b" font-weight="700">원문 검토 · 초안</text>
+<text x="371" y="768" font-size="15" fill="#526a7b" font-weight="400">선택된 관점과 실제 코드를</text>
+<text x="371" y="790" font-size="15" fill="#526a7b" font-weight="400">함께 읽어 잠정 판단</text>
+<rect x="658" y="673" width="267" height="139" rx="9" fill="white" stroke="#278270"/>
+<path d="M668 674H915" stroke="#278270" stroke-width="3"/>
+<rect x="674" y="687" width="208" height="26" rx="5" fill="#e5f4ed" stroke="#278270"/>
+<text x="686" y="705" font-size="13" fill="#185b4d" font-weight="700">Bonsai2 · 검토 모델</text>
+<text x="910" y="708" font-size="15" fill="#788da0" font-weight="700" text-anchor="end">08</text>
+<text x="676" y="742" font-size="21" fill="#17354b" font-weight="700">최종 정리 · 통합</text>
+<text x="676" y="768" font-size="15" fill="#526a7b" font-weight="400">초안과 원문으로 최종 판단</text>
+<text x="676" y="790" font-size="15" fill="#526a7b" font-weight="400">여러 묶음은 원응답을 함께 읽음</text>
+<rect x="963" y="673" width="267" height="139" rx="9" fill="white" stroke="#278270"/>
+<path d="M973 674H1220" stroke="#278270" stroke-width="3"/>
+<rect x="979" y="687" width="208" height="26" rx="5" fill="#e5f4ed" stroke="#278270"/>
+<text x="991" y="705" font-size="13" fill="#185b4d" font-weight="700">Bonsai2 · 검토 모델</text>
+<text x="1215" y="708" font-size="15" fill="#788da0" font-weight="700" text-anchor="end">09</text>
+<text x="981" y="742" font-size="21" fill="#17354b" font-weight="700">문장의 사실 확인</text>
+<text x="981" y="768" font-size="15" fill="#526a7b" font-weight="400">실제 주장을 원문과 대조</text>
+<text x="981" y="790" font-size="15" fill="#526a7b" font-weight="400">사실 오류만 한도 내 정정</text>
+<path d="M1052 568L1052 610L486 610L486 673" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M315 742L353 742" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="6 5"/>
+<path d="M620 742L658 742" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M925 742L963 742" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="24" y="870" width="1232" height="213" rx="8" fill="#f2f6fa" stroke="#e3eaf0"/>
+<text x="42" y="896" font-size="15" fill="#506d85" font-weight="700">4  근거와 게시 조건은 프로그램이 관리</text>
+<rect x="48" y="917" width="360" height="139" rx="9" fill="white" stroke="#486c96"/>
+<path d="M58 918H398" stroke="#486c96" stroke-width="3"/>
+<rect x="64" y="931" width="208" height="26" rx="5" fill="#edf3fa" stroke="#486c96"/>
+<text x="76" y="949" font-size="13" fill="#294a70" font-weight="700">PROGRAM · 실행 책임</text>
+<text x="393" y="952" font-size="15" fill="#788da0" font-weight="700" text-anchor="end">10</text>
+<text x="66" y="986" font-size="21" fill="#17354b" font-weight="700">코드 원문 인용 첨부</text>
+<text x="66" y="1012" font-size="15" fill="#526a7b" font-weight="400">모델이 고른 참조에</text>
+<text x="66" y="1034" font-size="15" fill="#526a7b" font-weight="400">원문 · 파일 · 행 번호 연결</text>
+<rect x="460" y="917" width="360" height="139" rx="9" fill="white" stroke="#486c96"/>
+<path d="M470 918H810" stroke="#486c96" stroke-width="3"/>
+<rect x="476" y="931" width="208" height="26" rx="5" fill="#edf3fa" stroke="#486c96"/>
+<text x="488" y="949" font-size="13" fill="#294a70" font-weight="700">PROGRAM · 실행 책임</text>
+<text x="805" y="952" font-size="15" fill="#788da0" font-weight="700" text-anchor="end">11</text>
+<text x="478" y="986" font-size="21" fill="#17354b" font-weight="700">완료와 최신 상태 확인</text>
+<text x="478" y="1012" font-size="15" fill="#526a7b" font-weight="400">미완료는 완료 본문을 게시하지 않음</text>
+<text x="478" y="1034" font-size="15" fill="#526a7b" font-weight="400">PR 변경·종료·권한 상태 확인</text>
+<rect x="872" y="917" width="360" height="139" rx="9" fill="white" stroke="#486c96"/>
+<path d="M882 918H1222" stroke="#486c96" stroke-width="3"/>
+<rect x="888" y="931" width="208" height="26" rx="5" fill="#edf3fa" stroke="#486c96"/>
+<text x="900" y="949" font-size="13" fill="#294a70" font-weight="700">PROGRAM · 실행 책임</text>
+<text x="1217" y="952" font-size="15" fill="#788da0" font-weight="700" text-anchor="end">12</text>
+<text x="890" y="986" font-size="21" fill="#17354b" font-weight="700">리뷰별 댓글 갱신</text>
+<text x="890" y="1012" font-size="15" fill="#526a7b" font-weight="400">문제 · 변경 효과 · 리뷰 의견</text>
+<text x="890" y="1034" font-size="15" fill="#526a7b" font-weight="400">상세 기술 근거는 펼쳐 보기</text>
+<path d="M1096 812L1096 854L228 854L228 917" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M408 987L460 987" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M820 987L872 987" fill="none" stroke="#8093a6" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="34" y="1112" font-size="14" fill="#536d80" font-weight="400">선택이 없으면 생략 · 필요한 근거가 없으면 보류 · 인용 공백을 고치기 위한 모델 재호출은 하지 않음</text>
+</g></svg>

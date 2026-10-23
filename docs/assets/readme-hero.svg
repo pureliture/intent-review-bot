@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="276" viewBox="0 0 1200 276" role="img" aria-labelledby="title desc">
+  <title id="title">Intent Review Bot</title>
+  <desc id="desc">TEV1이 검토 계획을 선택하고 Bonsai2가 개발 의도와 코드 구조를 검토합니다. PMD와 CPD는 아키텍처 검토의 근거를 제공합니다.</desc>
+  <rect width="1200" height="276" rx="12" fill="#102b38"/>
+  <path d="M0 240H1200" stroke="#2b4d58"/>
+  <path d="M970 0V276M1040 0V276M1110 0V276" stroke="#234450" opacity=".55"/>
+  <g font-family="sans-serif">
+    <text x="46" y="42" fill="#9bc5c5" font-size="13" letter-spacing="3">DEVELOPMENT INTENT · ARCHITECTURE · SOURCE EVIDENCE</text>
+    <text x="43" y="108" fill="#ffffff" font-size="58" font-weight="750" letter-spacing="-2">Intent Review Bot</text>
+    <text x="47" y="146" fill="#d4e6e6" font-size="22">개발 의도와 코드 구조를 근거로 설명하는 PR 리뷰봇</text>
+    <rect x="46" y="181" width="325" height="39" rx="4" fill="#5b401f"/>
+    <text x="63" y="207" fill="#ffdea4" font-size="17">TEV1 · 무엇을 어떻게 검토할까</text>
+    <path d="M384 200H414m-8-7 8 7-8 7" stroke="#adc9cb" fill="none" stroke-width="2"/>
+    <rect x="428" y="181" width="325" height="39" rx="4" fill="#164b46"/>
+    <text x="445" y="207" fill="#bcf1da" font-size="17">Bonsai2 · 목적과 코드를 읽고 판단</text>
+    <rect x="781" y="181" width="325" height="39" rx="4" fill="#283f58"/>
+    <text x="798" y="207" fill="#d6e8ff" font-size="17">PMD / CPD · 구조 검토의 근거</text>
+    <text x="47" y="260" fill="#9bc5c5" font-size="12" letter-spacing="1">GitHub App / 고정된 PR 원문 / 선택한 관점만 리뷰 / 코드 원문 인용</text>
+  </g>
+</svg>

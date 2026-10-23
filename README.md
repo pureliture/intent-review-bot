@@ -1,463 +1,234 @@
-# github-review-bot
+![Intent Review Bot — TEV1이 검토 계획을 선택하고 Bonsai2가 개발 의도와 코드 구조를 검토합니다](docs/assets/readme-hero.png)
 
-Standalone GitHub Architecture and Development Intent Review Bot (`review_bot`) implementing Port-Adapter (Hexagonal) Architecture.
+[SVG 원본 보기](docs/assets/readme-hero.svg)
 
-**Design conformance:** the [2026-10-16 audit](docs/design-conformance-20261016.md) records unresolved review-contract gaps and risks requiring reproduction. Passing execution/schema/citation tests is not proof of complete design conformance or review quality.
+# Intent Review Bot
 
-## Requirements
-- Python >= 3.11
-- uv >= 0.10.0
+**PR에서 설명한 목적이 코드에 반영됐는지, 바뀐 구조에 검토할 문제가 있는지 함께 살펴봅니다.**
 
-## Quickstart
+선택 모델이 검토 범위와 방법을 고르고, Bonsai2가 고정된 코드 원문을 읽어 판단합니다.<br/>
+Java + Gradle의 구조 검토에는 PMD·CPD 분석을 근거로 연결하고, 개발자가 이해할 수 있는 설명과 코드 인용을 PR에 남깁니다.
 
-Initialize environment and install dependencies:
+**대상 프로젝트의 CI에 분석 작업을 추가하지 않습니다. 리뷰봇 실행 노드에서 PR 원문을 받아 독립적으로 분석합니다.**
+
+`GitHub App` · `TEV1 + Bonsai2` · `개발 의도 리뷰` · `아키텍처 리뷰` · `PMD / CPD`
+
+[어떤 점이 다른가](#difference) · [리뷰 기능](#reviews) · [모델과 실행 흐름](#runtime) · [시스템 구조](#architecture) · [결과 예시](#output) · [시작하기](#start)
+
+
+<br/>
+
+<a id="difference"></a>
+
+## 🎯 어떤 점이 다른가
+
+**개발 의도와 구조적 영향을 각각의 검토 방법으로 다루고, 필요한 검토만 계획해서 실행하는 봇입니다.**
+
+Codex 같은 범용 PR 리뷰의 대표적인 질문은 “이 변경에 중요한 버그나 위험이 있는가?”입니다.
+이 프로젝트는 여기에 **“설명한 문제를 실제로 해결하는가?”**, **“책임·의존·복잡도·중복을 구조적으로 검토할 필요가 있는가?”**를 명시적인 리뷰 흐름으로 제공합니다.
+
+**그림의 `Decision1`은 선택 담당 역할이며, 이 README는 최근 실PR 검증의 `TEV1 + Bonsai2` 구성을 기준으로 표시합니다.** 다른 프로필의 선택 모델이 TEV1과 동일한 모델이라는 뜻은 아닙니다.
+
+![Decision1 선택 역할의 TEV1이 검토 계획과 종류를 선택하고, Bonsai2가 개발 의도와 아키텍처를 검토하며, 프로그램이 PMD·CPD 실행과 원문 인용·게시를 담당하는 흐름](docs/assets/review-responsibilities.png)
+
+[SVG 원본 보기](docs/assets/review-responsibilities.svg)
+
+| 비교할 지점 | Codex GitHub 코드 리뷰의 공식 기본 흐름 | 이 프로젝트가 명시적으로 제공하는 흐름 |
+|---|---|---|
+| 검토 초점 | PR diff와 저장소 지침을 바탕으로 중요한 문제 검토 | 개발 의도와 아키텍처 검토를 구분하고 필요한 모드 선택 |
+| 팀의 기준 반영 | `AGENTS.md`의 리뷰 규칙 | 저장소별 리뷰 지시·댓글 양식과 고정된 검토 관점 |
+| 검토 절차의 구성 | Codex의 코드 리뷰 기능 사용 | TEV1의 계획·선택과 Bonsai2의 원문 검토를 분리해 운영 |
+| 구조 분석의 연결 | 제품·팀의 별도 도구 구성에 따라 달라짐 | 선택된 Java + Gradle 아키텍처 리뷰에 PMD·CPD 결과 연결 |
+
+Codex도 저장소별 규칙과 문맥을 활용할 수 있습니다. 이 표는 우열이나 기능 부재를 단정하는 비교가 아니라, **이 프로젝트가 직접 구성해 둔 리뷰 절차**를 설명합니다. 비교 기준은 OpenAI의 [GitHub 코드 리뷰 안내](https://learn.chatgpt.com/docs/third-party/github)와 [저장소별 리뷰 규칙 안내](https://developers.openai.com/blog/custom-code-review-rules-for-codex)입니다.
+
+<br/>
+
+<a id="reviews"></a>
+
+## 🔎 두 가지 리뷰 기능
+
+### 개발 의도 리뷰
+
+**무엇을 고치려는 변경인지와 실제 구현이 연결되는지 검토합니다.**
+
+PR 설명·연결된 이슈와 변경 전후 코드·테스트를 함께 읽습니다. 테스트 코드를 읽었다는 사실을 테스트가 통과했다는 주장으로 바꾸지 않습니다.
+고정된 8개 관점 중 TEV1이 필요한 N개를 **한 번의 요청으로 선택**하고, 초안·최종 결과·사실 확인·댓글 모두 선택된 N개만 다룹니다.
+
+<details>
+<summary>선택 가능한 8개 관점</summary>
+
+| 관점 | 확인하는 질문 |
+|---|---|
+| 문제와 성공 기준 | 어떤 상황이 문제이며 무엇이 달라져야 해결인가? |
+| 목적과 변경의 대응 | 목적에 필요한 구현이 있고, 주요 변경의 이유가 설명되는가? |
+| 수단의 적합성 | 이 구현 방식이 의도한 문제에 작용하는가? |
+| 결과까지의 연결 | 변경의 효과가 사용자·호출자·후속 처리까지 도달하는가? |
+| 달성 범위 | 의도한 대상과 조건을 빠짐없이, 과하지 않게 다루는가? |
+| 보존 조건 | 유지해야 할 동작과 변경하지 않기로 한 경계를 지키는가? |
+| 전제와 절충 | 필요한 가정과 감수하는 비용이 목적에 맞는가? |
+| 검증 근거 | 제공된 코드와 테스트가 목적 달성 주장을 뒷받침하는가? |
+
+선택되지 않은 관점의 결과를 억지로 작성하지 않습니다. 선택된 관점에서도 근거가 부족하면 그 한계를 표시합니다.
+
+</details>
+
+### 아키텍처 리뷰
+
+**코드 복잡도와 중복 분석 결과를 바탕으로, 구조를 개선할 필요가 있는지 검토합니다.**
+
+- **PMD:** 코드 복잡도, 한 클래스에 기능이 몰린 정도 등을 분석합니다.
+- **CPD:** 코드가 중복되는 위치와 관계를 제공합니다.
+- **Bonsai2:** 분석 대상 코드의 변경 전후를 읽고, 실제 문제·개선 제안·확인 질문을 구분합니다.
+
+**Java + Gradle은 분석 후보가 되는 조건입니다. 해당 조건만으로 PMD·CPD를 항상 실행하지 않습니다.**
+TEV1이 아키텍처 검토가 필요하다고 선택한 경우에 분석하고, Maven 모듈은 이 모드의 지원 대상에서 제외합니다. 개발 의도 리뷰는 Java·Gradle 여부와 독립적입니다.
+
+분석 수치가 높거나 중복이 있다는 이유만으로 결함이나 공통 코드 추출을 요구하지 않습니다. 개발자에게 알릴 내용은 원문 근거와 함께 선별합니다.
+
+### 정적 분석은 어디에서 실행하나
+
+**리뷰봇 Worker가 실행되는 Linux 노드의 격리된 분석 컨테이너에서 수행합니다.** 대상 저장소의 CI 실행 머신에 분석을 맡기는 방식이 아닙니다.
+
+1. 리뷰봇이 GitHub에서 고정된 PR 커밋의 원문을 수집합니다.
+2. 아키텍처 리뷰가 선택되면, 같은 노드의 컨테이너에서 PMD·CPD를 실행합니다.
+3. 분석 결과와 코드 원문을 모델 검토에 연결하고, 리뷰봇이 PR 댓글로 전달합니다.
+
+대상 프로젝트에 PMD·CPD용 Gradle 플러그인·태스크나 CI 작업을 추가할 필요가 없습니다. 대상 프로젝트의 Gradle 빌드·테스트 스크립트도 실행하지 않습니다. 기존 CI와 별개로 동작하는 **독립적인 PR 분석 서비스**입니다.
+
+| 구성 요소 | 실행 위치 |
+|---|---|
+| 리뷰봇 Worker와 PMD·CPD 컨테이너 | 같은 리뷰봇 실행 노드 |
+| TEV1·Bonsai2 모델 서버 | 같은 노드 또는 별도로 연결한 모델 서버 |
+| 대상 프로젝트의 기존 CI | 리뷰봇 분석과 독립적으로 유지 |
+
+<br/>
+
+<a id="runtime"></a>
+
+## 🧠 TEV1과 Bonsai2는 언제 쓰이나
+
+**TEV1은 검토 계획과 선택을 맡고, Bonsai2는 코드를 읽어 설명과 판단을 만듭니다. 프로그램은 원문·크기 한도·인용·게시 조건을 관리합니다.**
+
+| 단계 | 담당 | 하는 일 |
+|---|---|---|
+| 입력 준비 | 프로그램 | PR의 검토 커밋과 수집 범위를 고정하고, 원문을 유지하는 묶음 후보 생성 |
+| 읽기 계획 | TEV1 | 프로그램이 제시한 유효한 묶음 계획 중 하나 선택 |
+| 묶음 관측 | TEV1 | 각 묶음에 관련된 리뷰 모드와 문맥 충분성을 각각 판단 |
+| 전체 모드 선택 | TEV1 | 관측 결과를 모아 PR 전체의 아키텍처 리뷰·개발 의도 리뷰 수행 여부 선택 |
+| 의도 관점 선택 | TEV1 | 개발 의도 리뷰가 선택되면 8개 중 필요한 N개를 한 번에 선택 |
+| 분석·초안 | PMD·CPD / Bonsai2 | 선택된 구조 분석을 수행하고, 원문을 읽어 리뷰 초안 작성 |
+| 최종 정리·통합 | Bonsai2 | 초안과 원문을 대조해 최종 리뷰 작성. 여러 묶음이면 원래 응답과 근거를 함께 읽어 통합 |
+| 사실 확인 | Bonsai2 / TEV1 / 프로그램 | Bonsai2는 문장과 원문을 대조. 필요한 PMD 지표 의미는 TEV1이 분류하고 프로그램이 고정 정의와 비교 |
+| 결과 전달 | 프로그램 | 선택한 코드 참조에 원문·파일·행을 붙이고, 완료된 리뷰를 게시 |
+
+아래 주황색 **Decision1 · 기준 TEV1** 상자들은 **서로 다른 판단 단계**입니다. 모든 판단을 한 요청에 몰아넣지 않습니다. 초기 계획은 이후 리뷰에서 재사용하며, 분석 근거나 요청 크기 때문에 필요할 때만 수정합니다.
+
+![프로그램의 입력 준비, Decision1 역할의 TEV1 선택, Bonsai2의 초안·최종 정리·사실 확인, 프로그램의 인용·게시 순서를 담당자별로 표시한 실행 흐름](docs/assets/review-runtime.png)
+
+[SVG 원본 보기](docs/assets/review-runtime.svg)
+
+두 리뷰를 함께 선택할 수 있으며 현재 Worker는 선택된 모드를 순서대로 처리합니다. 분기선은 검토 경로를 나타내며, 한 PR 안의 모델 호출을 모두 병렬 실행한다는 뜻은 아닙니다.
+
+**큰 입력은 원문을 유지한 채 나눕니다.** 프로그램이 함수·클래스 같은 코드 경계를 이용해 전송 가능한 후보를 만들고 TEV1이 선택합니다. 이전 모델 응답도 그대로 보존합니다. 필요한 근거를 끝까지 처리하지 못하면 완료된 리뷰로 게시하지 않습니다.
+
+**인용은 프로그램이 붙입니다.** 모델이 제공된 코드 참조를 고르면 원문 코드와 파일·행 번호를 연결합니다. 인용의 공백이나 범위를 고치기 위해 모델끼리 재작성·재검증을 반복하지 않습니다. 실제 내용의 사실 오류에 대한 확인은 유지합니다.
+
+<br/>
+
+<a id="architecture"></a>
+
+## 🏛️ 시스템 디자인과 아키텍처
+
+대상 프로젝트의 CI 바깥에 **리뷰봇 실행 노드**를 둡니다. Worker와 정적 분석 컨테이너는 이 노드에서 함께 실행하고, 모델 서버는 별도로 연결할 수 있습니다. GitHub 연결, 검토 규칙, 모델 실행, 정적 분석은 책임별로 분리합니다. 선택 모델과 Bonsai2가 GitHub 댓글이나 분석 컨테이너를 직접 조작하지 않고, **리뷰 서비스가 모델의 선택을 검증해 실행**합니다.
+
+![리뷰 서비스가 GitHub 요청과 작업·근거·게시를 관리하고 Decision1 선택 모델, Bonsai2 검토 모델, 격리된 PMD·CPD 분석을 호출하는 시스템 구조](docs/assets/review-system.png)
+
+[SVG 원본 보기](docs/assets/review-system.svg)
+
+| 설계 원칙 | 사용자에게 의미하는 것 |
+|---|---|
+| 프로젝트 CI와 독립 | 대상 CI에 분석 작업을 추가하지 않고 리뷰봇 노드에서 실행 |
+| 같은 원문으로 검토 | 어느 커밋과 어떤 코드에 대한 판단인지 확인 가능 |
+| 검토 규칙과 외부 연결 분리 | GitHub·모델·분석 도구 연결이 바뀌어도 검토 책임을 구분해 유지 |
+| 작업과 모델 요청량 관리 | 여러 PR 요청이 들어와도 대기·취소·현재 실행 범위를 추적 |
+| 리뷰별 완료·게시 판단 | 한 리뷰가 실패했다고 다른 리뷰의 정상 결과를 버리지 않음 |
+| 코드·분석·모델 결과 구분 | 분석 결과나 코드 인용만으로 판단의 정확성을 보장하지 않음 |
+
+PR이 변경되거나 닫히면 게시 시점의 최신 상태를 확인합니다. 새 실행마다 댓글을 늘리는 대신 리뷰 종류별로 기존 봇 댓글을 갱신합니다. 병합 승인과 최종 개발 판단은 사람에게 남깁니다.
+
+<br/>
+
+<a id="output"></a>
+
+## 💬 개발자는 무엇을 받나
+
+본문은 **문제 상황 → 변경 효과 → 리뷰 의견** 순서로 읽을 수 있게 구성합니다. 함수·상수 이름, 분석 세부 결과, 코드 원문은 필요한 곳에서 펼쳐 볼 수 있습니다.
+
+> ### 개발 의도 리뷰
+> **판단: 이번 변경은 PR에서 설명한 문제를 해결하는 방향과 맞습니다.**
+>
+> **문제:** 메뉴바에서 한도가 없는 설정이 `$0`으로 보일 수 있었습니다.
+>
+> **변경 효과:** 비용 정보를 평소 방식으로 가져오지 못할 때도 무제한 한도를 `∞`로 유지합니다.
+>
+> **리뷰 의견:** 제공된 코드와 추가된 테스트는 이 목적에 맞게 작성돼 있습니다. 선택된 검토 관점에서는 추가 수정을 요청할 사항을 찾지 못했습니다.
+>
+> **상세 근거:** 검토한 관점 · 판단 조건 · 파일과 행 번호 · 실제 코드 인용
+
+위 예시는 [실제로 게시한 PR #5 리뷰](https://github.com/pureliture/openai-compatible-bridge/pull/5#issuecomment-6310551402)를 짧게 정리한 것입니다. 이번 실행은 **TEV1 5회 + Bonsai2 3회, 총 5분 7초**였으며, 관점 선택 1회로 1개 관점을 검토했습니다. 이 수치는 해당 입력의 실행 기록이며 다른 PR의 소요시간이나 리뷰 품질을 보장하지 않습니다.
+
+팀이 원하는 설명 기준과 댓글 양식은 저장소 기본 브랜치의 설정 파일에서 변경할 수 있습니다. **팀별 리뷰·설명 지시와 양식은 다음 요청부터 서비스 재시작 없이 적용**됩니다. 모드 선택·실행 권한·근거 검증 규칙은 앱이 관리합니다. 자세한 범위는 [저장소별 리뷰 지시와 댓글 양식](docs/repository-review-settings.md)을 참고하세요.
+
+<br/>
+
+<a id="start"></a>
+
+## 🚀 시작하기
+
+### 실행 도구 준비
+
+Python 3.11 이상과 uv가 필요합니다.
+
 ```bash
-uv sync
-```
-
-Run CLI:
-```bash
+git clone https://github.com/pureliture/intent-review-bot.git
+cd intent-review-bot
+uv sync --locked
 uv run review-bot --help
 ```
 
-Run tests:
-```bash
-uv run pytest
-```
+위 명령은 실행 도구를 준비합니다. 실제 리뷰에는 모델 서버 또는 명시적으로 선택한 모델 연결 설정이 필요합니다.
 
-## GitHub App service (operator-prepared)
+### 사용할 방식 선택
 
-For the Docker Compose web/worker deployment and authenticated fixed-input intent API, see [의도 리뷰 API와 컨테이너 운영](docs/intent-api-deployment.md). `perspectives-v1` supports private artifacts and explicitly enabled GitHub App comments; the fixed-input API remains private and also runs without GitHub credentials. The [personal neurons configuration](deploy/personal-neurons.yaml) restricts webhook reviews to `pureliture/neurons`. Live deployment and model-review evidence are recorded separately in `milestones.md`.
+| 방식 | 적합한 상황 | 다음 문서 |
+|---|---|---|
+| GitHub App | PR 요청을 받아 봇 댓글로 리뷰 제공 | [서비스와 컨테이너 운영](docs/intent-api-deployment.md) |
+| 고정 입력 평가 | 수집된 PR 원문으로 비공개 리뷰 실행 | [운영·설정·실행 참고](docs/runtime-reference.md#private-shared-partition-evaluation) |
+| 저장소별 맞춤 설정 | 팀의 리뷰 기준·설명·댓글 양식 변경 | [저장소별 설정](docs/repository-review-settings.md) |
 
-The GitHub App path is **signed PR event → SQLite lease → immutable source and default-branch settings → bounded TEV observations and PR-wide mode selection → selected architecture and development intent reviews → factual verification/correction → separate developer comments**. Java+Gradle permits A as a candidate; it never forces static analysis. Normal App processing uses the shared execution plan even when the private `partition_evaluation` flag is absent. The CLI composes the existing signed FastAPI receiver, SQLite job store, installation-scoped GitHub/repository adapters and `WorkerLoop`; it does not install an App or deploy a service.
+기준 모델 조합은 **TEV1 + Bonsai2**이며, 다른 모델 프로필의 연결 범위와 실행 조건은 [모델·운영 참고](docs/runtime-reference.md#local-llamacpp-explicit-opt-in)에 정리돼 있습니다.
+아키텍처 리뷰의 PMD·CPD 실행에는 지원되는 Linux 격리 환경이 추가로 필요합니다.
 
-Developer comments reuse the `seulgi-server` PMD/CPD layout with a separate grounded LLM section. Intent comments lead with purpose, overall assessment and actionable findings; the N perspectives selected in one TEV request and their literal source quotes are collapsed. Failed or incomplete reviews publish only a short status notice. Architecture and development intent reviews retain separate bot-owned comments. [Repository-owned prompts and templates](docs/repository-review-settings.md) apply on the next request without a service restart; presentation changes reuse the validated original plan/result without model generations.
+<br/>
 
-- **D1 — installation-based eligibility:** repositories selected during installation are eligible without operator registration. Empty `service.installation_allowlist` and `service.repository_allowlist` allow installed repositories; nonempty lists add restrictions. Installation/repository binding and installation-token scope still apply.
-- **D2 — publication default:** `execution.mode: github_app` defaults to `publish.mode: comment` when the publication mode is omitted. Offline/local CLI review retains the `artifact_only` default. An operator can explicitly select `artifact_only` to keep results private without GitHub writes.
-- Architecture comments use `<!-- review-bot:architecture:v1 -->` by default and update an existing bot-owned marker comment rather than creating one per run. Ambiguous or foreign-owned markers fail closed. No automatic approval or request-changes review is submitted; draft comments are disabled by default.
+<a id="status"></a>
 
-### App permissions and configuration
+## 📍 현재 범위와 확인된 상태
 
-Prepare a GitHub App with **Contents: read** and **Pull requests: write** (GitHub's implicit Metadata read permission remains). Subscribe to `pull_request`, `installation` and `installation_repositories` webhook events. PR handling covers `opened`, `synchronize`, `reopened`, `edited`, `labeled`, `unlabeled`, `ready_for_review` and `closed`; installation deletion/suspension and repository removal cancel affected work. Configure a webhook secret and an operator-managed HTTPS endpoint forwarding to `POST /webhook`; the receiver binds to loopback by default.
+- **구현된 흐름:** 공통 계획, 선택한 관점만 리뷰, Java + Gradle 아키텍처 분석 연계, 원문 인용, 사실 확인, 저장소별 설정과 댓글 렌더링.
+- **실제 확인:** TEV1·Bonsai2의 고정 PR 개발 의도 리뷰 완료와 GitHub App 작성자 댓글 갱신. 위 PR #5 게시는 사용자의 명시 요청에 따른 병합 PR 댓글 갱신입니다.
+- **별도 확인이 필요한 범위:** 최신 변경 기준의 대형 PR 검토 품질·동시 부하·장애 복구·열린 PR의 자동 게시 전체 경로.
 
-Supply an operator-owned, full **schema-version-2** configuration using `--config`. No configuration file or image is generated by the service commands. Architecture fields below apply to architecture review, not development intent only execution:
+기능 구현, 자동화된 검증, 실제 모델의 리뷰 품질, 현재 배포 상태는 구분합니다. 과거 측정·시행착오·세부 실행 조건은 본문의 기능 설명 대신 아래 문서에서 확인할 수 있습니다.
 
-| Field | Required setting |
-| --- | --- |
-| `execution.mode`, `execution.backend` | `github_app` |
-| `execution.worker_concurrency` | `1` (default) or `2`; larger values are rejected |
-| `model.max_concurrency` | `1` (default) or `2`; the shared model-admission group never exceeds two |
-| `service.worker` | `synchronous` |
-| `service.sqlite_wal`, `service.lease_and_generation_fencing` | `true` |
-| `architecture.isolation.runtime` | `rootless_docker`; no host subprocess fallback |
-| `architecture.isolation.network`, `read_only_root`, `no_new_privileges` | `none`, `true`, `true` |
-| `architecture.tool_image_digest` | A trusted, preloaded image's exact `sha256:<64 lowercase hex digits>` or `repository@sha256:<64 lowercase hex digits>`; null, tags and malformed pins are rejected |
+## 📚 더 알아보기
 
-`execution.available_modes` defaults to `[architecture]`; add `intent` explicitly for development intent review. Architecture review is eligible only for changed Java code in a Gradle module, identified by `build.gradle` or `build.gradle.kts` at the fixed Git revision. A nearer `pom.xml` excludes a Maven module, including inside a Gradle repository. Deleted Java uses the comparison base; current Java uses the head build system. TEV subsequently decides whether responsibilities, dependencies, method control-flow/complexity or duplication need architectural inspection. Failed selection never falls back to running architecture review. development intent review eligibility is independent of Java and Gradle. architecture-only and mixed service configurations require an explicit pinned analyzer image and rootless isolation settings; preparation errors fail architecture review without suppressing independently selected development intent review. Target Gradle scripts are not executed.
-
-### Private environment and Ubuntu preparation
-
-The configuration stores **environment variable references**, not raw secrets. References can be changed using the corresponding `service.*_env` fields; their defaults are:
-
-| Reference field | Default environment variable | Operator-provided value |
-| --- | --- | --- |
-| `service.app_id_env` | `REVIEW_BOT_APP_ID` | GitHub App's positive decimal ID |
-| `service.app_private_key_file_env` | `REVIEW_BOT_APP_PRIVATE_KEY_FILE` | Absolute path to an owned, regular private-key file, mode `0600` or read-only `0400` |
-| `service.webhook_secret_env` | `REVIEW_BOT_WEBHOOK_SECRET` | Webhook signing secret from the operator's secret facility |
-| `service.state_root_env` | `REVIEW_BOT_STATE_DIR` | Absolute, private service-state directory shared by the receiver and its one or two workers |
-
-Do not commit the key, secrets or private state. Paths must not contain symlink components; root/HOME state paths, shared state directories, foreign ownership and linked database/key files are rejected. Existing unsafe permissions are not repaired. State/cache/analysis/artifact directories are created with mode `0700`, SQLite database and sidecars must be `0600`, and service execution uses `umask 077`, restoring the caller's mask on exit. Key reading, JWT signing and GitHub access occur only after a run is claimed; `/health` is liveness, not proof that credentials or publication work.
-
-For **architecture review**, prepare **Ubuntu with a rootless Linux Docker daemon**, delegated cgroup v2/systemd memory, swap, CPU and PID limits, and the trusted pinned image already available locally. The worker and daemon must belong to the same host UID; private bind-mount access still requires deployment validation. Rootful Docker and Docker Desktop are not fallback options. The image must already contain `/usr/local/bin/python3`, the trusted installed `review_bot` package and locked PMD 7.3.0/JDK 21 artifacts for the fixed `/usr/local/bin/python3 -I` container invocation. Image provenance is the operator's responsibility: there is no automatic pull, build, host JDK provisioning or target-build-script execution. **development intent only requires none of these Java/analysis-image prerequisites.**
-
-### Commands and verification boundaries
-
-With the configuration, private state and secret references prepared, run the receiver and worker in separate processes with the same state-root value:
-
-```bash
-uv run --locked review-bot webhook --config /home/review-bot/operator.yaml --host 127.0.0.1 --port 8000
-uv run --locked review-bot worker --config /home/review-bot/operator.yaml
-```
-
-For bounded processing:
-
-```bash
-uv run --locked review-bot worker --config /home/review-bot/operator.yaml --once
-```
-
-`--once` exits `0` for an empty queue or successful processing, including normal skips/cancellations; an unsuccessfully processed claimed run exits `1`. Startup/configuration failures also exit nonzero. Continuous processing reuses `WorkerLoop`'s signal-based shutdown, and both service commands close their SQLite store on exit. The analyzer is constructed/preflighted only after architecture review is selected; an empty queue or development intent only selection never initializes it.
-
-The App requires the configured review and TEV roles. When a required role cannot complete selection or review, the affected review is incomplete; its final body is withheld. Lease/generation fences, PR head/base freshness checks, event coalescing and close/revocation cancellation remain active. Cancellation does **not** delete retained source/artifacts: `artifacts.retention_days` defaults to 30, but **TTL/data-cleanup automation is not implemented**. Private inputs must not be published to public CI.
-
-Automated service CLI tests use in-process signed FastAPI requests, real SQLite and `WorkerLoop`, with mock GitHub/repository/analyzer boundaries and a fake server runner. Existing integration tests separately exercise local Git/PMD/CPD and the architecture pipeline against mock GitHub. This is **not** live App installation, live comment publication, a deployment/public release or an Actions cutover. Actual Ubuntu rootless execution, UID bind access and live GitHub/model behavior on this service path remain unverified.
-
-### Two workers and shared model admission
-
-The receiver stores accepted work before returning `202`; it does not wait for analysis or model execution. Continuous workers poll the existing SQLite queue when idle (default one second), not cron. With `execution.worker_concurrency: 2`, the service runs two independent Workers with separate DB connections, leases and App adapters, and shared shutdown. The atomic claim admits at most **two live leases** across processes sharing that jobs DB and at most **one live lease per repository/PR**. Third and later requests remain queued. New events still coalesce to the latest PR generation; expired leases can recover, but execution is not exactly-once. `--once` still claims only one task.
-
-Every actual model HTTP request uses a separate **shared SQLite admission group**, including selection, admission, review, retries and metadata verification. No measurement-only call exists: `ModelExecutionBudget.measure()` admits locally via each client's pure `admission_bytes()` (exact wire bytes plus framing reserve, a proven token upper bound), never over HTTP. For me707/Ollama, set `REVIEW_BOT_MODEL_STATE_DIR` to the same absolute, owned private directory in **every participating Worker and evaluation CLI** for the same GPU/model group. If omitted, all processes under the same OS account use `~/.local/state/github-review-bot/model-admission`. The isolated [MacBook profile](#macbook-local-llamacpp-explicit-opt-in) uses its own group/variable instead. Different group directories, other OS accounts and non-bot clients are not controlled by this limit. A caller configured for one request can conservatively lower active group concurrency; neither setting enables parallel stages inside one PR.
-
-The admission DB stores reservation tokens/state/deadlines/limits, never prompts, source or credentials. Directories are `0700`, DB/sidecars `0600`; unsafe paths/ownership fail closed. Waiting consumes the original request/task deadline, and queued calls recheck worker cancellation and generation/lease fences before HTTP. Unused reservations can expire. **A sent generation with a lost response or crashed caller is not automatically freed by TTL:** the server may still be running it. Capacity remains conservatively reserved until actual server idleness is confirmed and an operator uses `SQLiteModelAdmission.resolve_uncertain(token, confirmed_idle=True)`. There is no automatic reconciliation or recovery CLI; never clear that state merely to bypass the limit.
-
-The me707 llama.cpp deployment contract requires **two actual generation slots per model server**, independent of that shared HTTP admission group. The separate MacBook profile retains one slot per server. See [server-side generation capacity](#server-side-generation-capacity). Slot verification does not release uncertain SQLite tickets or recover a lost response.
-
-The existing `seulgi-server` CI PMD/CPD analysis is **not migrated or replaced** by this general-purpose bot. Optional architecture review retains its rootless/pinned-image requirements. Company use is deferred to a separate repository after personal development; no PAT support or personal/company authentication-switch framework is added here.
-
-## 1회 개발 의도 리뷰 (perspectives-v1)
-
-승인된 8개 관점으로 PR 본문과 고정된 변경 전후 코드를 함께 검토하는 명시적 평가 모드다. Tev1이 관점별 적용·비적용·판단불가를 선택하고, 주 리뷰 LLM이 원문을 읽어 의도와 구현의 연결 및 달성 가능성을 검토한다. 관점 추가·제외, 기존 원문의 재해석에 따른 판단 정정, 필요한 맥락의 누적과 부분 검토를 지원한다.
-
-    rtk proxy uv run --locked --offline review-bot intent \
-      --input /path/to/private/input.json --output /path/to/private/review-001 \
-      --pipeline perspectives-v1 --model-profile me707-llamacpp \
-      --language ko --call-timeout-seconds 120
-
-이 모드는 고정 입력 한 번을 리뷰하고 비공개 결과를 저장한다. 기본은 선택 8회와 주 리뷰 2회이며, 한도 안에서 최대 1회 원문 재확인이 추가될 수 있다. 입력·ModelRequest schema 1을 유지하고 새 결과만 schema 3이다. CLI는 완료 0, 미완료 1을 반환한다. 생성 전 전체 원문 한도를 검사하며 실제 사용량·실패·이력을 보존한다.
-
-사용자 설명은 의도 → 구현과의 연결 → 달성 가능성 → 질문 순서이며, 기본 언어는 ko다. 기존 declared-v1/code-first-v2와 구별되는 명시적 옵션이고 Worker·게시기·반복 리뷰를 구성하지 않는다. 최신성 보강은 후순위다. [선택지와 실행 계약](docs/intent-review-single-run.md)을 참고한다.
-
-## Development intent evaluation (fixed input, never posts)
-
-The offline `intent` command evaluates **text code of any language**. The default `declared-v1` pipeline preserves `extract_goals → observe_changes → assess`; the explicitly selected [code-first v2](#code-first-development-intent-review-and-tev1-planning-v2-explicit-opt-in) reads code before reconstructing purpose. Neither pipeline reads a target checkout, executes target code/builds/tests/hooks, initializes PMD/CPD, requires Java or an analysis image, enqueues work, or composes a GitHub publisher. Both use the shared Worker's `intent` mode; **development intent review automatic posting remains disabled by default**, including when `publish.mode: comment`.
-
-Prepare a fixed `IntentTaskInput` v1 with `build_intent_task_input(snapshot, base, head, related_paths=())` in `review_bot.application.intent_context`. It contains exactly `schema_version`, the existing service-v2 `snapshot`, full-file `base`/`head` code snapshots, sorted `reviewed_paths`, and `input_hash`. Supply PR/issue original text in `snapshot.evidence`; a text digest alone is not original text. The builder includes changed/rename paths and explicitly related paths, checks file/evidence/inventory hashes and fixed versions, and computes the input hash over the complete record excluding `input_hash`. Serialize it with `dataclasses.asdict` and JSON; do not hand-edit the resulting record or reuse a hash after material changes.
-
-Keep that input in an owned regular **0600/0400** file with no symlink components or hard links. Outputs use owned **0700** directories and **0600** files. Use a fresh output directory for every evaluation: an existing manifest or `B/` namespace is rejected before model setup, not overwritten or automatically repaired.
-
-```bash
-rtk proxy uv run --locked review-bot intent --input /path/to/private/fixed-B-input.json \
-  --output /path/to/private/evaluation-001
-```
-
-Without `--model-profile`, the result is `not_run/model_profile_unset`, with zero review or measurement calls (no measurement-only call exists). Ambient model opt-in does not enable this command. Explicit profiles are `ollama-local-128k`, `me707-llamacpp`, `macbook-llamacpp` and `macbook-granite-llamacpp`; model preparation is the operator's responsibility, with no model download or provider fallback.
-
-Each default v1 evaluation stores `B/{input,goals,observations,result,scope,usage,validation}.json`, `B/comment.md` and a mode-specific `manifest.json` with `publication=not_attempted/artifact_only`. Unattempted or invalid stage data is JSON `null`; earlier validated stages and actual call usage survive later failures. For v1, exit `0` means artifacts were saved for a completed or explicitly `not_run` outcome, **not** that a real review completed. V2 instead exits `0` only for `completed`; `partial_review`, `not_run` and failure exit `1` while preserving their files. Invalid input, unsafe paths or storage failure exits `1`; no source or raw exception value is printed.
-
-In `declared-v1`, goals receive PR/issue text only; observations receive full code/test files, change metadata and supplied execution records only, never goals or PR descriptions. Assessment receives the validated two results and original evidence. Duplicate JSON keys, extra fields, invalid types/enums/IDs/quotes, forged SHA/path/line evidence and hypothesis-only conflicts fail closed without another review call. Incomplete prepared scope or input overflow is not replaced by fewer paths, summaries, splitting or truncation. Default v1 limits are 131,072 input/total context tokens per request and 900 seconds per task, additionally constrained by the existing profile's byte/input/output limits; at most three attempts per stage are permitted. Output entities are bounded to 20 per array, strings to 4,000 characters and evidence references to 128.
-
-Goal/constraint quotes must be literal contiguous spans present in every referenced original text and contain at least **12 non-whitespace Unicode characters**. A shorter quote is accepted only when it equals a complete original `title` or `body` field (after stripping leading/trailing whitespace) in each referenced text record, while still occurring literally in every record. The trusted prompt instructs the model to include surrounding original text in the same contiguous span for brief intent embedded in a longer field, without padding, joining separate spans or rewriting text; short sentences/lines are not additional exceptions. These citation checks do not prove that the statement faithfully represents the quoted meaning.
-
-`usage.calls` counts generation attempts, including v2 planning. No preflight, tokenizer, or other measurement call exists: `usage` records only the delivery/usage riding on real review/planning responses (normally three v1 review generations). Metadata verification HTTP requests still share admission. Unknown transport/usage remains `null` with known subtotals, not zero. (Historical Ollama one-token preflight and llama.cpp template/tokenizer measurement records are superseded by the zero-measurement contract.) Supplied `test_run` records are integrity-checked and version/path-bound, **not independently attested**; reading test source never creates a run record. Drafts show scope, unexecuted tests, missing context, and uncertainty, and construct links only from verified evidence.
-
-Synthetic Python/JavaScript/Java fixtures and CLI tests exercise the real development intent review pipeline using mock models/HTTP. They establish integration and validation, not model quality or completion of the live PR #36 evaluation. Architecture v1 records, commands, `A/` artifacts and marker remain unchanged.
-
-### Private shared partition evaluation
-
-Trusted configuration can enable `partition_evaluation.enabled: true` with explicit `max_calls`, `max_total_tokens` and task deadlines. The existing fixed-input API and Worker then use the shared planner before choosing PR-wide modes. CLI and fixed-input evaluation require `publish.mode: artifact_only` and reject comment publication. Normal signed GitHub App jobs use the shared partition flow and may publish comments under the existing authorization, freshness, lease and publication gates. For a fixed development intent review input, the CLI exposes `--partition-evaluation` with `--max-calls`, `--max-total-tokens` and `--task-timeout-seconds`. The separate `--input-target-tokens` option is an experimental byte-budget target; it does not impose a smaller live context or authorize shortening source. An unspecified partition input ceiling uses the validated role byte-upper-bound profiles (with the legacy conservative ceiling for an unknown role cap); an explicit operator or shared-budget ceiling remains binding.
-
-The shared flow is:
-
-1. Freeze the declared PR source scope, base/head versions, supplied tests, PR purpose and exact derived diffs. Use deterministic AST boundaries and explicit line fallback where needed. Admission-bound every complete request with the client's exact-wire `admission_bytes()` (wire bytes plus framing reserve as a proven token upper bound), including prompts, schema instructions and output reservation. No tokenizer or measurement call exists.
-2. The program supplies complete, admissible grouping candidates. Tev1 chooses a closed option, observes each bounded group and chooses modes for the whole PR. Java changes must belong to a Gradle module for PMD/CPD review; Maven modules are excluded. The same immutable nearest-build-marker rule also filters actual architecture signals, including every CPD partner, when a PR mixes Gradle and Maven modules. Current Java uses head ownership; removed Java uses base ownership. Original PR context and raw analysis remain retained, and excluded-signal counts are recorded. Intent eligibility is independent. Tev1 selects the necessary N perspectives from the fixed eight in one JSON-list request, with at most one generation attempt. Only these N are reviewed and rendered; an empty valid selection skips intent, and a failed selection defers intent without converting failure into exclusion.
-3. Reuse the initial plan in both modes. New analysis evidence or a changed request fit can amend affected groups; preserve the parent plan, exact reasons and amended identity.
-4. The review model reads every fixed source unit with the same PR purpose. Intent groups produce actual provisional assessments for exactly the selected N perspectives; architecture groups assess the program-linked PMD/CPD targets. Exact source blocks carry their reference IDs beside the code. These blocks present all supplied bytes in one request; they do not create extra model calls.
-
-Provisional insufficiency without a named gap is retained unchanged with a program validation issue for final source-based correction. Final insufficiency still requires concrete missing evidence. A parsed group reply rejected by source or semantic validation can receive at most one configured `max_rechecks` correction with the exact prior reply and field error, unchanged originals, citation catalog and schema. Every request is admitted under the existing task/call/token/fence budget. Draft concerns and conditional risks still require a concrete failure condition and a HEAD code reference; the program never changes a verdict to pass validation. Private replay binds rejected replies, actual requests, groups and the accepted correction, and rejects omitted or duplicated history. If correction is disabled, unfittable, invalid or out of budget, the private result retains earlier raw group responses and the rejected reply and stops.
-
-Architecture integration pages without code-bound targets preserve and account for their observations with no findings. A necessary fixed-source request can add actual code before a target-bound judgement; findings cannot use a target absent from that page.
-5. Final review receives the original group responses unchanged, their evidence anchors and fixed source. It may correct the drafts with source-backed reasons. Context gaps require explicit evidence to resolve; an explained correction alone is not a missing-evidence state. Later pages also receive the earlier accepted context state, its complete reason and quoted citations, plus the originating page and response hash. These are exact copies of the stored decision fields, not a generated summary or a replacement for the original group responses. Omitting an unchanged update preserves its earlier state; a revised judgement still requires evidence and a reason. Earlier context quotes do not create new page review targets. Their bytes are included in the byte-upper-bound admission of the actual request, and stored-result validation replays their provenance. PMD targets require explicit review accounting.
-6. Admission-bound the complete final request first. Only a proven over-budget refusal triggers lossless source delivery across integration pages. Preserve the original assessments of every page in the ledger; the program never invents a global majority verdict. Each integration page can request one bounded source/semantic correction under the shared task/call budget. A fixed-original request first admission-bounds the full additive delivery. Only a proven over-budget refusal permits a focused delivery of the requested originals, unchanged group/prior final replies and every nested cited byte; earlier complete source deliveries stay in the validated audit history. Private result schema 13 records and revalidates that history and the context state supplied to each page. Requests outside the frozen inventory are rejected; unresolved or unfittable corrections remain partial. A fully known output-length failure can separately trigger one request-local bounded-reasoning recovery with the identical system/user/schema input and total output cap. This requests a target of about 8,192 tokens for final JSON; sampler stop-message/framing consumes part of that allowance. Normal thinking is unchanged, and unknown usage, cancelled work, exhausted budgets or unsupported profiles do not trigger this recovery. Rejected content/reasoning and known usage remain in private failure records. A failed page is never promoted to a global PR conclusion; valid failed results remain readable through the authenticated API.
-
-7. If integration required multiple pages, Bonsai makes a global semantic judgment from every complete accepted page response, its original hash/index, all nested cited original text and the common PR purpose. Inherit the actual per-target review records rather than regenerate them. Require explicit dispositions for every page and every earlier finding: retained, revised or excluded with source-backed reasons and resulting finding indices. Keep the original page responses and findings regardless of the global decision. Admission-bound full-original delivery first; only a proven over-budget refusal allows the intact page-result/cited-source packet. Unused citation aliases and repeated source metadata are not source summaries. Necessary rechecks stay within the frozen inventory and shared correction/call budget. If the intact packet cannot fit or global validation fails, retain all upstream pages and report failure rather than promote their concatenation to a global conclusion. Single-page integration stays direct. Stored validation reconstructs inputs, original citations, byte-upper-bound overflow decisions and final normalization independently. If a global response names required missing context but omits `source_requests`, TEV receives bounded pages of candidates from the same frozen inventory and selects a source label or no suitable source. Record this as an amendment linked to the existing integration plan; never discover new repository paths. Reuse the existing bounded correction, task budget, admission and fencing. The recheck retains the exact previous global response and all original page/citation data, and delivers selected originals only after byte-upper-bound admission. Full TEV states stay in the ledger; Bonsai receives their exact choices and identity receipts without repeated copies of the same review/purpose/inventory. Newly named gaps receive fixed context IDs and require explicit state/reason/source citations on recheck. Clearing a free-text missing list or omitting an earlier evidenced negative state cannot silently resolve them. A no-source decision or a still-unresolved state remains partial; no positive judgement is forced.
-
-8. Preserve the accepted synthesis unchanged, then check the summary, every finding, every perspective and every question against frozen sources, PMD definitions/actual analysis facts and execution receipts. TEV extracts the category actually asserted about each supported named metric; the program compares it with the versioned definition. A separate Bonsai request checks all prose fields for source support. This is model-assisted factual review, not a deterministic semantic proof. Rewrite only an item with an explicit contradiction/unverifiable premise, retain the original, correction reason and exact sources, and recheck the complete replacement. Each item has at most the configured `max_rechecks` rewrites under the SAME task/call/token/fence/admission budget. Unresolved facts, failed validation, unfittable evidence and exhausted budgets produce `partial_review / factual_verification_incomplete`. They never produce silent approval. Full original delivery is admission-bounded first; a proven over-budget refusal can select whole cited originals with base/head counterparts, then every nested cited byte. Every request retains the complete item and common PR purpose. No source discovery, prose compression, target execution or arbitrary live size target is introduced. See [the factual review contract](docs/review-fact-verification.md).
-
-Factual checks must judge each literal assertion, including AND/OR, necessary versus sufficient conditions, defaults and method-specific behavior. A weaker true paraphrase cannot justify `supported` for a field containing a false clause. Claims naming multiple methods are checked against each method. Controlled negative and corrected-positive examples validate these instructions; model-assisted checks remain fallible.
-
-New factual check/rewrite responses use `fact-review/v7-semantic-code-references`: models select supplied code-block `reference_id` values. The program attaches the exact immutable source text, path and line numbers. Checks judge factual meaning against all delivered originals; an earlier narrow citation range does not trigger model rewriting or rechecking. Supporting references from a successful factual check are attached by the program without another model call. Unknown references are rejected. Historical v3–v6 artifacts retain their original strict replay contracts and prompts.
-
-
-When a factual premise is unverifiable because a necessary original was omitted from a focused request, the checker requests only existing, not-fully-delivered frozen IDs from a program-defined inventory. This uses the same fixed-original request principle as final review. This source amendment is bound to the input, original final result, item and exact checker response. The existing bounded rewrite/recheck receives those complete originals, the unchanged prior checker/item and every cited byte; it may retain the original item when the added evidence supports it. Selected originals remain mandatory on the subsequent factual check, including focused delivery after actual overflow. Shared budgets and correction limits remain in force; no-source or unavailable evidence stays partial. Asking for a human decision does not by itself supply or invalidate the question's factual premise.
-
-For Python/Java production HEAD originals, a simple definition inventory also detects known callable names in a factual field when no complete definition is covered by the delivered code ranges. Only `non_factual` fields are excluded: evidence delivery is independent of the earlier model verdict. A name in an import, call or comment does not supply its implementation. This records a program evidence-gap issue without changing the raw model verdict and carries the known originals through the same source amendment, rewrite and recheck. Test/base definitions are excluded. Definition coverage does not establish a call path or semantic truth; other languages and unparseable originals retain the existing model check. Stored validation replays the same gap and source-request union.
-
-The evaluation result is schema 13 (`partitioned-review/v18-selected-perspectives-code-references`). Private artifacts preserve the plan, source hashes, full original model results, delivered ranges, factual check/rewrite records and actual usage. `fact-verification.json` contains the unchanged pre-check final result and all candidates; `partition.json` binds it to source and byte-upper-bound stage receipts. Truncated output and unbounded unknown usage stop the review. No `native_capacity_rejections` are recorded: a byte-upper-bound over-limit refusal (pre-send gate or adapter/provider context enforcement) is `input_limit_exceeded` with no retry, and only then does lossless splitting/replanning proceed; response usage is recorded post-send and over-budget usage fails closed as `usage_limit_exceeded`. Stored legacy native-capacity packets fail closed on replay. (Historical note, superseded: a fully received Beam native-capacity rejection once reserved one request plus the reported input/one-token output allowance; that path no longer exists. This exception never bypassed factual validation.) See [capacity accounting](docs/review-fact-verification.md#native-용량-거절과-사용량). Structural validation and regression tests establish these execution contracts; they do not establish semantic review quality. Older private evaluation artifacts retain their original versions and evidence.
-
-With this option disabled, existing `declared-v1`, `code-first-v2` and `perspectives-v1` behavior remains selected through `intent.pipeline`. Model profiles select the actual prepared serving environment separately from these pipeline versions.
-
-### Code-first development intent review and Tev1 planning (v2, explicit opt-in)
-
-```bash
-rtk proxy uv run --locked review-bot intent --input /path/to/private/fixed-B-input.json \
-  --output /path/to/private/code-first-001 --pipeline code-first-v2 \
-  --model-profile macbook-llamacpp --call-timeout-seconds 120
-```
-
-For the shared Worker, select `intent.pipeline: code-first-v2` in trusted operator configuration; retain the existing mode/profile/context-path settings. The default remains `declared-v1` and old configuration hashes are preserved. `--call-timeout-seconds` only exposes the existing per-call `ModelConfig` setting for both planning/review; omitted means the existing 60s default, not a change to the 900s task, context, token or admission limits.
-
-The implemented sequence is:
-
-```text
-Byte-upper-bound full-input admission → first-pass Tev1 plan + program validation
-→ complete-original group observation → bounded direct original recheck if needed
-→ code-based intent hypotheses → final assessment with optional PR/issue reference text
-```
-
-- **Whole input first:** if it fits, every complete prepared file is reviewed together. Tev1 receives the admission-bound fit, complete change list/diffs and path/size/version metadata; its full-fit schema and validator require one group covering every prepared path. An absent/unsupported planner or safely accounted planner failure cannot unnecessarily block a fitting joint review. If the whole input exceeds limits, a valid relationship-group plan is required; no silent per-file fallback or dropped/trimmed large file is allowed.
-- **Separate model roles:** explicit llama.cpp profiles supply a new planning client for their Tev model, using the same transport/admission and byte-upper-bound gate. Existing architecture and development intent mode selection and its 64-token metadata-only selector are unchanged. Planning is not `/v1/systemone`, never decides whether to trust a PR body, and never triggers a Tev replan loop. Ollama has no new planning client; fitting joint v2 review remains possible without one.
-- **Code first:** observations receive complete fixed base/head originals, full unified diffs and test source; reconstruction receives verified observations/relationships and their original source spans. Neither receives PR/issue purpose text. Final assessment can identify code defects with no body or a false body, but inferred purpose stays a hypothesis with counterevidence, alternatives and uncertainty, never a confirmed requirement.
-- **Relationships, not file-only verdicts:** discovered relations retain `unreviewed/consistent/conflict/insufficient_context`, their two endpoints and original support. At most one direct development intent review recheck supplies the relationship's originals together. Additional requests stay inside fixed `reviewed_paths`; already-delivered whole originals do not cause no-progress rereads. Unknown/excluded/out-of-scope information remains missing; no automatic repository exploration is implemented.
-- **Validated records:** models cannot generate new result IDs, Evidence, SHA/path/URL or publication fields. The program assigns `O/I/R/F/Q` IDs and constructs original quotes from validated `evidence_id/start_line/end_line`. `code_defect`, `conditional_risk`, `insufficient_context` and `explanation_mismatch` remain distinct. Linked relation findings require both endpoint citations; this does not guarantee semantic correctness or discovery of every relationship.
-- **Bounded work:** defaults are 131,072 input tokens and **131,072 accumulated task tokens**, 900 seconds, max 12 model calls including retries (no measurement calls exist), max 8 groups and at most one direct recheck. Calls/output-token capacity for final reconstruction/assessment are reserved; the original task deadline is checked at boundaries and can still expire. Profile input allowances already exclude output reserve and are not reduced twice. Failed validation stops subsequent stages and preserves completed evidence/actual usage.
-
-V2 results use `schema_version=2` and `review-b/code-first-v2` while fixed task inputs remain schema 1. `B/` stores `plan.json`, `observations.json`, `intents.json`, `relations.json` plus input/result/scope/usage/validation/comment files; the Worker also stores a v2 mode receipt. Old `goals.json` data is not reinterpreted as inferred purpose. V1/v2 and different planner profiles cannot reuse each other's result fingerprints.
-
-`scope.review_complete`, `review_sufficient` and `no_findings` distinguish execution, scoped judgement and absence of findings. Unresolved important relations or unavailable context yield `partial_review`, not a successful complete review. Only a `completed` validated result can pass the existing separate development intent review opt-in/publication freshness/fence gates. The standalone CLI never publishes. Normal App posting follows the explicit controls below.
-
-### Development intent review in the shared Worker (posting opt-in)
-
-Normal GitHub App requests use the shared TEV execution plan and schema 13 for both modes, regardless of the legacy standalone `intent.pipeline` name. TEV selects the global modes before PMD/CPD initialization. Completed results use the developer comment layouts; incomplete results publish only a status notice. [Repository review settings](docs/repository-review-settings.md) control review instructions and comment layouts without redeployment. Presentation changes reuse the stored original result with zero TEV/review generations; changed judgment instructions invalidate only that mode's review cache. Shared PR-purpose/source changes require a fresh common plan and may invalidate both modes.
-
-In the operator configuration, select `execution.available_modes: [intent]` (or `[architecture, intent]`) and `publish.mode: artifact_only`. Optional `intent.context_paths` is a default-empty list of explicit repository-relative **file** paths for related code/tests; host, traversal, duplicate and trusted-excluded paths are rejected. development intent review reads full regular UTF-8 Git blobs for changed/renamed paths and these related files at fixed comparison-base/head SHAs, not a checkout. Unrequested files are not part of development intent review completeness; absent, excluded or unsupported files remain in the scope, and overflow never reduces it.
-
-When development intent review is available, PR title/body and explicit same-repository references (`#12`, `owner/repo#12`, `https://github.com/owner/repo/issues/12`) are frozen **before selection**. Only the bound repository's issue endpoint is used; issue bodies are not recursively followed. The collector admits at most eight distinct references, 256 KiB per original text, 1 MiB total original text and ten seconds of issue-request time; individual PR/issue responses are capped at 512 KiB. No permissions are widened. Missing references, 403/404, limits and unavailable historical versions are explicit; 401/installation authorization loss aborts the shared run. Source bodies/versions, complete scoped files and missing states affect `context_digest`/`snapshot_id`. Retrieval-time-only changes do not change that material digest; the fixed input still records collection/as-of times and hashes its entire record.
-
-Selected architecture and development intent executors run sequentially in the existing SQLite task/lease. Architecture eligibility or empty PMD signals do not exclude development intent review. The normal App path uses TEV closed choices for the shared global mode selection; legacy local selectors do not bypass that decision. Standalone pipelines retain their explicitly selected adapters. Mode preparation/review/storage/publication failures preserve the other mode; common collection/authorization failures, PR close, worker stop, deadline or generation/lease loss abort all remaining work. Normal completed/`not_run` outcomes aggregate to `succeeded`; execution/publication failures aggregate to `failed`.
-
-Common `snapshot.json`/`selection.json`/`manifest.json` stay at the run root; architecture review filenames remain under `A/`, and development intent review stores its stage files under `B/`. Each mode has `receipt.json` (service v2, optional `a_result`/`b_result`, separate usage/delivery/publication); the shared manifest records mode input fingerprints and statuses. A completed core result/usage survives mode-local output failures as well as publication failures. Directories/files remain 0700/0600. SQLite run status is authoritative after external cancellation or lease loss: an interrupted manifest may remain `running`, because the lost owner must not write it.
-
-Publication configuration is independent of mode selection:
-
-| Field | Default / boundary |
-| --- | --- |
-| `publish.b_marker` | `<!-- review-bot:intent:v1 -->`; must be distinct from the architecture marker |
-| `publish.b_comments_enabled` | `false`; enabling it requires a separate user decision after evaluation |
-| `publish.mode` | `artifact_only` always makes no architecture and development intent comment writes; service `comment` alone does not enable development intent review |
-
-With development intent review posting disabled, its receipt says `not_attempted/b_comments_disabled` (or `artifact_only`) and private stage files/draft remain available. Even an explicitly enabled development intent review requires a completed validated result and known bot identity; unset profiles, incomplete/oversized inputs and invalid responses cannot publish a review judgment. When posting is enabled, a short status-only notice identifies the incomplete scope. Each mode creates or updates only its own single bot-owned marker comment. Foreign/other-bot ownership, repeated or ambiguous markers and marker collisions fail closed; no approval/request-changes is submitted. development intent review drafts escape untrusted HTML/markers and generate links only from validated evidence.
-
-Before and after writes, the publisher checks current PR head/target base, open/Draft policy, PR text/context and lease/generation; development intent review also rechecks the used same-repository issues' original contents/versions and missing states. A failed freshness check is not a current successful publication or reusable result. Common authorization loss stops remaining modes while retaining completed results and attempted publication identity. GitHub reads and writes are not atomic; post-write stale/unknown receipts do not imply the comment was never written. Issue-only changes do not enqueue work; sources are recollected at the next PR request.
-
-SQLite adds nullable `publication_receipts.input_fingerprint` non-destructively. Each mode's actual material, prompt/schema, execution/profile configuration and model identity determine its own reuse key; `published_fingerprint` retains its comment-body hash meaning. Only a successful matching individual receipt plus installation/fence and a fresh bot-owned comment/body recheck permits reuse. A whole-run failure or an architecture cache hit cannot hide development intent review's retry/result. Legacy rows remain readable through the legacy architecture path or safely miss the new cache; they are never assumed to prove development intent review success. No cleanup/retention policy is changed.
-
-### Implementation evidence and actual PR evaluation
-
-Signed real-Git/SQLite fixtures with mock HTTP/models verify per-mode creation and same-ID updates, reuse from partial failure, unsafe/stale comment blocking, issue changes and architecture-only/security regressions. They include code-first CLI/Worker/plan/citation/failure/cache paths, four signed PRs through two Workers, llama.cpp HTTP/admission and stale-generation suppression. Historical full regression at functional commit **`9616396`**: **2,946 passed in 74.12s**; exact commands/checkpoints are in `milestones.md`. Earlier 2,703/2,426/2,357/2,037 counts remain historical. Automated checks prove implementation/integration, not model quality, live automated publication, Ubuntu server reconfiguration or deployment. Separate [actual MacBook tests](#macbook-local-llamacpp-explicit-opt-in) now also complete validated code-first reviews with real Tev1/LFM2.5. The personal deployment example now enables development intent review posting; this configuration and historical mock/admission evidence do not prove that the current candidate was installed or published automatically.
-
-The read-only PR #36 input pins base `20f911fb4c73a9f0b016ba9876a5daa9e0772572` and head `f149d9a4dc04f37198e0c53025f479b211ea2b43`, with text collection separately dated. Historical Granite v1 ran goals only, then stopped at **215,531 > 92,160 bytes**. The unchanged fixed input was now tried through code-first v2/MacBook: whole-input **50,733 tokens**, Tev-proposed joint group **50,878**, over the Mac input allowance **28,672**. Exactly one Tev plan generation (1256 input/323 output tokens) and three free measurements occurred (measurement-era record, superseded: no measurement calls exist under the zero-measurement contract; the same refusal is now `input_limit_exceeded` from the byte-upper-bound gate); **zero code-review generations** were sent. It remains **`not_run/input_limit_exceeded`, not a completed PR review**. Whole base/head files and tests were not cut or omitted. Larger-model/Ubuntu validation remains separate; no target tests/build/hooks, external comment or automatic context increase occurred.
-
-The smaller real [PR #5](https://github.com/pureliture/openai-compatible-bridge/pull/5) subsequently completed the ordinary `code-first-v2` CLI with real MacBook Tev1/LFM2.5: **`completed/validated`, exit 0**. Both changed files' entire base/head contents total **16,077 bytes**; joint observation is **6,688 input tokens**, and the largest later request is **17,811**, below the unchanged **28,672** input allowance. One Tev plan plus three review generations used **40,105 input / 2,211 output tokens** cumulatively (measurement-era record included five generation-free measurements; superseded — no measurement calls exist under the current contract). No target code was run or comment posted.
-
-**This is execution/structural-evidence success, not semantic-quality approval.** Readback found one false-positive finding: the model describes the fix as a `code_defect` and asks to change the historical base version rather than identifying a remaining head defect. All 11 stored citation instances match the pinned originals, illustrating that valid citations do not guarantee a correct conclusion. The private draft is retained unchanged; automatic development intent review posting stays disabled, and PR #36 is still incomplete. Exact SHAs, command, usage and provenance are in `milestones.md`.
-
-**Code-first development intent review and first-pass Tev1 planning are implemented and actually exercised**, not still-unimplemented proposals. Automatic additional repository discovery, large-file internal splitting, general model-quality validation, Ubuntu operation and uncertain-ticket automatic recovery remain outside this delivery.
-
-## Local llama.cpp (explicit opt-in)
-
-Adapter modules identify the serving runtime: `ollama_local.py` implements local Ollama,
-`llama_cpp_local.py` implements self-hosted llama.cpp, and `llama_cpp_macbook.py`
-provides its MacBook role configuration. `openrouter_chat.py` and
-`openrouter_decisions.py` implement the OpenRouter cloud APIs.
-
-`me707-llamacpp` uses separate OpenAI-compatible servers and exact model IDs:
-
-| Role | Model ID | Required per-slot context | Explicit endpoint variable |
-| --- | --- | --- | --- |
-| Review | `bonsai2-27b` | 131,072 tokens | `ME707_BONSAI_BASE_URL` |
-| Existing System 1 mode selection | `tev1-4b-q8_0` | 131,072 tokens | `ME707_TEV1_BASE_URL` |
-| Separate code-first development intent review planning | `tev1-4b-q8_0` | 131,072 tokens | `ME707_TEV1_BASE_URL` |
-
-Endpoints must be uncredentialed HTTP `/v1` URLs. Loopback is allowed by default; remote hosts must be listed exactly in the operator-owned `LLAMA_CPP_ALLOWED_HOSTS` environment variable (comma-separated, no wildcards or URL paths). Set actual hostnames from the deployment's private connection context. The bot calls the model API directly; any private-network forwarding is configured by the operator. Proxy environment variables and redirects are not used. Neither the service nor CLI infers a node IP, downloads a model or falls back to Ollama. Keep model APIs on the approved private network; the webhook forwarding path is not model authentication.
-
-For example, prepare these environment references in the process environment (not a committed secret/config file):
-
-```bash
-export ME707_BONSAI_BASE_URL="http://<private-model-host>:11435/v1"
-export ME707_TEV1_BASE_URL="http://<private-model-host>:11437/v1"
-export LLAMA_CPP_ALLOWED_HOSTS="<private-model-host>"
-export REVIEW_BOT_MODEL_STATE_DIR=/home/review-bot/private-model-admission
-```
-
-The following is only a fragment of the existing operator configuration; it does not generate or activate a deployment:
-
-```yaml
-execution:
-  available_modes: [intent]
-  worker_concurrency: 2
-  selector_uses_model: true
-model:
-  profile: me707-llamacpp
-  max_concurrency: 2
-publish:
-  mode: artifact_only
-  b_comments_enabled: false
-```
-
-For a non-publishing fixed-input evaluation, explicitly select the profile:
-
-```bash
-rtk proxy uv run --locked review-bot intent --input /path/to/private/fixed-B-input.json \
-  --output /path/to/private/evaluation-llamacpp-001 --model-profile me707-llamacpp
-```
-
-Construction remains offline. Preparation verifies model identity, exactly two server generation slots, per-slot context and a chat template through `/v1/models` and `/props`, without a warmup generation. For me707 the slot count must be integer `2`; one, three or more, missing, boolean, float and string values are rejected before admission or generation calls. The MacBook profile separately requires integer `1`. Clients recheck this on each completion. Before generation, the byte-upper-bound gate (`admission_bytes()` exact wire bytes plus framing reserve, tokens<=bytes proof) admits the intact request; `/v1/chat/completions` uses strict JSON schema output and checks response usage post-send. No `/apply-template`, `/tokenize`, or other measurement call exists. Unsupported admission/usage, truncation, bad identity/usage/JSON or exhausted budgets fail closed. A 16 MiB transport cap is not a token estimate. V1's per-request 131,072-token input/total limits and v2's 131,072-token input/**accumulated task** limits are not automatically enlarged by a 256k model.
-
-Native structured output uses the OpenAI `response_format.json_schema` envelope with `name`, `strict` and the unchanged request `schema`. The earlier flat `response_format.schema` did not enforce the closed-choice schema on the installed me707 server. The common transport now uses the same supported envelope as the MacBook profile; original response-field, citation, usage and application validation remain in place.
-
-On 2026-10-17 the user confirmed two slots for each me707 server, superseding the earlier one-slot proposal. Native inspection identified the existing `bonsai-llama.service` and `tev1-llama.service` user services. Bonsai was running with two slots; Tev1 was inactive with an existing two-slot configuration and was started through that manager. Current native verification and fixed-input review results are recorded in [milestones](milestones.md). Historical weight descriptions and model aliases alone do not attest the currently loaded weights. A successful sequential review does not establish concurrent queue/disconnect behavior, restart recovery, Ubuntu bot deployment or external publication.
-
-### Server-side generation capacity
-
-Keep the existing SQLite review queue and shared HTTP admission. Configure the **existing** llama.cpp launch commands with two slots and 128K context per slot. The user approved GPU KV placement and Q4_0 K/V caches for both models on 2026-10-18:
-
-| Server | Generation flag | Total context flag | Expected `/props` |
-| --- | --- | --- | --- |
-| Bonsai2 | `--parallel 2` | `--ctx-size 262144` | `total_slots=2`, per-slot `n_ctx=131072` |
-| Tev1 | `--parallel 2` | `--ctx-size 262144` | `total_slots=2`, per-slot `n_ctx=131072` |
-
-These are capacity settings, **not complete launch commands**. Replace conflicting command/environment values rather than appending duplicates. llama.cpp's context flag is the total across slots. Both servers use `--kv-offload --cache-type-k q4_0 --cache-type-v q4_0`; remove Bonsai's old `--no-kv-offload`. Weight quantization is separate: Bonsai retains PQ2_0 weights and Tev1 retains Q8_0 weights. Preserve model files, the existing Bonsai mean-centering bias and attention-rotation setting, aliases, ports, private-network binding and authentication. The MacBook 32k, one-slot launch commands below are separate.
-
-Bonsai reserves 32,678 output tokens, leaving a 98,394-token byte-upper-bound input budget (plus the 8,192-token framing reserve; operator config, no redeploy). The application's existing task token and JSON limits still apply. Q4 KV support and memory calculations alone do not establish successful GPU allocation, generation throughput or unchanged Tev selection quality; read back the live configuration and measure those separately after applying it.
-
-With this configuration each server has two generation slots, so the server processes expose four slots combined. The bot's existing shared SQLite HTTP admission still limits its aggregate in-flight requests to at most two. Same-model requests can use that model's two slots; excess work cannot use another model's slots. The server can defer an excess request even while its HTTP connection is open. Client timeout does not prove that the server stopped computing or removed a queued request. These server slots do not bound other GPU applications; bot admission does not constrain independent non-bot clients.
-
-Apply and verify only when the node is reachable:
-
-1. Identify the actual owner/supervisor for both listening ports and the installed server version. Preserve existing launch settings privately. Historical systemd unit names are not proof of the current manager; do not start a second copy of a server.
-2. Pause new generation senders, including evaluation commands and non-bot clients, and confirm active **and deferred** work has drained. A health response or one idle-slot sample alone is insufficient. Do not interrupt someone else's active request to apply the flags.
-3. Back up both units and apply context/KV settings through the existing manager. Restart drained Tev first to release its larger Q8 KV allocation, then restart Bonsai with GPU KV. If either startup fails, restore the saved configuration through that manager. Do not kill arbitrary processes, recreate services or change network/authentication settings.
-4. Check both exact model IDs and `/props` values above. With the two explicit endpoint environment variables set, the existing verification API makes only metadata calls:
-
-   ```bash
-   rtk proxy uv run --locked python -c '
-   from review_bot.runtime.model_clients import build_review_client, build_selector_client
-   for factory in (build_review_client, build_selector_client):
-       factory("me707-llamacpp").verify()
-   print("model, two-slot, context and template checks passed")
-   '
-   ```
-
-   These client checks still share HTTP admission and can wait on unresolved tickets. An operator's direct read-only metadata inspection does not release those tickets; do not switch to a fresh admission DB to bypass them.
-
-5. For a separate capacity test, use bounded synthetic requests and actual slot/deferred-work telemetry to verify a maximum of two generations per server and waiting/resumption of excess work. Retain bot admission when testing bot callers. Use finite output/deadline limits and drain the test requests before resuming senders. Mock HTTP tests, `/health` and a sequential PR review alone do not establish concurrent behavior on the installed version.
-
-This does **not** implement automatic uncertain-ticket reconciliation, durable inference results or server-hang recovery. Existing `sent/uncertain` admission records remain intact and may still block new model calls. Neither the two-slot metadata check nor a service restart by itself authorizes clearing them.
-
-## MacBook local llama.cpp (explicit opt-in)
-
-`macbook-llamacpp` reuses the common review engine and llama.cpp transport with thin local adapters. It does not modify `me707-llamacpp` or Ollama, select an environment automatically, or fall back to Ubuntu when a local endpoint fails. Both endpoints must be loopback HTTP `/v1`; the model aliases and configured **32k test context** are exact, not claims about maximum training context.
-
-| Role | Required server alias | Endpoint variable | Configured context | Maximum output |
-| --- | --- | --- | --- | --- |
-| Review | `lfm2.5-2.6b-q8_0` | `MACBOOK_LFM_BASE_URL` | 32768 | 4096 tokens |
-| Existing mode selector | `tev1-0.8b-q8_0` | `MACBOOK_TEV1_BASE_URL` | 32768 | 64 tokens |
-| Separate code-first development intent review planning | `tev1-0.8b-q8_0` | `MACBOOK_TEV1_BASE_URL` | 32768 | 4096 tokens |
-
-For an explicit MacBook evaluation, `MACBOOK_REVIEW_MAX_OUTPUT_TOKENS=8192` gives the review role an 8,192-token output allowance and derives a 24,576-token input allowance inside the same 32K context. This setting is optional, preserves the default above, and does not change Tev1 or the production Bonsai profile. It is useful when a complete structured response exceeds 4,096 tokens; it does not authorize shortening source or accepting truncated responses.
-
-`macbook-granite-llamacpp` explicitly selects a prepared `granite4.2` review server through `MACBOOK_GRANITE_BASE_URL`. It requires one generation slot and a 65,536-token context, reserves 16,384 output tokens and admits at most 49,152 input tokens. It uses the same local Tev1 endpoint and private admission group as above. Set `model.max_output_bytes: 65536` for structured evaluations; byte and token ceilings are separate. The LFM output override does not apply to Granite. Neither local profile automatically switches models when a request fails.
-
-The local recovery evaluation uses an existing Granite4.2 8.8B Q4_K_M GGUF and a server reasoning budget of 2,048 tokens. The server's reasoning budget consumes part of its output allowance. Local results establish behavior for those actual weights and settings; they do not establish Bonsai quality or Linux analyzer isolation.
-
-Keep model files in a private ignored directory. This session prepared the author's [LFM2.5 Q8_0 GGUF](https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF) and the unchanged Q8_0 model layer from official [Ollama `tev1:0.8b`](https://ollama.com/library/tev1); no Ollama server, converted replacement or external inference provider is used. Exact revisions, file sizes and verified SHA-256 hashes are in `milestones.md`.
-
-Use a build that supports this Tev1 GGUF's decision metadata: official ARM64 **b11447** (`da263e727`) was actually verified. Homebrew 0.6.0/build 11429 rejected it as `unsupported decision model type: pplx-decider`. Installing that older package alone is not sufficient. The pinned [official release](https://github.com/ggml-org/llama.cpp/releases/tag/b11447) was prepared locally under the ignored runtime directory; these binaries/models are not included in Git.
-
-From this feature worktree, run one server per terminal using that verified binary and prepared files (do not start a second copy on an occupied port):
-
-```bash
-rtk proxy .review-bot-state/macbook-runtime/runtime-b11447/llama-b11447/llama-server \
-  --model .review-bot-state/macbook-runtime/models/LFM2.5-2.6B-Q8_0.gguf \
-  --alias lfm2.5-2.6b-q8_0 --host 127.0.0.1 --port 18135 \
-  --parallel 1 --ctx-size 32768 -ngl 99 --slots --metrics --no-webui \
-  --no-context-shift --reasoning-format auto --reasoning-budget 0
-```
-
-```bash
-rtk proxy .review-bot-state/macbook-runtime/runtime-b11447/llama-b11447/llama-server \
-  --model .review-bot-state/macbook-runtime/models/Tev1-0.8B-Q8_0.gguf \
-  --alias tev1-0.8b-q8_0 --host 127.0.0.1 --port 18137 \
-  --parallel 1 --ctx-size 32768 -ngl 99 --slots --metrics --no-webui \
-  --no-context-shift --reasoning-format auto --reasoning-budget 0
-```
-
-The LFM template prefixes `<think>` even with `enable_thinking=false`. The supported server reasoning flags above are necessary: `--reasoning-format none` produced HTTP 400 with structured-output grammar in the live test. The MacBook adapter uses the same request envelope for admission and generation with the server's `response_format.json_schema` envelope, and retains strict usage/output validation. Input is limited to **28672 tokens**, reserving 4096 output tokens; the 16 MiB transport guard is not a token estimate, and oversized input is rejected rather than trimmed.
-
-In the bot/test shell:
-
-```bash
-export MACBOOK_LFM_BASE_URL=http://127.0.0.1:18135/v1
-export MACBOOK_TEV1_BASE_URL=http://127.0.0.1:18137/v1
-export REVIEW_BOT_MACBOOK_MODEL_STATE_DIR="$PWD/.review-bot-state/macbook-runtime/admission"
-rtk proxy uv run --locked review-bot intent --input /path/to/fixed-input.json \
-  --output "$PWD/.review-bot-state/macbook-runtime/evaluation-new" --model-profile macbook-llamacpp \
-  --pipeline code-first-v2 --call-timeout-seconds 120
-```
-
-Use a fresh output directory for each evaluation. Service/review commands use the same explicit profile through `model.profile` or `--model-profile`. For development intent only local operation keep `execution.available_modes: [intent]`; optional architecture review still requires its existing Linux/rootless analysis environment. `intent` directly chooses development intent review and does not call the architecture and development intent mode selector. Explicit code-first v2 can call the **separate first-pass Tev1 planning client**, not the metadata-only selector or `/v1/systemone`. Omitting `--pipeline` keeps v1.
-
-Both local roles share their own private SQLite admission group; absent an override, its directory is the current user's `.local/state/github-review-bot/macbook-model-admission`. The production default/explicit `REVIEW_BOT_MODEL_STATE_DIR` cannot be reused. Existing `model.max_concurrency: 1|2` applies (default 1), with direct-client defaults bounded at 2; server parallel 1 additionally serializes same-model generation. Separate local endpoints/state/results prevent profile/cache mixing, not permission to bypass unresolved tickets. The conservative `sent/uncertain` rules remain unchanged.
-
-### Actual local verification, not review quality
-
-- Real production-factory calls verified both aliases/context/one-slot contracts, byte-upper-bound admission and matching generation usage (measurement-era "native template/tokenizer" wording superseded; no measurement calls exist). A three-request workload measured participating HTTP/SQLite peak **2**, generation **1 per server / 2 combined**; the third request waited until an earlier response completed, then all three succeeded.
-- Closing an actual streaming connection while another LFM request was deferred left the server bound at **1**, and the waiting request completed. This direct server component test did **not** create/reconcile uncertain app tickets. Both servers and the existing admission DB returned to idle/empty; no server restart or manual ticket clearing was used to make the workload pass.
-- The earlier v1 run failed for `duplicate_result_id` at **2508/1490 tokens**. That failure is retained as history. V1 generation now uses distinct entity namespaces and valid reference choices while keeping strict duplicate/evidence checks; a new actual v1 CLI run completes **`completed/validated`, 2964/1516 tokens**.
-- Actual **code-first v2** finishes **`completed/validated`, exit 0** for both a body-absent and an incorrect-body multi-file fixture. Each uses one validated Tev plan plus three LFM review generations (measurement-era record included five free native measurements; superseded — no measurement calls exist under the current contract). The ordinary unwrapped CLI succeeds with **7117 input/2455 output tokens**; the wrong-body run uses **7240/2396**. Both preserve a grounded code defect and original relationship citations, non-mock profiles, complete usage, private files and `artifact_only/not_attempted` publication. The source/tests were not executed. Earlier failed/partial runs are retained; neither IDs nor evidence validation was weakened to make a result pass.
-- The real PR #36 still exceeds the local 32k context as detailed above. Small-model general review quality, Ubuntu capacity/deployment and automatic uncertain-ticket recovery remain unverified or incomplete. Test servers were confirmed idle and only the session-owned processes stopped; the prepared private binaries/models/results remain available. No permanent daemon, external comment, merge or push was performed.
-
-## Local Ollama (explicit opt-in)
-
-The local profile `ollama-local-128k` uses two separate models:
-- **Review:** `granite4.2:128k` through `/api/chat`, with JSON schema output and `num_ctx=131072`.
-- **System 1:** `tev1:0.8b-128k` through `/v1/systemone`. Tev is a decision model, not a chat model; its saved `num_ctx` is verified before use.
-
-With Ollama running and the original models already downloaded, create the 128k tags without overwriting the originals:
-```bash
-curl --noproxy '*' --fail --silent --show-error http://127.0.0.1:11434/api/create \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"granite4.2:128k","from":"granite4.2:latest","parameters":{"num_ctx":131072},"stream":false}'
-curl --noproxy '*' --fail --silent --show-error http://127.0.0.1:11434/api/create \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"tev1:0.8b-128k","from":"tev1:0.8b","parameters":{"num_ctx":131072},"stream":false}'
-```
-
-Run a local Git/PMD review with Granite (no GitHub publication):
-```bash
-uv run --locked review-bot review --repo /path/to/java-repo --base main --head HEAD \
-  --model-profile ollama-local-128k --format json
-```
-Without an explicit profile, the existing offline result remains `not_run/model_profile_unset` and makes no model calls. The CLI also accepts `--config` with `model.profile`; the command-line profile takes precedence. Ambient `OLLAMA_HOST` and proxy variables do not redirect model traffic: adapters only accept loopback HTTP origins and reject cloud models.
-
-For the existing `WorkerLoop`, add these fields to a valid operator configuration:
-```yaml
-model:
-  profile: ollama-local-128k
-  call_timeout_seconds: 60
-  max_attempts: 1
-execution:
-  selector_uses_model: true
-```
-The worker composes the two clients separately and preserves explicitly injected clients. `run_once()`/`run_forever()` verify metadata, load Granite **without generating tokens**, then warm Tev before claiming work. This order avoids the observed first-Granite-load eviction of Tev. If claiming manually, call `worker.prepare_models()` **before** claiming a job. Preparation errors leave jobs unclaimed. The `worker` service command supplies the repository, rootless analyzer, job-store and GitHub composition described above; model preparation remains owned by `WorkerLoop`.
-
-Tev routing is on the worker PR-metadata path, not the local Git-review CLI. Definite documentation/assets and known source changes retain their existing local architecture classification, independently retaining available development intent review; only uncertain paths reach Tev. The 0.75-second selection deadline and conservative available-mode fallback retain architecture-only behavior. First load, long inputs, inactivity or memory eviction can exceed that deadline; warmup is not a latency guarantee.
-
-### Input and verification boundaries
-
-- Both tags use a 131,072-token context, but this is **not** a full-128k input/quality benchmark.
-- Review input is kept intact: the profile has a conservative **90 KiB serialized-input cap** and a 4,096-output-token reserve. Larger inputs return `not_run` without summarization, splitting or truncation. No preflight or measurement call exists; the byte-upper-bound gate bounds the input and response usage is recorded post-send.
-- `/v1/systemone` limits the JSON body to **64 KiB** independently of the model context. The existing selector metadata limit still applies; oversized or invalid requests retain architecture review.
-- The 128k Granite model used **25.874 GiB** with the original cache settings and **16.064 GiB** with `q8_0` KV cache and Flash Attention. Tev used about **1 GiB**; loading Granite first allowed both 128k models to remain resident on this 32 GiB Mac. Check `ollama ps` and memory pressure before concurrent workloads. A five-minute keep-alive does not prevent eviction.
-- Local calls were verified on macOS with Ollama 0.40.1. Ubuntu, full-size inputs, review quality and live GitHub publication require separate validation. Default pytest uses mock HTTP boundaries, not a live Ollama server.
-
-On macOS, these **global, user-approved** cache settings were used for the verification:
-```bash
-launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0
-launchctl setenv OLLAMA_FLASH_ATTENTION 1
-```
-Quit and reopen the existing Ollama app after setting them. They affect all models and reduce KV-cache precision, not model weights or the configured context. These launch-environment values apply to the current login session; reapply after a new login unless your startup environment supplies them. No automatic startup hook is installed by this project.
-
-### OpenRouter validation mapping (Beam Cloud retired)
-
-`model.profile: macbook-beam-cloud-tev4b` is retired. Validation runs on OpenRouter; production keeps the 128K envelope below. No `beam:cloud` bridge, paid measurement, measurement memo, `think` levels, or native-capacity reservation exists. (Historical Beam bullets superseded by the zero-measurement contract; per-slot context numbers retained as history only.)
-
-| Role | Validation (OpenRouter) | Production | 128K envelope |
-| --- | --- | --- | --- |
-| Review llm | `google/gemma-4-31b-it:free` (`src/review_bot/adapters/openrouter_chat.py`, `POST /api/v1/chat/completions`) | `bonsai2-27b` (128K) | input 98,394 + output 32,678 |
-| decision1 | `perplexity/pplx-decider-flash-v1.2` (`src/review_bot/adapters/openrouter_decisions.py`, `POST /api/alpha/decisions`) | `tev1:4b` (128K) | input 126,976 + output 4,096 |
-
-- Shared fail-closed byte-upper-bound gate (`src/review_bot/adapters/byte_budget.py`, `FRAMING_RESERVE_TOKENS=8192`, tokens<=bytes proof, no estimation). `ModelExecutionBudget.measure()` admits locally with no client calls; clients expose pure `admission_bytes()` (exact wire bytes + framing reserve) or `None`. A bound over the limit is `input_limit_exceeded` → split/replan; an adapter over-budget refusal is `input_limit_exceeded` with no retry. Response usage is recorded post-send; over-budget usage fails closed as `usage_limit_exceeded`. Stored legacy native-capacity packets fail closed on replay.
-- Budgets are operator config, no redeploy: `ModelConfig` fields `review_input_tokens=98394`, `review_output_tokens=32678`, `decision_input_tokens=126976`, `decision_output_tokens=4096`, `framing_reserve_tokens=8192`, `max_transport_bytes=16777216`, `require_token_count=False` (retired). Model IDs via env (`OPENROUTER_REVIEW_MODEL`, `OPENROUTER_DECISION_MODEL`, `OPENROUTER_API_KEY`).
-
-These are implementation and configuration contracts. The current commit's live PR, semantic quality and actual App publication evidence remain separate from synthetic adapter checks.
+| 문서 | 내용 |
+|---|---|
+| [운영·설정·실행 참고](docs/runtime-reference.md) | 기존 README의 세부 설정, 실행 명령, 모델 프로필, 과거 실행 기록 |
+| [서비스와 컨테이너 운영](docs/intent-api-deployment.md) | API와 서비스 실행·배포 구성 |
+| [저장소별 리뷰 지시와 댓글 양식](docs/repository-review-settings.md) | 배포 없이 변경하는 팀별 지시와 표시 양식 |
+| [사실 확인과 재작성](docs/review-fact-verification.md) | 사실 대조·원문 전달·정정 범위 |
+| [독립적인 개발 의도 리뷰](docs/intent-review-single-run.md) | 개별 평가 파이프라인의 실행 계약 |
+| [검증 이력](milestones.md) | 소스 버전별 구현·검증 기록 |
