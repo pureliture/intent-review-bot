@@ -1189,7 +1189,7 @@ def test_oversized_original_requires_direct_whole_claim_recheck_after_complete_d
 
 @pytest.mark.parametrize("limited_stage", ["fact_check", "fact_rewrite"])
 @pytest.mark.parametrize("known_usage", [True, False])
-def test_known_native_batch_output_limit_splits_items_after_bounded_recovery_only(limited_stage, known_usage):
+def test_known_native_batch_output_limit_splits_items_after_proactive_bound(limited_stage, known_usage):
     from review_bot.application.architecture_review import ModelOutputLimitError
     failing = {"perspectives:0", "perspectives:1"}
     corrected = "Corrected complete factual premise."
@@ -1228,12 +1228,12 @@ def test_known_native_batch_output_limit_splits_items_after_bounded_recovery_onl
         and len(json.loads(request.user_content)["items"]) == root_size]
     if known_usage:
         assert result.status == "completed", result.reason
-        assert len(root_calls) == 2 and root_calls[1].reasoning_budget_tokens is not None
+        assert len(root_calls) == 1 and root_calls[0].reasoning_budget_tokens == 24486
         assert call["split"] == "items" and call["split_cause"] == "known_output_limit"
         assert len(call["children"]) == 2 and all("response" in child for child in call["children"])
         assert result.usage["usage_complete"]
-        assert len(result.partition["rejected_model_outputs"]) == 2
-        assert len(result.partition["output_recoveries"]) == 1
+        assert len(result.partition["rejected_model_outputs"]) == 1
+        assert not result.partition["output_recoveries"]
         assert all(record["output"]["content"] == '{"unfinished":' for record in result.partition["rejected_model_outputs"])
         changed = deepcopy(result)
         changed_call = changed.partition["fact_verification"]["items"][0 if limited_stage == "fact_check" else 1]["attempts"][0]["check" if limited_stage == "fact_check" else "rewrite"]
@@ -1711,7 +1711,7 @@ def _v4_fact_packet():
 def test_v4_exact_quote_output_and_original_union_are_explicit_without_legacy_q_output():
     head, final, row = _v4_fact_packet()
     payload, schema, refs, spans = facts.request_spec("fact_check", [row], final, [head], {}, kind="complete_originals")
-    assert refs.protocol_version == facts.VERSION == "fact-review/v4-exact-source-quotes"
+    assert refs.protocol_version == facts.VERSION == "fact-review/v5-line-boundary-support"
     assert refs.originals == {head.evidence_id: head}
     assert payload["items"][0]["original_item"] == row["item"]
     support = payload["items"][0]["original_support_quotes"]
@@ -1818,3 +1818,53 @@ def test_v3_q_schema_and_decode_stay_strict_explicit_legacy_only():
         facts.decode_citations([{"source_id": head.evidence_id, "quote": head.text}], refs)
     assert facts.prompt_for("fact_check", facts.LEGACY_VERSION) == facts.LEGACY_CHECK_PROMPT
     assert facts.prompt_for("fact_rewrite", facts.LEGACY_VERSION) == facts.LEGACY_REWRITE_PROMPT
+
+
+@pytest.mark.parametrize("prefix,suffix,allowed", [
+    ("\n", "\n\n\n", True), ("\r\n", "\r\n", True),
+    ("", "", True), (" ", "", False), ("\n ", "", False),
+    ("", "\n ", False), ("extra = 0\n", "", False),
+])
+def test_v5_binding_exempts_only_boundary_cr_lf_and_preserves_exact_quotes(prefix, suffix, allowed):
+    from review_bot.application.source_partition import SourceOriginal, make_span
+    body = "value = 1"
+    original = SourceOriginal("S-boundary", prefix + body + suffix, "source", "src/value.py", "head", "a" * 40)
+    own = make_span(original, len(prefix.encode()), len((prefix + body).encode()), "fixture")
+    witness = make_span(original, 0, len(original.raw), "fixture")
+    cite = lambda span: {k: getattr(span, k) for k in ("evidence_id", "sha", "path", "version",
+        "start_byte", "end_byte", "begin_line", "end_line")} | {"quote": span.text}
+    row = {"id": "findings:0", "kind": "findings",
+        "item": {"statement": "The value is one.", "reasoning": "", "failure_condition": "", "citations": [cite(own)]}}
+    assessments = {"statement": {"state": "supported", "reason": "Exact support.",
+        "citations": [{"source_id": original.evidence_id, "quote": original.text}]}}
+    unchanged = deepcopy((row, assessments))
+    issues = facts.citation_binding_issues(row, assessments, [original], [cite(witness)])
+    assert bool(issues) is not allowed
+    assert (row, assessments) == unchanged
+    legacy_issues = facts.citation_binding_issues(row, assessments, [original], [cite(witness)],
+        protocol_version=facts.QUOTE_VERSION)
+    assert bool(legacy_issues) is bool(prefix or suffix)
+
+
+def test_fact_reasoning_is_bounded_before_first_generation_without_extra_calls():
+    review = PartitionModelClient()
+    review.profile = replace(review.profile, max_output_tokens=32678)
+    review.supports_bounded_reasoning = True
+    result = run_partition_review(make_task(), "intent", review, PartitionModelClient(), limits=limits())
+    assert result.status == "completed", result.reason
+    requests = [r for r in review.requests if json.loads(r.user_content)["stage"] == "fact_check"]
+    assert len(requests) == 1 and requests[0].reasoning_budget_tokens == 24486
+    assert requests[0].max_output_tokens == 32678
+    assert not result.partition["output_recoveries"] and not result.partition["rejected_model_outputs"]
+    assert result.usage["token_measurements"] == 0
+    validate_partition_result(result, make_task())
+
+
+def test_v5_prompts_recheck_conditions_and_keep_historical_v4_prompt_exact():
+    assert "actual predicate" in facts.CHECK_PROMPT
+    assert "constant/collection definition" in facts.CHECK_PROMPT
+    assert "previous checker labelled supported" in facts.REWRITE_PROMPT
+    assert "not only correction_citations" in facts.REWRITE_PROMPT
+    assert facts.prompt_for("fact_check", facts.QUOTE_VERSION) == facts.V4_CHECK_PROMPT
+    assert facts.prompt_for("fact_rewrite", facts.QUOTE_VERSION) == facts.V4_REWRITE_PROMPT
+    assert facts.CHECK_PROMPT.startswith(facts.V4_CHECK_PROMPT)

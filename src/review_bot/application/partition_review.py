@@ -716,7 +716,10 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         return ModelRequest(1, current.model, prompt,
             json.dumps({"stage": stage, "mode": mode, "language": language, **payload},
                 ensure_ascii=False, separators=(",", ":"), allow_nan=False),
-            current.timeout_seconds, output, schema)
+            current.timeout_seconds, output, schema,
+            reasoning_budget_tokens=(output - OUTPUT_RECOVERY_FINAL_RESERVE
+                if stage in ("fact_check", "fact_rewrite") and output > OUTPUT_RECOVERY_FINAL_RESERVE
+                and getattr(review_client, "supports_bounded_reasoning", False) is True else None))
 
     def choice_request(stage, state, options, question):
         return ModelRequest(1, planner.model, choices.SYSTEM,

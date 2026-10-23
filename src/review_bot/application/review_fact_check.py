@@ -18,7 +18,9 @@ from review_bot.application.source_partition import PartitionError, make_span
 from review_bot.application.source_citations import citation_spans, citation_catalog, source_blocks
 
 LEGACY_VERSION = "fact-review/v3-capacity-batches"
-VERSION = "fact-review/v4-exact-source-quotes"
+QUOTE_VERSION = "fact-review/v4-exact-source-quotes"
+VERSION = "fact-review/v5-line-boundary-support"
+SUPPORTED_VERSIONS = (VERSION, QUOTE_VERSION, LEGACY_VERSION)
 PMD_REFERENCE = "https://github.com/pmd/pmd/blob/pmd_releases/7.3.0/pmd-java/src/main/java/net/sourceforge/pmd/lang/java/metrics/JavaMetrics.java"
 METRICS = {
     "TCC": ("cohesion", "Tight Class Cohesion: related method pairs sharing direct attribute access. Low TCC means low cohesion (응집도), and does not establish low coupling (결합도)."),
@@ -132,28 +134,53 @@ not invent a route or silently remove the disputed assertion to obtain approval.
 
 
 QUOTE_OUTPUT_CONTRACT = """Citation output is exactly {source_id, quote}: source_id is the supplied original's evidence_id, and quote is nonempty verbatim source text. Preserve every character, whitespace and newline; never normalize, paraphrase, trim, add ellipses, or invent quote text. The quote must occur exactly once in that entire frozen original and be fully covered by the exact source ranges delivered in THIS request. If a short quote repeats, choose sufficient directly relevant verbatim context to make it unique. Select only actually delivered originals. Input Q reference_ids identify input catalog/block ranges only and must never be returned. Output no reference_id, offsets, path, line numbers or other citation fields. source_requests continues to use evidence_id from fixed_original_inventory; a missing range is not evidence of repository absence. Exact matching and delivery prove quotation identity, not semantic support for the claim."""
-CHECK_PROMPT = LEGACY_CHECK_PROMPT.replace(
+V4_CHECK_PROMPT = LEGACY_CHECK_PROMPT.replace(
     "Select exact source reference IDs; never invent sources, quotes or offsets.",
     "Select exact source quotations; never invent sources, quotes or offsets.").replace(
     "For citations[].reference_id, copy an allowed reference_id from citation_catalog exactly; never substitute a source-level evidence_id (including S-prefixed IDs), even for whole-file or test-presence claims. The evidence_id namespace is used for source_requests from fixed_original_inventory, not for citations.",
     QUOTE_OUTPUT_CONTRACT)
-REWRITE_PROMPT = LEGACY_REWRITE_PROMPT.replace("Select supplied reference IDs only.",
+V4_REWRITE_PROMPT = LEGACY_REWRITE_PROMPT.replace("Select supplied reference IDs only.",
     "Select exact supplied source quotations only.") + "\n" + QUOTE_OUTPUT_CONTRACT + "\n"
 
 
+CHECK_PROMPT = V4_CHECK_PROMPT + """
+For a conditional claim, compare its exact accepted/rejected value sets with the
+actual predicate and every referenced constant/collection definition. A claim
+about all values except one is not supported by a guard accepting multiple values.
+State a concrete counterexample when false. For own-citation binding only, extra
+leading/trailing CR/LF characters add no source facts: ignore only those boundary
+line breaks for range containment, retaining the complete exact quotation. Spaces,
+indentation, interior gaps and additional source code are never exempt. Minimality
+and preservation claims need relevant base/head or diff evidence in own citations.
+"""
+REWRITE_PROMPT = V4_REWRITE_PROMPT + """
+Independently re-evaluate every retained literal clause, including clauses the
+previous checker labelled supported. Prior assessments can miss a false condition.
+Check the exact predicate and all referenced constant/collection definitions.
+Repair newly identified false clauses with explicit correction reasons and source
+evidence; do not repair only citations while retaining an incorrect condition.
+When retaining minimality or preservation claims, carry the relevant base/head or
+diff evidence in replacement.citations, not only correction_citations. Keep all
+original source bytes and original items in the audit record.
+"""
+
+
 def prompt_for(stage, protocol_version=VERSION):
-    if protocol_version not in (VERSION, LEGACY_VERSION):
+    if protocol_version not in SUPPORTED_VERSIONS:
         raise PartitionError("fact_protocol_version_unknown")
     if stage not in ("fact_check", "fact_rewrite"):
         raise PartitionError("fact_protocol_stage_unknown")
-    return ((CHECK_PROMPT if stage == "fact_check" else REWRITE_PROMPT) if protocol_version == VERSION else
-        (LEGACY_CHECK_PROMPT if stage == "fact_check" else LEGACY_REWRITE_PROMPT))
+    if protocol_version == LEGACY_VERSION:
+        return LEGACY_CHECK_PROMPT if stage == "fact_check" else LEGACY_REWRITE_PROMPT
+    if protocol_version == QUOTE_VERSION:
+        return V4_CHECK_PROMPT if stage == "fact_check" else V4_REWRITE_PROMPT
+    return CHECK_PROMPT if stage == "fact_check" else REWRITE_PROMPT
 
 
 class CitationContext(dict):
     """Request-local decoding authority; no process-global original inventory."""
     def __init__(self, refs, originals, delivered_spans, protocol_version=VERSION):
-        if protocol_version not in (VERSION, LEGACY_VERSION):
+        if protocol_version not in SUPPORTED_VERSIONS:
             raise PartitionError("fact_protocol_version_unknown")
         super().__init__(refs)
         self.originals = {original.evidence_id: original for original in
@@ -178,13 +205,13 @@ def merge_reference_contexts(contexts):
         for span in getattr(context, "delivered_spans", ()):
             spans[(span.evidence_id, span.start_byte, span.end_byte)] = span
         refs.update(context)
-    if version == VERSION and not originals:
+    if version != LEGACY_VERSION and not originals:
         raise PartitionError("fact_reference_context_missing")
     return CitationContext(refs, originals.values(), spans.values(), version)
 
 
 def _quote_protocol(refs):
-    return getattr(refs, "protocol_version", LEGACY_VERSION) == VERSION
+    return getattr(refs, "protocol_version", LEGACY_VERSION) != LEGACY_VERSION
 
 
 def _quote_object_schema(source_ids):
@@ -267,7 +294,7 @@ def quote_spans(value, originals):
 
 
 def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version=VERSION):
-    if protocol_version not in (VERSION, LEGACY_VERSION):
+    if protocol_version not in SUPPORTED_VERSIONS:
         raise PartitionError("fact_protocol_version_unknown")
     by_id = {o.evidence_id: o for o in originals}
     # Every nested quote survives. Summary/questions use all accepted evidence.
@@ -324,6 +351,10 @@ def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version
             "For supported, select supporting checker references wholly contained in the ORIGINAL item's citation range union for the same evidence_id. If your supporting references extend outside that union, use unverifiable so the existing rewrite can correct the item's citation binding. "
             "Your own correct checker citations do not silently repair the unchanged original_item.citations or justify supported for that binding gap. Recheck the actual replacement citations after rewrite. "
             "This binding requirement does not apply to empty or non_factual fields; a summary without its own citations retains its existing source-check treatment. Preserve original fields, items, citation sets and all audit responses.")
+    if protocol_version == VERSION and "citation_grounding_rule" in payload["canonical_facts"]:
+        payload["canonical_facts"]["citation_grounding_rule"] += (
+            " For binding containment only, exclude leading/trailing CR/LF bytes from the checker support range. "
+            "Keep exact quotes unchanged; spaces, indentation, interior gaps and added code are never exempt.")
     if any(row["kind"] == "perspectives" for row in rows):
         from review_bot.domain.intent_perspectives import CATALOG_VERSION, PERSPECTIVES
 
@@ -340,7 +371,7 @@ def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version
                 "correction": "Use the existing complete-item correction when a scope premise is unsupported. Preserve the original item and initial TEV choices in the audit trail, keep perspective_id, and select any allowed verdict justified by the frozen sources.",
             },
         }
-    if protocol_version == VERSION:
+    if protocol_version != LEGACY_VERSION:
         payload["citation_output_contract"] = QUOTE_OUTPUT_CONTRACT
     return payload, refs, spans
 
@@ -392,7 +423,7 @@ def request_spec(stage, rows, final, originals, meta, *, kind, extra=None, range
     inventory = unread_inventory(originals, spans)
     payload["fixed_original_inventory"] = inventory
     refs = CitationContext(refs, originals, spans, protocol_version)
-    if protocol_version == VERSION:
+    if protocol_version != LEGACY_VERSION:
         by_id = {o.evidence_id: o for o in originals}
         payload["citation_sources"] = [{"source_id": key, "path": by_id[key].path,
             "version": by_id[key].version, "sha": by_id[key].sha, "source_hash": by_id[key].digest,
@@ -791,11 +822,11 @@ def original_support_reference_ids(row, refs):
         for start, end in union.get(span.evidence_id, []))]
 
 
-def citation_binding_issues(row, assessments, originals, cited_evidence):
+def citation_binding_issues(row, assessments, originals, cited_evidence, *, protocol_version=VERSION):
     """Conservative binding guard, not a semantic falsehood determination.
 
-    A correct checker may choose a broader useful context than the item cites.
-    That still requires explicit re-review; raw assessments and items stay intact.
+    Added source context requires explicit re-review. The current protocol exempts
+    only boundary CR/LF; all raw assessments, quotations and items stay intact.
     Containment alone never proves that the cited bytes entail the prose.
     """
     union = original_citation_union(row)
@@ -818,7 +849,15 @@ def citation_binding_issues(row, assessments, originals, cited_evidence):
                 cite = references.get(reference.get("reference_id"))
             if cite is None:
                 raise PartitionError("fact_check_support_evidence_missing")
-            if not any(start <= cite["start_byte"] < cite["end_byte"] <= end
+            support_start, support_end = cite["start_byte"], cite["end_byte"]
+            if protocol_version == VERSION:
+                # Retain exact quotes; only boundary CR/LF is exempt from containment.
+                raw = by_id[cite["evidence_id"]].raw
+                while support_start < support_end and raw[support_start] in (10, 13):
+                    support_start += 1
+                while support_end > support_start and raw[support_end - 1] in (10, 13):
+                    support_end -= 1
+            if not any(start <= support_start < support_end <= end
                     for start, end in union.get(cite["evidence_id"], [])):
                 outside.append({key: cite[key] for key in ("evidence_id", "start_byte", "end_byte")})
         if outside:
@@ -898,10 +937,10 @@ def callable_delivery_issues(row, assessments, originals, delivered_ranges):
     return result
 
 
-def issues(assessments, metric_checks, *, row, originals, cited_evidence, delivered_ranges=None):
+def issues(assessments, metric_checks, *, row, originals, cited_evidence, delivered_ranges=None, protocol_version=VERSION):
     return [dict(kind="source_assertion", field=key, **deepcopy(value)) for key, value in assessments.items()
         if value["state"] in ("contradicted", "unverifiable")] + citation_binding_issues(
-            row, assessments, originals, cited_evidence) + callable_delivery_issues(
+            row, assessments, originals, cited_evidence, protocol_version=protocol_version) + callable_delivery_issues(
             row, assessments, originals, delivered_ranges) + [deepcopy(c["issue"]) for c in metric_checks if c["issue"]]
 
 
@@ -1070,7 +1109,7 @@ def validate(result, originals, meta):
     ledger = result.partition.get("fact_verification", {})
     original = result.partition.get("pre_verification_final")
     protocol_version = ledger.get("version")
-    if (protocol_version not in (VERSION, LEGACY_VERSION) or ledger.get("original_final") != original or
+    if (protocol_version not in SUPPORTED_VERSIONS or ledger.get("original_final") != original or
             ledger.get("original_final_hash") != hash_json(original) or ledger.get("model_assisted_is_not_proof") is not True
             or ledger.get("status") not in ("unverified", "model_supported")):
         raise PartitionError("stored_fact_verification_missing")
@@ -1348,7 +1387,7 @@ def validate(result, originals, meta):
                 break
             expected_issues = issues(checked, checks, row=current,
                 originals=originals, cited_evidence=attempt["check"]["cited_evidence"],
-                delivered_ranges=attempt["check"]["delivered_ranges"])
+                delivered_ranges=attempt["check"]["delivered_ranges"], protocol_version=protocol_version)
             if attempt.get("assessments") != checked or attempt.get("issues") != expected_issues:
                 raise PartitionError("stored_fact_assessment_changed")
             if not expected_issues or number == limit - 1:
