@@ -15,6 +15,7 @@ from review_bot.adapters.intent_planner import LlamaCppPlanClient
 from review_bot.application.context import build_task_input, hash_json
 from review_bot.application.delta import build_delta
 from review_bot.application.intent_context import build_intent_task_input
+from review_bot.application.intent_source_scope import build_source_scope
 from review_bot.application.architecture_review import ModelProfile, build_system_prompt, run_review_a_pipeline
 from review_bot.application.model_execution import ModelExecutionBudget
 from review_bot.adapters.openrouter_chat import review_wire_payload
@@ -54,7 +55,7 @@ def architecture_input_fingerprint(snapshot, classification, config, client, *, 
             return hash_json({"schema": "partition-evaluation/architecture", "snapshot": asdict(snapshot),
                 "classification": asdict(classification), "config": config.config_hash, "model": _profile(client),
                 "decider": _profile(decision_client),
-                "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, resolve_quote_citations, native_integration_pages, run_fact_verification, is_gradle_java_path,
+                "implementation": _implementation_hash(run_partition_review, partition_original, build_source_scope, ModelExecutionBudget, plan_candidates, citation_spans, resolve_quote_citations, native_integration_pages, run_fact_verification, is_gradle_java_path,
                     LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient, review_wire_payload,
                     OpenRouterDecisionClient, decision_wire_payload)})
         architecture = config.architecture.model_dump(mode="json")
@@ -101,7 +102,7 @@ def intent_input_fingerprint(task, config, client, *, planning_client=None, sele
                 "decider": _profile(decision_client),
                 "trial": config.partition_evaluation.model_dump(mode="json"),
                 "language": config.output.language,
-                "implementation": _implementation_hash(run_partition_review, partition_original, ModelExecutionBudget, plan_candidates, citation_spans, resolve_quote_citations, native_integration_pages, run_fact_verification, is_gradle_java_path,
+                "implementation": _implementation_hash(run_partition_review, partition_original, build_source_scope, ModelExecutionBudget, plan_candidates, citation_spans, resolve_quote_citations, native_integration_pages, run_fact_verification, is_gradle_java_path,
                     LlamaCppModelClient, MacBookLlamaCppModelClient, LlamaCppPlanClient, review_wire_payload,
                     OpenRouterDecisionClient, decision_wire_payload)})
         if config.intent.pipeline == "perspectives-v1":

@@ -355,6 +355,7 @@ def quote_spans(value, originals):
 
 
 def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version=VERSION):
+    from review_bot.application.intent_source_scope import scoped_ranges, scope_notice
     if protocol_version not in SUPPORTED_VERSIONS:
         raise PartitionError("fact_protocol_version_unknown")
     by_id = {o.evidence_id: o for o in originals}
@@ -368,7 +369,8 @@ def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version
     paths = {s.path for s in anchors if s.path}
     whole = [o for o in originals if kind == "complete_originals" or o.kind == "pr_text" or o.evidence_id in requested or
         kind == "cited_originals" and (o.evidence_id in selected or o.path in paths)]
-    spans = [make_span(o, 0, len(o.raw), "fact_original") for o in whole]
+    spans = [make_span(o, start, end, "fact_original") for o in whole
+        for start, end in scoped_ranges(o, meta.get("source_scope"))]
     delivered = {s.evidence_id for s in spans}
     spans.extend(s for s in anchors if s.evidence_id not in delivered)
     # Overlapping immutable ranges are one byte cover. Keep every anchor's
@@ -383,7 +385,8 @@ def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version
             merged.append(span)
     spans = merged
     refs = citation_spans(spans, by_id, [asdict(s) for s in anchors])
-    payload = {"items": [{"item_id": row["id"], "original_item": deepcopy(row["item"]),
+    payload = {**scope_notice(meta, {s.evidence_id for s in spans}),
+        "items": [{"item_id": row["id"], "original_item": deepcopy(row["item"]),
             "fields": fields(row)} for row in rows],
         "originals": source_blocks(spans, by_id),
         "citation_catalog": citation_catalog(spans, by_id, [asdict(s) for s in anchors]),
