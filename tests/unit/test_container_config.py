@@ -42,14 +42,14 @@ def test_network_preparation_keeps_host_resolver_and_private_directory(tmp_path)
     resolver.write_text("nameserver 127.0.0.53\nsearch synthetic.invalid\n")
     directory = tmp_path / "network"
     prepare = network_preparer()
-    prepare(directory, "100.64.0.1", resolver=resolver)
+    prepare(directory, "100.64.0.1", model_host="model-api.internal", resolver=resolver)
     assert directory.stat().st_mode & 0o777 == 0o700
     for name in ("hosts", "resolv.conf"):
         assert (directory / name).stat().st_mode & 0o777 == 0o644
-    assert "100.64.0.1 ubuntu-ms-7e07" in (directory / "hosts").read_text()
+    assert "100.64.0.1 model-api.internal" in (directory / "hosts").read_text()
     assert (directory / "resolv.conf").read_text().endswith(resolver.read_text())
-    prepare(directory, "100.64.0.2", resolver=resolver)
-    assert "100.64.0.2 ubuntu-ms-7e07" in (directory / "hosts").read_text()
+    prepare(directory, "100.64.0.2", model_host="model-api.internal", resolver=resolver)
+    assert "100.64.0.2 model-api.internal" in (directory / "hosts").read_text()
     assert resolver.read_text() == "nameserver 127.0.0.53\nsearch synthetic.invalid\n"
 
 
@@ -66,6 +66,15 @@ def test_network_preparation_preserves_unrelated_files(tmp_path, linked):
     else:
         (directory / "hosts").write_text("preserve me")
     with pytest.raises(ValueError, match="unrelated"):
-        network_preparer()(directory, "100.64.0.1", resolver=resolver)
+        network_preparer()(directory, "100.64.0.1", model_host="model-api.internal", resolver=resolver)
     assert unrelated.read_text() == "preserve me"
     assert (directory / "hosts").read_text() == "preserve me"
+
+
+@pytest.mark.parametrize("host", ["", "*", "model.internal\n127.0.0.1 attacker",
+    "http://model.internal", "model.internal:11435", "localhost", "ip6-localhost", "a..internal"])
+def test_network_preparation_rejects_invalid_hostname_before_writing(tmp_path, host):
+    directory = tmp_path / "network"
+    with pytest.raises(ValueError, match="model hostname"):
+        network_preparer()(directory, "100.64.0.1", model_host=host)
+    assert not directory.exists()
