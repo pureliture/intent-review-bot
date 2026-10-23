@@ -105,7 +105,7 @@ def decision_request() -> ModelRequest:
 
 
 def test_granite_warmup_uses_load_only_request(mock_http: Any) -> None:
-    from review_bot.adapters.ollama import OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaModelClient
 
     requests = mock_http(lambda request: httpx.Response(200, json=load_response()))
     client = OllamaModelClient(timeout_seconds=17)
@@ -125,7 +125,7 @@ def test_granite_warmup_uses_load_only_request(mock_http: Any) -> None:
     load_response(done_reason="stop"), load_response(response="generated output"), load_response(response=None),
 ])
 def test_granite_warmup_rejects_invalid_load_response(mock_http: Any, response: Any) -> None:
-    from review_bot.adapters.ollama import OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaModelClient
 
     mock_http(lambda request: httpx.Response(200, json=response))
     with pytest.raises(PermanentModelError):
@@ -133,7 +133,7 @@ def test_granite_warmup_rejects_invalid_load_response(mock_http: Any, response: 
 
 
 def test_granite_port_posts_chat_schema_and_128k(mock_http: Any, main_request: ModelRequest) -> None:
-    from review_bot.adapters.ollama import OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaModelClient
 
     requests = mock_http(lambda request: httpx.Response(200, json=chat_response()))
     client = OllamaModelClient()
@@ -157,7 +157,7 @@ def test_granite_port_posts_chat_schema_and_128k(mock_http: Any, main_request: M
 
 
 def test_no_count_only_probe_and_complete_uses_full_budget(mock_http: Any, main_request: ModelRequest) -> None:
-    from review_bot.adapters.ollama import OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaModelClient
 
     requests = mock_http(lambda request: httpx.Response(200, json=chat_response()))
     client = OllamaModelClient()
@@ -181,7 +181,7 @@ def test_no_count_only_probe_and_complete_uses_full_budget(mock_http: Any, main_
 
 
 def test_granite_pipeline_preserves_token_gate_and_validates_review(mock_http: Any, worker_review_inputs: Any) -> None:
-    from review_bot.adapters.ollama import OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaModelClient
 
     task, expected = worker_review_inputs
     body = json.dumps({
@@ -203,7 +203,7 @@ def test_granite_pipeline_preserves_token_gate_and_validates_review(mock_http: A
 
 
 def test_granite_oversized_input_never_reaches_http(mock_http: Any, main_request: ModelRequest) -> None:
-    from review_bot.adapters.ollama import OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaModelClient
 
     requests = mock_http(lambda request: pytest.fail("Oversized input must not be sent"))
     client = OllamaModelClient()
@@ -224,7 +224,7 @@ def test_granite_oversized_input_never_reaches_http(mock_http: Any, main_request
     chat_response(message={"role": "assistant", "content": None}),
 ])
 def test_granite_rejects_incomplete_or_invalid_response(mock_http: Any, main_request: ModelRequest, response: Any) -> None:
-    from review_bot.adapters.ollama import OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaModelClient
 
     mock_http(lambda request: httpx.Response(200, json=response))
     with pytest.raises(PermanentModelError):
@@ -234,7 +234,7 @@ def test_granite_rejects_incomplete_or_invalid_response(mock_http: Any, main_req
 @pytest.mark.parametrize("status,error", [(400, PermanentModelError), (307, PermanentModelError),
                                          (429, TransientModelError), (503, TransientModelError)])
 def test_http_errors_use_pipeline_error_contract(mock_http: Any, main_request: ModelRequest, status: int, error: Any) -> None:
-    from review_bot.adapters.ollama import OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaModelClient
 
     mock_http(lambda request: httpx.Response(status, json={"error": "synthetic failure"}))
     with pytest.raises(error):
@@ -242,7 +242,7 @@ def test_http_errors_use_pipeline_error_contract(mock_http: Any, main_request: M
 
 
 def test_transport_timeout_becomes_timeout_error(mock_http: Any, main_request: ModelRequest) -> None:
-    from review_bot.adapters.ollama import OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaModelClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("synthetic timeout", request=request)
@@ -255,7 +255,7 @@ def test_transport_timeout_becomes_timeout_error(mock_http: Any, main_request: M
 @pytest.mark.parametrize("api_url", ["https://example.com", "http://127.0.0.1.example.com:11434",
                                    "http://user:secret@127.0.0.1:11434", "http://127.0.0.1:11434/api"])
 def test_external_or_ambiguous_endpoint_is_rejected(api_url: str) -> None:
-    from review_bot.adapters.ollama import OllamaDecisionClient, OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaDecisionClient, OllamaModelClient
 
     for client_type in (OllamaModelClient, OllamaDecisionClient):
         with pytest.raises(ValueError):
@@ -265,7 +265,7 @@ def test_external_or_ambiguous_endpoint_is_rejected(api_url: str) -> None:
 
 
 def test_tev_port_uses_systemone_not_chat(mock_http: Any, decision_request: ModelRequest) -> None:
-    from review_bot.adapters.ollama import OllamaDecisionClient
+    from review_bot.adapters.ollama_local import OllamaDecisionClient
 
     requests = mock_http(lambda request: httpx.Response(200, json=decision_response()))
     client = OllamaDecisionClient()
@@ -298,7 +298,7 @@ def test_tev_port_uses_systemone_not_chat(mock_http: Any, decision_request: Mode
     (["intent", "architecture"], "architecture_and_intent", ["intent", "architecture"]),
 ])
 def test_tev_selects_available_intent_subsets_in_one_existing_request(mock_http, decision_request, modes, choice, expected):
-    from review_bot.adapters.ollama import OllamaDecisionClient
+    from review_bot.adapters.ollama_local import OllamaDecisionClient
 
     choices = ["intent", "not_applicable"] if len(modes) == 1 else ["architecture", "intent", "architecture_and_intent", "not_applicable"]
     data = decision_response()
@@ -316,7 +316,7 @@ def test_tev_selects_available_intent_subsets_in_one_existing_request(mock_http,
 
 @pytest.mark.parametrize("modes", [[], ["intent", "intent"], ["intent", "unknown"], ["general"], ["architecture_and_intent"]])
 def test_tev_invalid_mode_availability_is_rejected_without_http(mock_http, decision_request, modes):
-    from review_bot.adapters.ollama import OllamaDecisionClient
+    from review_bot.adapters.ollama_local import OllamaDecisionClient
 
     requests = mock_http(lambda request: pytest.fail("Invalid availability must not be sent"))
     metadata = json.loads(decision_request.user_content)
@@ -327,7 +327,7 @@ def test_tev_invalid_mode_availability_is_rejected_without_http(mock_http, decis
 
 
 def test_tev_architecture_choice_and_local_prefilter_remain_separate(mock_http: Any) -> None:
-    from review_bot.adapters.ollama import OllamaDecisionClient
+    from review_bot.adapters.ollama_local import OllamaDecisionClient
 
     requests = mock_http(lambda request: httpx.Response(200, json=decision_response("architecture")))
     selector = ModelModeSelector(OllamaDecisionClient(), model=SELECTOR)
@@ -341,7 +341,7 @@ def test_tev_architecture_choice_and_local_prefilter_remain_separate(mock_http: 
 
 
 def test_tev_invalid_choice_falls_back_to_architecture(mock_http: Any) -> None:
-    from review_bot.adapters.ollama import OllamaDecisionClient
+    from review_bot.adapters.ollama_local import OllamaDecisionClient
 
     mock_http(lambda request: httpx.Response(200, json=decision_response("unknown")))
     snapshot, pr = selection_inputs(("config/appearance.settings",))
@@ -357,7 +357,7 @@ def test_tev_invalid_choice_falls_back_to_architecture(mock_http: Any) -> None:
     {"architecture": -0.1, "not_applicable": 1.1},
 ])
 def test_tev_inconsistent_probabilities_cannot_skip(mock_http: Any, probabilities: Any) -> None:
-    from review_bot.adapters.ollama import OllamaDecisionClient
+    from review_bot.adapters.ollama_local import OllamaDecisionClient
 
     response = decision_response()
     response["answers"]["review_mode"]["probabilities"] = probabilities
@@ -368,7 +368,7 @@ def test_tev_inconsistent_probabilities_cannot_skip(mock_http: Any, probabilitie
 
 
 def test_tev_oversized_body_and_wrong_role_are_not_sent(mock_http: Any, decision_request: ModelRequest) -> None:
-    from review_bot.adapters.ollama import OllamaDecisionClient
+    from review_bot.adapters.ollama_local import OllamaDecisionClient
 
     requests = mock_http(lambda request: pytest.fail("Invalid state must not be sent"))
     client = OllamaDecisionClient()
@@ -382,7 +382,7 @@ def test_tev_oversized_body_and_wrong_role_are_not_sent(mock_http: Any, decision
 
 
 def test_tev_warmup_is_explicit_and_outside_selector_deadline(mock_http: Any) -> None:
-    from review_bot.adapters.ollama import OllamaDecisionClient
+    from review_bot.adapters.ollama_local import OllamaDecisionClient
 
     requests = mock_http(lambda request: httpx.Response(200, json=decision_response()))
     client = OllamaDecisionClient()
@@ -394,7 +394,7 @@ def test_tev_warmup_is_explicit_and_outside_selector_deadline(mock_http: Any) ->
 
 @pytest.mark.parametrize("fault", ["context", "parameters", "capability", "remote", "tokenizer"])
 def test_model_verification_fails_closed(monkeypatch: pytest.MonkeyPatch, fault: str) -> None:
-    from review_bot.adapters.ollama import OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaModelClient
 
     info = model_info(MAIN)
     if fault == "context":
@@ -416,7 +416,7 @@ def test_model_verification_fails_closed(monkeypatch: pytest.MonkeyPatch, fault:
 
 
 def test_review_profile_factory_is_explicit_and_uses_operator_limits(mock_http: Any) -> None:
-    from review_bot.adapters.ollama import OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaModelClient
     from review_bot.config import ModelConfig
     from review_bot.runtime.model_clients import build_review_client
 
@@ -435,7 +435,7 @@ def test_review_profile_factory_is_explicit_and_uses_operator_limits(mock_http: 
 def test_worker_profile_warms_models_before_claiming_work(mock_http: Any, valid_config_yaml: str, monkeypatch: pytest.MonkeyPatch) -> None:
     from unittest.mock import Mock
 
-    from review_bot.adapters.ollama import OllamaModelClient
+    from review_bot.adapters.ollama_local import OllamaModelClient
     from review_bot.config import load_review_config_from_str
     from review_bot.ports import JobStore
     from review_bot.runtime.worker import WorkerLoop

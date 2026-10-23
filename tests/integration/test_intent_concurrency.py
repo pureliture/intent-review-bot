@@ -21,10 +21,10 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from review_bot.adapters import llamacpp
+from review_bot.adapters import llama_cpp_local as llamacpp
 from review_bot.adapters.git import GitRepositoryReader
 from review_bot.adapters.github.client import GitHubApiClient
-from review_bot.adapters.llamacpp import LLAMACPP_PROFILE, REVIEW_MODEL, LlamaCppModelClient
+from review_bot.adapters.llama_cpp_local import LLAMACPP_PROFILE, REVIEW_MODEL, LlamaCppModelClient
 from review_bot.adapters.sqlite.model_admission import SQLiteModelAdmission
 from review_bot.adapters.sqlite.store import SQLiteJobStore
 from review_bot.config import load_review_config_from_str

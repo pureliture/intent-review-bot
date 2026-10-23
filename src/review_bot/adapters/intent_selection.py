@@ -1,8 +1,8 @@
 """Thin Tev clients for closed choices about predefined intent perspectives."""
 from __future__ import annotations
 
-from review_bot.adapters.llamacpp import SELECTOR_MODEL, LlamaCppModelClient
-from review_bot.adapters.llamacpp_macbook import MACBOOK_SELECTOR_MODEL, MacBookLlamaCppModelClient
+from review_bot.adapters.llama_cpp_local import SELECTOR_MODEL, LlamaCppModelClient
+from review_bot.adapters.llama_cpp_macbook import MACBOOK_SELECTOR_MODEL, MacBookLlamaCppModelClient
 
 
 class LlamaCppIntentSelectionClient(LlamaCppModelClient):

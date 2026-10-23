@@ -9,8 +9,8 @@ from pathlib import Path
 
 from review_bot.adapters.markdown.formatter import format_review_markdown
 from review_bot.adapters.markdown.intent_formatter import format_intent_markdown
-from review_bot.adapters.llamacpp import LlamaCppModelClient
-from review_bot.adapters.llamacpp_macbook import MacBookLlamaCppModelClient
+from review_bot.adapters.llama_cpp_local import LlamaCppModelClient
+from review_bot.adapters.llama_cpp_macbook import MacBookLlamaCppModelClient
 from review_bot.adapters.intent_planner import LlamaCppPlanClient
 from review_bot.application.context import build_task_input, hash_json
 from review_bot.application.delta import build_delta

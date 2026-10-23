@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import os
 
-from review_bot.adapters.llamacpp import LLAMACPP_PROFILE, LlamaCppDecisionClient, LlamaCppModelClient
-from review_bot.adapters.llamacpp_macbook import (
+from review_bot.adapters.llama_cpp_local import LLAMACPP_PROFILE, LlamaCppDecisionClient, LlamaCppModelClient
+from review_bot.adapters.llama_cpp_macbook import (
     MACBOOK_LLAMACPP_PROFILE,
     MACBOOK_GRANITE_PROFILE,
     MacBookGraniteLlamaCppModelClient,
@@ -13,7 +13,7 @@ from review_bot.adapters.llamacpp_macbook import (
     macbook_model_admission,
 )
 from review_bot.adapters.model_http import default_model_admission
-from review_bot.adapters.ollama import OLLAMA_PROFILE, OllamaDecisionClient, OllamaModelClient
+from review_bot.adapters.ollama_local import OLLAMA_PROFILE, OllamaDecisionClient, OllamaModelClient
 from review_bot.adapters.openrouter_chat import (
     OPENROUTER_REVIEW_PROFILE,
     OpenRouterReviewClient,

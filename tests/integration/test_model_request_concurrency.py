@@ -10,7 +10,7 @@ from contextlib import contextmanager
 import httpx
 import pytest
 
-from review_bot.adapters.llamacpp import LlamaCppDecisionClient, LlamaCppModelClient
+from review_bot.adapters.llama_cpp_local import LlamaCppDecisionClient, LlamaCppModelClient
 from review_bot.adapters.model_http import reset_model_request_context, set_model_request_context
 from review_bot.adapters.sqlite.model_admission import ModelAdmissionCancelled, SQLiteModelAdmission
 from review_bot.application.architecture_review import PermanentModelError, TransientModelError

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from review_bot.adapters.intent_planner import MacBookLlamaCppPlanClient
 from review_bot.adapters.intent_selection import MacBookIntentSelectionClient
-from review_bot.adapters.llamacpp_macbook import MacBookLlamaCppDecisionClient
+from review_bot.adapters.llama_cpp_macbook import MacBookLlamaCppDecisionClient
 
 TEV4B_PROFILE = "macbook-beam-cloud-tev4b"
 TEV4B_MODEL = "tev1-4b-q8_0"

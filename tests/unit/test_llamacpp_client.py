@@ -115,7 +115,7 @@ def test_truncated_output_has_a_typed_rejection_and_preserves_both_output_channe
 
 @pytest.fixture
 def adapter() -> Any:
-    return importlib.import_module("review_bot.adapters.llamacpp")
+    return importlib.import_module("review_bot.adapters.llama_cpp_local")
 
 
 @pytest.fixture

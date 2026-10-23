@@ -143,7 +143,7 @@ def test_native_measured_plan_observation_selection_and_review_reach_eight_persp
     assert result.usage["calls"] == 15 and result.usage["usage_complete"] is True
     import hashlib
     from pathlib import Path
-    from review_bot.adapters import intent_planner, llamacpp, llamacpp_macbook
+    from review_bot.adapters import intent_planner, llama_cpp_local as llamacpp, llama_cpp_macbook as llamacpp_macbook
     from review_bot.adapters import openrouter_chat, openrouter_decisions, openrouter_common, byte_budget
     for module in (intent_planner, llamacpp, llamacpp_macbook,
             openrouter_chat, openrouter_decisions, openrouter_common, byte_budget):

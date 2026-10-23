@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from review_bot.adapters.llamacpp import LlamaCppDecisionClient, LlamaCppModelClient
+from review_bot.adapters.llama_cpp_local import LlamaCppDecisionClient, LlamaCppModelClient
 from review_bot.adapters.sqlite.model_admission import SQLiteModelAdmission
 from review_bot.domain.models_v1 import ModelRequest
 

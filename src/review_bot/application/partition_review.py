@@ -1880,7 +1880,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         for name in ("partition_review.py", "source_partition.py", "model_execution.py", "model_wire_contract.py", "partition_choices.py", "source_citations.py", "source_quote_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py", "review_fact_check.py", "selection.py")}
     identity["implementation"].update({"adapters/" + name: hashlib.sha256(
         (Path(__file__).parents[1] / "adapters" / name).read_bytes()).hexdigest()
-        for name in ("llamacpp.py", "llamacpp_macbook.py", "intent_planner.py",
+        for name in ("llama_cpp_local.py", "llama_cpp_macbook.py", "intent_planner.py",
             "openrouter_chat.py", "openrouter_decisions.py", "openrouter_common.py", "byte_budget.py")})
     identity["implementation"]["domain/models_v1.py"] = hashlib.sha256(
         (Path(__file__).parents[1] / "domain/models_v1.py").read_bytes()).hexdigest()

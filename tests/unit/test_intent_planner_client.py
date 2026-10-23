@@ -15,8 +15,8 @@ from typing import Any
 import httpx
 import pytest
 
-from review_bot.adapters import llamacpp as common
-from review_bot.adapters import llamacpp_macbook as macbook
+from review_bot.adapters import llama_cpp_local as common
+from review_bot.adapters import llama_cpp_macbook as macbook
 from review_bot.adapters.model_http import reset_model_request_context, set_model_request_context
 from review_bot.application.architecture_review import ModelProfile
 from review_bot.domain.models_v1 import ModelRequest

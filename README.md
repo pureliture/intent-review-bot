@@ -244,6 +244,11 @@ The smaller real [PR #5](https://github.com/pureliture/openai-compatible-bridge/
 
 ## Local llama.cpp (explicit opt-in)
 
+Adapter modules identify the serving runtime: `ollama_local.py` implements local Ollama,
+`llama_cpp_local.py` implements self-hosted llama.cpp, and `llama_cpp_macbook.py`
+provides its MacBook role configuration. `openrouter_chat.py` and
+`openrouter_decisions.py` implement the OpenRouter cloud APIs.
+
 `me707-llamacpp` uses separate OpenAI-compatible servers and exact model IDs:
 
 | Role | Model ID | Required per-slot context | Explicit endpoint variable |
@@ -252,13 +257,13 @@ The smaller real [PR #5](https://github.com/pureliture/openai-compatible-bridge/
 | Existing System 1 mode selection | `tev1-4b-q8_0` | 131,072 tokens | `ME707_TEV1_BASE_URL` |
 | Separate code-first B planning | `tev1-4b-q8_0` | 131,072 tokens | `ME707_TEV1_BASE_URL` |
 
-Endpoints must be uncredentialed HTTP `/v1` URLs on loopback or the approved `ubuntu-ms-7e07` host. Proxy environment variables and redirects are not used. Neither the service nor CLI infers a node IP, downloads a model or falls back to Ollama. Keep model APIs on the approved private network; the webhook forwarding path is not model authentication.
+Endpoints must be uncredentialed HTTP `/v1` URLs and pass the adapter's endpoint validation. Set actual hostnames from the deployment's private connection context. The bot calls the model API directly; any private-network forwarding is configured by the operator. Proxy environment variables and redirects are not used. Neither the service nor CLI infers a node IP, downloads a model or falls back to Ollama. Keep model APIs on the approved private network; the webhook forwarding path is not model authentication.
 
 For example, prepare these environment references in the process environment (not a committed secret/config file):
 
 ```bash
-export ME707_BONSAI_BASE_URL=http://ubuntu-ms-7e07:11435/v1
-export ME707_TEV1_BASE_URL=http://ubuntu-ms-7e07:11437/v1
+export ME707_BONSAI_BASE_URL="http://<private-model-host>:11435/v1"
+export ME707_TEV1_BASE_URL="http://<private-model-host>:11437/v1"
 export REVIEW_BOT_MODEL_STATE_DIR=/home/review-bot/private-model-admission
 ```
 

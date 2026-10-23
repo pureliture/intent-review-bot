@@ -1,4 +1,4 @@
-"""Explicit me707 llama.cpp chat adapters with generation-free native token preflight."""
+"""Self-hosted llama.cpp adapters with explicit endpoints and local input admission."""
 from __future__ import annotations
 
 import ipaddress

@@ -27,7 +27,7 @@ from review_bot.adapters.byte_budget import (
     CHOICE_WIRE_FLOOR_TOKENS,
     _CHOICE_REQUEST_CEILING_TOKENS,
 )
-from review_bot.adapters.llamacpp import _check_output_fields, _json_object
+from review_bot.adapters.llama_cpp_local import _check_output_fields, _json_object
 from review_bot.adapters.model_http import mark_model_request_sent, model_request_slot
 from review_bot.adapters.openrouter_common import (
     _METADATA_SECONDS,

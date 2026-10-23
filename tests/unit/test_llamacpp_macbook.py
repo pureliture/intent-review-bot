@@ -16,8 +16,8 @@ from typing import Any
 import httpx
 import pytest
 
-from review_bot.adapters import llamacpp as common
-from review_bot.adapters import llamacpp_macbook as adapter
+from review_bot.adapters import llama_cpp_local as common
+from review_bot.adapters import llama_cpp_macbook as adapter
 from review_bot.adapters.sqlite.model_admission import ModelAdmissionError, SQLiteModelAdmission
 from review_bot.domain.models_v1 import ModelRequest
 from review_bot.ports import ModelClient

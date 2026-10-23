@@ -19,12 +19,12 @@ from typing import Any
 
 from review_bot.adapters.github.auth import GitHubAppAuthError
 from review_bot.adapters.github.intent_sources import collect_intent_sources, intent_sources_current
-from review_bot.adapters.llamacpp import LlamaCppModelClient
+from review_bot.adapters.llama_cpp_local import LlamaCppModelClient
 from review_bot.adapters.markdown.formatter import format_review_markdown
 from review_bot.adapters.markdown.intent_formatter import format_intent_markdown
 from review_bot.adapters.openrouter_chat import OpenRouterReviewClient
 from review_bot.adapters.model_http import reset_model_request_context, set_model_request_context
-from review_bot.adapters.ollama import OllamaModelClient
+from review_bot.adapters.ollama_local import OllamaModelClient
 from review_bot.application.classification import classify_pr
 from review_bot.application.context import build_task_input
 from review_bot.application.delta import build_delta
