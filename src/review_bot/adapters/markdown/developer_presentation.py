@@ -342,8 +342,10 @@ def walkthrough(task, findings, questions=(), *, signals=()) -> str:
         return ""
     counts: dict[str, int] = {path: 0 for path in files}
     for item in (*findings, *questions):
-        for raw in row(item).get("citations", ()):
-            path = row(raw).get("path")
+        value = row(item)
+        if isinstance(value, str):
+            continue  # Plain author questions have no source citations to count.
+        for path in {row(raw).get("path") for raw in value.get("citations", ())}:
             if path in counts:
                 counts[path] += 1
     if sum(counts.values()) == 0 and not signals:

@@ -1731,8 +1731,21 @@ def validate(result, originals, meta):
                 raise PartitionError("stored_fact_source_changed")
         candidate["supplied_quotes"] = deepcopy(ledger.get("accepted_final", original)["supplied_quotes"])
     expected_status = "model_supported" if not interrupted and all(e["status"] == "model_supported" for e in entries) else "unverified"
-    if (ledger["status"] != expected_status or ledger.get("accepted_final") != candidate or
-            ledger.get("accepted_final_hash") != hash_json(candidate) or result.partition.get("final") != candidate):
+    accepted_final = ledger.get("accepted_final")
+    # Batched execution accepts supported items before the next rewrite round;
+    # replay walks each item's whole history. The source inventory can therefore
+    # be inserted in a different order. Compare every complete source record,
+    # preserving duplicates and bytes, while retaining the stored serialization's
+    # original hash and the exact published-final comparison.
+    def inventory_view(value):
+        return {**value, "supplied_quotes": sorted(value["supplied_quotes"],
+            key=lambda span: (span["evidence_id"], span["start_byte"], span["end_byte"]))}
+    try:
+        same_inventory = inventory_view(accepted_final) == inventory_view(candidate)
+    except (KeyError, TypeError):
+        raise PartitionError("stored_fact_final_changed") from None
+    if (ledger["status"] != expected_status or not same_inventory or
+            ledger.get("accepted_final_hash") != hash_json(accepted_final) or result.partition.get("final") != accepted_final):
         raise PartitionError("stored_fact_final_changed")
     return decision_ids
 
