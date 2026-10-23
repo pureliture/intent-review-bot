@@ -72,7 +72,7 @@ def format_review_markdown(
     title = label(presentation, "architecture_title", "아키텍처 리뷰")
     if task_input is None:
         return finish(marker, title, status_sections(result,
-            unreviewed=("검토 입력이 없어 정적 신호와 코드 근거를 다시 확인할 수 없습니다.",)),
+            unreviewed=("검토 입력이 없어 정적 분석 결과와 코드 근거를 다시 확인할 수 없습니다.",)),
             scope="", max_length=max_length)
     if result.status != "completed" or result.reason != "validated" or result.validation_errors or stale_reason:
         unreviewed = list(result.validation_errors)

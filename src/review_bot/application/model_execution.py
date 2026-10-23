@@ -154,8 +154,8 @@ class ModelExecutionBudget:
         """Admission without any measurement call.
 
         Checks fence, call/deadline/transport budgets, then asks the
-        client for its exact-wire admission bound (``admission_bytes``:
-        wire bytes plus the client's framing reserve, a proven token
+        client for its admitted-input bound (``admission_bytes``:
+        prompt-relevant bytes plus the client's framing reserve, a proven token
         upper bound). The input-token budget is therefore proven pre-send
         without any extra request; the response usage is recorded
         post-send. Returns (admitted, index).

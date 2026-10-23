@@ -47,10 +47,10 @@ def measurement_text(measurements) -> str:
     return "; ".join(f"{m.name}: {value(m.base)} → {value(m.head)}" for m in measurements)
 
 
-def details(title: str, body: str) -> str:
+def details(title: str, body: str, *, open_first: bool = False) -> str:
     # Markdown escapes are literal inside an HTML summary element.
     title = re.sub(r"\\([\\`*_\[\]{}()|#+.!-])", r"\1", title)
-    return f"<details>\n<summary>{title}</summary>\n\n{body}\n\n</details>"
+    return f"<details{' open' if open_first else ''}>\n<summary>{title}</summary>\n\n{body}\n\n</details>"
 
 
 def compose(sections: Mapping[str, str], template: str | None = None) -> str:
@@ -85,6 +85,8 @@ def finish(marker: str, title: str, sections: Mapping[str, str], *, scope: str,
 
 
 _STATUS_REASONS = {
+    "global_original_results_exceed_context": ("묶음별 검토 결과를 합치는 단계에서 입력 크기 사전 검사를 통과하지 못했습니다.",
+        "The combined review results did not pass the input-size check before the final assessment."),
     "factual_verification_incomplete": ("코드와 근거를 대조하는 확인이 끝나지 않았습니다.",
         "The code and supporting evidence have not been fully checked."),
     "unresolved_context": ("판단에 필요한 정보가 아직 부족합니다.", "Information needed for the assessment is still missing."),
@@ -181,50 +183,79 @@ def selected_signals(task, findings=(), target_reviews=None):
     return selected
 
 
+# Labels, lenses and display severities follow seulgi-server's comment template:
+# .github/pmd/pmd_report_markdown.py and pmd_report_rules.py at
+# 90ddd1712d0d6f39d7b5c22f68a01ea34af141fa. These are rule explanations,
+# not model verdicts or observed metric values. Thresholds depend on the run's
+# ruleset and must not be inferred from this presentation metadata.
+_PMD_RULE_PRESENTATION = {
+    "CognitiveComplexity": ("코드 이해 어려움", "중첩이 깊어 읽기 어려움", "high"),
+    "CyclomaticComplexity": ("조건 분기 복잡도", "if/switch 분기 과다", "high"),
+    "NPathComplexity": ("실행 경로 폭증", "분기 조합이 폭발적", "critical"),
+    "CouplingBetweenObjects": ("다른 클래스와 얽힘", "의존 클래스 과다", "medium"),
+    "ExcessiveParameterList": ("메서드 파라미터 과다", "호출부에서 실수하기 쉬움", "low"),
+    "GodClass": ("책임이 너무 많은 클래스", "한 클래스가 너무 많은 일을 함", "critical"),
+    "NcssCount": ("크기가 너무 큰 메서드/클래스", "메서드/클래스 크기 과다", "medium"),
+    "ExcessivePublicCount": ("외부 노출 멤버 과다", "캡슐화 약함", "low"),
+}
+_SEVERITY_CHIPS = {"critical": "🔴 Critical", "high": "🟠 High", "medium": "🟡 Medium", "low": "🔵 Low"}
+_CHANGE_LABELS = {"new": "신규", "worsened": "악화", "existing": "기존", "improved": "개선",
+    "resolved": "해소", "unknown": "변화 판정 불가"}
+
+
 def static_analysis(task, signals, *, presentation=None) -> str:
+    """Show per-file rule violations and CPD locations without a count summary."""
     from review_bot.adapters.markdown.formatter import _a_link
 
     repository = task.snapshot.pr.repository
     changed = set(task.snapshot.pr.changed_files)
-    affected = {p for signal in signals for p in signal.paths if p in changed}
-    counts = {name: sum(signal.change == name for signal in signals) for name in ("new", "worsened", "existing")}
-    cpd = [signal for signal in signals if signal.tool == "cpd"]
-    lines = ["#### " + label(presentation, "static_section", "정적 분석 · 선택한 PMD/CPD 신호"), "",
-        "| 측정 영역 | 이번 PR 검토 범위 |", "|---|---:|",
-        f"| 신호가 잡힌 변경 파일 | {len(affected)} / {len(changed)}개 |",
-        f"| 검토 대상으로 선택한 신호 | {len(signals)}건 |",
-        f"| 신규 / 악화 / 변경과 관련된 기존 신호 | {counts['new']} / {counts['worsened']} / {counts['existing']}건 |",
-        f"| 선택한 CPD 중복 블록 | {sum(len(s.head_findings) for s in cpd)}개 |", "",
-        "> 복잡도·중복 측정은 코드 탐색의 출발점입니다. 수치만으로 실행 중 결함이나 공통화 필요성을 확정하지 않습니다."]
-    if not task.delta.comparable:
-        lines.extend(["", "> 분석 비교가 불완전하거나 조건이 다릅니다. 표시할 신호가 없더라도 분석 0건으로 확정하지 않습니다."])
     grouped = defaultdict(list)
+    cpd = []
     for signal in signals:
         if signal.tool == "cpd":
-            continue
-        for path in signal.paths:
-            if path in changed:
-                grouped[path].append(signal)
-    for path, file_signals in sorted(grouped.items()):
-        rows = ["| 라인 | 신호·변화 | 측정·메시지 |", "|---|---|---|"]
-        for signal in file_signals:
-            metrics = measurement_text(signal.measurements)
+            cpd.extend((signal, block) for block in signal.head_findings)
+        else:
             for finding in signal.head_findings:
-                if hasattr(finding, "occurrences"):
-                    continue
-                if finding.path == path:
-                    location = _a_link(repository, task.snapshot.head.sha, path, finding.begin_line, finding.end_line)
-                    anchor = f"signal-{signal.signal_id}"
-                    rows.append(f'| {location} | <a id="{html.escape(anchor, quote=True)}"></a>{escape(finding.rule)} · {escape(signal.change)} | {escape(metrics)}<br>{escape(finding.message)} |')
-        lines.extend(["", details(escape(path) + f" — {len(file_signals)}건", "\n".join(rows))])
+                if finding.path in changed:
+                    grouped[finding.path].append((signal, finding))
+    lines = ["#### " + label(presentation, "static_section", "PMD/CPD 분석 결과")]
+    if not task.delta.comparable:
+        lines.extend(["", "> 분석 비교가 불완전하거나 조건이 다릅니다. 표시할 위반 내역이 없더라도 분석 0건으로 확정하지 않습니다."])
+    for index, (path, entries) in enumerate(sorted(grouped.items())):
+        rows = ["| 라인 | 위반 규칙 | 무엇을 보는가 | 분석 결과 |", "|---:|---|---|---|"]
+        severity_counts = defaultdict(int)
+        for signal, finding in sorted(entries, key=lambda item: (item[1].begin_line, item[1].rule)):
+            name, lens, severity = _PMD_RULE_PRESENTATION.get(finding.rule, (finding.rule, "규칙 설명 미등록", ""))
+            if severity:
+                severity_counts[severity] += 1
+            chip = _SEVERITY_CHIPS.get(severity, "⚪ 중요도 미등록")
+            location = _a_link(repository, task.snapshot.head.sha, path, finding.begin_line, finding.end_line)
+            # Keep fixed-SHA links, but use the original template's short line labels.
+            if location.startswith("["):
+                line_label = f"L{finding.begin_line}" + (f"–{finding.end_line}" if finding.end_line != finding.begin_line else "")
+                location = "[" + line_label + location[location.index("]"):]
+            metrics = measurement_text(signal.measurements) or "실제 측정값: 보고값 없음"
+            change = _CHANGE_LABELS.get(str(signal.change), str(signal.change))
+            anchor = f"signal-{signal.signal_id}"
+            rows.append(f'| {location} | <a id="{html.escape(anchor, quote=True)}"></a>{chip} {escape(name)}<br><sub>`{escape(finding.rule)}`</sub> | {escape(lens)} | **{escape(change)}** · {escape(metrics)}<br>{escape(finding.message)} |')
+        chips = " · ".join(f"{label} {severity_counts[severity]}" for severity, label in _SEVERITY_CHIPS.items() if severity_counts[severity])
+        title = escape(path) + f" — {len(entries)}건" + (" · " + chips if chips else "")
+        lines.extend(["", details(title, "\n".join(rows), open_first=index == 0)])
     if cpd:
-        rows = ["| 줄수 / 토큰 | 변화 | 중복된 위치 |", "|---:|---|---|"]
-        for signal in cpd:
-            for duplication in signal.head_findings:
-                locations = ", ".join(_a_link(repository, task.snapshot.head.sha, loc.path, loc.begin_line, loc.end_line)
-                    for loc in duplication.occurrences)
-                rows.append(f'| {duplication.lines} / {duplication.tokens} | <a id="signal-{html.escape(signal.signal_id, quote=True)}"></a>{escape(signal.change)} | {locations} |')
-        lines.extend(["", details("CPD · 변경과 관련된 중복 위치", "\n".join(rows))])
+        rows = ["| 줄수 | 토큰 | 변경 파일 | 함께 중복된 위치 |", "|---:|---:|---|---|"]
+        for signal, duplication in cpd:
+            changed_locations = []
+            other_locations = []
+            for loc in duplication.occurrences:
+                target = changed_locations if loc.path in changed else other_locations
+                target.append(_a_link(repository, task.snapshot.head.sha, loc.path, loc.begin_line, loc.end_line))
+            others = ", ".join(other_locations) or "변경 파일 내부 중복"
+            change = _CHANGE_LABELS.get(str(signal.change), str(signal.change))
+            rows.append(f'| {duplication.lines} | {duplication.tokens} | <a id="signal-{html.escape(signal.signal_id, quote=True)}"></a>{", ".join(changed_locations)} | {others}<br>{escape(change)} |')
+        lines.extend(["", "##### 중복 코드 (변경 파일이 포함된 구간)", "",
+            "\n".join(rows)])
+    if not grouped and not cpd:
+        lines.extend(["", "이번 리뷰에서 표시할 규칙 위반 내역이 없습니다."])
     return "\n".join(lines)
 
 
@@ -322,7 +353,7 @@ def walkthrough(task, findings, questions=(), *, signals=()) -> str:
         for path in getattr(signal, "paths", ()):
             if path in counts:
                 flagged.add(path)
-    lines = ["| 파일 | 지적 | 정적 신호 |", "|---|---|---|"]
+    lines = ["| 파일 | 지적 | 정적 분석 경고 |", "|---|---|---|"]
     for path in files:
         mark = "없음"
         if path in flagged:
@@ -352,7 +383,7 @@ def findings_section(findings, questions, task, *, signals=(), target_reviews=No
             lines.extend(["", "제안: " + escape(finding["recommendation"])])
         if finding.get("basis"):
             basis = {"criterion": "명시한 PR 기준", "explicit_criterion": "명시한 PR 기준",
-                "observed_structure": "코드 구조", "analysis_signal": "정적 분석 신호", "insufficient_evidence": "근거 부족"}.get(finding["basis"], finding["basis"])
+                "observed_structure": "코드 구조", "analysis_signal": "정적 분석 결과", "insufficient_evidence": "근거 부족"}.get(finding["basis"], finding["basis"])
             lines.extend(["", "판단 근거: " + escape(basis)])
         targets = finding.get("target_ids", [finding.get("signal_id")])
         for target in targets:
@@ -361,7 +392,7 @@ def findings_section(findings, questions, task, *, signals=(), target_reviews=No
                 continue
             rules = sorted({getattr(f, "rule", "CPD") for f in signal.head_findings})
             metrics = measurement_text(signal.measurements)
-            lines.extend(["", f"관련 정적 신호: [{escape(', '.join(rules))}](#signal-{target}) · {escape(signal.change)}" +
+            lines.extend(["", f"관련 정적 분석 경고: [{escape(', '.join(rules))}](#signal-{target}) · {escape(signal.change)}" +
                 (" · " + escape(metrics) if metrics else "")])
             for violation in signal.head_findings:
                 for loc in getattr(violation, "occurrences", (violation,)):
@@ -403,7 +434,7 @@ def findings_section(findings, questions, task, *, signals=(), target_reviews=No
                 state = {"reviewed": "검토함", "not_apply": "해당 없음", "insufficient_context": "추가 맥락 필요"}.get(review["state"], review["state"])
                 rows.append(f"- **{escape(rules)} · {escape(state)}**: {escape(review['reason'])}\n  - {citation_links(review.get('citations', []), task)}")
         if rows:
-            lines.extend(["", details(label(presentation, "details_label", "선택한 신호별 검토 근거"), "\n\n".join(rows))])
+            lines.extend(["", details(label(presentation, "details_label", "규칙별 검토 근거"), "\n\n".join(rows))])
     return "\n".join(lines)
 
 

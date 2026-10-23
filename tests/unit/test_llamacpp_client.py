@@ -208,7 +208,7 @@ def test_role_contracts_are_explicit_and_construction_is_offline(adapter: Any, m
     bound = review.admission_bytes(main_request)
     assert type(bound) is int
     assert bound == len(json.dumps(
-        review._chat_payload(main_request), ensure_ascii=False, allow_nan=False,
+        {key: value for key, value in review._chat_payload(main_request).items() if key != "response_format"}, ensure_ascii=False, allow_nan=False,
         separators=(",", ":")).encode("utf-8")) + 8192
     assert review.admission_bytes(main_request) == bound
     assert requests == []
@@ -400,7 +400,8 @@ def test_admission_bytes_is_pure_local_proven_upper_bound(
     assert type(bound) is int
     wire = json.dumps(client._chat_payload(request), ensure_ascii=False,
                       allow_nan=False, separators=(",", ":")).encode("utf-8")
-    assert bound == len(wire) + 8192 > len(wire)
+    assert bound == client._context_bytes(client._chat_payload(request)) + 8192
+    assert bound < len(wire) + 8192
     assert client.admission_bytes(request) == bound
     assert client.admission_bytes(main_request) != bound
     assert requests == []
@@ -465,7 +466,7 @@ def test_review_a_uses_large_transport_cap_and_byte_gate(
     assert sum(r.url.path == "/v1/chat/completions" for r in requests) == 1
 
 
-def test_admission_bytes_tracks_prompt_schema_and_input_changes_without_http(
+def test_admission_bytes_tracks_prompt_input_but_not_output_grammar_without_http(
     adapter: Any, mock_http: Any, main_request: ModelRequest,
 ) -> None:
     requests = mock_http(lambda request: pytest.fail("admission_bytes must remain offline"))
@@ -477,7 +478,8 @@ def test_admission_bytes_tracks_prompt_schema_and_input_changes_without_http(
                         replace(main_request, system_prompt="Changed system"),
                         replace(main_request, response_schema=changed_schema))
     }
-    assert len(bounds) == 4
+    assert len(bounds) == 3
+    assert client.admission_bytes(main_request) == client.admission_bytes(replace(main_request, response_schema=changed_schema))
     assert requests == []
 
 
@@ -940,3 +942,39 @@ def test_concurrent_completions_do_not_share_prompt_counts(
                                                        replace(main_request, user_content="second-prompt"))))
     assert [response.usage["input_tokens"] for response in responses] == [11, 29]
     assert sum(r.url.path == "/v1/chat/completions" for r in requests) == 2
+
+
+def test_large_output_schema_is_not_counted_as_prompt_but_is_sent_unchanged(adapter, main_request, mock_http):
+    from review_bot.application.model_execution import ModelExecutionBudget
+    from review_bot.domain.partition_review import PartitionReviewLimits
+    import time
+
+    request = replace(main_request, response_schema={"type": "object", "properties": {
+        "ok": {"type": "boolean"}, "reference": {"type": "string", "enum": [f"Q{i:012d}" for i in range(8000)]}},
+        "required": ["ok"], "additionalProperties": False})
+    requests = mock_http()
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    full_payload = client._chat_payload(request)
+    assert len(adapter._encode(full_payload)) + 8192 > client.profile.max_input_tokens
+    limits = PartitionReviewLimits(max_input_tokens=client.profile.max_input_tokens, max_calls=8)
+    budget = ModelExecutionBudget(limits, time.monotonic() + 60, None)
+    admitted, _ = budget.measure(request, client, client.profile, label="global_review:admission", generate=True,
+        reserve_calls=0, reserve_tokens=0)
+    assert admitted and requests == []
+    assert client.admission_bytes(request) == client.admission_bytes(main_request)
+    assert request.response_schema == full_payload["response_format"]["json_schema"]["schema"]
+    client.complete(request)
+    sent = json.loads(requests[-1].content)
+    assert sent == full_payload
+    assert [r.url.path for r in requests] == ["/v1/models", "/props", "/v1/chat/completions"]
+
+
+def test_large_actual_prompt_still_fails_before_generation(adapter, main_request, mock_http):
+    requests = mock_http()
+    request = replace(main_request, user_content="X" * 100000)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    assert client.admission_bytes(request) > client.profile.max_input_tokens
+    with pytest.raises(PermanentModelError, match="byte-upper-bound"):
+        client.complete(request)
+    assert all(r.url.path != "/v1/chat/completions" for r in requests)
+    assert request.user_content == "X" * 100000

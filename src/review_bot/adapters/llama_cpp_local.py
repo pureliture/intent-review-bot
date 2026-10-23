@@ -333,13 +333,21 @@ class _LlamaCppClient:
             raise PermanentModelError("llama.cpp input exceeds transport byte limit")
         return _json_object(encoded)
 
-    def admission_bytes(self, request: ModelRequest) -> int:
-        """Exact chat-payload bytes plus framing reserve: a proven token upper bound.
+    @staticmethod
+    def _context_bytes(payload: dict[str, Any]) -> int:
+        """Conservative serialized prompt bound, separate from transport size.
 
-        Pure local computation; no HTTP, no measurement call.
+        llama.cpp consumes response_format as an output grammar, not prompt text
+        (common/chat.cpp at server build adfffbe41). Keep the entire messages
+        and all other fields in this conservative bound; exclude only that
+        decoding configuration. The unchanged full payload is still sent and
+        checked against the independent transport byte limit.
         """
-        payload = self._chat_payload(request)
-        return len(_encode(payload)) + FRAMING_RESERVE_TOKENS
+        return len(_encode({key: value for key, value in payload.items() if key != "response_format"}))
+
+    def admission_bytes(self, request: ModelRequest) -> int:
+        """Local prompt-byte upper bound; no tokenizer or generation request."""
+        return self._context_bytes(self._chat_payload(request)) + FRAMING_RESERVE_TOKENS
 
     def _check_output(self, value: dict[str, Any], payload: dict[str, Any]) -> None:
         try:
@@ -421,7 +429,7 @@ class _LlamaCppClient:
         payload = self._chat_payload(request)
         self._verify(deadline)
         # Fail-closed byte-upper-bound pre-gate. No measurement call exists.
-        precheck_byte_budget(len(_encode(payload)), payload["max_tokens"],
+        precheck_byte_budget(self._context_bytes(payload), payload["max_tokens"],
             app_input_tokens=self._max_input_tokens, app_output_tokens=self._max_output_tokens,
             model_context_tokens=self._context_tokens, role="llama.cpp",
             framing_reserve_tokens=FRAMING_RESERVE_TOKENS)

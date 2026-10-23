@@ -41,8 +41,8 @@ def test_partition_a_target_reviews_are_collapsed_and_metrics_are_not_findings()
     assert result.partition["final"]["target_reviews"]
     markdown = format_partition_review_markdown(result, task, publication_mode="comment")
     assert "이 검토 범위에서 추가로 조치할 발견사항은 없습니다." in markdown
-    assert "| 검토 대상으로 선택한 신호 | 0건 |" in markdown
-    assert "<summary>선택한 신호별 검토 근거</summary>" in markdown
+    assert "이번 리뷰에서 표시할 규칙 위반 내역이 없습니다." in markdown
+    assert "<summary>규칙별 검토 근거</summary>" in markdown
     assert "Synthetic explicit review" in markdown
 
 

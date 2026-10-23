@@ -73,14 +73,14 @@ def format_intent_markdown(
         "- Publication: not attempted (artifact_only); no automatic approval or request-changes."
         if publication_mode == "artifact_only" else "- Output policy: comment; no automatic approval or request-changes."
     )
-    lines = [marker, heading, "",
-        f"- Model review: **{result.status}** · `{result.reason}`",
-        f"- Comparison base: `{task.base.sha}`", f"- Head: `{task.head.sha}`",
+    intro = [marker, heading, "", f"- Model review: **{result.status}** · `{result.reason}`"]
+    metadata = [f"- Comparison base: `{task.base.sha}`", f"- Head: `{task.head.sha}`",
         f"- Text captured: {_escape(task.snapshot.captured_at)}; as of: {_escape(task.snapshot.as_of)}",
         publication_notice, "",
         "**Scope:** full files at the fixed versions below, not the whole repository. Material outside these paths was not reviewed.",
         "**Execution:** target code, builds, tests and hooks were not executed by this bot. Test source is not a successful test run.",
         "**Uncertainty:** schema and citation validation do not establish semantic accuracy or complete PR correctness.", ""]
+    lines = [*intro, *(metadata if publication_mode == "artifact_only" else [])]
     if result.model.get("is_mock"):
         lines.extend(["> **Mock model: contract/integration evidence only, not actual model review quality.**", ""])
     for path in task.reviewed_paths:
@@ -131,14 +131,8 @@ def format_intent_markdown(
         lines.extend(["", "No validated final assessment. Earlier validated stages, if any, are not a complete review."])
     comment = "\n".join(lines) + "\n"
     if len(comment) > max_length:
-        notice = [marker, heading, "",
-            f"- Model review: **{result.status}** · `{result.reason}`",
-            f"- Comparison base: `{task.base.sha}`", f"- Head: `{task.head.sha}`",
-            publication_notice, "",
-            "Draft body omitted: comment_limit_exceeded. Complete stage/result/scope data remains in private review files.",
-            "Material outside the prepared paths was not reviewed; this is not a whole-repository assessment.",
-            "Target code, builds, tests and hooks were not executed by this bot.",
-            "Validation is not semantic accuracy, approval, or complete PR correctness."]
+        notice = [*intro, *(metadata if publication_mode == "artifact_only" else []), "",
+            "Draft body omitted: comment_limit_exceeded. Complete stage/result/scope data remains in private review files."]
         if result.model.get("is_mock"):
             notice.append("Mock model: contract/integration evidence only, not actual model review quality.")
         return "\n".join(notice) + "\n"

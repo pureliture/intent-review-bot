@@ -1,8 +1,9 @@
 """Fail-closed byte-upper-bound input gate shared by all model adapters.
 
 Every token covers at least one UTF-8 byte, so the byte length of a
-request body is a proven upper bound on the tokens our own payload can
-occupy. A fixed framing reserve covers provider/server-side template
+admitted input representation bounds the tokens our own prompt can occupy.
+Adapters using a full wire body are conservative; llama.cpp excludes its
+response_format output grammar, which is not prompt content. A fixed framing reserve covers provider/server-side template
 framing we cannot see. Anything beyond the reserve is caught post-send
 by the response usage check and fails closed.
 
@@ -36,8 +37,9 @@ def precheck_byte_budget(wire_len: int, max_output_tokens: int, *, app_input_tok
         framing_reserve_tokens: int = FRAMING_RESERVE_TOKENS) -> None:
     """Fail-closed pre-send gate. Raises PermanentModelError on any exceed.
 
-    ``wire_len`` is UTF-8 bytes of the exact request body about to be
-    sent. Since every token spans >= 1 byte, ``wire_len +
+    ``wire_len`` is UTF-8 bytes of the adapter's admitted input representation
+    (the full wire body, or llama.cpp's body without output-grammar configuration).
+    Since every token spans >= 1 byte, ``wire_len +
     framing_reserve_tokens`` is a proven input-token upper bound, never
     an estimate.
     """
