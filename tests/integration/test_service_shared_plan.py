@@ -56,8 +56,8 @@ def _app_worker(tmp_path, valid_config_yaml, ports, selected, *, comments=False,
             else:
                 key = "review:" + (selected or "none")
                 body["choice"] = next(option["label"] for option in payload["options"] if option["key"] == key)
-        elif payload["stage"] == "select_perspective" and payload["state"]["field"] == fail_perspective:
-            body["choice"] = "not-a-declared-choice"
+        elif payload["stage"] == "select_perspectives" and fail_perspective:
+            body["selected_perspective_ids"] = ["not-a-declared-perspective"]
         return body
 
     analyze = ports["analyzer"].run_analysis.side_effect
@@ -295,10 +295,8 @@ def test_real_default_branch_presentation_commit_reuses_review_with_current_base
 def test_b_perspective_failure_preserves_selected_a_execution_and_posts_b_status(
     tmp_path, valid_config_yaml, worker_pipeline_ports,
 ):
-    from review_bot.domain.intent_perspectives import PERSPECTIVES
-
     with _app_worker(tmp_path, valid_config_yaml, worker_pipeline_ports, "architecture,intent", comments=True,
-        fail_perspective="perspective:" + PERSPECTIVES[1].id) as context:
+        fail_perspective=True) as context:
         config, worker, github, store, root, _, review, tev = context
         assert worker.run_once() is False
         assert worker_pipeline_ports["analyzer"].run_analysis.call_count == 2
@@ -306,13 +304,13 @@ def test_b_perspective_failure_preserves_selected_a_execution_and_posts_b_status
         plan = json.loads((run_dir / "execution-plan.json").read_text())
         assert plan["status"] == "planned"
         assert plan["partition"]["selected_modes"] == ["architecture", "intent"]
-        assert plan["partition"]["deferred_modes"] == {"intent": "invalid_closed_choice"}
+        assert plan["partition"]["deferred_modes"] == {"intent": "invalid_perspective_subset"}
         architecture = json.loads((run_dir / "A/result.json").read_text())
         assert architecture["status"] == "completed", architecture["reason"]
         assert architecture["partition"]["shared_plan_id"] == plan["partition"]["plan_id"]
         receipt = json.loads((run_dir / "B/receipt.json").read_text())
         assert receipt["execution_status"] == "failed"
-        assert receipt["error_code"] == "partition_mode_planning_deferred:invalid_closed_choice"
+        assert receipt["error_code"] == "partition_mode_planning_deferred:invalid_perspective_subset"
         assert not (run_dir / "B/result.json").exists()
         assert all(json.loads(request.user_content)["mode"] == "architecture" for request in review.requests)
         assert len(github.posted_comments) == 2

@@ -152,8 +152,11 @@ def test_public_contracts_and_constructors_are_offline(tmp_path: Path) -> None:
     assert not hasattr(review, "token_count_receipt")
     bound = review.admission_bytes(role_request(MAIN))
     assert type(bound) is int
+    payload = review._chat_payload(role_request(MAIN))
+    assert "response_format" in payload
+    input_payload = {key: value for key, value in payload.items() if key != "response_format"}
     assert bound == len(json.dumps(
-        review._chat_payload(role_request(MAIN)), ensure_ascii=False, allow_nan=False,
+        input_payload, ensure_ascii=False, allow_nan=False,
         separators=(",", ":")).encode("utf-8")) + 8192
     assert not (tmp_path / "macbook-admission").exists()
 
@@ -307,7 +310,10 @@ def test_admission_bytes_is_generation_free_and_input_sensitive(mock_http: Any) 
     request = replace(role_request(MAIN), user_content="한" * 40000)
     bound = client.admission_bytes(request)
     assert type(bound) is int
-    wire = json.dumps(client._chat_payload(request), ensure_ascii=False,
+    payload = client._chat_payload(request)
+    assert "response_format" in payload
+    input_payload = {key: value for key, value in payload.items() if key != "response_format"}
+    wire = json.dumps(input_payload, ensure_ascii=False,
                       allow_nan=False, separators=(",", ":")).encode("utf-8")
     assert bound == len(wire) + 8192 > len(wire)
     assert client.admission_bytes(request) == bound

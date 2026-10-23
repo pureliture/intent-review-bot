@@ -337,7 +337,7 @@ class TestMarkdownFormatter60kStress:
         assert len(formatted) <= 60000
         assert formatted.splitlines()[0] == DEFAULT_A_MARKER
         assert "리뷰 미완료" in formatted
-        assert "검토 입력이 없어 정적 신호와 코드 근거를 다시 확인할 수 없습니다" in formatted
+        assert "검토 입력이 없어 정적 분석 결과와 코드 근거를 다시 확인할 수 없습니다" in formatted
         assert "Excessive architectural entanglement" not in formatted
         assert "#### LLM 리뷰" not in formatted
 
