@@ -1,4 +1,4 @@
-"""Private bounded PR planning and A/B review through production model ports.
+"""Private bounded PR planning and architecture/development intent reviews.
 
 The opt-in service plans before global mode selection and reuses that plan in
 both consumers. Additional analysis evidence may amend only the affected groups.
@@ -41,6 +41,19 @@ from review_bot.domain.models_v1 import ModelRequest, Snapshot, TaskInput
 from review_bot.domain.partition_review import PartitionReviewLimits, PartitionReviewResult
 
 PROMPT_VERSION = "partitioned-review/v18-selected-perspectives-code-references"
+READABLE_REVIEW_GUIDANCE = """Explain the review to someone who has not read the implementation.
+Lead with the user's situation, what went wrong, what this change does, and the
+review judgement. Use short sentences in the requested language. The summary
+must be understandable without file names, function names, constant names,
+base/head labels, or terms such as fallback, formatter, schema and assertion.
+Explain any indispensable technical term when first using it. Put exact code
+identifiers and implementation evidence in the supporting reasoning/citations,
+not in place of an explanation. Describe what a test is written to check;
+never imply it was executed. Preserve conditions and uncertainty while simplifying.
+Use the display names '아키텍처 리뷰' and '개발 의도 리뷰' in Korean, or
+'architecture review' and 'development intent review' in English. Do not use
+internal mode letters as review names. Do not claim entire-repository approval.
+"""
 MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
 MAX_MODEL_CITATIONS = 32
@@ -707,6 +720,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
     prompts = {"observe": OBSERVE_PROMPT, "final": FINAL_PROMPT}
     if not isinstance(review_instructions, str):
         raise ValueError("invalid_review_instructions")
+    if mode != "planning":
+        review_instructions = READABLE_REVIEW_GUIDANCE + ("\n" + review_instructions if review_instructions else "")
     guidance = ("\nRepository review judgment and explanation guidance:\n" + review_instructions
         if review_instructions and mode != "planning" else "")
     if guidance:

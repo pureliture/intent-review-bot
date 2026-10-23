@@ -369,7 +369,7 @@ class ReviewBotConfig(BaseModel):
             "architecture" in self.execution.available_modes and "intent" not in self.execution.available_modes
             and "architecture" not in self.model_fields_set
         ):
-            raise ValueError("architecture configuration is required for A-only execution")
+            raise ValueError("architecture configuration is required for architecture-only execution")
         if self.execution.mode == "github_app" and "mode" not in self.publish.model_fields_set:
             self.publish.mode = "comment"
         if self.partition_evaluation.enabled and self.publish.mode != "artifact_only" and self.execution.mode != "github_app":

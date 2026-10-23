@@ -23,7 +23,7 @@ def test_partition_b_completed_no_findings_has_collapsed_perspectives_and_no_int
     assert result.status == "completed", result.reason
     before = deepcopy(asdict(result))
     markdown = format_partition_review_markdown(result, task, publication_mode="comment")
-    assert "### 의도 리뷰 B" in markdown
+    assert "### 개발 의도 리뷰" in markdown
     assert "이 검토 범위에서 추가로 조치할 발견사항은 없습니다." in markdown
     assert "<summary>선택한 8개 관점별 검토 근거</summary>" in markdown
     assert "문제와 성공 기준" in markdown and "검증 근거" in markdown

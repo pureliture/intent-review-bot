@@ -21,7 +21,7 @@ MAX_SETTINGS_BYTES = 65536
 MAX_INSTRUCTION_BYTES = 16384
 MAX_TEMPLATE_BYTES = 8192
 PRESENTATION_KEYS = frozenset({
-    "title_a", "title_b", "static_section", "llm_section", "details_label", "footer_notice",
+    "architecture_title", "intent_title", "title_a", "title_b", "static_section", "llm_section", "details_label", "footer_notice",
 })
 TEMPLATE_SECTIONS = {
     "architecture": ("summary", "static_analysis", "llm_review"),

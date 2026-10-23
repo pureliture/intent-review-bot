@@ -41,8 +41,8 @@ def format_intent_perspective_markdown(result: IntentPerspectiveResult, task_inp
         return ", ".join(values)
 
     private = publication_mode == "artifact_only"
-    title = ("### 의도 리뷰 · 비공개 결과" if ko else "### Intent review · private result") if private else (
-        "### 의도 리뷰" if ko else "### Intent review")
+    title = ("### 개발 의도 리뷰 · 비공개 결과" if ko else "### Development intent review · private result") if private else (
+        "### 개발 의도 리뷰" if ko else "### Development intent review")
     status = {"completed": "검토 완료", "partial_review": "부분 검토", "failed": "실행 실패", "not_run": "미실행"}.get(result.status) if ko else result.status
     scope = ("- 검토 대상은 고정된 PR 입력과 제공된 원문입니다. 대상 코드·빌드·테스트는 실행하지 않았습니다." if ko else
         "- Scope: the fixed PR input and supplied originals. Target code, builds, and tests were not executed.")

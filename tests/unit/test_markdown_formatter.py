@@ -192,7 +192,7 @@ def test_markdown_formatter_selected_static_template_and_llm_sections() -> None:
     result, task = _build_test_fixtures(findings_count=1)
     before = asdict(result)
     markdown = format_review_markdown(result, task)
-    assert markdown.splitlines()[:2] == ["<!-- review-bot:architecture:v1 -->", "### PMD/CPD 아키텍처 리뷰 A"]
+    assert markdown.splitlines()[:2] == ["<!-- review-bot:architecture:v1 -->", "### 아키텍처 리뷰"]
     assert "#### 전체 판단" in markdown
     assert "#### 정적 분석" in markdown
     assert "| 측정 영역 | 이번 PR 검토 범위 |" in markdown

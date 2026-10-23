@@ -178,7 +178,7 @@ class TestOfflineCliE2E:
 
         comment = (out_dir / "comment.md").read_text(encoding="utf-8")
         assert "<!-- review-bot:architecture:v1 -->" in comment
-        assert "### PMD/CPD 아키텍처 리뷰 A" in comment
+        assert "### 아키텍처 리뷰" in comment
 
     def test_cli_offline_subcommand_compat(
         self, synthetic_repo: SyntheticGitRepo, tmp_path: Path

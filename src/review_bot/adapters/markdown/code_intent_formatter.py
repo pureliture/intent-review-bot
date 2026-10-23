@@ -1,4 +1,4 @@
-"""Inert code-first B drafts; only fixed input originals can produce links."""
+"""Inert code-first development intent drafts; only fixed input originals can produce links."""
 from __future__ import annotations
 
 from dataclasses import asdict, replace
@@ -34,7 +34,7 @@ def format_code_intent_markdown(
                 links.append(link)
         return ", ".join(links)
 
-    heading = "### B · Code-first intent review" + (" (private draft)" if publication_mode == "artifact_only" else "")
+    heading = "### Development intent review" + (" (private draft)" if publication_mode == "artifact_only" else "")
     notice = "Publication: not attempted (artifact_only)." if publication_mode == "artifact_only" else "Output policy: comment; publication is a separate operation."
     base = [marker, heading, "", f"- Model review: **{result.status}** · `{result.reason}`",
         f"- Base: `{task.base.sha}`; head: `{task.head.sha}`", f"- {notice}",

@@ -14,15 +14,15 @@
 형식 오류·잘림·추가 근거·후보·재검사와 shared budget은 모두 같은 기록에 연결된다.
 최종 검증이 일부라도 미완료면 해당 모드의 본문은 게시하지 않는다. 정상 완료된 다른 모드는 독립적으로 처리한다.
 
-2026-10-21 사용자가 추가 승인한 공통 A/B 단계다. 기존 초기 계획·원문 분할·모드 선택·관점 리뷰·통합을 수행한 뒤, 최종 문장의 사실 오류를 검사하고 오류 항목을 재작성한다. PMD 리뷰와 의도 리뷰에 같은 단계가 적용된다.
+2026-10-21 사용자가 추가 승인한 공통 아키텍처/개발 의도 단계다. 기존 초기 계획·원문 분할·모드 선택·관점 리뷰·통합을 수행한 뒤, 최종 문장의 사실 오류를 검사하고 오류 항목을 재작성한다. PMD 리뷰와 의도 리뷰에 같은 단계가 적용된다.
 
 ```mermaid
 flowchart TD
-    F[고정 PR 원문 · diff · 목적] --> E[프로그램: Java + Gradle 자격으로 A 후보 제한]
+    F[고정 PR 원문 · diff · 목적] --> E[프로그램: Java + Gradle 자격으로 아키텍처 리뷰 후보 제한]
     E --> P[프로그램: AST 분할 후보와 byte-upper-bound admission]
     P --> T[TEV: 후보 선택 · 묶음 관측 · PR 전체 모드 선택]
-    T -->|A 선택| A[PMD/CPD 분석 · 공통 계획의 A 리뷰]
-    T -->|B 선택| B[TEV 1회로 선택한 N관점 B 리뷰]
+    T -->|아키텍처 리뷰 선택| A[PMD/CPD 분석 · 공통 계획의 아키텍처 리뷰]
+    T -->|개발 의도 리뷰 선택| B[TEV 1회로 선택한 N관점 개발 의도 리뷰]
     T -->|판단 실패| N[해당 리뷰 보류 안내]
     A --> I[원본 묶음 결과와 원문으로 통합]
     B --> I
@@ -51,7 +51,7 @@ flowchart TD
 
 넓은 TEV 참·거짓 판정이 실제 TCC 오답을 통과시킨 관찰이 있으므로, 그 판정을 단독 품질 게이트로 사용하지 않는다. Bonsai의 원문 대조 역시 오판할 수 있다. `model_supported`는 이 검사 절차를 통과했다는 뜻이며, 의미적 정확성이 증명됐다는 뜻은 아니다. 고정 실제 PR의 독립적인 품질 평가는 별도로 수행한다.
 
-현재 검증 단계의 `fact_check`·`fact_rewrite` 요청은 OpenRouter 매핑을 사용한다(Beam 프로필 retired, thinking 구분 없음). admission bound 확인과 생성에 같은 전송 정책을 적용하고 출력 예약 32,678과 보고 사용량에 함께 포함한다. 검토 단계를 추가하거나 병합만을 위한 호출을 만들지 않는다. 전송 정책의 구현도 A/B 결과 재사용 지문에 포함한다. (역사적 Beam thinking/`think: low` 기록은 zero-measurement 계약으로 superseded.)
+현재 검증 단계의 `fact_check`·`fact_rewrite` 요청은 OpenRouter 매핑을 사용한다(Beam 프로필 retired, thinking 구분 없음). admission bound 확인과 생성에 같은 전송 정책을 적용하고 출력 예약 32,678과 보고 사용량에 함께 포함한다. 검토 단계를 추가하거나 병합만을 위한 호출을 만들지 않는다. 전송 정책의 구현도 아키텍처/개발 의도 결과 재사용 지문에 포함한다. (역사적 Beam thinking/`think: low` 기록은 zero-measurement 계약으로 superseded.)
 
 ## 원문 전달
 
@@ -75,7 +75,7 @@ Python·Java의 production HEAD 원문에는 단순 함수·메서드 정의의 
 
 항목별 재작성 횟수는 기존 `max_rechecks`를 사용한다. 별도의 무제한 예산을 만들지 않는다. 기존 작업 마감, 호출·토큰 예산, 취소 fence와 모델 admission을 공유한다. 검사가 끝나기 전 예산·취소·모델·스키마 오류가 발생하면 마지막으로 받아들인 결과를 보존하고 `partial_review / factual_verification_incomplete`로 남긴다. 확인하지 않은 수정본을 최종 결과로 승격하지 않는다.
 
-결과 schema 13와 prompt `partitioned-review/v18-selected-perspectives-code-references`는 원본 통합 결과, 항목별 전체 후보·검사·재작성·재검사, 원문 범위, 실제 사용량을 보존한다. 저장 결과 검증기는 항목과 필드의 전수 대응, 지표 선택과 정의 비교, byte-upper-bound 초과 후 전달 변경, 원본과 수정본의 결합을 다시 확인한다. A/B 비공개 산출물의 `fact-verification.json`과 `partition.json`에서 확인할 수 있다. 비공개 평가에서는 발행하지 않는다. 정상 GitHub App 경로는 검증이 완료된 결과만 개발자용 본문으로 게시하며, 미완료 상태에서는 보류 안내만 게시한다.
+결과 schema 13와 prompt `partitioned-review/v18-selected-perspectives-code-references`는 원본 통합 결과, 항목별 전체 후보·검사·재작성·재검사, 원문 범위, 실제 사용량을 보존한다. 저장 결과 검증기는 항목과 필드의 전수 대응, 지표 선택과 정의 비교, byte-upper-bound 초과 후 전달 변경, 원본과 수정본의 결합을 다시 확인한다. 아키텍처/개발 의도 비공개 산출물의 `fact-verification.json`과 `partition.json`에서 확인할 수 있다. 비공개 평가에서는 발행하지 않는다. 정상 GitHub App 경로는 검증이 완료된 결과만 개발자용 본문으로 게시하며, 미완료 상태에서는 보류 안내만 게시한다.
 
 ### Native 용량 거절과 사용량
 
@@ -128,5 +128,5 @@ PMD의 rule·ruleset·class·method·message·행·열·fragment, CPD의 token �
 
 
 PMD 검토의 문맥 전용 페이지도 A 모드를 유지한다. 모든 A 최종 페이지와 전체 통합의 `perspectives`는 빈 배열이며,
-분석 대상이 없는 페이지의 `findings`와 `target_reviews`도 비운다. B의 관점 항목 정의를 A의 빈 배열 스키마에 포함하지 않는다.
+분석 대상이 없는 페이지의 `findings`와 `target_reviews`도 비운다. 개발 의도 리뷰의 관점 항목 정의를 아키텍처 리뷰의 빈 배열 스키마에 포함하지 않는다.
 모드를 섞은 응답에는 기대 개수 0과 실제 개수를 명확히 전달하여 기존 1회 정정 절차로 처리하며, 응답을 자동으로 빈 배열로 바꾸지 않는다.

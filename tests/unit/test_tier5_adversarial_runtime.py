@@ -654,7 +654,7 @@ class TestMarkdownFormatterAdversarialHardening:
         md = format_review_markdown(result, task_input, max_length=60000)
         assert len(md) <= 60000
         assert md.startswith("<!-- review-bot:architecture:v1 -->")
-        assert "### PMD/CPD 아키텍처 리뷰 A" in md
+        assert "### 아키텍처 리뷰" in md
         assert "Clean architectural refactor" in md
 
     def test_truncation_enforces_60k_hard_limit_on_massive_payload(self) -> None:
@@ -791,7 +791,7 @@ class TestMarkdownFormatterAdversarialHardening:
     def test_actions_artifact_url_validation_adversarial(self) -> None:
         """_a_artifact_link strictly requires credential-free HTTPS address <= 4096 chars."""
         valid_url = "https://github.com/owner/repo/actions/runs/123/artifacts/456"
-        assert f"[전체 A 자료]({valid_url})" == _a_artifact_link(valid_url)
+        assert f"[전체 아키텍처 리뷰 자료]({valid_url})" == _a_artifact_link(valid_url)
 
         with pytest.raises(ValueError, match="credential-free HTTPS address"):
             _a_artifact_link("http://insecure.site/artifact")

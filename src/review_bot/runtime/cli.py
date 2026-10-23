@@ -354,7 +354,7 @@ def create_parser() -> argparse.ArgumentParser:
     intent_parser.add_argument("--model-profile", choices=MODEL_PROFILES, default=None,
         help="Explicitly enable a review profile (default: no model calls)")
     intent_parser.add_argument("--pipeline", choices=("declared-v1", "code-first-v2", "perspectives-v1"), default="declared-v1",
-        help="B review contract; perspectives-v1 performs one fixed-input intent review with closed perspective choices")
+        help="Development intent review contract; perspectives-v1 performs one fixed-input intent review with closed perspective choices")
     intent_parser.add_argument("--language", choices=("ko", "en"), default="ko",
         help="Human output language for perspectives-v1 (default: ko)")
     intent_parser.add_argument("--call-timeout-seconds", type=int, default=None,

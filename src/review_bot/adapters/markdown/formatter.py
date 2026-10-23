@@ -1,4 +1,4 @@
-"""Developer-facing A review comments with bounded, grounded sections."""
+"""Developer-facing architecture review comments with bounded, grounded sections."""
 from __future__ import annotations
 
 import html
@@ -40,7 +40,7 @@ def _a_link(repository: str, sha: str, path: str, begin: int, end: int) -> str:
 def _a_artifact_link(url: str | None) -> str:
     """Format safe HTTPS Actions artifact link or default notice."""
     if not url:
-        return "전체 A 자료는 Actions artifact에서 확인할 수 있습니다."
+        return "전체 아키텍처 리뷰 자료는 Actions artifact에서 확인할 수 있습니다."
     parsed = urlsplit(url)
     if (
         len(url) > 4096
@@ -50,8 +50,8 @@ def _a_artifact_link(url: str | None) -> str:
         or parsed.password
         or any(ord(char) < 32 for char in url)
     ):
-        raise ValueError("A artifact URL must be a credential-free HTTPS address")
-    return f"[전체 A 자료]({quote(url, safe=':/?#=&%')})"
+        raise ValueError("Architecture artifact URL must be a credential-free HTTPS address")
+    return f"[전체 아키텍처 리뷰 자료]({quote(url, safe=':/?#=&%')})"
 
 
 def format_review_markdown(
@@ -66,10 +66,10 @@ def format_review_markdown(
 ) -> str:
     """Present selected static signals and adopted LLM opinions to developers."""
     from review_bot.adapters.markdown.developer_presentation import (
-        findings_section, finish, label, review_summary, selected_signals, static_analysis, status_sections, walkthrough,
+        BUILTIN_COMMENT_TEMPLATES, findings_section, finish, label, review_summary, selected_signals, static_analysis, status_sections, walkthrough,
     )
 
-    title = label(presentation, "title_a", "PMD/CPD 아키텍처 리뷰 A")
+    title = label(presentation, "architecture_title", "아키텍처 리뷰")
     if task_input is None:
         return finish(marker, title, status_sections(result,
             unreviewed=("검토 입력이 없어 정적 신호와 코드 근거를 다시 확인할 수 없습니다.",)),
@@ -90,4 +90,4 @@ def format_review_markdown(
     footer = _a_escape(artifact_notice) if artifact_notice is not None else _a_artifact_link(artifact_url) if artifact_url else ""
     if presentation and presentation.get("footer_notice"):
         footer += ("\n\n" if footer else "") + label(presentation, "footer_notice", "")
-    return finish(marker, title, sections, scope="", template=comment_template, max_length=max_length, footer=footer)
+    return finish(marker, title, sections, scope="", template=comment_template if comment_template is not None else BUILTIN_COMMENT_TEMPLATES["architecture"], max_length=max_length, footer=footer)

@@ -11,7 +11,7 @@ def _format_private_partition_markdown(result: PartitionReviewResult, task, **_o
         raise ValueError("partition_evaluation_is_private_only")
     validate_partition_result(result, task)
     ko = result.language == "ko"
-    name = ("의도" if ko else "Intent") if result.review_type == "B" else "PMD/CPD"
+    name = ("개발 의도" if ko else "Development intent") if result.review_type == "B" else ("아키텍처" if ko else "Architecture")
     lines = [f"### {name} 리뷰 · 분할 평가 · 비공개" if ko else f"### {name} review · partition trial · private", "",
         f"- {_escape(result.status)} / {_escape(result.reason)}",
         f"- base: {result.base_sha}; head: {result.head_sha}",
@@ -90,7 +90,7 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
     if publication_mode != "comment" or result.review_type not in ("A", "B"):
         raise ValueError("invalid_partition_formatter_options")
     from review_bot.adapters.markdown.developer_presentation import (
-        actionable_intent_findings, findings_section, finish, intent_lead, label, perspective_section, review_summary, walkthrough,
+        BUILTIN_COMMENT_TEMPLATES, actionable_intent_findings, findings_section, finish, intent_lead, label, perspective_section, review_summary, walkthrough,
         selected_signals, static_analysis, status_sections,
     )
     from review_bot.domain.markers import DEFAULT_B_MARKER
@@ -98,7 +98,7 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
 
     validate_partition_result(result, task)
     architecture = result.review_type == "A"
-    title = label(presentation, "title_a" if architecture else "title_b", "PMD/CPD 아키텍처 리뷰 A" if architecture else "의도 리뷰 B")
+    title = label(presentation, "architecture_title" if architecture else "intent_title", "아키텍처 리뷰" if architecture else "개발 의도 리뷰")
     marker = marker or (DEFAULT_A_MARKER if architecture else DEFAULT_B_MARKER)
     if result.status != "completed" or result.validation_errors:
         final = result.partition.get("final", {})
@@ -123,10 +123,11 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
         lead = intent_lead(result.perspectives)
         if lead:
             summary = lead + "\n\n" + summary
+        sections["summary"] = summary
         walk = walkthrough(task, findings, result.questions)
         if walk:
             sections["summary"] = summary + "\n\n" + walk
         sections["llm_review"] = findings_section(findings, result.questions, task, presentation=presentation)
         sections["perspectives"] = perspective_section(result.perspectives, task, presentation)
     footer = label(presentation, "footer_notice", "")
-    return finish(marker, title, sections, scope="", template=comment_template, max_length=max_length, footer=footer)
+    return finish(marker, title, sections, scope="", template=comment_template if comment_template is not None else BUILTIN_COMMENT_TEMPLATES["architecture" if architecture else "intent"], max_length=max_length, footer=footer)

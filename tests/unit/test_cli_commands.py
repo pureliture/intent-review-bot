@@ -223,7 +223,7 @@ def test_cli_review_end_to_end_on_synthetic_repo(synthetic_repo: SyntheticGitRep
 
     comment_content = (out_dir / "comment.md").read_text(encoding="utf-8")
     assert "<!-- review-bot:architecture:v1 -->" in comment_content
-    assert "### PMD/CPD 아키텍처 리뷰 A" in comment_content
+    assert "### 아키텍처 리뷰" in comment_content
 
 
 def test_cli_review_invalid_repo(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:

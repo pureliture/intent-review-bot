@@ -1,4 +1,4 @@
-"""Safe B comment drafts; links are constructed only from validated input evidence."""
+"""Safe development intent comment drafts; links are constructed only from validated input evidence."""
 from __future__ import annotations
 
 import html
@@ -68,7 +68,7 @@ def format_intent_markdown(
     def links(refs) -> str:
         return ", ".join(_link(evidence[ref], task) for ref in refs)
 
-    heading = "### B · PR intent review" + (" (private evaluation draft)" if publication_mode == "artifact_only" else "")
+    heading = "### Development intent review" + (" (private evaluation draft)" if publication_mode == "artifact_only" else "")
     publication_notice = (
         "- Publication: not attempted (artifact_only); no automatic approval or request-changes."
         if publication_mode == "artifact_only" else "- Output policy: comment; no automatic approval or request-changes."
@@ -135,7 +135,7 @@ def format_intent_markdown(
             f"- Model review: **{result.status}** · `{result.reason}`",
             f"- Comparison base: `{task.base.sha}`", f"- Head: `{task.head.sha}`",
             publication_notice, "",
-            "Draft body omitted: comment_limit_exceeded. Complete stage/result/scope data remains in private B/ files.",
+            "Draft body omitted: comment_limit_exceeded. Complete stage/result/scope data remains in private review files.",
             "Material outside the prepared paths was not reviewed; this is not a whole-repository assessment.",
             "Target code, builds, tests and hooks were not executed by this bot.",
             "Validation is not semantic accuracy, approval, or complete PR correctness."]

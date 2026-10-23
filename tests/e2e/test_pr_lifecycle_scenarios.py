@@ -210,7 +210,7 @@ class TestScenario4OfflineCliFullAudit:
 
         comment_text = (out_dir / "comment.md").read_text(encoding="utf-8")
         assert "<!-- review-bot:architecture:v1 -->" in comment_text
-        assert "### PMD/CPD 아키텍처 리뷰 A" in comment_text
+        assert "### 아키텍처 리뷰" in comment_text
 
 
 # ==============================================================================
@@ -345,7 +345,7 @@ class TestScenario5GuardedConcurrentPublicationRace:
                 fingerprints.append(fingerprint)
                 body = github.comments[comment_id]["body"]
                 assert body.startswith(config.publish.a_marker)
-                assert "### PMD/CPD 아키텍처 리뷰 A" in body
+                assert "### 아키텍처 리뷰" in body
                 assert "#### 전체 판단" in body and "#### 리뷰 의견" in body
                 assert "이 검토 범위에서 추가로 조치할 발견사항은 없습니다" in body
                 assert f"Architecture pass {generation}" in body

@@ -70,7 +70,7 @@ class TestCliOfflineAndCompatibility:
 
         comment_text = (out_dir / "comment.md").read_text(encoding="utf-8")
         assert comment_text.splitlines()[0] == "<!-- review-bot:architecture:v1 -->"
-        assert "### PMD/CPD 아키텍처 리뷰 A" in comment_text
+        assert "### 아키텍처 리뷰" in comment_text
 
     def test_version_subcommand_and_flags(self, capsys: pytest.CaptureFixture[str]) -> None:
         """Verify --version, version, and version --json."""

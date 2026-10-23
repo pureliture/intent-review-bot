@@ -14,6 +14,11 @@ from dataclasses import asdict, is_dataclass
 
 from review_bot.domain.intent_perspectives import PERSPECTIVES
 
+BUILTIN_COMMENT_TEMPLATES = {
+    "architecture": "{{summary}}\n\n{{static_analysis}}\n\n{{llm_review}}",
+    "intent": "{{summary}}\n\n{{llm_review}}\n\n{{perspectives}}",
+}
+
 
 def row(value):
     return asdict(value) if is_dataclass(value) else value
@@ -25,9 +30,14 @@ def escape(value) -> str:
 
 
 def label(presentation, name: str, fallback: str) -> str:
-    value = (presentation or {}).get(name, fallback)
+    values = presentation or {}
+    legacy = {"architecture_title": "title_a", "intent_title": "title_b"}.get(name)
+    value = values.get(name, values.get(legacy, fallback))
     if not isinstance(value, str) or len(value) > 1000:
         raise ValueError("invalid_comment_presentation")
+    if name in ("architecture_title", "intent_title"):
+        value = {"PMD/CPD 아키텍처 리뷰 A": "아키텍처 리뷰",
+            "의도 리뷰 B": "개발 의도 리뷰", "의도 리뷰": "개발 의도 리뷰"}.get(value, value)
     return escape(value)
 
 
@@ -138,7 +148,7 @@ def review_summary(summary: str, task, *, is_mock=False) -> str:
                 break
     body = "#### 전체 판단\n\n" + escape(summary)
     if purpose:
-        body = "PR 목적: " + escape(purpose) + "\n\n" + body
+        body += "\n\n" + details("PR에 작성된 목적", escape(purpose))
     if is_mock:
         body = "> 모의 모델 결과입니다. 실제 리뷰 품질을 확인한 결과가 아닙니다.\n\n" + body
     return body
@@ -425,5 +435,5 @@ def intent_lead(perspectives) -> str:
         return ""
     flagged = [v for v in verdicts if v not in ("aligned", "not_apply")]
     if not flagged:
-        return "> 이 PR의 목적과 구현이 부합한다는 판단입니다."
-    return f"> 목적과 구현의 불일치 또는 확인이 필요한 점 {len(flagged)}건을 제기합니다."
+        return "> **판단: 이번 변경은 PR에서 설명한 문제를 해결하는 방향과 맞습니다.**"
+    return f"> **판단: 목적과 구현을 대조한 결과, 확인하거나 수정할 점 {len(flagged)}건이 있습니다.**"
