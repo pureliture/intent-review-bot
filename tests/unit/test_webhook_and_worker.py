@@ -950,8 +950,8 @@ def test_worker_publishes_formatted_review_with_real_receipt(
     comment = next(iter(github.comments.values()))
     assert comment["body"] == format_review_markdown(result, task, marker=marker)
     assert r"Worker architecture review completed\." in comment["body"]
-    assert f"HEAD `{'b' * 40}`" in comment["body"]
     assert "전체 판단" in comment["body"]
+    assert "리뷰 의견" in comment["body"]
     if existing:
         assert comment["id"] == previous_id
         assert len(github.posted_comments) == 1

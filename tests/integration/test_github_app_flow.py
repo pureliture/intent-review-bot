@@ -150,7 +150,8 @@ def test_installed_first_pr_runs_real_analysis_and_creates_one_comment(app_flow)
     assert len(flow.comments) == 1
     assert flow.calls.count(("POST", "/repos/org/repo/issues/7/comments")) == 1
     assert "<!-- review-bot:architecture:v1 -->" in flow.comments[0]["body"]
-    assert "LLM" in flow.comments[0]["body"]
+    assert "#### 전체 판단" in flow.comments[0]["body"]
+    assert "#### 리뷰 의견" in flow.comments[0]["body"]
     assert "모델 미실행" not in flow.comments[0]["body"]
     assert "Actions artifact" not in flow.comments[0]["body"]
     run_id, status = flow.store._get_connection().execute("SELECT run_id, status FROM runs;").fetchone()

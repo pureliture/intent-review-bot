@@ -187,4 +187,3 @@ class PartitionModelClient:
             body = self.transform(payload, body)
         return body if isinstance(body, ModelResponse) else ModelResponse(json.dumps(body, ensure_ascii=False),
             {"input_tokens": self.count_input_tokens(request), "output_tokens": 10})
-

@@ -82,4 +82,3 @@ def compact_schema(schema):
     if not result["$defs"]:
         result.pop("$defs")
     return result if len(_encode(result)) < len(_encode(schema)) else schema
-

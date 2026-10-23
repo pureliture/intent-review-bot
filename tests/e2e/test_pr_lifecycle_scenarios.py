@@ -349,7 +349,7 @@ class TestScenario5GuardedConcurrentPublicationRace:
                 assert "#### 전체 판단" in body and "#### 리뷰 의견" in body
                 assert "이 검토 범위에서 추가로 조치할 발견사항은 없습니다" in body
                 assert f"Architecture pass {generation}" in body
-                assert f"고정된 HEAD `{head}`" in body
+                assert "Base SHA:" not in body and "Head SHA:" not in body
                 supplied = json.loads(model.requests[-1].user_content)
                 assert supplied["snapshot"]["base"]["sha"] == comparison_base
                 assert supplied["snapshot"]["head"]["sha"] == head

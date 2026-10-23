@@ -354,4 +354,3 @@ def test_post_slices_deadline_per_attempt(monkeypatch):
     # the retry got a fresh ~30s slice instead of 10s of crumbs.
     assert 25.0 < seen_deadlines[0] <= 30.0
     assert 25.0 < seen_deadlines[1] <= 30.0
-
