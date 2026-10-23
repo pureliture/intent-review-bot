@@ -25,7 +25,7 @@ def test_partition_b_completed_no_findings_has_collapsed_perspectives_and_no_int
     markdown = format_partition_review_markdown(result, task, publication_mode="comment")
     assert "### 의도 리뷰 B" in markdown
     assert "이 검토 범위에서 추가로 조치할 발견사항은 없습니다." in markdown
-    assert "<summary>8개 관점별 검토 근거</summary>" in markdown
+    assert "<summary>선택한 8개 관점별 검토 근거</summary>" in markdown
     assert "문제와 성공 기준" in markdown and "검증 근거" in markdown
     assert "https://github.com/" in markdown and "#L" in markdown
     for internal in ("shared_plan", "plan:", "UTF-8", "분할 평가", "Usage", "Tokens", "사실 검토"):
@@ -119,7 +119,7 @@ def test_partition_declared_verdict_keeps_its_label_and_failure_condition(verdic
     result = completed(task, "intent", PartitionModelClient(transform=concern))
     assert result.status == "completed", result.reason
     markdown = format_partition_review_markdown(result, task, publication_mode="comment")
-    main = markdown.split("<summary>8개 관점별 검토 근거</summary>")[0]
+    main = markdown.split("<summary>선택한 8개 관점별 검토 근거</summary>")[0]
     assert label in main and other_label not in main and "Missing caller guard" in main
     assert "성립 조건:" in main
     assert "A caller bypasses the guard" in main

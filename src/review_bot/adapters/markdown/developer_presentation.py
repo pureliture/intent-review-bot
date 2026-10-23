@@ -411,7 +411,7 @@ def perspective_section(perspectives, task, presentation=None) -> str:
                 blocks.extend(["", "성립 조건: " + escape(assessment["failure_condition"])])
             quoted = quotes(assessment.get("citations", []), task, seen_quotes)
             blocks.extend(["", citation_links(assessment.get("citations", []), task), "", quoted, ""])
-    return details(label(presentation, "details_label", "8개 관점별 검토 근거"), "\n".join(blocks)) if blocks else ""
+    return details(label(presentation, "details_label", f"선택한 {len(perspectives)}개 관점별 검토 근거"), "\n".join(blocks)) if blocks else ""
 
 
 def intent_lead(perspectives) -> str:

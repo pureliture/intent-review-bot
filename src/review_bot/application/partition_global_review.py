@@ -49,6 +49,11 @@ for static review. Preserve genuinely unavailable necessary evidence explicitly.
 Select supplied reference IDs; never author numeric offsets. Return only schema JSON.
 """
 
+def prompt_for(meta):
+    return (PROMPT.replace("each of the eight perspective IDs", "each supplied selected perspective ID")
+        if "intent_perspective_ids" in meta else PROMPT)
+
+
 SOURCE_QUESTION = """Choose one fixed original that directly supplies the exact fact
 needed for this named gap. Prefer complete head source for current implementation or
 configuration, not merely related tests/prose. Select no_suitable_source when this
@@ -216,7 +221,7 @@ def payload(data, *, full=False, previous=None):
         "provisional_missing_context": deepcopy(data["inherited"]["missing_context"]),
         "review_targets": list(data["meta"]["targets"]), "pending_review_targets": list(data["pending"]),
         "review_target_details": deepcopy(data["meta"].get("target_details", [])),
-        "perspective_catalog": [asdict(p) for p in PERSPECTIVES],
+        "perspective_catalog": [asdict(p) for p in PERSPECTIVES if p.id in data["meta"].get("intent_perspective_ids", [x.id for x in PERSPECTIVES])],
         "fixed_original_inventory": [{"evidence_id": o.evidence_id, "path": o.path, "version": o.version,
             "sha": o.sha, "source_hash": o.digest, "bytes": len(o.raw)} for o in originals],
         "pr_purpose": [{"evidence_id": o.evidence_id, "source_hash": o.digest, "text": o.text}
@@ -325,7 +330,7 @@ def _normalize(raw, data, mode, *, references=None):
     perspectives, seen = [], set()
     for value in bounded_array(body["perspectives"], maximum=8):
         row = bounded_object(value, {"perspective_id", "verdict", "statement", "reasoning", "failure_condition", "citations"})
-        if row["perspective_id"] in seen or row["perspective_id"] not in {p.id for p in PERSPECTIVES} or row["verdict"] not in ("aligned", "concern", "conditional_risk", "insufficient_context", "not_apply"):
+        if row["perspective_id"] in seen or row["perspective_id"] not in set(data["meta"].get("intent_perspective_ids", [p.id for p in PERSPECTIVES])) or row["verdict"] not in ("aligned", "concern", "conditional_risk", "insufficient_context", "not_apply"):
             raise PartitionError("global_perspective_invalid")
         seen.add(row["perspective_id"])
         clean = {**row, "citations": citations(row["citations"])}
@@ -334,7 +339,7 @@ def _normalize(raw, data, mode, *, references=None):
         if row["verdict"] in ("concern", "conditional_risk") and (not row["failure_condition"] or not any(c["path"] and c["version"] == "head" for c in clean["citations"])):
             raise PartitionError("global_concern_without_head_failure_evidence")
         perspectives.append(clean)
-    if (mode == "intent" and seen != {p.id for p in PERSPECTIVES}) or (mode == "architecture" and perspectives):
+    if (mode == "intent" and seen != set(data["meta"].get("intent_perspective_ids", [p.id for p in PERSPECTIVES]))) or (mode == "architecture" and perspectives):
         raise PartitionError("global_perspectives_incomplete")
     page_decisions = bounded_object(body["observation_dispositions"], {r["observation_id"] for r in data["rows"]})
     normalized_pages = []

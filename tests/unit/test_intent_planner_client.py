@@ -438,3 +438,22 @@ def test_macbook_plan_cannot_use_production_admission_state(
     with pytest.raises(ValueError, match="separate from production state"):
         adapter.MacBookLlamaCppPlanClient(api_url="http://localhost:8080/v1")
     assert not (tmp_path / "production-admission").exists()
+
+
+def test_subset_selection_disables_thinking_and_uses_one_post(role, mock_http):
+    from review_bot.application.partition_choices import perspective_subset_schema
+    from review_bot.domain.intent_perspectives import PERSPECTIVES
+    selected = [PERSPECTIVES[0].id, PERSPECTIVES[4].id]
+    def handler(request):
+        if request.url.path == "/v1/chat/completions":
+            wire = json.loads(request.content)
+            assert wire["chat_template_kwargs"]["enable_thinking"] is False
+            assert wire["max_tokens"] == 256
+            return httpx.Response(200, json=chat_response(model=role.model,
+                content=json.dumps({"selected_perspective_ids": selected})))
+    requests = mock_http(role, handler)
+    request = replace(plan_request(role.model), max_output_tokens=256,
+        response_schema=perspective_subset_schema(), user_content=json.dumps({"stage": "select_perspectives", "state": {}}))
+    response = role.client_type(api_url=role.api_url).complete(request)
+    assert json.loads(response.text)["selected_perspective_ids"] == selected
+    assert sum(r.url.path == "/v1/chat/completions" for r in requests) == 1

@@ -24,9 +24,8 @@ class LlamaCppPlanClient(LlamaCppModelClient):
     def _chat_payload(self, request: ModelRequest) -> dict:
         payload = super()._chat_payload(request)
         properties = request.response_schema.get("properties")
-        if isinstance(properties, dict) and set(properties) == {"choice"}:
-            # The closed label allowance must not be spent on hidden reasoning.
-            # Keep the closed-choice wire free of hidden reasoning.
+        if isinstance(properties, dict) and set(properties) in ({"choice"}, {"selected_perspective_ids"}):
+            # Closed labels and fixed-ID subsets need no hidden reasoning.
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         return payload
 

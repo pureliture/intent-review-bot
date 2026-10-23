@@ -72,12 +72,14 @@ class PartitionModelClient:
             options = payload["options"]
             option = options[-1] if stage == "plan_partitions" and not self.group_all else options[0]
             body = {"choice": option["label"]}
+        elif stage == "select_perspectives":
+            body = {"selected_perspective_ids": [p.id for p in PERSPECTIVES]}
         elif stage == "global_review":
             pages = payload["observations"]
             previous = payload.get("recheck", {})
             findings = [deepcopy(f) for page in pages for f in page["raw_response"]["findings"]]
             perspectives = []
-            for perspective in PERSPECTIVES if payload["mode"] == "intent" else ():
+            for perspective in ([p for p in PERSPECTIVES if p.id in {c["id"] for c in payload["perspective_catalog"]}] if payload["mode"] == "intent" else ()):
                 candidates = [p for page in pages for p in page["raw_response"]["perspectives"]
                     if p["perspective_id"] == perspective.id]
                 perspectives.append(deepcopy(next((p for p in candidates if p["verdict"] in
@@ -136,7 +138,7 @@ class PartitionModelClient:
                 return {"replacement": replacement, "correction_reason": "Synthetic complete replacement for contract checks.",
                     "correction_citations": [encode_citation(ref)]}
             body = ({"items": {row["item_id"]: rewrite(row) for row in payload["items"]}}
-                if _quote_citation_schema(request.response_schema) and set(request.response_schema["properties"]) == {"items"}
+                if set(request.response_schema["properties"]) == {"items"}
                 else rewrite(payload["items"][0]))
         else:
             spans = [*payload.get("originals", payload.get("original_quotes", [])), *payload.get("pr_purpose", [])]
@@ -162,7 +164,7 @@ class PartitionModelClient:
                 body = {"summary": "Synthetic contract result, not a real review.", "findings": [], "questions": [],
                     "perspectives": [{"perspective_id": p.id, "verdict": "aligned", "statement": "Synthetic judgement.",
                         "reasoning": "Fixture cites an actual delivered original.", "failure_condition": "", "citations": [cite]}
-                        for p in PERSPECTIVES] if payload["mode"] == "intent" else [], "missing_context": []}
+                        for p in PERSPECTIVES if p.id in {c["id"] for c in payload["perspective_catalog"]}] if payload["mode"] == "intent" else [], "missing_context": []}
             else:
                 body = {"statement": "Synthetic observation.", "citations": [cite], "missing_context": []}
                 if stage == "review_partition":

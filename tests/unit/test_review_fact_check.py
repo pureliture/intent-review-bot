@@ -159,7 +159,7 @@ def test_native_capacity_rejection_reserves_unknown_usage_before_lossless_batch_
     assert client.profile.max_input_tokens == context_tokens - output_tokens
     assert not hasattr(client, "supports_native_input_measurement")
     assert not hasattr(client, "token_count_receipt")
-    settings = PartitionReviewLimits(max_calls=256, max_total_tokens=24000000 if fits else (4300 if output_tokens == 512 else 36500))
+    settings = PartitionReviewLimits(max_calls=256, max_total_tokens=24000000 if fits else (3591 if output_tokens == 512 else 35757))
     budget = ModelExecutionBudget(settings, time.monotonic() + settings.task_timeout_seconds, None)
     result = run_partition_review(task, "intent", client, PartitionModelClient(), limits=settings, shared_budget=budget)
     # No metering packets or reservations exist in the new contract.
@@ -400,7 +400,7 @@ def _fact_citation(payload, reference):
 
     This is not applied after transforms: malformed outputs remain malformed.
     """
-    if payload["canonical_facts"]["version"] == facts.LEGACY_VERSION:
+    if payload["canonical_facts"]["version"] in (facts.LEGACY_VERSION, facts.VERSION):
         return {"reference_id": reference}
     for source in facts.materialize_source_texts(payload):
         choices = [entry for catalog in payload["citation_catalog"] if catalog["evidence_id"] == source["evidence_id"]
@@ -657,8 +657,8 @@ def test_invalid_checker_reference_is_retained_in_readable_partial_result():
     result = run_partition_review(task, "intent", PartitionModelClient(transform=corrupt), PartitionModelClient(), limits=limits())
     assert result.status == "partial_review" and result.reason == "factual_verification_incomplete"
     ledger = result.partition["fact_verification"]
-    assert ledger["interruption_reason"] == "citation_quote_unknown_source"
-    assert result.stages[-1].status == "failed" and result.stages[-1].reason == "citation_quote_unknown_source"
+    assert ledger["interruption_reason"] == "fact_check_unknown_reference"
+    assert result.stages[-1].status == "failed" and result.stages[-1].reason == "fact_check_unknown_reference"
     assert ledger["items"][0]["attempts"][0]["check"]["response"]["items"]
     assert result.partition["final"] == result.partition["pre_verification_final"]
     validate_partition_result(result, task)
@@ -717,14 +717,14 @@ def test_checker_receives_literal_prose_and_exact_claim_rules_without_repairing_
     assert "source_requests from fixed_original_inventory" in request.system_prompt
     namespace_rule = "For citations[].reference_id, copy an allowed reference_id from citation_catalog exactly; never substitute a source-level evidence_id (including S-prefixed IDs), even for whole-file or test-presence claims. The evidence_id namespace is used for source_requests from fixed_original_inventory, not for citations."
     assert namespace_rule in facts.LEGACY_CHECK_PROMPT
-    assert namespace_rule not in request.system_prompt
-    assert facts.QUOTE_OUTPUT_CONTRACT in request.system_prompt
-    assert request.system_prompt.index(facts.QUOTE_OUTPUT_CONTRACT) < request.system_prompt.index("Program output contract")
-    assert "source_id" in request.system_prompt and "verbatim" in request.system_prompt
+    assert namespace_rule in request.system_prompt
+    assert facts.CODE_REFERENCE_CONTRACT in request.system_prompt
+    assert request.system_prompt.index(facts.CODE_REFERENCE_CONTRACT) < request.system_prompt.index("Program output contract")
+    assert "reference_id" in request.system_prompt and "exact source lines" in request.system_prompt
     assert "keep the unresolved limitation explicit for the factual recheck" in facts.REWRITE_PROMPT
     assert "silently remove the disputed assertion" in facts.REWRITE_PROMPT
     assert result.partition["identity"]["prompts"]["fact_check"] == hash_json(facts.CHECK_PROMPT)
-    assert result.prompt_version == "partitioned-review/v17-shared-service-batched-facts"
+    assert result.prompt_version == "partitioned-review/v18-selected-perspectives-code-references"
     assert result.model["is_mock"] is True  # no semantic accuracy claim from this fixture
 
 
@@ -1256,16 +1256,12 @@ def test_known_native_batch_output_limit_splits_items_after_proactive_bound(limi
 
 
 
-def test_fixed_perspective_scope_premises_use_existing_four_item_rewrite_batch():
+def test_selected_perspective_false_scope_premises_use_existing_four_item_rewrite_batch():
     from dataclasses import asdict
     from review_bot.domain.intent_perspectives import CATALOG_VERSION, PERSPECTIVES
     excluded = {"problem_success", "outcome_connection", "preservation", "assumptions_tradeoffs"}
     invented = "This perspective is excluded because this page focuses on other perspectives."
     observed_contexts = []
-    def plan_transform(payload, body):
-        if payload["stage"] == "select_perspective" and payload["state"]["perspective"]["id"] in excluded:
-            body["choice"] = next(option["label"] for option in payload["options"] if option["key"] == "not_apply")
-        return body
     def review_transform(payload, body):
         stage = payload["stage"]
         if stage == "final_review":
@@ -1276,9 +1272,8 @@ def test_fixed_perspective_scope_premises_use_existing_four_item_rewrite_batch()
             context = payload["canonical_facts"]["intent_perspectives"]
             assert context["catalog_version"] == CATALOG_VERSION
             assert context["catalog"] == [asdict(perspective) for perspective in PERSPECTIVES]
-            assert context["scope_policy"]["review_all_eight_from_fixed_catalog"] is True
-            assert "Provisional" in context["scope_policy"]["initial_tev_applicability"]
-            assert "Page focus" in context["scope_policy"]["unsupported_exclusions"]
+            assert context["scope_policy"]["review_selected_perspectives_only"] is True
+            assert len(context["scope_policy"]["selected_perspective_ids"]) == 8
             observed_contexts.append(context)
             if stage == "fact_check":
                 assert payload["originals"] and payload["fixed_original_inventory"] == []
@@ -1302,10 +1297,10 @@ def test_fixed_perspective_scope_premises_use_existing_four_item_rewrite_batch()
     task = make_task()
     review = PartitionModelClient(transform=review_transform)
     result = run_partition_review(task, "intent", review,
-        PartitionModelClient(group_all=True, transform=plan_transform), limits=limits())
+        PartitionModelClient(group_all=True), limits=limits())
     assert result.status == "completed", result.reason
     hints = {row["perspective_id"]: row["decision"] for row in result.partition["scope_selection"]["perspectives"]}
-    assert {key for key, value in hints.items() if value == "not_apply"} == excluded
+    assert all(value == "apply" for value in hints.values())
     original = result.partition["pre_verification_final"]
     assert {item["perspective_id"] for item in original["perspectives"] if item["verdict"] == "not_apply"} == excluded
     assert all(item["verdict"] == "aligned" for item in result.perspectives) and len(result.perspectives) == 8
@@ -1327,8 +1322,8 @@ def test_source_grounded_perspective_non_applicability_is_still_permitted():
                     item.update(verdict="not_apply", statement=legitimate, reasoning=legitimate)
         elif payload["stage"] == "fact_check":
             context = payload["canonical_facts"]["intent_perspectives"]
-            assert "not_apply remains allowed" in context["scope_policy"]["source_grounded_not_apply"]
-            assert "Do not force apply" in context["scope_policy"]["source_grounded_not_apply"]
+            assert "not_apply is allowed" in context["scope_policy"]["source_grounded_not_apply"]
+            assert context["scope_policy"]["review_selected_perspectives_only"] is True
         return body
     task = make_task(repair=True)
     review = PartitionModelClient(transform=transform)
@@ -1367,7 +1362,7 @@ def test_empty_field_rule_preserves_original_field_and_strict_response_contract(
     assert assessment["properties"]["citations"]["minItems"] == 0
 
 
-def test_true_test_claim_with_header_citation_is_repaired_without_model_rewrite():
+def test_true_test_claim_attaches_literal_support_with_one_check_and_no_citation_rewrite():
     from review_bot.application.intent_context import build_intent_task_input
     from tests.fixtures.intent_review import digest
     task = make_task()
@@ -1394,9 +1389,9 @@ def test_true_test_claim_with_header_citation_is_repaired_without_model_rewrite(
             item.update(statement=literal, reasoning="The HEAD test contains an explicit assertion for the caller's expected string output.",
                 citations=[{"reference_id": reference(payload, "import os")}])
         elif stage == "fact_check":
-            rule = payload["canonical_facts"]["citation_grounding_rule"]
-            assert "ORIGINAL item's citation set" in rule and "return unverifiable" in rule
-            assert "do not silently repair" in rule and "empty or non_factual fields" in rule
+            assert "citation_grounding_rule" not in payload["canonical_facts"]
+            assert "original_support_quote_rule" not in payload["canonical_facts"]
+            assert "original_support_reference_rule" not in payload["canonical_facts"]
             for row in payload["items"]:
                 item = row["original_item"]
                 if isinstance(item, dict) and item.get("citations"):
@@ -1427,7 +1422,7 @@ def test_true_test_claim_with_header_citation_is_repaired_without_model_rewrite(
     review = PartitionModelClient(transform=transform)
     result = run_partition_review(task, "intent", review, PartitionModelClient(), limits=limits())
     assert result.status == "completed", result.reason
-    assert checked_fields == [False, True]
+    assert checked_fields == [False]
     original = next(item for item in result.partition["pre_verification_final"]["perspectives"] if item["perspective_id"] == "supporting_evidence")
     accepted = next(item for item in result.perspectives if item["perspective_id"] == "supporting_evidence")
     assert original["citations"][0]["quote"] == header and original["citations"][0]["end_line"] == 8
@@ -1435,36 +1430,24 @@ def test_true_test_claim_with_header_citation_is_repaired_without_model_rewrite(
     assert accepted["reasoning"] == original["reasoning"] and accepted["failure_condition"] == ""
     assert any(assertion.strip() in cite["quote"] and cite["begin_line"] == 9 for cite in accepted["citations"])
     entry = next(entry for entry in result.partition["fact_verification"]["items"] if entry["original"] == original)
-    first, second = entry["attempts"]
+    first, = entry["attempts"]
     assert first["assessments"]["statement"]["state"] == "supported"
-    assert first["check"]["response"]["items"][entry["item_id"]]["statement"]["state"] == "supported"
-    gap = next(issue for issue in first["issues"] if issue["field"] == "statement")
-    assert gap["state"] == "unverifiable" and gap["binding_gap_ranges"]
+    assert first["issues"] == [] and "citation_repair" not in first
     assert any(assertion.strip() in cite["quote"] for cite in first["check"]["cited_evidence"])
-    assert second["assessments"]["statement"]["state"] == "supported"
     assert not [request for request in review.requests if json.loads(request.user_content)["stage"] == "fact_rewrite"]
+    assert len([request for request in review.requests if json.loads(request.user_content)["stage"] == "fact_check"]) == 1
     from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
-    assert "인용 보강 후 재검토" in format_partition_review_markdown(result, task)
-    assert first["citation_repair"]["origin"] == "program_citation_union"
-    assert first["citation_repair"]["replacement"] == second["item"]
-    assert first["citation_repair"]["replacement_hash"] == hash_json(second["item"])
+    comment = format_partition_review_markdown(result, task, publication_mode="comment")
+    assert "인용 원문" in comment and "test_label.py" in comment and "assert label(7)" in comment
     assert original["citations"][0] in accepted["citations"]
     assert result.summary == result.partition["pre_verification_final"]["summary"]
     validate_partition_result(result, task)
     changed = deepcopy(result)
     changed_entry = next(value for value in changed.partition["fact_verification"]["items"] if value["item_id"] == entry["item_id"])
-    changed_entry["attempts"][0]["issues"][0]["binding_gap_ranges"] = []
-    with pytest.raises(PartitionError, match="stored_fact_assessment_changed"):
+    changed_entry["accepted"]["citations"] = deepcopy(original["citations"])
+    with pytest.raises(PartitionError, match="stored_fact_acceptance_changed"):
         validate_partition_result(changed, task)
-    changed = deepcopy(result)
-    changed_entry = next(value for value in changed.partition["fact_verification"]["items"] if value["item_id"] == entry["item_id"])
-    changed_entry["attempts"][0]["citation_repair"]["replacement"]["statement"] = "Forged changed prose."
-    with pytest.raises(PartitionError, match="citation_repair_changed"):
-        validate_partition_result(changed, task)
-    changed = deepcopy(result)
-    changed.partition["fact_verification"]["execution_policy_version"] = 1
-    with pytest.raises(PartitionError):
-        validate_partition_result(changed, task)
+
 
 
 
@@ -1528,7 +1511,7 @@ def test_architecture_rewrite_declares_existing_concern_guard_and_analysis_attri
     assert conditional["if"]["properties"]["verdict"]["const"] == "concern"
     assert conditional["then"]["properties"]["failure_condition"] == {"type": "string", "minLength": 1, "pattern": r"\S"}
     head_refs = [key for key, value in refs.items() if value.path and value.version == "head"]
-    key = "reference_id" if protocol_version == facts.LEGACY_VERSION else "source_id"
+    key = "reference_id" if protocol_version in (facts.LEGACY_VERSION, facts.VERSION) else "source_id"
     assert conditional["then"]["properties"]["citations"]["contains"]["properties"][key]["enum"] == (head_refs if key == "reference_id" else [head.evidence_id])
     cite = [{"reference_id": head_refs[0]}] if key == "reference_id" else [{"source_id": head.evidence_id, "quote": head.text}]
     raw = {"replacement": {**item, "verdict": "concern", "citations": cite}, "correction_reason": "Source-based correction.", "correction_citations": cite}
@@ -1731,8 +1714,8 @@ def _v4_fact_packet():
 
 def test_v4_exact_quote_output_and_original_union_are_explicit_without_legacy_q_output():
     head, final, row = _v4_fact_packet()
-    payload, schema, refs, spans = facts.request_spec("fact_check", [row], final, [head], {}, kind="complete_originals")
-    assert refs.protocol_version == facts.VERSION == "fact-review/v6-diff-quote-choices"
+    payload, schema, refs, spans = facts.request_spec("fact_check", [row], final, [head], {}, kind="complete_originals", protocol_version=facts.QUOTE_VERSION)
+    assert refs.protocol_version == facts.QUOTE_VERSION
     assert refs.originals == {head.evidence_id: head}
     assert payload["items"][0]["original_item"] == row["item"]
     support = payload["items"][0]["original_support_quotes"]
@@ -1752,7 +1735,7 @@ def test_v4_exact_quote_output_and_original_union_are_explicit_without_legacy_q_
 @pytest.mark.parametrize("outside", [False, True])
 def test_v4_supported_quote_retains_exact_own_citation_union_guard_and_raw_verdict(outside):
     head, final, row = _v4_fact_packet()
-    _, _, refs, _ = facts.request_spec("fact_check", [row], final, [head], {}, kind="complete_originals")
+    _, _, refs, _ = facts.request_spec("fact_check", [row], final, [head], {}, kind="complete_originals", protocol_version=facts.QUOTE_VERSION)
     quote = "second distinct assertion" if outside else "first unique assertion"
     citation = {"source_id": head.evidence_id, "quote": quote}
     assessments = {key: {"state": "supported" if value else "non_factual", "reason": "Exact unchanged model assessment.",
@@ -1762,7 +1745,7 @@ def test_v4_supported_quote_retains_exact_own_citation_union_guard_and_raw_verdi
     cited = facts.response_citations(raw, refs)
     checked = facts.accept_check(raw, [row], refs)
     issues = facts.issues(checked[row["id"]], [], row=row, originals=[head], cited_evidence=cited,
-        delivered_ranges=[{"evidence_id": head.evidence_id, "start_byte": 0, "end_byte": len(head.raw)}])
+        delivered_ranges=[{"evidence_id": head.evidence_id, "start_byte": 0, "end_byte": len(head.raw)}], protocol_version=facts.QUOTE_VERSION)
     assert bool(issues) is outside and raw == original
     if outside:
         assert all(issue["state"] == "unverifiable" and issue["binding_gap_ranges"] for issue in issues)
@@ -1780,7 +1763,7 @@ def test_v4_source_page_and_whole_claim_context_merges_keep_exact_delivered_cove
     children, contexts = [], []
     for index, (begin, end) in enumerate(((0, cut), (cut, len(head.raw)))):
         ranges = [{"evidence_id": head.evidence_id, "start_byte": begin, "end_byte": end}]
-        _, _, refs, spans = facts.request_spec("fact_check", [row], final, [head], {}, kind="cited_ranges", ranges=ranges)
+        _, _, refs, spans = facts.request_spec("fact_check", [row], final, [head], {}, kind="cited_ranges", ranges=ranges, protocol_version=facts.QUOTE_VERSION)
         raw = {"items": {"summary": {"text": {"state": "supported", "reason": "Page-local assertion only.",
             "citations": [{"source_id": head.evidence_id, "quote": head.raw[begin:end].decode()}]}}}, "source_requests": []}
         contexts.append(refs)
@@ -1795,7 +1778,7 @@ def test_v4_source_page_and_whole_claim_context_merges_keep_exact_delivered_cove
     assert assembled["items"]["summary"]["text"]["state"] == "unverifiable"
     ranges, discovery = facts.whole_claim_packet({"children": children}, [row], [head])
     assert len(discovery["pages"]) == 2 and discovery["pages"][0]["response"] == children[0]["response"]
-    _, _, whole_refs, _ = facts.request_spec("fact_check", [row], final, [head], {}, kind="cited_ranges", ranges=ranges, whole_claim=discovery)
+    _, _, whole_refs, _ = facts.request_spec("fact_check", [row], final, [head], {}, kind="cited_ranges", ranges=ranges, whole_claim=discovery, protocol_version=facts.QUOTE_VERSION)
     assert facts.decode_citations([{"source_id": head.evidence_id, "quote": head.text}], whole_refs)
     with pytest.raises(PartitionError, match="fact_reference_protocol_changed"):
         facts.merge_reference_contexts([merged, {"Qold": None}])
@@ -1859,7 +1842,7 @@ def test_v5_binding_exempts_only_boundary_cr_lf_and_preserves_exact_quotes(prefi
     assessments = {"statement": {"state": "supported", "reason": "Exact support.",
         "citations": [{"source_id": original.evidence_id, "quote": original.text}]}}
     unchanged = deepcopy((row, assessments))
-    issues = facts.citation_binding_issues(row, assessments, [original], [cite(witness)])
+    issues = facts.citation_binding_issues(row, assessments, [original], [cite(witness)], protocol_version=facts.LINE_BOUNDARY_VERSION)
     assert bool(issues) is not allowed
     assert (row, assessments) == unchanged
     legacy_issues = facts.citation_binding_issues(row, assessments, [original], [cite(witness)],
@@ -1881,14 +1864,13 @@ def test_fact_reasoning_is_bounded_before_first_generation_without_extra_calls()
     validate_partition_result(result, make_task())
 
 
-def test_v5_prompts_recheck_conditions_and_keep_historical_v4_prompt_exact():
+def test_current_prompts_check_facts_without_own_citation_rewrite_and_keep_old_prompts():
     assert "actual predicate" in facts.CHECK_PROMPT
-    assert "constant/collection definition" in facts.CHECK_PROMPT
-    assert "previous checker labelled supported" in facts.REWRITE_PROMPT
-    assert "not only correction_citations" in facts.REWRITE_PROMPT
+    assert "constant/collection definition" in facts.REWRITE_PROMPT
+    assert "Do not request\nrewrite or recheck just to change citation" in facts.CHECK_PROMPT
     assert facts.prompt_for("fact_check", facts.QUOTE_VERSION) == facts.V4_CHECK_PROMPT
-    assert facts.prompt_for("fact_rewrite", facts.QUOTE_VERSION) == facts.V4_REWRITE_PROMPT
-    assert facts.CHECK_PROMPT.startswith(facts.V4_CHECK_PROMPT)
+    assert facts.prompt_for("fact_rewrite", facts.DIFF_QUOTE_VERSION) == facts.V6_REWRITE_PROMPT
+    assert "not only correction_citations" in facts.V5_REWRITE_PROMPT
 
 
 def test_v6_diff_quote_choices_keep_context_markers_and_share_schema_definitions():
@@ -1897,7 +1879,7 @@ def test_v6_diff_quote_choices_keep_context_markers_and_share_schema_definitions
         "diff", "src/value.py", "diff", "a" * 40)
     final = {"summary": "The call changed.", "findings": [], "perspectives": [], "questions": [], "supplied_quotes": []}
     row = {"id": "summary", "kind": "summary", "item": final["summary"]}
-    payload, schema, refs, _ = facts.request_spec("fact_check", [row], final, [original], {}, kind="complete_originals")
+    payload, schema, refs, _ = facts.request_spec("fact_check", [row], final, [original], {}, kind="complete_originals", protocol_version=facts.DIFF_QUOTE_VERSION)
     assert schema["$defs"]
     choices = [q for definition in schema["$defs"].values() for q in definition["properties"]["quote"]["enum"]]
     assert original.text in choices and all(original.text.count(q) == 1 for q in choices)
@@ -2004,7 +1986,7 @@ def test_program_citation_repair_preserves_prose_and_never_repairs_semantic_nega
         "cited_evidence": [witness], "delivered_ranges": [{"evidence_id": original.evidence_id, "start_byte": 0, "end_byte": len(original.raw)}]}
     check["response_hash"] = hash_json(check["response"])
     record = {"assessments": assessments, "issues": facts.issues(assessments, [], row=row, originals=[original],
-        cited_evidence=[witness], delivered_ranges=check["delivered_ranges"]), "check": check}
+        cited_evidence=[witness], delivered_ranges=check["delivered_ranges"], protocol_version=facts.DIFF_QUOTE_VERSION), "check": check}
     unchanged = deepcopy((row, record))
     repair = facts.citation_only_repair(row, record, [original])
     assert (row, record) == unchanged

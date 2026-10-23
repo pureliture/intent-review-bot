@@ -78,7 +78,9 @@ def decision_pair(monkeypatch, tmp_path):
 
 class ExplodingPlanningClient(PartitionModelClient):
     def complete(self, request):
-        raise AssertionError("choices must not reach the planning chat client")
+        payload = json.loads(request.user_content)
+        assert payload["stage"] == "select_perspectives", "single choices must not reach planning chat"
+        return super().complete(request)
 
 
 def test_choices_use_decisions_transport_not_planning_chat(decision_pair):
@@ -94,8 +96,8 @@ def test_choices_use_decisions_transport_not_planning_chat(decision_pair):
     decision_posts = [c for c in transport.calls if c[1] == "/api/alpha/decisions"]
     assert len(decision_posts) >= 2
     # Admission probes may consult the planning client (zero HTTP each);
-    # no choice or review generation may reach it.
-    assert planning.requests == []
+    # Single choices stay on Decisions; the one subset selection uses planning chat.
+    assert [json.loads(r.user_content)["stage"] for r in planning.requests] == ["select_perspectives"]
     assert result.partition["decisions"], "no choice records"
     assert all(record["method"] == "model" for record in result.partition["decisions"])
     validate_partition_result(result, make_task())

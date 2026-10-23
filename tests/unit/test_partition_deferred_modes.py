@@ -16,16 +16,16 @@ from tests.fixtures.intent_perspectives import make_task
 from tests.fixtures.partition_review import PartitionModelClient
 
 
-@pytest.mark.parametrize("failed_stage", ["select_review_scope", "select_perspective"])
+@pytest.mark.parametrize("failed_stage", ["select_review_scope", "select_perspectives"])
 def test_only_post_global_perspective_failure_defers_b_and_preserves_a(failed_stage):
     task = make_task()
-    failed_field = "perspective:" + PERSPECTIVES[1].id
 
     def fail_closed_choice(payload, body):
-        if payload["stage"] == failed_stage and (
-            failed_stage == "select_review_scope" or payload["state"]["field"] == failed_field
-        ):
-            body["choice"] = "outside-declared-options"
+        if payload["stage"] == failed_stage:
+            if failed_stage == "select_review_scope":
+                body["choice"] = "outside-declared-options"
+            else:
+                body["selected_perspective_ids"] = ["outside-declared-options"]
         return body
 
     review = PartitionModelClient()
@@ -44,12 +44,12 @@ def test_only_post_global_perspective_failure_defers_b_and_preserves_a(failed_st
     assert plan.status == "planned", plan.reason
     validate_execution_plan(plan)  # A can bind the validated shared plan.
     assert plan.partition["selected_modes"] == ["architecture", "intent"]
-    assert plan.partition["deferred_modes"] == {"intent": "invalid_closed_choice"}
+    assert plan.partition["deferred_modes"] == {"intent": "invalid_perspective_subset"}
     assert plan.partition["execution_plan"]["deferred_modes"] == plan.partition["deferred_modes"]
-    assert [row["perspective_id"] for row in plan.partition["scope_selection"]["perspectives"]] == [PERSPECTIVES[0].id]
-    rejected = plan.partition["rejected_choices"]
-    assert len(rejected) == 2 and all(item["field"] == failed_field for item in rejected)
-    assert all(item["response"] == {"choice": "outside-declared-options"} for item in rejected)
+    assert all(row["decision"] == "undetermined" for row in plan.partition["scope_selection"]["perspectives"])
+    selection = plan.partition["scope_selection"]["perspective_selection"]
+    assert selection["status"] == "failed" and selection["response"] == {"selected_perspective_ids": ["outside-declared-options"]}
+    assert sum(stage.stage == "select_perspectives" for stage in plan.stages) == 1
     assert plan.usage["calls"] == len(tev.requests)
     previous_calls = (len(review.requests), len(tev.requests))
     deferred = run_partition_review(task, "intent", review, tev, prepared_plan=plan,
@@ -69,7 +69,7 @@ def test_only_post_global_perspective_failure_defers_b_and_preserves_a(failed_st
     changed.partition["execution_plan"]["deferred_modes"].clear()
     changed.partition["execution_plan"]["deferred_mode_failures"].clear()
     changed.partition["plan_id"] = hash_json(changed.partition["execution_plan"])
-    with pytest.raises(PartitionError, match="stored_global_modes_mismatch"):
+    with pytest.raises(PartitionError, match="stored_global_modes_mismatch|stored_perspective_subset_failure_changed"):
         validate_partition_result(changed, task)
 
     changed = deepcopy(plan)
@@ -78,5 +78,5 @@ def test_only_post_global_perspective_failure_defers_b_and_preserves_a(failed_st
     changed.partition["execution_plan"]["deferred_modes"]["intent"] = "invented_failure"
     changed.partition["execution_plan"]["deferred_mode_failures"]["intent"]["reason"] = "invented_failure"
     changed.partition["plan_id"] = hash_json(changed.partition["execution_plan"])
-    with pytest.raises(PartitionError, match="stored_deferred_perspective_retry_mismatch"):
+    with pytest.raises(PartitionError, match="stored_perspective_subset_failure_changed"):
         validate_partition_result(changed, task)

@@ -20,8 +20,9 @@ from review_bot.application.source_citations import citation_spans, citation_cat
 LEGACY_VERSION = "fact-review/v3-capacity-batches"
 QUOTE_VERSION = "fact-review/v4-exact-source-quotes"
 LINE_BOUNDARY_VERSION = "fact-review/v5-line-boundary-support"
-VERSION = "fact-review/v6-diff-quote-choices"
-SUPPORTED_VERSIONS = (VERSION, LINE_BOUNDARY_VERSION, QUOTE_VERSION, LEGACY_VERSION)
+DIFF_QUOTE_VERSION = "fact-review/v6-diff-quote-choices"
+VERSION = "fact-review/v7-semantic-code-references"
+SUPPORTED_VERSIONS = (VERSION, DIFF_QUOTE_VERSION, LINE_BOUNDARY_VERSION, QUOTE_VERSION, LEGACY_VERSION)
 EXECUTION_POLICY_VERSION = 2
 PMD_REFERENCE = "https://github.com/pmd/pmd/blob/pmd_releases/7.3.0/pmd-java/src/main/java/net/sourceforge/pmd/lang/java/metrics/JavaMetrics.java"
 METRICS = {
@@ -174,8 +175,18 @@ context lines begin with a literal space marker before any code indentation.
 Keep that marker and every newline exactly: never rewrite a diff as plain code.
 These choices restrict quotation spelling, not the review's factual verdict.
 """
-CHECK_PROMPT = V5_CHECK_PROMPT + DIFF_QUOTE_RULE
-REWRITE_PROMPT = V5_REWRITE_PROMPT + DIFF_QUOTE_RULE
+V6_CHECK_PROMPT = V5_CHECK_PROMPT + DIFF_QUOTE_RULE
+V6_REWRITE_PROMPT = V5_REWRITE_PROMPT + DIFF_QUOTE_RULE
+CODE_REFERENCE_CONTRACT = """Select reference_id values attached to the supplied original code blocks.
+The program attaches the exact source lines, path and line numbers; never retype
+quotes or calculate offsets. Check factual meaning against ALL delivered originals.
+An earlier item's narrow or incomplete citation selection is not a false claim or
+missing source evidence when the supporting code is delivered here. Do not request
+rewrite or recheck just to change citation spelling, coverage or attachment.
+Unknown reference IDs remain invalid and cannot be published as code evidence.
+"""
+CHECK_PROMPT = LEGACY_CHECK_PROMPT + "\nFor a conditional claim, compare its exact accepted/rejected value sets with the actual predicate and every referenced constant/collection definition.\n" + CODE_REFERENCE_CONTRACT
+REWRITE_PROMPT = LEGACY_REWRITE_PROMPT + "\nIndependently re-evaluate every retained literal clause against the actual predicate and every referenced constant/collection definition.\n" + CODE_REFERENCE_CONTRACT
 
 
 def prompt_for(stage, protocol_version=VERSION):
@@ -189,6 +200,8 @@ def prompt_for(stage, protocol_version=VERSION):
         return V4_CHECK_PROMPT if stage == "fact_check" else V4_REWRITE_PROMPT
     if protocol_version == LINE_BOUNDARY_VERSION:
         return V5_CHECK_PROMPT if stage == "fact_check" else V5_REWRITE_PROMPT
+    if protocol_version == DIFF_QUOTE_VERSION:
+        return V6_CHECK_PROMPT if stage == "fact_check" else V6_REWRITE_PROMPT
     return CHECK_PROMPT if stage == "fact_check" else REWRITE_PROMPT
 
 
@@ -226,14 +239,14 @@ def merge_reference_contexts(contexts):
 
 
 def _quote_protocol(refs):
-    return getattr(refs, "protocol_version", LEGACY_VERSION) != LEGACY_VERSION
+    return getattr(refs, "protocol_version", LEGACY_VERSION) in (QUOTE_VERSION, LINE_BOUNDARY_VERSION, DIFF_QUOTE_VERSION)
 
 
 def _quote_object_schema(source_ids, refs=None):
     source_ids = list(source_ids)
     basic = obj({"source_id": {"type": "string", "enum": source_ids},
         "quote": {"type": "string", "minLength": 1}})
-    if refs is None or refs.protocol_version != VERSION:
+    if refs is None or refs.protocol_version != DIFF_QUOTE_VERSION:
         return basic
     choices, unrestricted = [], []
     for source_id in source_ids:
@@ -388,7 +401,7 @@ def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version
             "PR prose excluding a feature from the requested review scope is not evidence that its implementation is absent.")
     if any(value == "" for row in rows for value in fields(row).values()):
         payload["canonical_facts"]["empty_field_rule"] = "An unchanged original field equal to the empty string contains no factual assertion. Return state=non_factual, a non-empty reason such as 'Empty field contains no factual assertion', and citations=[] for that field. Keep the original empty field and its item in the request and response coverage; never use an empty reason or supported for it."
-    if any(isinstance(row["item"], dict) and "citations" in row["item"] for row in rows):
+    if protocol_version != VERSION and any(isinstance(row["item"], dict) and "citations" in row["item"] for row in rows):
         payload["canonical_facts"]["citation_grounding_rule"] = (
             "For each nonempty factual field of an original_item with citations, supported requires that the ORIGINAL item's citation set directly supports every asserted source fact and relationship. "
             "Citation existence, matching bytes, or the same file is insufficient; imports/header lines do not establish later test assertions, and an adjacent range does not establish an omitted assignment or storage operation. "
@@ -399,7 +412,7 @@ def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version
             "For supported, select supporting checker references wholly contained in the ORIGINAL item's citation range union for the same evidence_id. If your supporting references extend outside that union, use unverifiable so the existing rewrite can correct the item's citation binding. "
             "Your own correct checker citations do not silently repair the unchanged original_item.citations or justify supported for that binding gap. Recheck the actual replacement citations after rewrite. "
             "This binding requirement does not apply to empty or non_factual fields; a summary without its own citations retains its existing source-check treatment. Preserve original fields, items, citation sets and all audit responses.")
-    if protocol_version in (VERSION, LINE_BOUNDARY_VERSION) and "citation_grounding_rule" in payload["canonical_facts"]:
+    if protocol_version in (DIFF_QUOTE_VERSION, LINE_BOUNDARY_VERSION) and "citation_grounding_rule" in payload["canonical_facts"]:
         payload["canonical_facts"]["citation_grounding_rule"] += (
             " For binding containment only, exclude leading/trailing CR/LF bytes from the checker support range. "
             "Keep exact quotes unchanged; spaces, indentation, interior gaps and added code are never exempt.")
@@ -419,7 +432,19 @@ def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version
                 "correction": "Use the existing complete-item correction when a scope premise is unsupported. Preserve the original item and initial TEV choices in the audit trail, keep perspective_id, and select any allowed verdict justified by the frozen sources.",
             },
         }
-    if protocol_version != LEGACY_VERSION:
+    if protocol_version == VERSION:
+        payload["citation_output_contract"] = CODE_REFERENCE_CONTRACT
+        if "intent_perspectives" in payload["canonical_facts"]:
+            contract = payload["canonical_facts"]["intent_perspectives"]
+            selected = {p["perspective_id"] for p in final.get("perspectives", [])}
+            contract["catalog"] = [p for p in contract["catalog"] if p["id"] in selected]
+            contract["scope_policy"] = {
+                "review_selected_perspectives_only": True,
+                "selected_perspective_ids": sorted(selected),
+                "check_scope_premises": "Verify asserted scope premises against frozen originals for these selected perspectives. Do not add or require unselected perspectives.",
+                "source_grounded_not_apply": "not_apply is allowed with a concrete source-grounded scope reason."
+            }
+    elif protocol_version != LEGACY_VERSION:
         payload["citation_output_contract"] = QUOTE_OUTPUT_CONTRACT
     return payload, refs, spans
 
@@ -471,7 +496,7 @@ def request_spec(stage, rows, final, originals, meta, *, kind, extra=None, range
     inventory = unread_inventory(originals, spans)
     payload["fixed_original_inventory"] = inventory
     refs = CitationContext(refs, originals, spans, protocol_version)
-    if protocol_version != LEGACY_VERSION:
+    if _quote_protocol(refs):
         by_id = {o.evidence_id: o for o in originals}
         payload["citation_sources"] = [{"source_id": key, "path": by_id[key].path,
             "version": by_id[key].version, "sha": by_id[key].sha, "source_hash": by_id[key].digest,
@@ -492,7 +517,7 @@ def request_spec(stage, rows, final, originals, meta, *, kind, extra=None, range
                     "For a nonempty factual field of an item with original_support_reference_ids, supported may cite ONLY IDs in that item's supplied list. "
                     "These are the actual catalog ranges contained in its original citation union, including adjacent cited pieces; an empty list cannot support a factual field. "
                     "Other supplied catalog IDs remain available as contradicted/unverifiable evidence and correction witnesses. This list does not itself prove entailment, and does not apply to empty/non_factual fields or items without their own citations.")
-        else:
+        elif _quote_protocol(refs):
             for row, item in zip(rows, payload["items"]):
                 support = original_support_quotes(row, originals)
                 if support is not None:
@@ -518,7 +543,7 @@ def request_spec(stage, rows, final, originals, meta, *, kind, extra=None, range
     schema = check_schema(rows, refs, [o["evidence_id"] for o in inventory]) if stage == "fact_check" else (
         rewrite_schema(rows[0], refs, architecture=architecture_rewrite) if len(rows) == 1 else
         obj({"items": obj({row["id"]: rewrite_schema(row, refs, architecture=architecture_rewrite) for row in rows})}))
-    if protocol_version == VERSION:
+    if protocol_version == DIFF_QUOTE_VERSION:
         # Cite choices recur in every assessment field. Define each exact
         # object once so schema constraints do not repeatedly copy source text.
         definitions = {}
@@ -652,6 +677,8 @@ def check_schema(rows, refs, source_ids=()):
     request = obj({"evidence_id": {"type": "string", "enum": list(source_ids) or ["no_unread_original"]}, "reason": text()})
     def field_schema(row, key):
         schema = deepcopy(assessment)
+        if getattr(refs, "protocol_version", LEGACY_VERSION) == VERSION:
+            return schema
         if _quote_protocol(refs):
             union = original_citation_union(row)
             support_ids = list(union) if union is not None else None
@@ -916,7 +943,7 @@ def citation_binding_issues(row, assessments, originals, cited_evidence, *, prot
             if cite is None:
                 raise PartitionError("fact_check_support_evidence_missing")
             support_start, support_end = cite["start_byte"], cite["end_byte"]
-            if protocol_version in (VERSION, LINE_BOUNDARY_VERSION):
+            if protocol_version in (DIFF_QUOTE_VERSION, LINE_BOUNDARY_VERSION):
                 # Retain exact quotes; only boundary CR/LF is exempt from containment.
                 raw = by_id[cite["evidence_id"]].raw
                 while support_start < support_end and raw[support_start] in (10, 13):
@@ -1005,8 +1032,8 @@ def callable_delivery_issues(row, assessments, originals, delivered_ranges):
 
 def issues(assessments, metric_checks, *, row, originals, cited_evidence, delivered_ranges=None, protocol_version=VERSION):
     return [dict(kind="source_assertion", field=key, **deepcopy(value)) for key, value in assessments.items()
-        if value["state"] in ("contradicted", "unverifiable")] + citation_binding_issues(
-            row, assessments, originals, cited_evidence, protocol_version=protocol_version) + callable_delivery_issues(
+        if value["state"] in ("contradicted", "unverifiable")] + ([] if protocol_version == VERSION else citation_binding_issues(
+            row, assessments, originals, cited_evidence, protocol_version=protocol_version)) + callable_delivery_issues(
             row, assessments, originals, delivered_ranges) + [deepcopy(c["issue"]) for c in metric_checks if c["issue"]]
 
 
@@ -1152,7 +1179,7 @@ def project_rewrite_context(extra, rows):
     return result
 
 
-def citation_only_repair(row, record, originals):
+def citation_only_repair(row, record, originals, *, protocol_version=DIFF_QUOTE_VERSION):
     """Append exact checker witnesses only; always recheck the candidate later."""
     item, assessments, problems = row["item"], record["assessments"], record["issues"]
     if (not isinstance(item, dict) or not item.get("citations") or not problems
@@ -1184,7 +1211,7 @@ def citation_only_repair(row, record, originals):
     if not added:
         return None
     replacement = {**deepcopy(item), "citations": [*deepcopy(item["citations"]), *added]}
-    if citation_binding_issues({**row, "item": replacement}, assessments, originals, check["cited_evidence"]):
+    if citation_binding_issues({**row, "item": replacement}, assessments, originals, check["cited_evidence"], protocol_version=protocol_version):
         return None
     return {"version": 1, "origin": "program_citation_union", "item_id": row["id"],
         "original_item_hash": hash_json(item), "checker_response_hash": check["response_hash"],
@@ -1221,6 +1248,29 @@ def deduplicate_exact_citation_arrays(raw):
 
     visit(result, [])
     return result, changes
+
+
+def attach_supported_code(row, record, originals):
+    """Materialize this item's checked reference IDs, without another model call.
+
+    This changes only citation attachment. Original prose and raw assessments
+    remain in the ledger; byte identity is owned by immutable source originals.
+    """
+    item = deepcopy(row["item"])
+    if not isinstance(item, dict) or "citations" not in item:
+        return item
+    by_id = {original.evidence_id: original for original in originals}
+    supported = {reference for value in record["assessments"].values() if value["state"] == "supported"
+        for reference in _references(value.get("citations", []))}
+    seen = {(c["evidence_id"], c["start_byte"], c["end_byte"]) for c in item["citations"]}
+    for cite in record["check"]["cited_evidence"]:
+        original = by_id[cite["evidence_id"]]
+        identity = (cite["evidence_id"], cite["start_byte"], cite["end_byte"])
+        key = "Q" + hash_json((original.evidence_id, original.digest, *identity[1:]))[:12]
+        if key in supported and identity not in seen:
+            item["citations"].append(deepcopy(cite))
+            seen.add(identity)
+    return item
 
 
 def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources, max_rewrites, ledger, language="en"):
@@ -1270,36 +1320,25 @@ def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources
                 originals=originals, cited_evidence=record["check"]["cited_evidence"],
                 delivered_ranges=record["check"]["delivered_ranges"])
             if not record["issues"] or number == max_rewrites:
-                entry.update(status="unverified" if record["issues"] else "model_supported", accepted=deepcopy(current["item"]))
-                apply_item(candidate, current, current["item"])
+                accepted = attach_supported_code(current, record, originals) if not record["issues"] else deepcopy(current["item"])
+                entry.update(status="unverified" if record["issues"] else "model_supported", accepted=accepted)
+                apply_item(candidate, current, accepted)
+                retain_sources(candidate, quote_spans(accepted, {o.evidence_id: o for o in originals}))
                 ledger["accepted_final"] = deepcopy(candidate)
             else:
                 if source_gaps(record):
                     resolve_sources(current, candidate, record)
                 pending.append(state)
         if pending:
-            model_pending = []
-            for state in pending:
-                row = state["row"]
-                repair = citation_only_repair(row, records[row["id"]], originals)
-                if repair is None:
-                    model_pending.append(state)
-                else:
-                    records[row["id"]]["citation_repair"] = repair
-                    retain_sources(candidate, quote_spans(repair["added_citations"],
-                        {original.evidence_id: original for original in originals}))
-            rewrite_rows = [state["row"] for state in model_pending]
+            rewrite_rows = [state["row"] for state in pending]
             rewrite_records = {row["id"]: records[row["id"]] for row in rewrite_rows}
-            replacements = {state["row"]["id"]: records[state["row"]["id"]]["citation_repair"]["replacement"]
-                for state in pending if "citation_repair" in records[state["row"]["id"]]}
-            if rewrite_rows:
-                batch = {"batch_records": rewrite_records}
-                try:
-                    replacements.update(rewrite(rewrite_rows, candidate, batch))
-                finally:
-                    if "rewrite" in batch:
-                        for record in rewrite_records.values():
-                            record["rewrite"] = batch["rewrite"]
+            batch = {"batch_records": rewrite_records}
+            try:
+                replacements = rewrite(rewrite_rows, candidate, batch)
+            finally:
+                if "rewrite" in batch:
+                    for record in rewrite_records.values():
+                        record["rewrite"] = batch["rewrite"]
             for state in pending:
                 row = state["row"]
                 state["requested"] = requested_sources(records[row["id"]])
@@ -1615,9 +1654,12 @@ def validate(result, originals, meta):
                 if any(key in attempt for key in ("source_plan", "citation_repair", "rewrite")):
                     raise PartitionError("stored_unnecessary_fact_source_plan")
                 expected_status = "model_supported" if not expected_issues else "unverified"
-                if number != len(attempts) - 1 or entry.get("status") != expected_status or entry.get("accepted") != current["item"]:
+                accepted = attach_supported_code(current, attempt, originals) if protocol_version == VERSION and not expected_issues else current["item"]
+                if number != len(attempts) - 1 or entry.get("status") != expected_status or entry.get("accepted") != accepted:
                     raise PartitionError("stored_fact_acceptance_changed")
-                apply_item(candidate, row, current["item"])
+                apply_item(candidate, row, accepted)
+                if protocol_version == VERSION:
+                    retain_sources(candidate, quote_spans(accepted, {o.evidence_id: o for o in originals}))
                 complete = True
                 break
             gaps = source_gaps(attempt)
@@ -1636,7 +1678,7 @@ def validate(result, originals, meta):
                     raise PartitionError("stored_fact_source_plan_changed")
             elif "source_plan" in attempt:
                 raise PartitionError("stored_unnecessary_fact_source_plan")
-            repair = citation_only_repair(current, attempt, originals) if execution_policy == EXECUTION_POLICY_VERSION else None
+            repair = citation_only_repair(current, attempt, originals, protocol_version=protocol_version) if execution_policy == EXECUTION_POLICY_VERSION else None
             if "citation_repair" in attempt:
                 if repair is None or attempt["citation_repair"] != repair or "rewrite" in attempt:
                     raise PartitionError("stored_fact_citation_repair_changed")

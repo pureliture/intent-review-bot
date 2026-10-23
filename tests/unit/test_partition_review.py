@@ -56,7 +56,7 @@ def test_known_output_limit_gets_one_bounded_reasoning_recovery_with_identical_i
     assert result.partition["rejected_model_outputs"][0]["output"]["content"] == '{"partial":'
     assert result.partition["rejected_model_outputs"][0]["output"]["reasoning_content"]
     assert len(result.partition["output_recoveries"]) == 1
-    assert result.usage["usage_complete"] and result.usage["calls"] == 16
+    assert result.usage["usage_complete"] and result.usage["calls"] == 9
     validate_partition_result(result, task)
     altered = deepcopy(result)
     altered.partition["rejected_model_outputs"][0]["output"]["content"] += "changed"
@@ -94,9 +94,9 @@ def test_output_recovery_cannot_exceed_the_shared_call_budget():
     task = make_task()
     review = _output_limited_review_client()
     result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True),
-        limits=PartitionReviewLimits(max_total_tokens=1000000, max_calls=14))
+        limits=PartitionReviewLimits(max_total_tokens=1000000, max_calls=7))
     assert result.status == "failed" and result.reason == "call_limit_exceeded"
-    assert result.usage["calls"] == 14 and result.usage["usage_complete"]
+    assert result.usage["calls"] == 7 and result.usage["usage_complete"]
     assert len([r for r in review.requests if json.loads(r.user_content)["stage"] == "final_review"]) == 1
     assert len(result.partition["rejected_model_outputs"]) == 1
     validate_partition_result(result, task)
@@ -121,7 +121,7 @@ def test_output_recovery_after_a_source_recheck_preserves_both_kinds_of_history(
     assert len(result.partition["rejected_model_outputs"]) == 1
     assert len(result.partition["output_recoveries"]) == 1
     assert result.partition["source_recheck_requests"][0]["admitted"]
-    assert result.usage["calls"] == 17 and result.usage["usage_complete"]
+    assert result.usage["calls"] == 10 and result.usage["usage_complete"]
     validate_partition_result(result, task)
 
 
@@ -138,9 +138,9 @@ def test_native_measured_plan_observation_selection_and_review_reach_eight_persp
     assert len(result.partition["groups"]) == 1
     assert len(result.partition["groups"][0]["unit_ids"]) > 1
     tev_stages = [json.loads(r.user_content)["stage"] for r in tev.requests]
-    assert tev_stages == ["plan_partitions", "observe_partition", "observe_partition", "select_review_scope"] + ["select_perspective"] * 8
+    assert tev_stages == ["plan_partitions", "observe_partition", "observe_partition", "select_review_scope"] + ["select_perspectives"]
     assert [json.loads(r.user_content)["stage"] for r in review.requests] == ["review_partition", "final_review"] + ["fact_check"]
-    assert result.usage["calls"] == 15 and result.usage["usage_complete"] is True
+    assert result.usage["calls"] == 8 and result.usage["usage_complete"] is True
     import hashlib
     from pathlib import Path
     from review_bot.adapters import intent_planner, llama_cpp_local as llamacpp, llama_cpp_macbook as llamacpp_macbook
@@ -292,7 +292,7 @@ def test_outside_span_citation_and_stored_quote_tampering_are_rejected():
     validate_partition_result(bad, task)
     result = run_partition_review(task, "intent", PartitionModelClient(), PartitionModelClient(), limits=limits())
     result.perspectives[0]["citations"][0]["quote"] = "fabricated"
-    with pytest.raises(PartitionError, match="quote_mismatch|assembly_mismatch|single_page_conclusion_changed|stored_fact_final_changed"):
+    with pytest.raises(PartitionError, match="quote_mismatch|assembly_mismatch|single_page_conclusion_changed|stored_fact_final_changed|stored_fact_acceptance_changed"):
         validate_partition_result(result, task)
 
 
@@ -306,14 +306,14 @@ def test_job_fence_cancels_before_any_model_call():
 def test_modes_share_one_call_budget_without_double_counting_usage():
     import time
     from review_bot.application.code_first_intent_review import _Budget
-    cap = PartitionReviewLimits(max_total_tokens=1000000, max_calls=16)
+    cap = PartitionReviewLimits(max_total_tokens=1000000, max_calls=9)
     shared = _Budget(cap, time.monotonic() + 900, None)
     review, tev = PartitionModelClient(), PartitionModelClient(group_all=True)
     first = run_partition_review(make_task(), "intent", review, tev, limits=cap, shared_budget=shared)
-    assert first.status == "completed" and first.usage["calls"] == 15
+    assert first.status == "completed" and first.usage["calls"] == 8
     second = run_partition_review(make_task(), "intent", review, tev, limits=cap, shared_budget=shared)
     assert second.reason == "call_limit_exceeded" and second.usage["calls"] == 0
-    assert len(review.requests) + len(tev.requests) == 15
+    assert len(review.requests) + len(tev.requests) == 8
 
 
 def _native_role_clients(*, review_input=1048576 - 32678, planner_input=126976,
@@ -1013,7 +1013,7 @@ def test_bonsai_limit_refines_units_and_only_safe_candidates_are_offered():
     offered = [json.loads(r.user_content)["state"]["candidate_plans"] for r in tev.requests
         if json.loads(r.user_content)["stage"] == "plan_partitions"]
     assert offered
-    assert all(set(r.response_schema["properties"]) == {"choice"} and r.max_output_tokens <= 16 for r in tev.requests)
+    assert all((set(r.response_schema["properties"]) == {"choice"} and r.max_output_tokens <= 16) or (set(r.response_schema["properties"]) == {"selected_perspective_ids"} and r.max_output_tokens <= 256) for r in tev.requests)
     assert all(count(r) <= 500 for r in review.requests)
     assert all(count(r) <= 2000 for r in tev.requests)
     validate_partition_result(result, task)
@@ -1126,11 +1126,11 @@ def test_routing_aggregation_is_lossless_and_never_uses_tev_prose_generation():
     plan = run_partition_review(task, "planning", review, tev, limits=limits(), available_modes=("intent",))
     assert plan.status == "planned", plan.reason
     assert plan.partition["routing_reductions"]
-    assert all(r.max_output_tokens <= 16 and set(r.response_schema["properties"]) == {"choice"} for r in tev.requests)
+    assert all((r.max_output_tokens <= 16 and set(r.response_schema["properties"]) == {"choice"}) or (r.max_output_tokens <= 256 and set(r.response_schema["properties"]) == {"selected_perspective_ids"}) for r in tev.requests)
     assert not any(json.loads(r.user_content)["stage"] == "reduce_observations" for r in tev.requests)
     validate_partition_result(plan, task)
     plan.partition["routing_reductions"][0]["output"]["classification"]["mode_counts"]["intent"] += 1
-    with pytest.raises(PartitionError, match="aggregation_mismatch"):
+    with pytest.raises(PartitionError, match="aggregation_mismatch|stored_perspective_subset_changed"):
         validate_partition_result(plan, task)
 
 
@@ -1669,9 +1669,9 @@ def test_recheck_without_a_remaining_generation_call_retains_the_valid_final_as_
     task = make_task()
     review = PartitionModelClient(transform=request_more)
     result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True),
-        limits=PartitionReviewLimits(max_total_tokens=1000000, max_calls=14))
+        limits=PartitionReviewLimits(max_total_tokens=1000000, max_calls=7))
     assert result.status == "partial_review", result.reason
-    assert result.usage["calls"] == 14 and result.usage["usage_complete"]
+    assert result.usage["calls"] == 7 and result.usage["usage_complete"]
     assert result.partition["source_recheck_requests"][0]["reason"] == "call_limit_exceeded"
     assert len([r for r in review.requests if json.loads(r.user_content)["stage"] == "final_review"]) == 1
     validate_partition_result(result, task)
@@ -1926,31 +1926,59 @@ def test_partition_requires_explicit_native_measurement_for_cloud_provider(nativ
     validate_partition_result(result, task)
 
 
-def test_initial_perspective_exclusions_are_provisional_and_final_review_accounts_for_all_eight():
-    seen = []
-
-    def exclude_initial(payload, body):
-        if payload["stage"] == "select_perspective":
-            body["choice"] = next(row["label"] for row in payload["options"] if row["key"] == "not_apply")
+@pytest.mark.parametrize("shared", [False, True])
+def test_one_tev_selection_controls_observations_final_fact_checks_and_comment(shared):
+    from review_bot.application.partition_review import PERSPECTIVE_IDS
+    selected = [PERSPECTIVE_IDS[0], PERSPECTIVE_IDS[4]]
+    def select(payload, body):
+        if payload["stage"] == "select_perspectives":
+            body["selected_perspective_ids"] = list(reversed(selected))
         return body
-
-    def final_contract(payload, body):
-        if payload["stage"] == "final_review":
-            assert all(row["decision"] == "not_apply" for row in payload["initial_perspective_selection"])
-            policy = payload["perspective_applicability_policy"]
-            assert "Provisional TEV focus" in policy["initial_selection"]
-            assert "not evidence of inapplicability" in policy["not_apply"]
-            assert len(payload["perspective_catalog"]) == 8
-            seen.append(payload)
-        return body
-
     task = make_task()
-    result = run_partition_review(task, "intent", PartitionModelClient(transform=final_contract),
-        PartitionModelClient(transform=exclude_initial), limits=limits())
+    review, tev = PartitionModelClient(), PartitionModelClient(transform=select, group_all=True)
+    plan = None
+    if shared:
+        plan = run_partition_review(task, "planning", review, tev, limits=limits(), available_modes=("intent",))
+        assert plan.status == "planned", plan.reason
+        validate_partition_result(plan, task)
+    result = run_partition_review(task, "intent", review, tev, limits=limits(), prepared_plan=plan)
     assert result.status == "completed", result.reason
-    assert seen and len(result.perspectives) == 8
-    assert all(row["verdict"] == "aligned" for row in result.perspectives)
-    assert all(row["decision"] == "not_apply" for row in result.partition["scope_selection"]["perspectives"])
+    assert [row["perspective_id"] for row in result.perspectives] == selected
+    assert [json.loads(r.user_content)["stage"] for r in tev.requests].count("select_perspectives") == 1
+    for request in review.requests:
+        payload = json.loads(request.user_content)
+        if payload["stage"] == "review_partition":
+            assert payload["draft_assessment_keys"] == selected
+        elif payload["stage"] == "final_review":
+            assert [p["id"] for p in payload["perspective_catalog"]] == selected
+            assert "eight perspective" not in request.system_prompt
+            assert request.response_schema["properties"]["perspectives"]["minItems"] == len(selected)
+            assert request.response_schema["properties"]["perspectives"]["maxItems"] == len(selected)
+        elif payload["stage"] == "fact_check":
+            context = payload["canonical_facts"]["intent_perspectives"]
+            assert {p["id"] for p in context["catalog"]} == set(selected)
+    comment = format_partition_review_markdown(result, task, publication_mode="comment")
+    assert "선택한 2개 관점" in comment and "8개 관점" not in comment
+    validate_partition_result(result, task)
+    changed = deepcopy(result)
+    changed.partition["scope_selection"]["perspective_selection"]["selected_ids"].append(PERSPECTIVE_IDS[1])
+    with pytest.raises(PartitionError):
+        validate_partition_result(changed, task)
+
+
+@pytest.mark.parametrize("ids,reason", [([], "no_selected_intent_perspectives"), (["unknown"], "invalid_perspective_subset"),
+    (["problem_success", "problem_success"], "invalid_perspective_subset")])
+def test_empty_or_invalid_subset_never_generates_an_unselected_review(ids, reason):
+    def select(payload, body):
+        if payload["stage"] == "select_perspectives":
+            body["selected_perspective_ids"] = ids
+        return body
+    task = make_task()
+    review, tev = PartitionModelClient(), PartitionModelClient(transform=select, group_all=True)
+    result = run_partition_review(task, "intent", review, tev, limits=limits())
+    assert result.reason == reason
+    assert not review.requests
+    assert sum(json.loads(r.user_content)["stage"] == "select_perspectives" for r in tev.requests) == 1
     validate_partition_result(result, task)
 
 
@@ -2144,7 +2172,9 @@ def test_selected_consumer_native400_keeps_unknown_reservation_and_fresh_childre
             validate_partition_result(legacy, task)
     else:
         assert result.status in ("not_run", "failed")
-        assert not delivery.get("complete", False)
+        assert result.reason in ("call_limit_exceeded", "task_token_limit_exceeded")
+        assert result.usage["calls"] <= settings.max_calls
+        assert result.usage["input_tokens"] + result.usage["output_tokens"] <= settings.max_total_tokens
     validate_partition_result(result, task)
 
 

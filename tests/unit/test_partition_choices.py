@@ -128,3 +128,12 @@ def test_closed_choice_accepts_exactly_one_known_label():
         choices.accept_choice({"choice": "A", "explanation": "not permitted"}, options)
     with pytest.raises(PartitionError, match="invalid_closed_choice"):
         choices.accept_choice({"choice": "Z"}, options)
+
+
+@pytest.mark.parametrize("raw", [None, {}, {"selected_perspective_ids": "problem_success"},
+    {"selected_perspective_ids": [], "extra": True}, {"selected_perspective_ids": ["unknown"]},
+    {"selected_perspective_ids": ["problem_success", "problem_success"]}])
+def test_subset_rejects_invalid_shapes_ids_and_duplicates(raw):
+    from review_bot.application.partition_choices import accept_perspective_subset
+    with pytest.raises(PartitionError, match="invalid_perspective_subset"):
+        accept_perspective_subset(raw)
