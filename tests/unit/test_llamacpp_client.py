@@ -82,6 +82,39 @@ def test_terminal_overflow_can_verify_exact_input_without_a_model_generation(ada
     assert json.loads(requests[-1].content)["messages"][1]["content"] == request.user_content
 
 
+def test_terminal_output_recovery_reverifies_changed_sampler_without_repeating_meter_generations(adapter, main_request, mock_http):
+    import time
+    from review_bot.application.model_execution import ModelExecutionBudget, OUTPUT_RECOVERY_FINAL_RESERVE
+    from review_bot.domain.partition_review import PartitionReviewLimits
+
+    def handler(request):
+        if request.url.path != "/v1/chat/completions":
+            return _deterministic_tokenizer(request)
+        payload = json.loads(request.content)
+        if "reasoning_budget_tokens" not in payload:
+            body = chat_response(None, output_tokens=32678)
+            body["choices"][0]["finish_reason"] = "length"
+            body["choices"][0]["message"]["reasoning_content"] = "Original exhausted reasoning"
+            return httpx.Response(200, json=body)
+        assert payload["reasoning_budget_tokens"] == 32678 - OUTPUT_RECOVERY_FINAL_RESERVE
+        return httpx.Response(200, json=chat_response())
+    requests = mock_http(handler)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    request = replace(main_request, user_content="한" * 40000, max_output_tokens=32678)
+    limits = PartitionReviewLimits(max_input_tokens=client.profile.max_input_tokens,
+        max_total_tokens=1000000, max_calls=2, task_timeout_seconds=60)
+    budget = ModelExecutionBudget(limits, time.monotonic() + 60, None)
+    result, _ = budget.execute_bounded_output(request, client, client.profile, label="global_review",
+        reserve_calls=0, reserve_tokens=0, allow_native_tokenizer=True)
+    assert result == {"ok": True}
+    assert budget.totals() == (2, 42 * 2 + 32678 + 5, False)
+    assert len(budget.output_recoveries) == 1 and budget.output_recoveries[0]["source_input_unchanged"]
+    assert sum(r.url.path == "/tokenize" for r in requests) == 2
+    wires = [json.loads(r.content) for r in requests if r.url.path == "/v1/chat/completions"]
+    assert len(wires) == 2 and wires[0]["messages"] == wires[1]["messages"]
+    assert wires[0]["max_tokens"] == wires[1]["max_tokens"] == 32678
+
+
 @pytest.mark.parametrize("tokens", [[], [True], [-1], [{"id": 1}]])
 def test_invalid_deterministic_tokenizer_response_cannot_admit_input(adapter, main_request, mock_http, tokens):
     def handler(request):

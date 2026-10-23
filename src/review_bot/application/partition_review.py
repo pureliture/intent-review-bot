@@ -885,7 +885,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         if not measure(req, client, current, label + ":admission"):
             raise Stop("native_request_exceeds_model_limits")
         raw, index = budget.execute_bounded_output(req, client, current, label=label,
-            reserve_calls=0, reserve_tokens=0)
+            reserve_calls=0, reserve_tokens=0,
+            allow_native_tokenizer=label.split(":", 1)[0] in ("global_review", "fact_check", "fact_rewrite"))
         if raw is None:
             raise Stop(budget.records[index].reason)
         return raw, index

@@ -103,10 +103,11 @@ class ModelExecutionBudget:
 
     def execute_bounded_output(self, request: ModelRequest, client: ModelClient, profile: ModelProfile, *,
         label: str, reserve_calls: int, reserve_tokens: int,
+        allow_native_tokenizer: bool = False,
     ) -> tuple[Any | None, int]:
         """One known-limit recovery, keeping all input and the total output cap."""
         body, index = self.execute(request, client, profile, label=label,
-            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens)
+            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens, allow_native_tokenizer=allow_native_tokenizer)
         if (body is not None or self.records[index].reason != "model_output_limit"
                 or not self.rejected_outputs.get(index)
                 or getattr(client, "supports_bounded_reasoning", False) is not True
@@ -117,7 +118,7 @@ class ModelExecutionBudget:
         bounded = replace(request,
             reasoning_budget_tokens=request.max_output_tokens - OUTPUT_RECOVERY_FINAL_RESERVE)
         recovered, next_index = self.execute(bounded, client, profile, label=label + ":output_recovery",
-            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens)
+            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens, allow_native_tokenizer=allow_native_tokenizer)
         self.output_recoveries.append({"failed_stage_index": index, "recovery_stage_index": next_index,
             "reason": "known_native_output_limit", "output_limit": request.max_output_tokens,
             "reasoning_budget_tokens": bounded.reasoning_budget_tokens,
@@ -229,9 +230,10 @@ class ModelExecutionBudget:
 
     def execute(self, request: ModelRequest, client: ModelClient, profile: ModelProfile, *,
         label: str, reserve_calls: int, reserve_tokens: int,
+        allow_native_tokenizer: bool = False,
     ) -> tuple[Any | None, int]:
         admitted, index = self.measure(request, client, profile, label=label,
-            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens)
+            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens, allow_native_tokenizer=allow_native_tokenizer)
         if not admitted:
             return None, index
         for number in range(1, profile.max_attempts + 1):
