@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import ipaddress
+import hashlib
 import json
 import math
 import re
 import time
+import threading
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -186,6 +188,9 @@ class _LlamaCppClient:
         self._max_input_tokens = context_tokens - max(_OUTPUT_RESERVE, max_output_tokens)
         self._max_output_tokens = max_output_tokens
         self._max_output_bytes = max_output_bytes
+        self._admission_lock = threading.Lock()
+        self._input_admissions = {}
+        self._chat_template_digest = None
 
     def _validate_endpoint(self, api_url: str) -> str:
         return _endpoint(api_url, self._allowed_hosts)
@@ -268,7 +273,7 @@ class _LlamaCppClient:
             raise PermanentModelError("llama.cpp returned an invalid response")
         return result
 
-    def _verify(self, deadline: float) -> None:
+    def _verify(self, deadline: float) -> str:
         models = self._request("GET", "/v1/models", deadline)
         entries = models.get("data")
         if (
@@ -289,6 +294,8 @@ class _LlamaCppClient:
         ):
             raise PermanentModelError("llama.cpp requires the configured per-slot context and chat template")
         _encode(template)
+        self._chat_template_digest = hashlib.sha256(template.encode()).hexdigest()
+        return self._chat_template_digest
 
     def verify(self) -> None:
         """Check the exact loaded alias and active slot settings, never training-context metadata."""
@@ -346,8 +353,52 @@ class _LlamaCppClient:
         return len(_encode({key: value for key, value in payload.items() if key != "response_format"}))
 
     def admission_bytes(self, request: ModelRequest) -> int:
-        """Local prompt-byte upper bound; no tokenizer or generation request."""
+        """Offline bound, using a previously verified exact prompt count if present."""
+        receipt = self.input_admission_receipt(request)
+        if receipt is not None:
+            return receipt["input_tokens"]
         return self._context_bytes(self._chat_payload(request)) + FRAMING_RESERVE_TOKENS
+
+    def input_admission_receipt(self, request: ModelRequest) -> dict | None:
+        key = hashlib.sha256(_encode(self._chat_payload(request))).hexdigest()
+        with self._admission_lock:
+            receipt = self._input_admissions.get(key)
+            if receipt is not None and receipt["template_sha256"] == self._chat_template_digest:
+                return dict(receipt)
+        return None
+
+    def verify_input_admission(self, request: ModelRequest) -> int:
+        """Render/tokenize the unchanged request without inference or billable usage.
+
+        Application callers explicitly opt in only after a terminal request
+        exceeds the conservative byte bound. Admission itself stays offline.
+        """
+        deadline = self._deadline(request)
+        payload = self._chat_payload(request)
+        template_digest = self._verify(deadline)
+        cached = self.input_admission_receipt(request)
+        if cached is not None:
+            return cached["input_tokens"]
+        rendered = self._request("POST", "/apply-template", deadline, payload)
+        prompt = rendered.get("prompt")
+        if not isinstance(prompt, str) or not prompt or len(prompt.encode()) > _MAX_INPUT_BYTES:
+            raise PermanentModelError("Invalid llama.cpp rendered prompt")
+        result = self._request("POST", "/tokenize", deadline,
+            {"content": prompt, "add_special": False, "parse_special": True})
+        tokens = result.get("tokens")
+        if not isinstance(tokens, list) or not tokens or any(type(t) is not int or t < 0 for t in tokens):
+            raise PermanentModelError("Invalid llama.cpp deterministic tokenization")
+        key = hashlib.sha256(_encode(payload)).hexdigest()
+        receipt = {"method": "native_template_tokenizer", "model": self.model,
+            "payload_sha256": key, "template_sha256": template_digest,
+            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "tokens_sha256": hashlib.sha256(_encode(tokens)).hexdigest(),
+            "input_tokens": len(tokens), "tokenizer_requests": 2, "model_generations": 0}
+        with self._admission_lock:
+            if len(self._input_admissions) >= 128:
+                del self._input_admissions[next(iter(self._input_admissions))]
+            self._input_admissions[key] = receipt
+        return len(tokens)
 
     def _check_output(self, value: dict[str, Any], payload: dict[str, Any]) -> None:
         try:
@@ -428,14 +479,18 @@ class _LlamaCppClient:
         deadline = self._deadline(request)
         payload = self._chat_payload(request)
         self._verify(deadline)
-        # Fail-closed byte-upper-bound pre-gate. No measurement call exists.
-        precheck_byte_budget(self._context_bytes(payload), payload["max_tokens"],
+        receipt = self.input_admission_receipt(request)
+        # Exact counts are accepted only for the same verified template/payload.
+        bound = receipt["input_tokens"] if receipt is not None else self._context_bytes(payload) + FRAMING_RESERVE_TOKENS
+        precheck_byte_budget(bound, payload["max_tokens"],
             app_input_tokens=self._max_input_tokens, app_output_tokens=self._max_output_tokens,
             model_context_tokens=self._context_tokens, role="llama.cpp",
-            framing_reserve_tokens=FRAMING_RESERVE_TOKENS)
+            framing_reserve_tokens=0)
         data = self._request("POST", "/v1/chat/completions", deadline, payload)
         try:
             response = self._response(data, payload)
+            if receipt is not None and response.usage["input_tokens"] != receipt["input_tokens"]:
+                raise PermanentModelError("llama.cpp rendered prompt differs from actual generation usage")
             self._remaining(deadline)
             return response
         except (PermanentModelError, TimeoutError) as error:

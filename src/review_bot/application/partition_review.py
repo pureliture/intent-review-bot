@@ -864,7 +864,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
 
     def measure(req, client, current, label, *, for_generation=False):
         admitted, index = budget.measure(req, client, current, label=label,
-            reserve_calls=0, reserve_tokens=0, generate=for_generation)
+            reserve_calls=0, reserve_tokens=0, generate=for_generation,
+            allow_native_tokenizer=label.split(":", 1)[0] in ("global_review", "fact_check", "fact_rewrite"))
         if not admitted:
             if budget.records[index].reason == "input_limit_exceeded":
                 return False
@@ -2771,6 +2772,19 @@ def _validate_capacity_rejections(result):
     if records:
         raise PartitionError("stored_native_capacity_reservation_changed")
     for event in result.stages:
+        receipt = event.input_admission
+        if receipt is not None:
+            if (not isinstance(receipt, dict) or receipt.get("method") != "native_template_tokenizer"
+                    or receipt.get("request_hash") != event.request_hash
+                    or type(receipt.get("input_tokens")) is not int
+                    or receipt["input_tokens"] != event.measured_input_tokens
+                    or receipt.get("tokenizer_requests") != 2 or receipt.get("model_generations") != 0
+                    or any(not isinstance(receipt.get(key), str) or len(receipt[key]) != 64
+                        or any(c not in "0123456789abcdef" for c in receipt[key])
+                        for key in ("payload_sha256", "template_sha256", "prompt_sha256", "tokens_sha256"))
+                    or any(event.status == "completed" and attempt.usage is not None and attempt.usage["input_tokens"] != receipt["input_tokens"]
+                        for attempt in event.attempts)):
+                raise PartitionError("stored_native_input_admission_changed")
         if (event.reason == "input_limit_exceeded" and event.token_measurement == "measured"
                 and event.token_measurement_usage is None):
             raise PartitionError("stored_native_capacity_rejection_missing")

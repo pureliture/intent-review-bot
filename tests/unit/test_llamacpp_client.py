@@ -38,6 +38,94 @@ def chat_response(
     }
 
 
+def _deterministic_tokenizer(request):
+    if request.url.path == "/apply-template":
+        assert json.loads(request.content)["messages"]
+        return httpx.Response(200, json={"prompt": "<s>exact native prompt<assistant>"})
+    if request.url.path == "/tokenize":
+        assert json.loads(request.content) == {"content": "<s>exact native prompt<assistant>",
+            "add_special": False, "parse_special": True}
+        return httpx.Response(200, json={"tokens": list(range(42))})
+
+
+def test_terminal_overflow_can_verify_exact_input_without_a_model_generation(adapter, main_request, mock_http):
+    import time
+    from review_bot.application.model_execution import ModelExecutionBudget
+    from review_bot.domain.partition_review import PartitionReviewLimits
+
+    requests = mock_http(_deterministic_tokenizer)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    request = replace(main_request, user_content="한" * 40000)
+    limits = PartitionReviewLimits(max_input_tokens=client.profile.max_input_tokens,
+        max_total_tokens=1000000, max_calls=10, task_timeout_seconds=60)
+    budget = ModelExecutionBudget(limits, time.monotonic() + 60, None)
+    admitted, _ = budget.measure(request, client, client.profile, label="global_review:byte_gate",
+        reserve_calls=0, reserve_tokens=0)
+    assert not admitted and not requests
+    admitted, index = budget.measure(request, client, client.profile, label="global_review:verified_gate",
+        reserve_calls=0, reserve_tokens=0, allow_native_tokenizer=True)
+    assert admitted
+    assert [r.url.path for r in requests] == ["/v1/models", "/props", "/apply-template", "/tokenize"]
+    event = budget.records[index]
+    assert event.measured_input_tokens == 42 and event.token_measurement_model_calls == 0
+    assert event.input_admission["request_hash"] == event.request_hash
+    assert event.input_admission["model_generations"] == 0
+    assert budget.totals() == (0, 0, False)
+    count = len(requests)
+    assert client.admission_bytes(request) == 42 and len(requests) == count
+    body, _ = budget.execute(request, client, client.profile, label="global_review",
+        reserve_calls=0, reserve_tokens=0)
+    assert body == {"ok": True}
+    assert budget.totals() == (1, 47, False)
+    assert sum(r.url.path == "/v1/chat/completions" for r in requests) == 1
+    assert sum(r.url.path == "/tokenize" for r in requests) == 1
+    assert json.loads(requests[-1].content)["messages"][1]["content"] == request.user_content
+
+
+@pytest.mark.parametrize("tokens", [[], [True], [-1], [{"id": 1}]])
+def test_invalid_deterministic_tokenizer_response_cannot_admit_input(adapter, main_request, mock_http, tokens):
+    def handler(request):
+        if request.url.path == "/tokenize":
+            return httpx.Response(200, json={"tokens": tokens})
+        return _deterministic_tokenizer(request)
+    requests = mock_http(handler)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    with pytest.raises(PermanentModelError, match="tokenization"):
+        client.verify_input_admission(main_request)
+    assert client.input_admission_receipt(main_request) is None
+    assert not any(r.url.path == "/v1/chat/completions" for r in requests)
+
+
+def test_exact_admission_is_bound_to_payload_and_server_template(adapter, main_request, mock_http):
+    template_changed = False
+    def handler(request):
+        if template_changed and request.url.path == "/props":
+            return httpx.Response(200, json={"default_generation_settings": {"n_ctx": 131072},
+                "total_slots": 2, "chat_template": "changed template"})
+        return _deterministic_tokenizer(request)
+    requests = mock_http(handler)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    request = replace(main_request, user_content="한" * 40000)
+    assert client.verify_input_admission(request) == 42
+    assert client.input_admission_receipt(replace(request, user_content=request.user_content + "x")) is None
+    assert client.input_admission_receipt(replace(request, response_schema={"type": "object"})) is None
+    template_changed = True
+    with pytest.raises(PermanentModelError, match="byte-upper-bound"):
+        client.complete(request)
+    assert not any(r.url.path == "/v1/chat/completions" for r in requests)
+
+
+def test_actual_usage_must_match_verified_prompt_count_and_failure_keeps_usage(adapter, main_request, mock_http):
+    requests = mock_http(_deterministic_tokenizer, tokens=43)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    client.verify_input_admission(main_request)
+    with pytest.raises(PermanentModelError, match="differs from actual") as captured:
+        client.complete(main_request)
+    assert captured.value.delivery == "sent"
+    assert captured.value.usage == {"input_tokens": 43, "output_tokens": 5}
+    assert sum(r.url.path == "/v1/chat/completions" for r in requests) == 1
+
+
 def test_truncated_answer_is_rejected_but_its_valid_native_usage_is_preserved(adapter, main_request, mock_http):
     def truncated(request):
         if request.url.path == "/v1/chat/completions":

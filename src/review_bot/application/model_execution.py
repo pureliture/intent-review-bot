@@ -3,8 +3,9 @@
 Review pipelines own their prompts and validation. This module owns admission,
 usage accounting, retry bounds and cancellation; it does not select review modes.
 
-There is no metering path: no measurement-only request is ever issued for
-any client. Admission checks calls, deadlines and transport bytes only.
+There is no measurement-only generation. Admission checks calls, deadlines and transport bytes.
+Terminal native overflow can explicitly verify a chat-template/tokenizer count
+without inference. Such metadata work never creates model usage or a generation attempt.
 The input-token budget is proven pre-send by each adapter's exact-wire
 byte-upper-bound gate; the response usage is recorded post-send and any
 budget exceedance fails closed.
@@ -150,15 +151,17 @@ class ModelExecutionBudget:
 
     def measure(self, request: ModelRequest, client: ModelClient, profile: ModelProfile, *,
         label: str, reserve_calls: int, reserve_tokens: int, generate: bool = True,
+        allow_native_tokenizer: bool = False,
     ) -> tuple[bool, int]:
-        """Admission without any measurement call.
+        """Admission without any measurement-only model generation.
 
         Checks fence, call/deadline/transport budgets, then asks the
         client for its admitted-input bound (``admission_bytes``:
         prompt-relevant bytes plus the client's framing reserve, a proven token
         upper bound). The input-token budget is therefore proven pre-send
-        without any extra request; the response usage is recorded
-        post-send. Returns (admitted, index).
+        without an extra generation. Explicit terminal overflow verification may
+        use deterministic native metadata endpoints and records its own receipt.
+        Response usage remains generation-only. Returns (admitted, index).
         """
         record = IntentStageRecord(label, prompt_hash=hash_json({"system": request.system_prompt, "schema": request.response_schema}))
         index = len(self.records)
@@ -196,7 +199,22 @@ class ModelExecutionBudget:
                     reason = "token_count_unavailable"
         if reason is None and bound is not None:
             context_limit = min(profile.max_input_tokens or self.limits.max_input_tokens, self.limits.max_input_tokens)
-            if bound > context_limit:
+            verify = getattr(client, "verify_input_admission", None)
+            if bound > context_limit and allow_native_tokenizer and callable(verify):
+                try:
+                    bound = verify(actual)
+                    if type(bound) is not int or bound < 0:
+                        raise ValueError
+                except Exception:
+                    reason, bound = "token_count_unavailable", None
+                if reason is None:
+                    reason = self.guard()
+            receipt = getattr(client, "input_admission_receipt", None)
+            if callable(receipt):
+                verified = receipt(actual)
+                if verified is not None:
+                    record = replace(record, input_admission={**verified, "request_hash": record.request_hash})
+            if bound is not None and bound > context_limit and reason is None:
                 reason = "input_limit_exceeded"
         if reason:
             self.records[index] = replace(record, status="not_run", reason=reason,
