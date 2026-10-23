@@ -25,6 +25,7 @@ from review_bot.runtime.github_app import GitHubAppAdapters
 from review_bot.runtime.webhook import create_webhook_app
 from review_bot.runtime.worker import WorkerLoop
 from tests.conftest import SyntheticGitRepo
+from tests.fixtures.partition_review import PartitionModelClient
 
 SECRET = "synthetic-webhook-secret"
 TOKEN = "synthetic-installation-token"
@@ -112,6 +113,8 @@ def app_flow(tmp_path: Path, synthetic_repo: SyntheticGitRepo, valid_config_yaml
     analyzer = PmdRunner(output_root=state / "tools")
     worker = WorkerLoop(
         config, store, analyzer=analyzer, worker_id="installation-worker",
+        model_client=PartitionModelClient(),
+        planning_client=PartitionModelClient(name="tev", group_all=True),
         github_client_factory=adapters.github_client,
         repo_reader_factory=adapters.repository_cache.prepare, artifact_root=state,
     )
@@ -147,8 +150,9 @@ def test_installed_first_pr_runs_real_analysis_and_creates_one_comment(app_flow)
     assert len(flow.comments) == 1
     assert flow.calls.count(("POST", "/repos/org/repo/issues/7/comments")) == 1
     assert "<!-- review-bot:architecture:v1 -->" in flow.comments[0]["body"]
-    assert r"- 모델 실행: **모델 미실행** · `model\_profile\_unset`" in flow.comments[0]["body"]
-    assert "비공개 서비스 결과 파일" in flow.comments[0]["body"]
+    assert "#### 전체 판단" in flow.comments[0]["body"]
+    assert "#### 리뷰 의견" in flow.comments[0]["body"]
+    assert "모델 미실행" not in flow.comments[0]["body"]
     assert "Actions artifact" not in flow.comments[0]["body"]
     run_id, status = flow.store._get_connection().execute("SELECT run_id, status FROM runs;").fetchone()
     assert status == "succeeded"
@@ -159,7 +163,7 @@ def test_installed_first_pr_runs_real_analysis_and_creates_one_comment(app_flow)
     analysis = json.loads((output / "A/analysis.json").read_text())
     assert manifest["publication"]["comment_id"] == 701
     assert manifest["status"] == "succeeded"
-    assert result["status"] == "not_run" and result["reason"] == "model_profile_unset"
+    assert result["status"] == "completed" and result["schema_version"] == 13
     assert analysis["base"]["status"] == "clean"
     assert analysis["head"]["pmd"]["status"] == "findings"
     assert any(signal["tool"] == "pmd" for signal in delta["signals"])

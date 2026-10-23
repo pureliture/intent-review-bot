@@ -124,7 +124,9 @@ def _build_stress_fixtures(
                 reason=f"Detailed reason for finding {i + 1}: " + ("R" * 200),
                 recommendation=f"Refactoring recommendation {i + 1}: " + ("REC" * 100),
                 evidence_ids=(f"ev-stress-{i + 1}",),
-                citations=(cit,),
+                citations=(Citation(evidence_id=cit.evidence_id, version=cit.version, sha=cit.sha,
+                    path=cit.path, begin_line=cit.begin_line, end_line=cit.end_line,
+                    quote=f"{quote_text} // finding {i + 1}"),),
             )
         )
 
@@ -216,13 +218,15 @@ class TestMarkdownFormatter60kStress:
         lines = formatted.splitlines()
         assert lines[0] == DEFAULT_A_MARKER
 
-        # 3. Omission notice present
-        assert "댓글 표시 한도:" in formatted
-        assert "상세 구간은 artifact에서 확인하세요" in formatted
+        # 3. Oversize reviews become a notice, never a partial set of findings.
+        assert "리뷰 본문 표시 보류:" in formatted
+        assert "본문 전체를 싣지 못했습니다" in formatted
+        assert "저장된 산출물" not in formatted
+        assert "Excessive architectural entanglement" not in formatted
 
-        # 4. Metadata footer preserved at bottom
-        assert "<sub>📊 전체 레포 누적: PMD/CPD 기준 분석</sub>" in formatted
-        assert "<sub>🤖 자동 생성: review-bot architecture review A</sub>" in formatted
+        # 4. Audit scope pins stay in the private artifact, not the developer comment.
+        assert "검토 범위: 고정된 HEAD" not in formatted
+        assert result.head_sha not in formatted
 
         # 5. Code block syntax integrity: <pre><code> must be perfectly balanced
         open_pre = len(re.findall(r"<pre><code>", formatted))
@@ -237,8 +241,9 @@ class TestMarkdownFormatter60kStress:
         assert len(formatted) <= 60000, f"Exceeded 60k limit: {len(formatted)} chars"
         lines = formatted.splitlines()
         assert lines[0] == DEFAULT_A_MARKER
-        assert "댓글 표시 한도:" in formatted
-        assert "<sub>🤖 자동 생성: review-bot architecture review A</sub>" in formatted
+        assert "리뷰 본문 표시 보류:" in formatted
+        assert "검토 범위: 고정된 HEAD" not in formatted
+        assert "Excessive architectural entanglement" not in formatted
 
         open_pre = len(re.findall(r"<pre><code>", formatted))
         close_pre = len(re.findall(r"</code></pre>", formatted))
@@ -251,16 +256,20 @@ class TestMarkdownFormatter60kStress:
 
         assert len(formatted) <= 60000
         assert formatted.splitlines()[0] == DEFAULT_A_MARKER
-        assert "댓글 표시 한도:" in formatted
-        assert "<sub>🤖 자동 생성: review-bot architecture review A</sub>" in formatted
+        assert "리뷰 본문 표시 보류:" in formatted
+        assert "검토 범위: 고정된 HEAD" not in formatted
+        assert "Architectural question" not in formatted
 
-    def test_massive_limitations_alone_trigger_truncation_cleanly(self) -> None:
+    def test_massive_private_limitations_do_not_displace_developer_review(self) -> None:
         result, task_input = _build_stress_fixtures(findings_count=2, limitations_count=200)
         formatted = format_review_markdown(result, task_input, max_length=60000)
 
         assert len(formatted) <= 60000
         assert formatted.splitlines()[0] == DEFAULT_A_MARKER
-        assert "댓글 한계 표시:" in formatted or "댓글 표시 한도:" in formatted
+        assert "Excessive architectural entanglement" in formatted
+        assert "analysis boundary reached" not in formatted
+        assert len(result.analysis.limitations) == len(task_input.limitations) == 200
+        assert "검토 범위: 고정된 HEAD" not in formatted
 
     def test_citation_quotes_containing_markdown_code_fences_and_html(self) -> None:
         adversarial_code = (
@@ -291,7 +300,9 @@ class TestMarkdownFormatter60kStress:
             formatted = format_review_markdown(result, task_input, max_length=budget)
             assert len(formatted) <= budget, f"Failed at budget {budget}: got {len(formatted)}"
             assert formatted.splitlines()[0] == DEFAULT_A_MARKER
-            assert "<sub>🤖 자동 생성: review-bot architecture review A</sub>" in formatted
+            assert "검토 범위: 고정된 HEAD" not in formatted
+            assert "리뷰 본문 표시 보류:" in formatted
+            assert formatted.count("<details>") == formatted.count("</details>")
 
     def test_extreme_scale_500k_raw_chars_capped_under_60k(self) -> None:
         # Extreme stress test: 500 findings, massive raw payload
@@ -300,8 +311,9 @@ class TestMarkdownFormatter60kStress:
 
         assert len(formatted) <= 60000, f"Exceeded 60k limit at extreme scale: {len(formatted)}"
         assert formatted.splitlines()[0] == DEFAULT_A_MARKER
-        assert "댓글 표시 한도:" in formatted
-        assert "<sub>🤖 자동 생성: review-bot architecture review A</sub>" in formatted
+        assert "리뷰 본문 표시 보류:" in formatted
+        assert "검토 범위: 고정된 HEAD" not in formatted
+        assert "Excessive architectural entanglement" not in formatted
 
         open_pre = len(re.findall(r"<pre><code>", formatted))
         close_pre = len(re.findall(r"</code></pre>", formatted))
@@ -315,7 +327,8 @@ class TestMarkdownFormatter60kStress:
 
         assert len(formatted) <= 60000
         assert formatted.splitlines()[0] == DEFAULT_A_MARKER
-        assert "<sub>🤖 자동 생성: review-bot architecture review A</sub>" in formatted
+        assert giant_token in formatted
+        assert "검토 범위: 고정된 HEAD" not in formatted
 
     def test_none_task_input_does_not_crash_formatter(self) -> None:
         result, _ = _build_stress_fixtures(findings_count=2)
@@ -323,7 +336,10 @@ class TestMarkdownFormatter60kStress:
         formatted = format_review_markdown(result, None)  # type: ignore[arg-type]
         assert len(formatted) <= 60000
         assert formatted.splitlines()[0] == DEFAULT_A_MARKER
-        assert "- 리뷰 모드: **일반 PR**" in formatted
+        assert "리뷰 미완료" in formatted
+        assert "검토 입력이 없어 정적 신호와 코드 근거를 다시 확인할 수 없습니다" in formatted
+        assert "Excessive architectural entanglement" not in formatted
+        assert "#### LLM 리뷰" not in formatted
 
 
 # ==============================================================================

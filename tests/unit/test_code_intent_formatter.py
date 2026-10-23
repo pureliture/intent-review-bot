@@ -87,8 +87,20 @@ def test_length_limit_omits_whole_body_not_partial_markdown_and_keeps_warning(li
 
 def test_partial_relation_review_is_not_presented_as_scope_sufficient():
     task = make_task()
-    result = run_code_first_review(task, split_client(), planning_client=CodeFirstModelClient(split=True),
+    main, planner = split_client(), CodeFirstModelClient(split=True)
+    result = run_code_first_review(task, main, planning_client=planner,
         limits=CodeFirstReviewLimits(max_rechecks=0))
+    assert (result.status, result.reason) == ("partial_review", "unresolved_context")
+    # Zero-measurement admission: joint full-input bound 2000 exceeds the
+    # grouped profile budget, so full_fits is False (admitted False) with
+    # reason input_limit_exceeded; smaller groups admit. No metering calls.
+    full = next(row for row in result.stages if row.stage == "full_input_admission")
+    assert (full.status, full.reason) == ("not_run", "input_limit_exceeded")
+    assert full.measured_input_tokens == 2000
+    assert main.count_requests == [] and planner.count_requests == []
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0
+    assert result.usage["metering_output_tokens"] == 0
     draft = format_code_intent_markdown(result, task)
     assert "partial_review" in draft and "scope sufficient: no" in draft and "unreviewed" in draft
     assert "Partial review: unresolved" in draft

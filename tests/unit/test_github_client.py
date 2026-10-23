@@ -2,20 +2,62 @@
 from __future__ import annotations
 
 import json
+import gzip
 import traceback
+import zlib
 from collections.abc import Callable
 from typing import Any
 
 import httpx
 import pytest
 
-from review_bot.adapters.github.client import GitHubApiClient
+from review_bot.adapters.github.client import GitHubApiClient, GitHubResponseLimitError
 from review_bot.application.publication import publish_review_comment
 
 COMMENTS_URL = "https://api.github.com/repos/org/repo/issues/42/comments"
 MARKER = "<!-- review-bot:architecture:v1 -->"
 BOT_LOGIN = "architecture-review[bot]"
 HttpHandler = Callable[[httpx.Request], httpx.Response]
+
+
+@pytest.mark.parametrize("encoding,compress", [("gzip", gzip.compress), ("deflate", zlib.compress)])
+def test_bounded_compressed_pr_body_decodes_once_and_keeps_response_metadata(encoding, compress):
+    payload = {"number": 305, "body": "압축된 PR 원문을 그대로 보존합니다." * 10}
+    decoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    compressed = compress(decoded)
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        assert request.url.path == "/repos/org/repo/pulls/305"
+        return httpx.Response(200, headers={"Content-Encoding": encoding,
+            "Content-Length": str(len(compressed)), "ETag": 'W/"original-validator"',
+            "Content-Type": "application/json; charset=utf-8"}, stream=httpx.ByteStream(compressed))
+
+    client = GitHubApiClient(token="installation-secret", repository="org/repo", transport=httpx.MockTransport(handler))
+    response = client._request("GET", "https://api.github.com/repos/org/repo/pulls/305",
+        max_response_bytes=len(decoded), timeout_seconds=1)
+    assert response.content == decoded and response.json() == payload
+    assert response.headers["ETag"] == 'W/"original-validator"'
+    assert response.headers["Content-Type"] == "application/json; charset=utf-8"
+    assert "Content-Encoding" not in response.headers
+    assert response.headers["Content-Length"] == str(len(decoded))
+    assert "Authorization" not in response.request.headers
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("encoding,compress", [("gzip", gzip.compress), ("deflate", zlib.compress)])
+def test_compressed_pr_limit_applies_to_decoded_body_and_redacts_failure(encoding, compress):
+    decoded = json.dumps({"number": 305, "body": "response-secret" * 1000}).encode()
+    compressed = compress(decoded)
+    assert len(compressed) < 512 < len(decoded)
+    client = GitHubApiClient(token="installation-secret", repository="org/repo", transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, headers={"Content-Encoding": encoding,
+            "Content-Length": str(len(compressed))}, stream=httpx.ByteStream(compressed))))
+    with pytest.raises(GitHubResponseLimitError, match="source_response_limit_exceeded") as caught:
+        client.get_pull_request(305, max_response_bytes=512, timeout_seconds=1)
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert "response-secret" not in rendered and "installation-secret" not in rendered
 
 
 @pytest.fixture

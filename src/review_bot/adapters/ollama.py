@@ -142,8 +142,6 @@ class OllamaModelClient(_LocalOllamaClient):
             max_output_bytes=max_output_bytes, timeout_seconds=timeout_seconds, max_attempts=max_attempts,
             max_input_tokens=CONTEXT_TOKENS - MAX_OUTPUT_TOKENS, max_output_tokens=MAX_OUTPUT_TOKENS,
         )
-        self.token_count_receipt: dict[str, object] | None = None
-
     def verify(self) -> None:
         if self._verified:
             return
@@ -170,7 +168,15 @@ class OllamaModelClient(_LocalOllamaClient):
         ):
             raise PermanentModelError("Invalid or incomplete Ollama load response")
 
-    def _chat(self, request: ModelRequest, *, count_only: bool = False) -> dict[str, Any]:
+    def admission_bytes(self, request: ModelRequest) -> None:
+        """Ollama has no exact wire bound; the adapter byte gate decides.
+
+        Returns None so application admission defers to the adapter's
+        conservative pre-send byte budget. No measurement call exists.
+        """
+        return None
+
+    def _chat(self, request: ModelRequest) -> dict[str, Any]:
         self._check_request(request)
         maximum = request.max_output_tokens if request.max_output_tokens is not None else MAX_OUTPUT_TOKENS
         if type(maximum) is not int or not 0 < maximum <= MAX_OUTPUT_TOKENS:
@@ -186,7 +192,7 @@ class OllamaModelClient(_LocalOllamaClient):
                 {"role": "user", "content": request.user_content},
             ],
             "format": request.response_schema, "think": False, "stream": False, "keep_alive": "5m",
-            "options": {"num_ctx": CONTEXT_TOKENS, "num_predict": 1 if count_only else maximum,
+            "options": {"num_ctx": CONTEXT_TOKENS, "num_predict": maximum,
                         "temperature": 0, "seed": 0},
         }
         if len(_encode(payload)) > _MAX_CHAT_BYTES:
@@ -200,13 +206,6 @@ class OllamaModelClient(_LocalOllamaClient):
         if input_tokens > self.profile.max_input_tokens or output_tokens > payload["options"]["num_predict"]:
             raise PermanentModelError("Ollama response exceeds token budget")
         return data
-
-    def count_input_tokens(self, request: ModelRequest) -> int:
-        self.token_count_receipt = {"delivery": "unknown", "model_calls": None, "usage": None}
-        data = self._chat(request, count_only=True)
-        self.token_count_receipt = {"delivery": "sent", "model_calls": 1,
-            "usage": {"input_tokens": data["prompt_eval_count"], "output_tokens": data["eval_count"]}}
-        return _count(data["prompt_eval_count"])
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         data = self._chat(request)

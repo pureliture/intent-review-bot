@@ -121,6 +121,16 @@ def service_config(tmp_path: Path, valid_config_yaml: str, monkeypatch: pytest.M
     return SimpleNamespace(path=path, state=state, key=key, raw=raw)
 
 
+def shared_fixture_worker(*args, **ports):
+    """Keep real service/worker gates, replace only the two model boundaries."""
+    from review_bot.runtime.worker import WorkerLoop
+    from tests.fixtures.partition_review import PartitionModelClient
+
+    ports.update(model_client=PartitionModelClient(),
+        planning_client=PartitionModelClient(name="tev", group_all=True))
+    return WorkerLoop(*args, **ports)
+
+
 def current_umask() -> int:
     previous = os.umask(0o077)
     os.umask(previous)
@@ -508,7 +518,7 @@ def test_service_failures_close_store_restore_umask_and_redact_values(
         github.pull_requests[7]["base"]["repo"] = {"id": 99, "full_name": "org/repo"}
         dependencies.adapters.github_client.return_value = github
         dependencies.adapters.repository_cache.prepare.return_value = worker_pipeline_ports["repo_reader"]
-        monkeypatch.setattr(service, "WorkerLoop", WorkerLoop)
+        monkeypatch.setattr(service, "WorkerLoop", shared_fixture_worker)
         dependencies.analyzer_factory.side_effect = error
     elif failure == "worker":
         dependencies.worker_factory.side_effect = error
@@ -532,7 +542,7 @@ def test_service_failures_close_store_restore_umask_and_redact_values(
         connection = sqlite3.connect(service_config.state / "jobs.sqlite")
         try:
             assert connection.execute("SELECT status, stage, error FROM runs").fetchone() == (
-                "failed", "analyze", "worker_pipeline_error:RuntimeError")
+                "failed", "publish", "worker_pipeline_error:RuntimeError")
         finally:
             connection.close()
     else:
@@ -633,7 +643,7 @@ def test_claimed_worker_rejects_unsafe_key_and_records_failure(
         (service_config.key.parent / "key-copy.pem").hardlink_to(service_config.key)
     else:
         monkeypatch.setenv("STEP7_KEY_FILE", str(service_config.key.parent / "absent.pem"))
-    monkeypatch.setattr(service, "WorkerLoop", WorkerLoop)
+    monkeypatch.setattr(service, "WorkerLoop", shared_fixture_worker)
     assert main(["worker", "--config", str(service_config.path), "--once"]) == 1
     connection = sqlite3.connect(service_config.state / "jobs.sqlite")
     try:
@@ -664,7 +674,7 @@ def test_rootless_preflight_failure_never_falls_back(
     github.pull_requests[7]["base"]["repo"] = {"id": 99, "full_name": "org/repo"}
     dependencies.adapters.github_client.return_value = github
     dependencies.adapters.repository_cache.prepare.return_value = worker_pipeline_ports["repo_reader"]
-    monkeypatch.setattr(service, "WorkerLoop", WorkerLoop)
+    monkeypatch.setattr(service, "WorkerLoop", shared_fixture_worker)
 
     docker = Mock(side_effect=OSError(SECRET + str(service_config.state)))
     monkeypatch.setattr(RootlessPmdAnalyzer, "_docker", docker)
@@ -675,7 +685,7 @@ def test_rootless_preflight_failure_never_falls_back(
     connection = sqlite3.connect(service_config.state / "jobs.sqlite")
     try:
         status, stage, error = connection.execute("SELECT status, stage, error FROM runs").fetchone()
-        assert (status, stage) == ("failed", "analyze")
+        assert (status, stage) == ("failed", "publish")
         assert error == "worker_pipeline_error:AnalysisSetupError"
     finally:
         connection.close()
@@ -721,7 +731,7 @@ def test_signed_cli_intake_to_real_worker_with_mock_github(
     dependencies.analyzer_factory.return_value = worker_pipeline_ports["analyzer"]
     dependencies.adapters.github_client.return_value = github
     dependencies.adapters.repository_cache.prepare.return_value = worker_pipeline_ports["repo_reader"]
-    monkeypatch.setattr(service, "WorkerLoop", WorkerLoop)
+    monkeypatch.setattr(service, "WorkerLoop", shared_fixture_worker)
     accepted = []
 
     def serve(app, **kwargs):
@@ -752,7 +762,8 @@ def test_signed_cli_intake_to_real_worker_with_mock_github(
         connection.close()
     artifacts = service_config.state / "artifacts" / "runs" / "99" / "7" / run_id
     result = json.loads((artifacts / "A" / "result.json").read_text(encoding="utf-8"))
-    assert result["status"] == "not_run"
+    assert result["status"] == "completed"
+    assert result["schema_version"] == 13
     assert (artifacts / "A" / "result.json").stat().st_mode & 0o777 == 0o600
     assert json.loads((artifacts / "manifest.json").read_text(encoding="utf-8"))["status"] == "succeeded"
     assert worker_pipeline_ports["analyzer"].run_analysis.call_count == 2

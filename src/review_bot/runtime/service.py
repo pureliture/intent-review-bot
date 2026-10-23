@@ -208,6 +208,15 @@ class _ClaimedAppAdapters:
     def repository_reader(self, run: RunRecord, pr_data: dict[str, Any], client: GitHubClient) -> RepositoryReader:
         return self._get().repository_cache.prepare(run, pr_data, client)
 
+    def review_settings(self, run: RunRecord, pr_data: dict[str, Any], client: GitHubClient, *, before_request=None):
+        from review_bot.adapters.repository_review_settings import FileRepositoryReviewSettingsStore
+        from review_bot.application.repository_review_settings import RepositoryReviewSettingsResolver
+
+        resolver = RepositoryReviewSettingsResolver(FileRepositoryReviewSettingsStore(self.cache_root.parent))
+        return resolver.resolve(run.installation_id, run.repository_id,
+            lambda: self._get().repository_cache.read_default_settings_source(
+                run, pr_data, client, before_request=before_request))
+
 
 def run_webhook(config_path: str | None, *, host: str = "127.0.0.1", port: int = 8000) -> int:
     config = load_service_config(config_path)
@@ -236,6 +245,7 @@ def run_worker(config_path: str | None, *, once: bool = False) -> int:
             return WorkerLoop(
                 config, store, analyzer_factory=analyzer_factory, github_client_factory=adapters.github_client,
                 repo_reader_factory=adapters.repository_reader, artifact_root=root / "artifacts", **options,
+                repository_settings_factory=adapters.review_settings,
             )
 
         loop = compose(job_store, 0)

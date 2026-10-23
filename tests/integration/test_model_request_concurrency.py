@@ -38,10 +38,8 @@ def _response(request, *, content=None):
     if request.url.path == "/props":
         return httpx.Response(200, json={"default_generation_settings": {"n_ctx": 131072 if selector else 131072},
             "chat_template": "fixture-chat-template", "total_slots": 2})
-    if request.url.path == "/apply-template":
-        return httpx.Response(200, json={"prompt": json.dumps(json.loads(request.content)["messages"])})
-    if request.url.path == "/tokenize":
-        return httpx.Response(200, json={"tokens": list(range(100))})
+    if request.url.path in ("/apply-template", "/tokenize"):
+        raise AssertionError(f"measurement endpoint must never be called: {request.url.path}")
     assert request.url.path == "/v1/chat/completions"
     return httpx.Response(200, json={"model": model, "choices": [{"index": 0, "finish_reason": "stop", "message": {
         "role": "assistant", "content": content if content is not None else
@@ -116,7 +114,7 @@ def test_review_selector_and_metering_share_exactly_two_http_slots(monkeypatch):
         assert json.loads(waiting.result(timeout=5).text) == {"ok": True}
     assert maximum == 2
     assert len([request for request in requests if request.url.path == "/v1/chat/completions"]) == 3
-    assert len([request for request in requests if request.url.path == "/tokenize"]) == 3
+    assert not any(request.url.path in ("/apply-template", "/tokenize") for request in requests)
 
 
 @pytest.mark.parametrize("failure", ["timeout", "full_invalid_json", "http_error", "connect_error"])

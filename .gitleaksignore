@@ -2,3 +2,5 @@
 tests/unit/test_tier5_adversarial_core.py:generic-api-key:1060
 # Synthetic HMAC fixture used only by the adversarial webhook tests.
 tests/unit/test_tier5_adversarial_runtime.py:generic-api-key:93
+# Synthetic v3 replay run_key is a deterministic review identity hash, not a credential.
+tests/fixtures/fact_review_v3_interrupted.json:generic-api-key:1

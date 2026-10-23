@@ -19,7 +19,10 @@ def _intent_artifact_values(task_input: Any, result: Any) -> dict[str, Any]:
         "usage.json": {"total": result.usage, "stages": [asdict(stage) for stage in result.stages]},
         "validation.json": {"status": result.status, "reason": result.reason, "errors": result.validation_errors,
             "stages": [{"stage": stage.stage, "status": stage.status, "reason": stage.reason} for stage in result.stages]}}
-    if result.schema_version == 3:
+    if result.schema_version == 13:
+        values.update({"partition.json": result.partition, "perspectives.json": result.perspectives,
+            "fact-verification.json": result.partition.get("fact_verification", {})})
+    elif result.schema_version == 3:
         from review_bot.domain.intent_perspectives import PERSPECTIVES
 
         values.update({"catalog.json": {"version": result.catalog_version, "hash": result.catalog_hash,
@@ -102,6 +105,12 @@ class RunArtifacts:
         self.write_json("selection.json", selection)
         self.write_json("manifest.json", self.manifest)
 
+    def save_execution_plan(self, plan: Any) -> None:
+        self.write_json("execution-plan.json", plan)
+        self.manifest["planning"] = {"plan_id": plan.partition.get("plan_id"), "status": plan.status,
+            "reason": plan.reason, "usage": plan.usage, "model_delivery": plan.model_delivery}
+        self.write_json("manifest.json", self.manifest)
+
     def save_review(
         self, *, snapshot: Any, selection: Any, task_input: Any,
         base_run: Any, head_run: Any, result: Any, markdown: str, config_hash: str,
@@ -117,6 +126,9 @@ class RunArtifacts:
         self.write_json("A/scope.json", result.scope)
         self.write_json("A/result.json", result)
         self.write_json("A/usage.json", result.usage)
+        if result.schema_version == 13:
+            self.write_json("A/partition.json", result.partition)
+            self.write_json("A/fact-verification.json", result.partition.get("fact_verification", {}))
         self.write_json("A/validation.json", {"status": result.status, "reason": result.reason})
         self._write("A/comment.md", markdown)
         self.write_json("manifest.json", self.manifest)
@@ -131,7 +143,7 @@ class RunArtifacts:
             "input_fingerprint": result.run_key, "prompt_version": result.prompt_version,
             "prompt_hash": result.prompt_hash, "status": result.status, "reason": result.reason,
             "publication": None}
-        if result.schema_version in (2, 3):
+        if result.schema_version in (2, 3, 13):
             self.manifest["modes"]["intent"]["result_schema_version"] = result.schema_version
         self.write_json("manifest.json", self.manifest)
 
@@ -214,9 +226,12 @@ def read_private_intent_input(path: Path, *, max_bytes: int) -> str:
 class IntentArtifacts:
     """Fresh private evaluation outputs, isolated from existing A/service files."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, mode="intent") -> None:
+        if mode not in ("intent", "architecture"):
+            raise ValueError("invalid_private_artifact_mode")
+        self.mode = mode
         self.root = _intent_directory(root)
-        self.directory = self.root / "B"
+        self.directory = self.root / ("B" if mode == "intent" else "A")
         manifest = self.root / "manifest.json"
         if manifest.exists() or manifest.is_symlink() or self.directory.exists() or self.directory.is_symlink():
             raise ValueError("intent_output_already_exists")
@@ -244,6 +259,10 @@ class IntentArtifacts:
                 os.unlink(pending, dir_fd=directory_fd)
             os.close(directory_fd)
 
+    def save_execution_plan(self, task_input: Any, plan: Any) -> None:
+        self._write(self.root, "planning-input.json", json.dumps(asdict(task_input), ensure_ascii=False, indent=2) + "\n")
+        self._write(self.root, "execution-plan.json", json.dumps(asdict(plan), ensure_ascii=False, indent=2) + "\n")
+
     def save(self, task_input: Any, result: Any, markdown: str) -> None:
         publication = {"status": "not_attempted", "reason": "artifact_only"}
         values = _intent_artifact_values(task_input, result)
@@ -251,13 +270,16 @@ class IntentArtifacts:
             data = asdict(value) if is_dataclass(value) else value
             self._write(self.directory, name, json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
         self._write(self.directory, "comment.md", markdown)
-        manifest = {"schema_version": 2, "snapshot_id": task_input.snapshot.snapshot_id, "selected_modes": ["intent"],
+        manifest = {"schema_version": 2, "snapshot_id": result.snapshot_id, "selected_modes": [self.mode],
             "status": "failed" if result.status == "failed" else "succeeded", "publication": publication,
-            "modes": {"intent": {"input_hash": task_input.input_hash, "input_fingerprint": result.run_key,
+            "modes": {self.mode: {"input_hash": task_input.input_hash, "input_fingerprint": result.run_key,
                 "prompt_version": result.prompt_version, "prompt_hash": result.prompt_hash,
                 "status": result.status, "reason": result.reason, "publication": publication}}}
-        if result.schema_version == 3:
-            manifest["status"] = "succeeded" if result.status == "completed" else "failed"
-        if result.schema_version in (2, 3):
-            manifest["modes"]["intent"]["result_schema_version"] = result.schema_version
+        if result.schema_version in (3, 13):
+            manifest["status"] = "succeeded" if result.status == "completed" or (
+                result.schema_version == 13 and result.status == "measured") else "failed"
+            if result.reason == "mode_not_selected_in_shared_plan":
+                manifest["status"] = "skipped"
+        if result.schema_version in (2, 3, 13):
+            manifest["modes"][self.mode]["result_schema_version"] = result.schema_version
         self._write(self.root, "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n")

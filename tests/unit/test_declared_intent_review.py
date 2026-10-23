@@ -208,25 +208,85 @@ def test_bounded_transient_retry_preserves_both_attempts() -> None:
     assert result.usage["known_input_tokens"] == 300
 
 
-@pytest.mark.parametrize("profile,limits,reason", [
-    (ModelProfile("mock", "fixture", max_input_bytes=100), None, "input_limit_exceeded"),
-    (ModelProfile("mock", "fixture", max_input_tokens=99), None, "input_limit_exceeded"),
-    (ModelProfile("mock", "fixture"), IntentReviewLimits(max_total_tokens=4195), "input_limit_exceeded"),
-    (ModelProfile("mock", "fixture", max_attempts=0), None, "invalid_model_profile"),
+@pytest.mark.parametrize("profile,limits,reason,status,expected_calls", [
+    (ModelProfile("mock", "fixture", max_input_bytes=100), None, "input_limit_exceeded", "not_run", 0),
+    # Token budgets are proven post-send from response usage (no measurement call):
+    # response input 100 > 99 fails closed after the single generation.
+    (ModelProfile("mock", "fixture", max_input_tokens=99), None, "usage_limit_exceeded", "failed", 1),
+    # Total budgets are gated pre-send via max_output_tokens > max_total_tokens (no metering).
+    (ModelProfile("mock", "fixture"), IntentReviewLimits(max_total_tokens=4095), "input_limit_exceeded", "not_run", 0),
+    (ModelProfile("mock", "fixture", max_attempts=0), None, "invalid_model_profile", "not_run", 0),
 ])
-def test_preflight_limits_make_no_review_calls(profile, limits, reason: str) -> None:
+def test_preflight_limits_make_no_review_calls(profile, limits, reason: str, status: str, expected_calls: int) -> None:
     client = MockModelClient(responses(), profile=profile, input_tokens=100)
+    assert not hasattr(client, "count_input_tokens")
+    assert not hasattr(client, "token_count_receipt")
     result = run_review_b_pipeline(make_task(), client, limits=limits)
-    assert result.reason == reason
-    assert client.requests == []
-    assert result.usage["calls"] == 0
+    assert (result.status, result.reason) == (status, reason)
+    assert len(client.requests) == expected_calls
+    assert result.usage["calls"] == expected_calls
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0
+    assert result.usage["metering_output_tokens"] == 0
+    assert all(record.token_measurement == "not_attempted" for record in result.stages)
+    assert all(record.measured_input_tokens is None for record in result.stages)
+    assert all(record.token_measurement_model_calls == 0 for record in result.stages)
+    if expected_calls == 0:
+        assert client.requests == []
+        assert result.usage["input_tokens"] == 0
+        assert result.usage["output_tokens"] == 0
+    else:
+        assert result.usage["input_tokens"] == 100
+        assert result.usage["output_tokens"] == 50
 
 
 def test_token_count_is_required_not_estimated() -> None:
+    """Retired metering contract: input_tokens= is ignored; admission uses bytes+usage.
+
+    No measurement call exists (no count_input_tokens/token_count_receipt). The mock
+    validates with only complete() calls, and byte-gate refusals happen without any
+    extra call. Name retained for history; assertions cover the new contract.
+    """
+    assert not hasattr(MockModelClient, "count_input_tokens")
+    # input_tokens=None is ignored; response usage alone drives accounting.
     client = MockModelClient(responses())
     result = run_review_b_pipeline(make_task(), client)
-    assert result.reason == "token_count_unavailable"
-    assert client.requests == []
+    assert (result.status, result.reason) == ("completed", "validated")
+    assert len(client.requests) == 3  # only complete() calls, zero measurement calls
+    assert result.usage["calls"] == 3
+    assert result.usage["input_tokens"] == 300
+    assert result.usage["output_tokens"] == 150
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0
+    assert result.usage["metering_output_tokens"] == 0
+    for record in result.stages:
+        assert record.token_measurement == "not_attempted"
+        assert record.measured_input_tokens is None
+        assert record.token_measurement_request_hash is None
+        assert record.token_measurement_delivery == "not_attempted"
+        assert record.token_measurement_model_calls == 0
+        assert record.token_measurement_usage is None
+    for record in result.model_delivery.values():
+        assert record["token_measurement"] == "not_attempted"
+        assert record["measured_input_tokens"] is None
+        assert record["token_measurement_model_calls"] == 0
+    # admission_bytes is never consulted by the declared pipeline (no extra call).
+    class ExplodingAdmission(MockModelClient):
+        def admission_bytes(self, request):  # type: ignore[override]
+            raise AssertionError("declared pipeline must not call admission_bytes")
+
+    exploding = ExplodingAdmission(responses())
+    assert run_review_b_pipeline(make_task(), exploding).status == "completed"
+    assert len(exploding.requests) == 3
+    # Byte-gate refusal happens without any extra call.
+    small = MockModelClient(responses(), profile=ModelProfile("mock", "fixture", max_input_bytes=100))
+    refused = run_review_b_pipeline(make_task(), small)
+    assert (refused.status, refused.reason) == ("not_run", "input_limit_exceeded")
+    assert small.requests == []
+    assert refused.usage["calls"] == 0
+    assert refused.usage["token_measurements"] == 0
+    assert refused.usage["metering_input_tokens"] == 0
+    assert refused.usage["metering_output_tokens"] == 0
 
 
 def test_stage_gate_loss_prevents_next_stage() -> None:
@@ -248,19 +308,36 @@ def test_tampered_fixed_input_is_not_sent() -> None:
 
 @pytest.mark.parametrize("overflow_stage", [1, 2])
 def test_later_stage_overflow_keeps_actual_earlier_usage_and_full_scope(overflow_stage: int) -> None:
-    class CountedClient(MockModelClient):
-        def count_input_tokens(self, request):
-            return 200000 if len(self.requests) == overflow_stage else 100
-
+    bodies = stage_bodies()
+    usages = [{"input_tokens": 100, "output_tokens": 50} for _ in bodies]
+    usages[overflow_stage] = {"input_tokens": 200, "output_tokens": 50}
+    profile = ModelProfile("mock", "fixture", max_input_tokens=150)
+    # input_tokens= is ignored; per-response usage alone enforces the token budget.
+    client = MockModelClient(
+        [ModelResponse(json.dumps(body), usage) for body, usage in zip(bodies, usages)],
+        profile=profile,
+        input_tokens=9999,
+    )
+    assert not hasattr(client, "count_input_tokens")
     task = make_task()
-    client = CountedClient(responses(), input_tokens=100)
     result = run_review_b_pipeline(task, client)
-    assert result.reason == "input_limit_exceeded"
-    assert result.usage["calls"] == overflow_stage
-    assert result.usage["input_tokens"] == overflow_stage * 100
+    assert (result.status, result.reason) == ("failed", "usage_limit_exceeded")
+    assert len(client.requests) == overflow_stage + 1
+    assert result.usage["calls"] == overflow_stage + 1
+    assert result.usage["input_tokens"] == 100 * overflow_stage + 200
+    assert result.usage["output_tokens"] == 50 * (overflow_stage + 1)
+    assert result.usage["known_input_tokens"] == 100 * overflow_stage + 200
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0
+    assert result.usage["metering_output_tokens"] == 0
+    assert all(record.token_measurement == "not_attempted" for record in result.stages)
+    assert all(record.measured_input_tokens is None for record in result.stages)
+    assert all(record.token_measurement_model_calls == 0 for record in result.stages)
     assert result.scope["reviewed_paths"] == list(task.reviewed_paths)
-    assert len(client.requests) == overflow_stage
     assert result.goals is not None
+    assert all(record.status == "completed" for record in result.stages[:overflow_stage])
+    assert result.stages[overflow_stage].status == "failed"
+    assert result.stages[overflow_stage].reason == "usage_limit_exceeded"
 
 
 @pytest.mark.parametrize("failure", ["oversized", "too_many", "boolean_usage", "missing_usage", "exception"])

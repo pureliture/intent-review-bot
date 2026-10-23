@@ -4,29 +4,26 @@ from __future__ import annotations
 import json
 import re
 import time
-from asyncio import CancelledError as AsyncCancelledError
 from collections.abc import Callable
-from concurrent.futures import CancelledError
 from copy import deepcopy
 from dataclasses import asdict, fields, replace
-from datetime import UTC, datetime
 from difflib import unified_diff
 from typing import Any
 
 from review_bot.application.context import hash_json
 from review_bot.application.intent_context import (
-    MAX_INPUT_BYTES, MAX_PATHS, TEXT_KINDS, IntentInputError,
+    MAX_PATHS, TEXT_KINDS, IntentInputError,
     bounded_array, bounded_object, bounded_text, build_intent_evidence,
-    decode_intent_task_input, intent_scope, safe_relative_path, strict_json_loads,
+    decode_intent_task_input, intent_scope, safe_relative_path,
 )
-from review_bot.application.architecture_review import ModelProfile, TransientModelError
+from review_bot.application.architecture_review import ModelProfile
 from review_bot.application.declared_intent_review import (
-    MAX_OUTPUT_BYTES, _array_schema, _gate, _make_result, _measurement_receipt,
-    _object_schema, _usage, _valid_profile,
+    _array_schema, _make_result, _object_schema,
 )
-from review_bot.domain.intent_models import IntentModelAttempt, IntentStageRecord, IntentTaskInput
+from review_bot.application.model_execution import ModelExecutionBudget as _Budget, model_profile as _profile
+from review_bot.domain.intent_models import IntentStageRecord, IntentTaskInput
 from review_bot.domain.code_first_intent_models import CodeFirstReviewLimits, CodeFirstReviewResult
-from review_bot.domain.models_v1 import ModelRequest, ModelResponse
+from review_bot.domain.models_v1 import ModelRequest
 from review_bot.ports import ModelClient
 
 PROMPT_VERSION = "review-b/code-first-v2"
@@ -554,167 +551,9 @@ def _validate_final(raw: Any, task: IntentTaskInput, supplied: list[dict], group
         "review_sufficient": _boolean(body["review_sufficient"]), "no_findings": no_findings}, updated
 
 
-def _profile(client: ModelClient | None, limits: CodeFirstReviewLimits) -> ModelProfile | None:
-    try:
-        active = getattr(client, "profile", None)
-        return active if _valid_profile(active, limits) else None
-    except Exception:
-        return None
-
-
 def _identity(client: ModelClient | None, profile: ModelProfile | None) -> dict:
     return {"type": f"{type(client).__module__}.{type(client).__qualname__}" if client is not None else None,
         "profile": {field.name: getattr(profile, field.name) for field in fields(ModelProfile)} if profile else None}
-
-
-class _Budget:
-    def __init__(self, limits: CodeFirstReviewLimits, deadline: float, fence: Callable[[], bool] | None):
-        self.limits, self.deadline, self.fence = limits, deadline, fence
-        self.records: list[IntentStageRecord] = []
-
-    def totals(self) -> tuple[int, int, bool]:
-        attempts = [attempt for record in self.records for attempt in record.attempts]
-        measured = [record for record in self.records if record.token_measurement != "not_attempted"]
-        known = [attempt.usage for attempt in attempts if attempt.usage is not None]
-        known.extend(record.token_measurement_usage for record in measured if record.token_measurement_usage is not None)
-        calls = len(attempts) + sum(record.token_measurement_model_calls or 0 for record in measured)
-        unknown = any(attempt.usage is None or attempt.delivery == "unknown" for attempt in attempts) or any(
-            record.token_measurement_usage is None or record.token_measurement_model_calls is None for record in measured)
-        return calls, sum(usage["input_tokens"] + usage["output_tokens"] for usage in known), unknown
-
-    def guard(self) -> str | None:
-        try:
-            return _gate(self.fence, self.deadline)
-        except AsyncCancelledError:
-            return "model_cancelled"
-
-    def measure(self, request: ModelRequest, client: ModelClient, profile: ModelProfile, *,
-        label: str, reserve_calls: int, reserve_tokens: int, generate: bool = True,
-    ) -> tuple[int | None, int]:
-        record = IntentStageRecord(label, prompt_hash=hash_json({"system": request.system_prompt, "schema": request.response_schema}))
-        index = len(self.records)
-        self.records.append(record)
-        reason = self.guard()
-        calls, tokens, unknown = self.totals()
-        meter_reserve = 0 if profile.is_mock else 1
-        if reason is None and unknown:
-            reason = "usage_unavailable"
-        if reason is None and calls + meter_reserve + int(generate) + reserve_calls > self.limits.max_calls:
-            reason = "call_limit_exceeded"
-        if reason is None and tokens + request.max_output_tokens + reserve_tokens > self.limits.max_total_tokens:
-            reason = "task_token_limit_exceeded"
-        remaining = self.deadline - time.monotonic()
-        if reason is None and remaining < 1:
-            reason = "task_deadline_exceeded"
-        actual = replace(request, timeout_seconds=min(profile.timeout_seconds, max(1, int(remaining))))
-        size = len(json.dumps(asdict(actual), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        record = replace(record, request_hash=hash_json(asdict(actual)), request_bytes=size)
-        if reason is None and size > min(profile.max_input_bytes, MAX_INPUT_BYTES):
-            reason = "input_limit_exceeded"
-        if reason:
-            self.records[index] = replace(record, status="not_run", reason=reason)
-            return None, index
-        record = replace(record, token_measurement_request_hash=hash_json(asdict(actual)))
-        count = None
-        count_reason = None
-        try:
-            count = client.count_input_tokens(actual)
-            if type(count) is not int or count < 0:
-                count = None
-        except (Exception, AsyncCancelledError) as error:
-            if isinstance(error, (CancelledError, AsyncCancelledError)):
-                count_reason = "model_cancelled"
-        record = _measurement_receipt(record, client, profile)
-        self.records[index] = replace(record, measured_input_tokens=count,
-            token_measurement="measured" if count is not None else "unknown")
-        reason = self.guard() or count_reason
-        calls, tokens, unknown = self.totals()
-        if reason is None and unknown:
-            reason = "usage_unavailable"
-        if reason is None and count is None:
-            reason = "token_count_unavailable"
-        if reason is None and calls + int(generate) + reserve_calls > self.limits.max_calls:
-            reason = "call_limit_exceeded"
-        context_limit = min(profile.max_input_tokens or self.limits.max_input_tokens, self.limits.max_input_tokens)
-        if reason is None and count > context_limit:
-            reason = "input_limit_exceeded"
-        if reason is None and tokens + count + request.max_output_tokens + reserve_tokens > self.limits.max_total_tokens:
-            reason = "task_token_limit_exceeded"
-        self.records[index] = replace(self.records[index], status="not_run" if reason else "completed", reason=reason or "input_measured")
-        return (None if reason else count), index
-
-    def execute(self, request: ModelRequest, client: ModelClient, profile: ModelProfile, *,
-        label: str, reserve_calls: int, reserve_tokens: int,
-    ) -> tuple[Any | None, int]:
-        count, index = self.measure(request, client, profile, label=label,
-            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens)
-        if count is None:
-            return None, index
-        for number in range(1, profile.max_attempts + 1):
-            reason = self.guard()
-            calls, tokens, unknown = self.totals()
-            if reason is None and unknown:
-                reason = "usage_unavailable"
-            if reason is None and calls + 1 + reserve_calls > self.limits.max_calls:
-                reason = "call_limit_exceeded"
-            if reason is None and tokens + count + request.max_output_tokens + reserve_tokens > self.limits.max_total_tokens:
-                reason = "task_token_limit_exceeded"
-            remaining = self.deadline - time.monotonic()
-            if reason is None and remaining < 1:
-                reason = "task_deadline_exceeded"
-            if reason:
-                self.records[index] = replace(self.records[index], status="not_run", reason=reason)
-                return None, index
-            actual = replace(request, timeout_seconds=min(profile.timeout_seconds, int(remaining)))
-            start, started_at = time.monotonic(), datetime.now(UTC).isoformat()
-            response, retry, usage, delivery = None, False, None, "unknown"
-            reason = "received"
-            try:
-                response = client.complete(actual)
-                if isinstance(response, ModelResponse):
-                    delivery, usage = "sent", _usage(response)
-                else:
-                    reason = "invalid_model_response"
-            except (Exception, AsyncCancelledError) as error:
-                reason = "model_cancelled" if isinstance(error, (CancelledError, AsyncCancelledError)) else (
-                    "model_timeout" if isinstance(error, TimeoutError) else "model_error")
-                try:
-                    receipt_delivery = getattr(error, "delivery", None)
-                    receipt_usage = _usage(ModelResponse("", getattr(error, "usage", None)))
-                except Exception:
-                    receipt_delivery, receipt_usage = None, None
-                if receipt_delivery == "not_sent" and receipt_usage in (None, {"input_tokens": 0, "output_tokens": 0}):
-                    delivery, usage = "not_sent", {"input_tokens": 0, "output_tokens": 0}
-                elif receipt_delivery == "sent" and receipt_usage is not None:
-                    delivery, usage = "sent", receipt_usage
-                retry = isinstance(error, (TimeoutError, TransientModelError)) and usage is not None and delivery != "unknown"
-            if reason == "received" and usage is None:
-                reason = "usage_unavailable"
-            context_limit = min(profile.max_input_tokens or self.limits.max_input_tokens, self.limits.max_input_tokens)
-            if usage is not None and (usage["input_tokens"] > context_limit
-                    or usage["output_tokens"] > request.max_output_tokens):
-                reason, retry = "usage_limit_exceeded", False
-            attempt = IntentModelAttempt(number, "completed" if reason == "received" else "failed", delivery, reason,
-                started_at, datetime.now(UTC).isoformat(), max(0, int((time.monotonic() - start) * 1000)), usage, hash_json(asdict(actual)))
-            record = self.records[index]
-            self.records[index] = replace(record, request_hash=attempt.request_hash, attempts=(*record.attempts, attempt))
-            gate_reason = self.guard()
-            _, used_tokens, unknown = self.totals()
-            if gate_reason or unknown or used_tokens + reserve_tokens > self.limits.max_total_tokens:
-                reason = gate_reason or ("usage_unavailable" if unknown else "task_token_limit_exceeded")
-                retry = False
-            if reason == "received":
-                try:
-                    body = strict_json_loads(response.text, max_bytes=min(profile.max_output_bytes, MAX_OUTPUT_BYTES))
-                    if not isinstance(body, dict):
-                        raise IntentInputError("invalid_fields")
-                    return body, index
-                except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
-                    reason = "invalid_model_response"
-            self.records[index] = replace(self.records[index], status="not_run" if gate_reason else "failed", reason=reason)
-            if not retry or number == profile.max_attempts:
-                return None, index
-        return None, index
 
 
 def _safe_fallback(record: IntentStageRecord) -> bool:
@@ -803,13 +642,13 @@ def run_code_first_review(
     if not task.reviewed_paths:
         return finish("not_run", "no_review_targets")
     output = profile.max_output_tokens
-    call_reservation = 1 if profile.is_mock else 2
+    call_reservation = 2
     joint = _joint_plan(task)
     request, _ = _request(task, "observe_group", profile, limits, group=joint["groups"][0],
         supplied=_material(task, list(task.reviewed_paths)))
-    count, index = budget.measure(request, model_client, profile, label="full_input_admission",
+    admitted, index = budget.measure(request, model_client, profile, label="full_input_admission",
         reserve_calls=3 * call_reservation, reserve_tokens=2 * output, generate=False)
-    full_fits = count is not None
+    full_fits = admitted
     if not full_fits and budget.records[index].reason != "input_limit_exceeded":
         return stopped(index)
     if planning_client is not None and planner_profile is not None:

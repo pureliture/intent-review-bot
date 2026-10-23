@@ -126,6 +126,8 @@ class ExecutionConfig(BaseModel):
     selector_uses_model: bool = False
     worker_concurrency: int = Field(ge=1, le=2, default=1)
     task_timeout_seconds: int = Field(ge=1, default=900)
+    max_model_calls: int = Field(ge=1, le=512, default=256)
+    max_total_tokens: int = Field(ge=1, default=8388608)
     pr_actions: list[str] = Field(
         default_factory=lambda: [
             "opened",
@@ -194,14 +196,30 @@ class ModelConfig(BaseModel):
     unconfigured_action: Literal["not_run", "fail"] = "not_run"
     input_policy: Literal["full_or_not_run"] = "full_or_not_run"
     overflow_action: Literal["not_run", "fail"] = "not_run"
-    require_token_count: bool = True
+    require_token_count: bool = False
     allow_summarization: bool = False
     allow_truncation: bool = False
     allow_automatic_splitting: bool = False
     max_concurrency: int = Field(ge=1, le=2, default=1)
     call_timeout_seconds: int = Field(ge=1, default=60)
     max_attempts: int = Field(ge=1, default=1)
+    # Slow model classes (e.g. diffusion reviewers) need longer per-call
+    # budgets than fast choice models. None means use call_timeout_seconds.
+    review_call_timeout_seconds: int | None = Field(ge=1, default=None)
+    # Optional cap on reasoning/thinking tokens for burn-heavy models.
+    # None means uncapped (current behavior). Bounds latency and cost;
+    # content budget is unchanged.
+    reasoning_max_tokens: int | None = Field(ge=1, default=None)
     max_output_bytes: int = Field(ge=1, default=32768)
+    # Operator-owned token budgets. Changing these needs no code deploy,
+    # only a config change. The byte-upper-bound gate enforces them.
+    # require_token_count is retired: no measurement-only call exists.
+    review_input_tokens: int = Field(ge=1, default=98394)
+    review_output_tokens: int = Field(ge=1, default=32678)
+    decision_input_tokens: int = Field(ge=1, default=126976)
+    decision_output_tokens: int = Field(ge=1, default=4096)
+    framing_reserve_tokens: int = Field(ge=0, default=8192)
+    max_transport_bytes: int = Field(ge=1024, default=16 * 1024 * 1024)
     required_profile_limits: list[str] = Field(
         default_factory=lambda: [
             "max_input_bytes",
@@ -276,6 +294,22 @@ class ComparisonConfig(BaseModel):
     ambiguous_base_action: Literal["incomparable"] = "incomparable"
 
 
+class PartitionEvaluationConfig(BaseModel):
+    """Operator-only private trial; resource budgets require an explicit choice."""
+    model_config = ConfigDict(strict=True, extra="forbid")
+    enabled: bool = False
+    input_target_tokens: int | None = Field(default=None, gt=0)
+    max_total_tokens: int | None = Field(default=None, gt=0)
+    max_calls: int | None = Field(default=None, gt=0, le=512)
+    observation_output_tokens: int | None = Field(default=None, gt=0, le=32678)
+
+    @model_validator(mode="after")
+    def require_trial_budgets(self):
+        if self.enabled and (self.max_total_tokens is None or self.max_calls is None):
+            raise ValueError("partition evaluation requires explicit max_total_tokens and max_calls")
+        return self
+
+
 class CodeInputConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
     versions: list[str] = Field(default_factory=lambda: ["comparison_base", "head"])
@@ -322,6 +356,7 @@ class ReviewBotConfig(BaseModel):
     model: ModelConfig
     architecture: ArchitectureConfig = Field(default_factory=ArchitectureConfig)
     intent: IntentConfig = Field(default_factory=IntentConfig)
+    partition_evaluation: PartitionEvaluationConfig = Field(default_factory=PartitionEvaluationConfig)
     repository_settings: RepositorySettingsConfig
     comparison: ComparisonConfig
     code_input: CodeInputConfig
@@ -337,6 +372,10 @@ class ReviewBotConfig(BaseModel):
             raise ValueError("architecture configuration is required for A-only execution")
         if self.execution.mode == "github_app" and "mode" not in self.publish.model_fields_set:
             self.publish.mode = "comment"
+        if self.partition_evaluation.enabled and self.publish.mode != "artifact_only" and self.execution.mode != "github_app":
+            raise ValueError("partition evaluation requires artifact_only publication")
+        if self.partition_evaluation.enabled and "intent" in self.execution.available_modes and self.intent.pipeline != "perspectives-v1":
+            raise ValueError("partition intent evaluation requires perspectives-v1")
         if self.intent.pipeline == "perspectives-v1":
             private_output = self.publish.mode == "artifact_only" and not self.publish.b_comments_enabled
             app_comments = (
@@ -353,6 +392,16 @@ class ReviewBotConfig(BaseModel):
     @property
     def config_hash(self) -> str:
         return compute_config_hash(self)
+
+
+def shared_plan_enabled(config: ReviewBotConfig | Any) -> bool:
+    """Every GitHub App review uses TEV selection before any analysis runs.
+
+    The old operator flag remains an opt-in for private fixed-input trials;
+    it is not an escape hatch from selection in the application service.
+    """
+    return (getattr(getattr(config, "execution", None), "mode", None) == "github_app"
+        or getattr(getattr(config, "partition_evaluation", None), "enabled", False) is True)
 
 
 class TargetRepositoryConfig(BaseModel):
@@ -372,6 +421,8 @@ class TargetRepositoryConfig(BaseModel):
 def compute_config_hash(data: dict[str, Any] | BaseModel) -> str:
     """Computes a deterministic SHA-256 digest over normalized canonical JSON."""
     raw_dict = data.model_dump(mode="json") if isinstance(data, BaseModel) else data
+    if isinstance(raw_dict.get("partition_evaluation"), dict) and not raw_dict["partition_evaluation"].get("enabled"):
+        raw_dict = {key: value for key, value in raw_dict.items() if key != "partition_evaluation"}
     if isinstance(raw_dict.get("intent"), dict) and raw_dict["intent"].get("pipeline") == "declared-v1":
         raw_dict = {**raw_dict, "intent": {key: value for key, value in raw_dict["intent"].items() if key != "pipeline"}}
     execution = raw_dict.get("execution")

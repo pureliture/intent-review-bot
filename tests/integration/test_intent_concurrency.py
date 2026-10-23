@@ -31,11 +31,12 @@ from review_bot.config import load_review_config_from_str
 from review_bot.domain.models_v1 import ModelRequest
 from review_bot.runtime.webhook import create_webhook_app
 from review_bot.runtime.worker import WorkerLoop
-from tests.integration.test_intent_flow import GOAL, SECRET, IntentFixtureModel, SyntheticGitRepo
+from tests.integration.test_intent_flow import GOAL, SECRET, SyntheticGitRepo
+from tests.fixtures.partition_review import PartitionModelClient
 
 WAIT_SECONDS = 10
 MODEL_URL = "http://localhost:8080/v1"
-STAGES = ("extract_goals", "observe_changes", "assess")
+STAGES = ("review_partition", "final_review", "fact_check")
 HEAD_SOURCE = "from threading import Lock\nlock = Lock()\ndef handle():\n    with lock:\n        return 1\n"
 
 
@@ -84,23 +85,12 @@ class ControlledLlamaHTTP:
             return httpx.Response(200, json=body)
         assert request.method == "POST"
         payload = json.loads(request.content)
-        if path == "/tokenize":
-            assert set(payload) == {"content", "add_special", "parse_special", "with_pieces"}
-            assert payload["add_special"] is True and payload["parse_special"] is True
-            assert payload["with_pieces"] is False
-            with self.condition:
-                assert payload["content"] in self.prompts
-                self.tokenized.add(payload["content"])
-            return httpx.Response(200, json={"tokens": list(range(100))})
+        if path in ("/apply-template", "/tokenize"):
+            raise AssertionError(f"measurement endpoint must never be called: {path}")
         messages = payload["messages"]
         assert len(messages) == 2 and [item["role"] for item in messages] == ["system", "user"]
         assert all(set(item) == {"role", "content"} and isinstance(item["content"], str) for item in messages)
         prompt = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
-        if path == "/apply-template":
-            assert set(payload) == {"messages"}
-            with self.condition:
-                self.prompts.add(prompt)
-            return httpx.Response(200, json={"prompt": prompt})
         assert path == "/v1/chat/completions"
         assert payload["model"] == REVIEW_MODEL
         assert payload["stream"] is False and payload["temperature"] == payload["seed"] == 0
@@ -115,7 +105,7 @@ class ControlledLlamaHTTP:
         data = json.loads(model_request.user_content)
         assert data["stage"] in STAGES
         with self.condition:
-            assert prompt in self.tokenized, "Generation must use the measured system/user messages"
+            self.prompts.add(prompt)
             self.requests.append(model_request)
             gate = None
             if data["stage"] == self.hold_stage and len(self.held) < self.hold_limit:
@@ -124,9 +114,9 @@ class ControlledLlamaHTTP:
             self.condition.notify_all()
         if gate is not None:
             assert gate.wait(WAIT_SECONDS), "The test did not release its held generation"
-        response = IntentFixtureModel().complete(model_request)
+        response = PartitionModelClient().complete(model_request)
         assert set(json.loads(response.text)) == set(schema["required"])
-        assert response.usage == {"input_tokens": 100, "output_tokens": 50}
+        assert response.usage == {"input_tokens": 100, "output_tokens": 10}
         return httpx.Response(200, json={
             "model": REVIEW_MODEL,
             "choices": [{"index": 0, "finish_reason": "stop",
@@ -270,7 +260,7 @@ def concurrency_flow(tmp_path: Path, valid_config_yaml: str, monkeypatch: pytest
             readers.append((run.run_id, run.pr_number, pr_data["base"]["sha"], pr_data["head"]["sha"]))
             return GitRepositoryReader(repo.repo_dir)
 
-        workers.append(WorkerLoop(config, stores[index + 1], model_client=model, worker_id=f"intent-worker-{index}",
+        workers.append(WorkerLoop(config, stores[index + 1], model_client=model, planning_client=PartitionModelClient(name="tev", group_all=True), worker_id=f"intent-worker-{index}",
             github_client_factory=lambda run, client=github: client, repo_reader_factory=reader_factory,
             artifact_root=state, analyzer_factory=analyzer_factory, lease_duration=30, stop_event=stop))
 
@@ -344,22 +334,25 @@ def assert_private_result(flow, run, *, publication="artifact_only"):
     assert task["snapshot"]["pr_number"] == run["pr_number"]
     assert task["reviewed_paths"] == ["app.py", "tests/test_app.py"] and "outside.py" not in json.dumps(task)
     assert next(item["content"] for item in task["head"]["files"] if item["path"] == "app.py") == HEAD_SOURCE
-    assert result["goals"]["declared_goals"][0]["quote"] == GOAL
-    assert {key: result["usage"][key] for key in ("calls", "input_tokens", "output_tokens")} == {
-        "calls": 3, "input_tokens": 300, "output_tokens": 150,
-    }
-    assert [stage["stage"] for stage in result["stages"]] == list(STAGES)
-    for stage in result["stages"]:
-        assert stage["measured_input_tokens"] == 100 and len(stage["attempts"]) == 1
-        assert stage["token_measurement_delivery"] == "sent" and stage["token_measurement_model_calls"] == 0
-        assert stage["token_measurement_usage"] == {"input_tokens": 0, "output_tokens": 0}
+    assert result["schema_version"] == 13 and len(result["perspectives"]) == 8
+    review_stages = [stage for stage in result["stages"] if stage["attempts"]]
+    assert [stage["stage"].split(":")[0] for stage in review_stages] == list(STAGES)
+    for stage in review_stages:
+        # Zero-measurement admission: bound int recorded, no metering fields.
+        assert type(stage["measured_input_tokens"]) is int and len(stage["attempts"]) == 1
+        assert stage["token_measurement"] == "not_attempted"
+        assert stage["token_measurement_delivery"] == "not_attempted"
+        assert stage["token_measurement_model_calls"] == 0
+        assert stage["token_measurement_usage"] is None
         assert stage["attempts"][0]["usage"] == {"input_tokens": 100, "output_tokens": 50}
+    assert result["usage"]["usage_complete"] is True
+    assert result["usage"]["calls"] == sum(len(s["attempts"]) for s in result["stages"])
     if publication == "artifact_only":
         assert receipt["publication"]["reason"] == publication and receipt["publication"]["status"] == "not_attempted"
     else:
         assert receipt["publication"]["status"] == publication
     assert list(root.rglob("result.json")) == [root / "B/result.json"] and not (root / "A").exists()
-    for name in ("input.json", "goals.json", "observations.json", "result.json", "scope.json", "usage.json",
+    for name in ("input.json", "partition.json", "perspectives.json", "fact-verification.json", "result.json", "scope.json", "usage.json",
         "validation.json", "comment.md", "receipt.json"):
         assert (root / "B" / name).is_file()
     for path in (root, *root.rglob("*")):
@@ -407,7 +400,7 @@ def test_four_signed_prs_run_on_two_workers_with_private_b_artifacts(concurrency
     assert len(flow.readers) == 4 and {item[0] for item in flow.readers} == {run["run_id"] for run in completed}
     assert all(item[2:] == (flow.base, flow.head) for item in flow.readers)
     assert Counter(json.loads(request.user_content)["stage"] for request in flow.http.requests) == {stage: 4 for stage in STAGES}
-    assert {path for _, path in flow.http.calls} == {"/v1/models", "/props", "/apply-template", "/tokenize", "/v1/chat/completions"}
+    assert {path for _, path in flow.http.calls} == {"/v1/models", "/props", "/v1/chat/completions"}
     assert flow.http.peak == 2 and flow.http.active == 0 and admission_states(flow) == []
     assert flow.store.claim_next_run("synthetic-drained-claim", 30) is None
     deliveries = flow.store._get_connection().execute(

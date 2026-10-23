@@ -521,7 +521,8 @@ class TestOfflineClientsAndPipelineAdversarial:
         with pytest.raises(PermanentModelError, match="No model connection is configured"):
             client.complete(req)
         with pytest.raises(NotImplementedError, match="No model-specific tokenizer is configured"):
-            client.count_input_tokens(req)
+            client.admission_bytes(req)
+        assert not hasattr(client, "count_input_tokens")
 
     def test_mock_client_playback_and_exhaustion(self) -> None:
         client = MockModelClient([ModelResponse("resp 1"), ModelResponse("resp 2")])
@@ -570,28 +571,63 @@ class TestOfflineClientsAndPipelineAdversarial:
         )
         task = build_task_input(snap, delta, Classification("general"))
 
+        # Zero-measurement contract: input_tokens= is ignored. The token
+        # budget is proven pre-send by the adapter's byte-upper-bound gate
+        # and enforced post-send from response usage. Usage 100 > cap 50
+        # fails closed after the single generation.
         profile = ModelProfile(provider="mock", model="m", max_input_tokens=50)
-        client = MockModelClient([], profile=profile, input_tokens=100)
+        client = MockModelClient(
+            [ModelResponse("{}", {"input_tokens": 100, "output_tokens": 10})],
+            profile=profile,
+        )
+        assert not hasattr(client, "count_input_tokens")
         res = run_review_a_pipeline(task, client)
-        assert res.status == "not_run"
-        assert res.reason == "input_limit_exceeded"
+        assert (res.status, res.reason) == ("failed", "usage_limit_exceeded")
+        assert len(client.requests) == 1
 
     def test_pipeline_aborts_when_token_counting_unavailable(self) -> None:
-        snap = _make_snapshot()
-        delta = compute_delta(
-            base_findings=[],
-            head_findings=[{"rule": "CognitiveComplexity", "path": "Service.java", "metric": 20}],
-            base_sha=snap.base.sha,
-            head_sha=snap.head.sha,
-        )
-        task = build_task_input(snap, delta, Classification("general"))
+        import time
 
+        from review_bot.application.model_execution import ModelExecutionBudget
+        from review_bot.domain.partition_review import PartitionReviewLimits
+
+        # Zero-measurement contract: only admission_bytes raising/invalid
+        # yields token_count_unavailable, via ModelExecutionBudget.measure().
+        # run_review_a_pipeline itself never measures; a Mock without
+        # input_tokens still executes (input_tokens= is ignored).
         profile = ModelProfile(provider="mock", model="m", max_input_tokens=500)
-        # Client without input_tokens configured raises NotImplementedError
         client = MockModelClient([], profile=profile)
-        res = run_review_a_pipeline(task, client)
-        assert res.status == "not_run"
-        assert res.reason == "token_count_unavailable"
+        assert not hasattr(client, "count_input_tokens")
+
+        class RaisingAdmission(MockModelClient):
+            def admission_bytes(self, request):  # type: ignore[override]
+                raise NotImplementedError("no tokenizer")
+
+        raising = RaisingAdmission([], profile=profile)
+        budget = ModelExecutionBudget(
+            PartitionReviewLimits(max_calls=128, max_total_tokens=1000000,
+                max_input_tokens=131072),
+            time.monotonic() + 60, None)
+        request = ModelRequest(1, "mock", "sys", "usr", 10, 10, {})
+        admitted, index = budget.measure(request, raising, profile,
+            label="probe", reserve_calls=0, reserve_tokens=0)
+        assert admitted is False
+        assert budget.records[index].status == "not_run"
+        assert budget.records[index].reason == "token_count_unavailable"
+
+        class HugeAdmission(MockModelClient):
+            def admission_bytes(self, request):  # type: ignore[override]
+                return 10**9
+
+        huge = HugeAdmission([], profile=profile)
+        budget = ModelExecutionBudget(
+            PartitionReviewLimits(max_calls=128, max_total_tokens=1000000,
+                max_input_tokens=131072),
+            time.monotonic() + 60, None)
+        admitted, index = budget.measure(request, huge, profile,
+            label="probe", reserve_calls=0, reserve_tokens=0)
+        assert admitted is False
+        assert budget.records[index].reason == "input_limit_exceeded"
 
     def test_pipeline_timeout_handling(self) -> None:
         snap = _make_snapshot()

@@ -179,12 +179,19 @@ class TestReviewAPipeline:
             pass
 
     def test_mock_model_client_executes_responses(self) -> None:
+        import json as _json
+        from dataclasses import asdict as _asdict
         mock_resp = ModelResponse("{\"ok\": true}")
-        client = MockModelClient([mock_resp], input_tokens=150)
+        client = MockModelClient([mock_resp])
         req = ModelRequest(1, "mock", "sys", "usr", 10, None, {})
         resp = client.complete(req)
         assert resp.text == "{\"ok\": true}"
-        assert client.count_input_tokens(req) == 150
+        assert not hasattr(client, "count_input_tokens")
+        assert not hasattr(client, "token_count_receipt")
+        expected = len(_json.dumps(_asdict(req), sort_keys=True,
+            ensure_ascii=False, separators=(",", ":"),
+            allow_nan=False).encode("utf-8"))
+        assert client.admission_bytes(req) == expected
         assert len(client.requests) == 1
 
     def test_build_model_request_pins_review_a_v1(self) -> None:

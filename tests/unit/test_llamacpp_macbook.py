@@ -26,7 +26,6 @@ MAIN = "lfm2.5-2.6b-q8_0"
 SELECTOR = "tev1-0.8b-q8_0"
 API_URL = "http://localhost:8080/v1"
 STATE_ENV = "REVIEW_BOT_MACBOOK_MODEL_STATE_DIR"
-ZERO_RECEIPT = {"delivery": "sent", "model_calls": 0, "usage": {"input_tokens": 0, "output_tokens": 0}}
 HTTP_CLIENT = httpx.Client
 ROLES = [MAIN, SELECTOR]
 
@@ -96,13 +95,9 @@ def mock_http(monkeypatch: pytest.MonkeyPatch) -> Any:
                     "total_slots": 1, "chat_template": "{{ messages }}<macbook-no-think>",
                 })
             if request.url.path == "/apply-template":
-                payload = json.loads(request.content)
-                assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-                return httpx.Response(200, json={"prompt": "<bos>" + "".join(
-                    f'<{message["role"]}>{message["content"]}' for message in payload["messages"]
-                ) + "<macbook-no-think>"})
+                raise AssertionError("removed measurement endpoint /apply-template must never be called")
             if request.url.path == "/tokenize":
-                return httpx.Response(200, json={"tokens": [7] * tokens})
+                raise AssertionError("removed measurement endpoint /tokenize must never be called")
             assert request.url.path == "/v1/chat/completions"
             assert json.loads(request.content)["chat_template_kwargs"] == {"enable_thinking": False}
             return httpx.Response(200, json=chat_response(model=model, tokens=tokens))
@@ -153,8 +148,31 @@ def test_public_contracts_and_constructors_are_offline(tmp_path: Path) -> None:
     assert (review.profile.max_input_tokens, review.profile.max_output_tokens) == (28672, 4096)
     assert (review.profile.max_output_bytes, review.profile.max_attempts) == (12000, 2)
     assert review.profile != common.LlamaCppModelClient(api_url=API_URL).profile
-    assert review.token_count_receipt is None
+    assert not hasattr(review, "count_input_tokens")
+    assert not hasattr(review, "token_count_receipt")
+    bound = review.admission_bytes(role_request(MAIN))
+    assert type(bound) is int
+    assert bound == len(json.dumps(
+        review._chat_payload(role_request(MAIN)), ensure_ascii=False, allow_nan=False,
+        separators=(",", ":")).encode("utf-8")) + 8192
     assert not (tmp_path / "macbook-admission").exists()
+
+
+def test_explicit_local_review_output_allowance_reduces_input_and_does_not_change_tev(monkeypatch):
+    from review_bot.adapters.intent_planner import MacBookLlamaCppPlanClient
+    monkeypatch.setenv("MACBOOK_REVIEW_MAX_OUTPUT_TOKENS", "8192")
+    review = adapter.MacBookLlamaCppModelClient(api_url=API_URL)
+    planner = MacBookLlamaCppPlanClient(api_url=API_URL)
+    assert (review.profile.max_input_tokens, review.profile.max_output_tokens) == (24576, 8192)
+    assert (review._max_input_tokens, review._max_output_tokens) == (24576, 8192)
+    assert (planner.profile.max_input_tokens, planner.profile.max_output_tokens) == (28672, 4096)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "32768", "28673", "٨١٩٢", "8192.0"])
+def test_invalid_local_output_override_is_rejected(monkeypatch, value):
+    monkeypatch.setenv("MACBOOK_REVIEW_MAX_OUTPUT_TOKENS", value)
+    with pytest.raises(ValueError, match="must leave"):
+        adapter.MacBookLlamaCppModelClient(api_url=API_URL)
 
 
 @pytest.mark.parametrize("api_url", [
@@ -222,7 +240,7 @@ def test_warmup_is_metadata_only(mock_http: Any, model: str) -> None:
 
 
 @pytest.mark.parametrize("model,operation", [
-    (MAIN, "verify"), (MAIN, "warmup"), (MAIN, "count_input_tokens"), (MAIN, "complete"),
+    (MAIN, "verify"), (MAIN, "warmup"), (MAIN, "complete"),
     (SELECTOR, "verify"), (SELECTOR, "warmup"), (SELECTOR, "complete"),
 ])
 @pytest.mark.parametrize("slots", [2, True, False])
@@ -264,14 +282,13 @@ def test_generation_preserves_messages_schema_and_template_kwargs(mock_http: Any
     assert response.usage == {"input_tokens": 42, "output_tokens": 5}
     assert json.loads(response.text) == ({"ok": True} if model == MAIN else {"selected_modes": ["intent"]})
     assert [item.url.path for item in requests] == [
-        "/v1/models", "/props", "/apply-template", "/tokenize", "/v1/chat/completions",
+        "/v1/models", "/props", "/v1/chat/completions",
     ]
-    template = json.loads(requests[2].content)
-    payload = json.loads(requests[4].content)
+    assert sum(item.url.path == "/v1/chat/completions" for item in requests) == 1
+    payload = json.loads(requests[2].content)
     messages = [{"role": "system", "content": request.system_prompt}, {"role": "user", "content": request.user_content}]
-    assert template == {"messages": messages, "chat_template_kwargs": {"enable_thinking": False}}
     assert payload["messages"] == messages and payload["model"] == model
-    assert payload["chat_template_kwargs"] == template["chat_template_kwargs"]
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
     assert payload["response_format"] == {
         "type": "json_schema",
         "json_schema": {"name": "review_bot", "strict": True, "schema": request.response_schema},
@@ -279,26 +296,23 @@ def test_generation_preserves_messages_schema_and_template_kwargs(mock_http: Any
     assert payload["max_tokens"] == request.max_output_tokens
     assert (payload["stream"], payload["temperature"], payload["seed"], payload["n"]) == (False, 0, 0, 1)
     assert payload["stop"] == [] and payload["cache_prompt"] is False and payload["n_keep"] == -1
-    assert json.loads(requests[3].content) == {
-        "content": "<bos><system>" + request.system_prompt + "<user>" + request.user_content + "<macbook-no-think>",
-        "add_special": True, "parse_special": True, "with_pieces": False,
-    }
     assert 0 < requests[-1].extensions["timeout"]["read"] <= request.timeout_seconds
 
 
-def test_native_count_is_generation_free_uncached_and_not_a_byte_estimate(mock_http: Any) -> None:
-    counts = iter((137, 138))
-    requests = mock_http(lambda request: httpx.Response(200, json={"tokens": [7] * next(counts)})
-                         if request.url.path == "/tokenize" else None)
+def test_admission_bytes_is_generation_free_and_input_sensitive(mock_http: Any) -> None:
+    requests = mock_http()
     client = role_client(MAIN)
+    assert not hasattr(client, "count_input_tokens")
+    assert not hasattr(client, "token_count_receipt")
     request = replace(role_request(MAIN), user_content="한" * 40000)
-    assert client.count_input_tokens(request) == 137
-    assert client.token_count_receipt == ZERO_RECEIPT
-    receipt = client.token_count_receipt
-    receipt["usage"]["input_tokens"] = 999
-    assert client.token_count_receipt == ZERO_RECEIPT
-    assert client.count_input_tokens(request) == 138
-    assert [item.url.path for item in requests] == ["/v1/models", "/props", "/apply-template", "/tokenize"] * 2
+    bound = client.admission_bytes(request)
+    assert type(bound) is int
+    wire = json.dumps(client._chat_payload(request), ensure_ascii=False,
+                      allow_nan=False, separators=(",", ":")).encode("utf-8")
+    assert bound == len(wire) + 8192 > len(wire)
+    assert client.admission_bytes(request) == bound
+    assert client.admission_bytes(role_request(MAIN)) != bound
+    assert [item.url.path for item in requests] == []
 
 
 @pytest.mark.parametrize("model,maximum", [(MAIN, 4096), (SELECTOR, 64)])
@@ -311,14 +325,19 @@ def test_default_output_reserve_and_exact_input_boundary(mock_http: Any, model: 
 
 @pytest.mark.parametrize("model", ROLES)
 def test_native_input_overflow_never_generates(mock_http: Any, model: str) -> None:
-    requests = mock_http(model=model, tokens=28673)
+    requests = mock_http(model=model)
     client = role_client(model)
-    with pytest.raises(common.PermanentModelError, match="truncation is forbidden"):
-        client.complete(role_request(model))
-    assert all(item.url.path != "/v1/chat/completions" for item in requests)
+    request = role_request(model)
     if model == MAIN:
-        assert client.count_input_tokens(role_request(model)) == 28673
-        assert client.token_count_receipt == ZERO_RECEIPT
+        request = replace(request, user_content="한" * 40000)
+    else:
+        metadata = json.loads(request.user_content)
+        metadata["body"] = "한" * 40000
+        request = replace(request, user_content=json.dumps(metadata))
+    assert client.admission_bytes(request) > client._max_input_tokens
+    with pytest.raises(common.PermanentModelError, match="byte-upper-bound"):
+        client.complete(request)
+    assert [item.url.path for item in requests] == ["/v1/models", "/props"]
 
 
 @pytest.mark.parametrize("model", ROLES)
@@ -337,18 +356,12 @@ def test_selector_output_budget_is_at_most_64() -> None:
         role_client(SELECTOR).complete(replace(role_request(SELECTOR), max_output_tokens=65))
 
 
-@pytest.mark.parametrize("content", [
-    b'{"tokens":[1],"tokens":[2]}', b'{"tokens":[NaN]}', b'{"tokens":[1e999]}', b'[]', b'\xff',
-    b'{"tokens":[true]}', b'{"tokens":[-1]}', b'{"tokens":[1.0]}', b'{"tokens":[]}', b'{}',
-])
-def test_invalid_native_counts_have_no_fallback_or_generation(mock_http: Any, content: bytes) -> None:
-    requests = mock_http(lambda request: httpx.Response(200, content=content)
-                         if request.url.path == "/tokenize" else None)
-    client = role_client(MAIN)
-    with pytest.raises(common.PermanentModelError):
-        client.count_input_tokens(role_request(MAIN))
-    assert client.token_count_receipt == ZERO_RECEIPT
-    assert all(item.url.path != "/v1/chat/completions" for item in requests)
+@pytest.mark.parametrize("model", ROLES)
+def test_generation_never_touches_measurement_endpoints(mock_http: Any, model: str) -> None:
+    requests = mock_http(model=model)
+    assert role_client(model).complete(role_request(model)).usage == {"input_tokens": 42, "output_tokens": 5}
+    assert [item.url.path for item in requests] == ["/v1/models", "/props", "/v1/chat/completions"]
+    assert sum(item.url.path == "/v1/chat/completions" for item in requests) == 1
 
 
 @pytest.mark.parametrize("text", [
@@ -447,11 +460,12 @@ def test_selector_accepts_only_registered_pr_metadata(changes: Any) -> None:
 def test_http_errors_and_redirects_are_sanitized(mock_http: Any, status: int, error: Any, model: str) -> None:
     requests = mock_http(lambda request: httpx.Response(
         status, headers={"Location": "http://remote.invalid/secret-token"}, json={"error": "secret-token"},
-    ) if request.url.path == "/apply-template" else None, model=model)
+    ) if request.url.path == "/v1/chat/completions" else None, model=model)
     with pytest.raises(error) as caught:
         role_client(model).complete(role_request(model))
     assert "secret-token" not in "".join(traceback.format_exception(caught.value))
     assert API_URL not in str(caught.value)
+    assert [item.url.path for item in requests] == ["/v1/models", "/props", "/v1/chat/completions"]
     assert len(requests) == 3
 
 
@@ -485,25 +499,26 @@ def test_preflight_and_generation_share_one_deadline(
         guard.setattr(time, "monotonic", lambda: clock[0])
         with pytest.raises(TimeoutError, match="request timed out"):
             role_client(model).complete(replace(role_request(model), timeout_seconds=1))
-    assert [item.url.path for item in requests] == ["/v1/models", "/props", "/apply-template"]
+    assert [item.url.path for item in requests] == ["/v1/models", "/props", "/v1/chat/completions"]
     assert [item.extensions["timeout"]["read"] for item in requests] == pytest.approx([1, 0.6, 0.2])
 
 
-@pytest.mark.parametrize("stage,delivery", [
-    ("/v1/models", "not_sent"), ("/apply-template", "unknown"), ("/tokenize", "unknown"),
-])
-def test_timeout_count_receipts_never_claim_generation(mock_http: Any, stage: str, delivery: str) -> None:
+@pytest.mark.parametrize("model", ROLES)
+@pytest.mark.parametrize("stage", ["/v1/models", "/props", "/v1/chat/completions"])
+def test_generation_timeouts_fail_closed_without_second_post(mock_http: Any, model: str, stage: str) -> None:
     def handler(request: httpx.Request) -> Any:
         if request.url.path == stage:
             raise httpx.ReadTimeout("secret-token", request=request)
         return None
 
-    requests = mock_http(handler)
-    client = role_client(MAIN)
+    requests = mock_http(handler, model=model)
+    client = role_client(model)
     with pytest.raises(TimeoutError):
-        client.count_input_tokens(role_request(MAIN))
-    assert client.token_count_receipt == {**ZERO_RECEIPT, "delivery": delivery}
-    assert all(item.url.path != "/v1/chat/completions" for item in requests)
+        client.complete(role_request(model))
+    assert not hasattr(client, "token_count_receipt")
+    assert sum(item.url.path == "/v1/chat/completions" for item in requests) == (
+        1 if stage == "/v1/chat/completions" else 0)
+    assert all(item.url.path not in ("/apply-template", "/tokenize") for item in requests)
 
 
 def test_admission_configuration_and_construction_are_io_free(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

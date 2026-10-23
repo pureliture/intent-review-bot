@@ -1,0 +1,42 @@
+# Private unified-plan evaluation for me707. Resolve the analyzer image pin before launch.
+schema_version: 2
+codebase:
+  product: github-review-bot
+  python_package: review_bot
+  python_min_version: "3.11"
+execution:
+  mode: github_app
+  backend: github_app
+  available_modes: [architecture, intent]
+  worker_concurrency: 2
+  task_timeout_seconds: 14400
+service:
+  repository_allowlist: [pureliture/neurons]
+architecture:
+  # Replace with the verified image ID from the dedicated rootless daemon.
+  tool_image_digest: null
+  tool_timeout_seconds: 120
+publish:
+  mode: artifact_only
+  b_comments_enabled: false
+  b_marker: "<!-- purelitention-ai:intent:v1 -->"
+  draft_comments: false
+model:
+  profile: me707-llamacpp
+  max_concurrency: 2
+  call_timeout_seconds: 3600
+  max_attempts: 1
+partition_evaluation:
+  enabled: true
+  # Finite task ceilings. Every live request uses its native profile limits.
+  max_total_tokens: 4194304
+  max_calls: 256
+  # No implicit observation cap: use the configured model's output allowance.
+intent:
+  pipeline: perspectives-v1
+repository_settings: {}
+comparison: {}
+code_input: {}
+artifacts: {}
+output:
+  language: ko

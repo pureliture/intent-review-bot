@@ -112,7 +112,22 @@ def test_full_input_budget_does_not_reserve_profile_output_space_twice():
     assert (result.status, result.reason) == ("completed", "validated")
     assert result.plan["source"] == "program_joint"
     assert len(client.requests) == 3
-    assert all(record.measured_input_tokens == 100 for record in result.stages)
+    # Zero-measurement contract: no metering reserve in ModelExecutionBudget.measure().
+    # The mock has no admission_bytes, so admission admits with bound None;
+    # accounting is generation-only (response usage), never double-reserved.
+    assert client.count_requests == []
+    assert all(record.measured_input_tokens is None for record in result.stages)
+    assert all(record.token_measurement == "not_attempted" for record in result.stages)
+    assert all(record.token_measurement_model_calls == 0 for record in result.stages)
+    assert all(record.token_measurement_usage is None for record in result.stages)
+    assert result.usage["calls"] == 3
+    assert result.usage["token_measurements"] == 0
+    assert result.usage["metering_input_tokens"] == 0
+    assert result.usage["metering_output_tokens"] == 0
+    assert result.usage["input_tokens"] == 300
+    assert result.usage["output_tokens"] == 150
+    assert result.usage["known_input_tokens"] == 300
+    assert result.usage["known_output_tokens"] == 150
 
 
 def test_planner_receives_measured_full_fit_and_schema_requires_every_prepared_path():

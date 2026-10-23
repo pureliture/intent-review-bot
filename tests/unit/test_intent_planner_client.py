@@ -28,7 +28,6 @@ ROLES = [
 ]
 STATE_ENV = "REVIEW_BOT_MACBOOK_MODEL_STATE_DIR"
 HTTP_CLIENT = httpx.Client
-ZERO_RECEIPT = {"delivery": "sent", "model_calls": 0, "usage": {"input_tokens": 0, "output_tokens": 0}}
 
 
 def plan_request(model: str) -> ModelRequest:
@@ -110,14 +109,6 @@ def mock_http(monkeypatch: pytest.MonkeyPatch) -> Any:
                     "total_slots": 1 if role.is_macbook else 2, "chat_template": "{{ messages }}<assistant>",
                 })
             assert request.method == "POST"
-            if request.url.path == "/apply-template":
-                payload = json.loads(request.content)
-                ending = "<macbook-no-think>" if role.is_macbook else "<assistant>"
-                return httpx.Response(200, json={"prompt": "<bos>" + "".join(
-                    f'<{message["role"]}>{message["content"]}' for message in payload["messages"]
-                ) + ending})
-            if request.url.path == "/tokenize":
-                return httpx.Response(200, json={"tokens": [7] * tokens})
             assert request.url.path == "/v1/chat/completions"
             return httpx.Response(200, json=chat_response(model=role.model, input_tokens=tokens))
 
@@ -151,14 +142,17 @@ def test_plan_contracts_and_constructors_are_offline(adapter: Any, tmp_path: Pat
         assert isinstance(client, base) and isinstance(client, ModelClient)
         assert (client.model, client.api_url, client.timeout_seconds) == (model, api_url, 60)
         assert client_type._role_model == model and client_type._role_context_tokens == context
-        for method in ("complete", "count_input_tokens", "verify", "warmup", "token_count_receipt"):
+        for method in ("complete", "verify", "warmup"):
             assert getattr(client_type, method) is getattr(base, method)
+        assert not hasattr(client_type, "count_input_tokens")
+        assert not hasattr(client_type, "token_count_receipt")
         assert client.profile == ModelProfile(
             provider="llamacpp", model=model, max_input_bytes=16 * 1024 * 1024,
             max_output_bytes=32768, timeout_seconds=60, max_attempts=1,
             max_input_tokens=context - 4096, max_output_tokens=4096,
         )
-        assert client.token_count_receipt is None
+        assert not hasattr(client, "count_input_tokens")
+        assert not hasattr(client, "token_count_receipt")
         configured = client_type(api_url=api_url, timeout_seconds=17, max_output_bytes=12000, max_attempts=2)
         assert (configured.profile.timeout_seconds, configured.profile.max_output_bytes,
                 configured.profile.max_attempts) == (17, 12000, 2)
@@ -177,8 +171,9 @@ def test_plan_roles_reject_review_and_other_selector_aliases(role: Any) -> None:
         with pytest.raises(common.PermanentModelError, match="does not match its role"):
             client.complete(request)
         with pytest.raises(common.PermanentModelError, match="does not match its role"):
-            client.count_input_tokens(request)
-        assert client.token_count_receipt == {**ZERO_RECEIPT, "delivery": "not_sent"}
+            client.admission_bytes(request)
+    assert not hasattr(client, "count_input_tokens")
+    assert not hasattr(client, "token_count_receipt")
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -197,7 +192,7 @@ def test_macbook_planning_never_accepts_remote_endpoints(adapter: Any, api_url: 
         adapter.MacBookLlamaCppPlanClient(api_url=api_url)
 
 
-def test_plan_generation_allows_more_than_64_tokens_and_preserves_native_wire(role: Any, mock_http: Any) -> None:
+def test_plan_generation_allows_more_than_64_tokens_and_preserves_exact_wire(role: Any, mock_http: Any) -> None:
     requests = mock_http(role)
     request = plan_request(role.model)
     client = role.client_type(api_url=role.api_url, timeout_seconds=17)
@@ -205,55 +200,59 @@ def test_plan_generation_allows_more_than_64_tokens_and_preserves_native_wire(ro
     assert json.loads(response.text) == {"ok": True}
     assert response.usage == {"input_tokens": 42, "output_tokens": 128}
     assert [item.url.path for item in requests] == [
-        "/v1/models", "/props", "/apply-template", "/tokenize", "/v1/chat/completions",
+        "/v1/models", "/props", "/v1/chat/completions",
     ]
-    template = json.loads(requests[2].content)
-    payload = json.loads(requests[4].content)
+    assert sum(item.url.path == "/v1/chat/completions" for item in requests) == 1
+    payload = json.loads(requests[2].content)
     messages = [{"role": "system", "content": request.system_prompt}, {"role": "user", "content": request.user_content}]
-    expected_template = {"messages": messages}
+    assert payload["messages"] == messages and payload["model"] == role.model
     if role.is_macbook:
-        expected_template["chat_template_kwargs"] = {"enable_thinking": False}
-        assert payload["chat_template_kwargs"] == expected_template["chat_template_kwargs"]
-        assert payload["response_format"] == {
-            "type": "json_schema",
-            "json_schema": {"name": "review_bot", "strict": True, "schema": request.response_schema},
-        }
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
     else:
         assert "chat_template_kwargs" not in payload
-        assert payload["response_format"] == {"type": "json_schema", "json_schema": {
-            "name": "review_bot", "strict": True, "schema": request.response_schema,
-        }}
-    assert template == expected_template
-    assert payload["messages"] == messages and payload["model"] == role.model
+    assert payload["response_format"] == {"type": "json_schema", "json_schema": {
+        "name": "review_bot", "strict": True, "schema": request.response_schema}}
     assert payload["max_tokens"] == 1024
     assert (payload["stream"], payload["temperature"], payload["seed"], payload["n"]) == (False, 0, 0, 1)
     assert payload["stop"] == [] and payload["cache_prompt"] is False and payload["n_keep"] == -1
-    ending = "<macbook-no-think>" if role.is_macbook else "<assistant>"
-    assert json.loads(requests[3].content) == {
-        "content": "<bos><system>" + request.system_prompt + "<user>" + request.user_content + ending,
-        "add_special": True, "parse_special": True, "with_pieces": False,
-    }
     assert all(0 < item.extensions["timeout"]["read"] <= 10 for item in requests)
 
 
-def test_warmup_and_uncached_native_counts_never_generate(role: Any, mock_http: Any) -> None:
-    counts = iter((137, 138))
-    requests = mock_http(role, lambda request: httpx.Response(200, json={"tokens": [7] * next(counts)})
-                         if request.url.path == "/tokenize" else None)
+def test_closed_choice_disables_thinking_in_generation_payload(role: Any, mock_http: Any) -> None:
+    def reply(request):
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, json=chat_response(model=role.model, output_tokens=6, content='{"choice":"A"}'))
+        return None
+    requests = mock_http(role, reply)
+    schema = {"type": "object", "properties": {"choice": {"type": "string", "enum": ["A", "B"]}},
+        "required": ["choice"], "additionalProperties": False}
+    request = replace(plan_request(role.model), max_output_tokens=16, response_schema=schema)
+    response = role.client_type(api_url=role.api_url).complete(request)
+    payload = next(json.loads(item.content) for item in requests if item.url.path == "/v1/chat/completions")
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert payload["max_tokens"] == 16
+    assert payload["response_format"]["json_schema"]["schema"] == schema
+    assert json.loads(response.text) == {"choice": "A"}
+    assert response.usage == {"input_tokens": 42, "output_tokens": 6}
+    assert [item.url.path for item in requests] == ["/v1/models", "/props", "/v1/chat/completions"]
+
+
+def test_warmup_and_admission_bound_never_generate(role: Any, mock_http: Any) -> None:
+    requests = mock_http(role)
     client = role.client_type(api_url=role.api_url)
     client.warmup()
     assert [item.url.path for item in requests] == ["/v1/models", "/props"]
-    assert client.token_count_receipt is None
+    assert not hasattr(client, "count_input_tokens")
+    assert not hasattr(client, "token_count_receipt")
     request = plan_request(role.model)
-    assert client.count_input_tokens(request) == 137
-    assert client.token_count_receipt == ZERO_RECEIPT
-    receipt = client.token_count_receipt
-    receipt["usage"]["input_tokens"] = 999
-    assert client.token_count_receipt == ZERO_RECEIPT
-    assert client.count_input_tokens(request) == 138
-    assert [item.url.path for item in requests] == ["/v1/models", "/props"] + [
-        "/v1/models", "/props", "/apply-template", "/tokenize",
-    ] * 2
+    bound = client.admission_bytes(request)
+    assert type(bound) is int
+    assert client.admission_bytes(request) == bound
+    assert [item.url.path for item in requests] == ["/v1/models", "/props"]
+    assert client.complete(request).usage == {"input_tokens": 42, "output_tokens": 128}
+    assert [item.url.path for item in requests] == [
+        "/v1/models", "/props", "/v1/models", "/props", "/v1/chat/completions",
+    ]
 
 
 @pytest.mark.parametrize("overflow", [False, True])
@@ -263,9 +262,10 @@ def test_plan_context_boundary_keeps_4096_output_reserve(role: Any, mock_http: A
     client = role.client_type(api_url=role.api_url)
     request = replace(plan_request(role.model), max_output_tokens=None)
     if overflow:
-        with pytest.raises(common.PermanentModelError, match="truncation is forbidden"):
+        with pytest.raises(common.PermanentModelError, match="budget"):
             client.complete(request)
-        assert [item.url.path for item in requests] == ["/v1/models", "/props", "/apply-template", "/tokenize"]
+        assert [item.url.path for item in requests] == ["/v1/models", "/props", "/v1/chat/completions"]
+        assert sum(item.url.path == "/v1/chat/completions" for item in requests) == 1
     else:
         assert client.complete(request).usage == {"input_tokens": tokens, "output_tokens": 128}
         assert json.loads(requests[-1].content)["max_tokens"] == 4096
@@ -327,21 +327,16 @@ def test_plan_output_byte_limit_is_inherited(role: Any, mock_http: Any) -> None:
         role.client_type(api_url=role.api_url, max_output_bytes=8).complete(plan_request(role.model))
 
 
-@pytest.mark.parametrize("tokens", [[], [True], [-1]])
-def test_invalid_native_counts_never_fall_back_or_generate(role: Any, mock_http: Any, tokens: Any) -> None:
-    requests = mock_http(role, lambda request: httpx.Response(200, json={"tokens": tokens})
-                         if request.url.path == "/tokenize" else None)
-    client = role.client_type(api_url=role.api_url)
-    with pytest.raises(common.PermanentModelError, match="native tokenization"):
-        client.count_input_tokens(plan_request(role.model))
-    assert client.token_count_receipt == ZERO_RECEIPT
-    assert all(item.url.path != "/v1/chat/completions" for item in requests)
+def test_generation_never_touches_measurement_endpoints(role: Any, mock_http: Any) -> None:
+    requests = mock_http(role)
+    assert role.client_type(api_url=role.api_url).complete(
+        plan_request(role.model)).usage == {"input_tokens": 42, "output_tokens": 128}
+    assert [item.url.path for item in requests] == ["/v1/models", "/props", "/v1/chat/completions"]
+    assert sum(item.url.path == "/v1/chat/completions" for item in requests) == 1
 
 
-@pytest.mark.parametrize("stage,delivery", [
-    ("/v1/models", "not_sent"), ("/apply-template", "unknown"), ("/tokenize", "unknown"),
-])
-def test_count_timeouts_keep_generation_free_receipts(role: Any, mock_http: Any, stage: str, delivery: str) -> None:
+@pytest.mark.parametrize("stage", ["/v1/models", "/props", "/v1/chat/completions"])
+def test_generation_timeouts_fail_closed_without_second_post(role: Any, mock_http: Any, stage: str) -> None:
     def handler(request: httpx.Request) -> Any:
         if request.url.path == stage:
             raise httpx.ReadTimeout("offline timeout", request=request)
@@ -350,9 +345,11 @@ def test_count_timeouts_keep_generation_free_receipts(role: Any, mock_http: Any,
     requests = mock_http(role, handler)
     client = role.client_type(api_url=role.api_url)
     with pytest.raises(TimeoutError):
-        client.count_input_tokens(plan_request(role.model))
-    assert client.token_count_receipt == {**ZERO_RECEIPT, "delivery": delivery}
-    assert all(item.url.path != "/v1/chat/completions" for item in requests)
+        client.complete(plan_request(role.model))
+    assert not hasattr(client, "token_count_receipt")
+    assert sum(item.url.path == "/v1/chat/completions" for item in requests) == (
+        1 if stage == "/v1/chat/completions" else 0)
+    assert all(item.url.path not in ("/apply-template", "/tokenize") for item in requests)
 
 
 def test_plan_transport_does_not_retry_or_fall_back(role: Any, mock_http: Any) -> None:
@@ -361,8 +358,9 @@ def test_plan_transport_does_not_retry_or_fall_back(role: Any, mock_http: Any) -
     with pytest.raises(common.TransientModelError, match="HTTP 503"):
         role.client_type(api_url=role.api_url, max_attempts=3).complete(plan_request(role.model))
     assert [item.url.path for item in requests] == [
-        "/v1/models", "/props", "/apply-template", "/tokenize", "/v1/chat/completions",
+        "/v1/models", "/props", "/v1/chat/completions",
     ]
+    assert sum(item.url.path == "/v1/chat/completions" for item in requests) == 1
 
 
 def test_existing_metadata_selectors_still_reject_plan_requests(role: Any) -> None:

@@ -12,7 +12,7 @@ from review_bot.runtime import cli
 from tests.fixtures.intent_review import make_task, stage_bodies
 
 
-@pytest.mark.parametrize("failure", [None, "wrong_model", "tokenizer_after_goals", "capacity_after_goals"])
+@pytest.mark.parametrize("failure", [None, "wrong_model", "completions_timeout_after_goals", "capacity_after_goals"])
 def test_macbook_cli_preserves_validated_results_and_never_falls_back(tmp_path, monkeypatch, failure):
     requests = []
     client_type = httpx.Client
@@ -32,14 +32,12 @@ def test_macbook_cli_preserves_validated_results_and_never_falls_back(tmp_path, 
                 "chat_template": "macbook-synthetic-template",
             })
         payload = json.loads(request.content)
-        if request.url.path == "/apply-template":
-            assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-            current_stage[0] = json.loads(payload["messages"][1]["content"])["stage"]
-            return httpx.Response(200, json={"prompt": json.dumps(payload["messages"])})
-        if request.url.path == "/tokenize":
-            if failure == "tokenizer_after_goals" and current_stage[0] == "observe_changes":
+        if request.url.path in ("/apply-template", "/tokenize"):
+            raise AssertionError(f"measurement endpoint must never be called: {request.url.path}")
+        if request.url.path == "/v1/chat/completions" and failure == "completions_timeout_after_goals":
+            stage = json.loads(payload["messages"][1]["content"])["stage"]
+            if stage == "observe_changes":
                 raise httpx.ReadTimeout("private transport details", request=request)
-            return httpx.Response(200, json={"tokens": list(range(100))})
         assert request.url.path == "/v1/chat/completions"
         assert payload["model"] == "lfm2.5-2.6b-q8_0"
         assert payload["chat_template_kwargs"] == {"enable_thinking": False}
@@ -66,32 +64,33 @@ def test_macbook_cli_preserves_validated_results_and_never_falls_back(tmp_path, 
     source.write_text(json.dumps(asdict(make_task())))
     source.chmod(0o600)
     output = tmp_path / "output"
+    expected_exit = 0 if failure is None else 1
     assert cli.main(["intent", "--input", str(source), "--output", str(output),
-        "--model-profile", "macbook-llamacpp"]) == 0
+        "--model-profile", "macbook-llamacpp"]) == expected_exit
     result = json.loads((output / "B/result.json").read_text())
     calls = [request for request in requests if request.url.path == "/v1/chat/completions"]
-    expected_calls = 3 if failure is None else (0 if failure == "wrong_model" else 1)
-    assert len(calls) == result["usage"]["calls"] == expected_calls
-    assert result["usage"]["known_input_tokens"] == 100 * expected_calls
-    assert result["usage"]["known_output_tokens"] == 50 * expected_calls
-    assert result["usage"]["review_input_tokens"] == 100 * expected_calls
-    assert result["usage"]["review_output_tokens"] == 50 * expected_calls
-    if failure == "tokenizer_after_goals":
-        assert result["usage"]["input_tokens"] is None and result["usage"]["output_tokens"] is None
-        assert result["usage"]["usage_complete"] is False and result["usage"]["unknown_usage_attempts"] == 1
-        assert result["stages"][0]["attempts"][0]["usage"] == {"input_tokens": 100, "output_tokens": 50}
-        assert result["stages"][1]["token_measurement_delivery"] == "unknown"
-    else:
-        assert result["usage"]["input_tokens"] == 100 * expected_calls
-        assert result["usage"]["output_tokens"] == 50 * expected_calls
-        assert result["usage"]["usage_complete"] is True and result["usage"]["unknown_usage_attempts"] == 0
+    assert not any(request.url.path in ("/apply-template", "/tokenize") for request in requests)
+    completed = 3 if failure is None else (0 if failure == "wrong_model" else 1)
+    expected_posts = completed + (1 if failure == "completions_timeout_after_goals" else 0)
+    assert len(calls) == expected_posts
+    # usage calls count attempts: completed generations plus the failed attempt.
+    assert result["usage"]["calls"] == completed + (0 if failure is None else 1)
+    assert result["usage"]["known_input_tokens"] == 100 * completed
+    assert result["usage"]["known_output_tokens"] == 50 * completed
     if failure is None:
+        assert result["usage"]["input_tokens"] == 300
+        assert result["usage"]["output_tokens"] == 150
+        assert result["usage"]["usage_complete"] is True and result["usage"]["unknown_usage_attempts"] == 0
         assert result["status"] == "completed" and result["reason"] == "validated"
         assert result["usage"]["model_calls"] == 3
         assert all(stage["token_measurement_model_calls"] == 0 for stage in result["stages"])
+        assert all(stage["token_measurement"] == "not_attempted" for stage in result["stages"])
     else:
-        assert result["status"] == "not_run" and result["reason"] == "token_count_unavailable"
-        assert bool(result["goals"]) == bool(expected_calls)
+        assert result["usage"]["input_tokens"] is None and result["usage"]["output_tokens"] is None
+        assert result["usage"]["usage_complete"] is False
+        expected_reason = "model_timeout" if failure == "completions_timeout_after_goals" else "model_error"
+        assert result["status"] == "failed" and result["reason"] == expected_reason
+        assert bool(result["goals"]) == bool(completed)
         assert result["observations"] is None and result["stages"][2]["status"] == "not_attempted"
         assert "private transport details" not in json.dumps(result)
     manifest = json.loads((output / "manifest.json").read_text())

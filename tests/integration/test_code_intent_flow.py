@@ -9,12 +9,13 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from review_bot.application.architecture_review import MockModelClient
 from review_bot.config import ModelConfig
 from review_bot.domain.models_v1 import ModelResponse
 from review_bot.runtime import cli
 from tests.conftest import SyntheticGitRepo
 from tests.fixtures.intent_review import make_task
+from tests.fixtures.partition_review import PartitionModelClient
+from tests.unit.test_delta_adversarial import make_pmd_violation, make_test_run
 from tests.fixtures.code_first_intent_review import (
     BASE_SOURCE,
     CALLER,
@@ -25,7 +26,6 @@ from tests.fixtures.code_first_intent_review import (
     stage_body,
 )
 from tests.integration.test_intent_flow import (
-    enable_a_fixture,
     intent_flow,
     output,
     send_event,
@@ -52,9 +52,27 @@ def select_code_first(flow):
 
 def code_models(flow):
     select_code_first(flow)
-    review, planner = CodeFirstModelClient(), CodeFirstModelClient()
-    flow.worker.model_client, flow.worker.planning_client = review, planner
-    return review, planner
+
+    def code_defect(payload, body):
+        if payload["stage"] == "final_review":
+            refs = []
+            for path, text in (("src/value.py", 'return {"value": value}'),
+                    ("src/caller.py", "return render(value).strip()")):
+                source = next(row for row in payload["original_quotes"]
+                    if row["version"] == "head" and row["path"] == path)
+                span = next(row for row in source["blocks"] if text in row["text"])
+                refs.append({"reference_id": span["reference_id"]})
+            body["findings"] = [{"verdict": "concern", "basis": "observed_structure",
+                "target_ids": ["src/value.py", "src/caller.py"],
+                "statement": "render returns a dict while label still requires its string interface.",
+                "reasoning": "The producer changed its return type; the unchanged caller invokes strip on that result.",
+                "failure_condition": "When label calls render(value).strip(), a dict has no strip attribute.",
+                "citations": refs}]
+        return body
+
+    review = PartitionModelClient(transform=code_defect)
+    flow.worker.model_client = flow.model = review
+    return review, flow.planning_model
 
 
 def test_code_first_cli_unconfigured_preserves_v2_not_run_files_and_reports_incomplete(tmp_path, monkeypatch):
@@ -80,19 +98,29 @@ def test_code_first_cli_unconfigured_preserves_v2_not_run_files_and_reports_inco
 def test_code_first_failure_preserves_completed_a_files_and_mode_receipts(intent_flow):
     flow = intent_flow
     use_modes(flow, ("architecture", "intent"))
-    enable_a_fixture(flow)
     select_code_first(flow)
-    flow.worker.model_client = MockModelClient([
-        ModelResponse("{}", {"input_tokens": 100, "output_tokens": 50}),
-    ], input_tokens=100)
+    path = "src/main/java/demo/ModeFixture.java"
+    flow.analyzer.run_analysis.side_effect = lambda sha, *args: make_test_run(sha, source_files=(path,),
+        pmd_violations=(make_pmd_violation(path=path, klass="ModeFixture"),) if sha == flow.pr["head"]["sha"] else ())
+
+    def fail_b(payload, body):
+        if payload["mode"] == "intent" and payload["stage"] == "review_partition":
+            return ModelResponse("{}", {"input_tokens": 100, "output_tokens": 50})
+        return body
+
+    review = PartitionModelClient(transform=fail_b)
+    flow.worker.model_client = flow.model = review
     assert send_event(flow).status_code == 202
     assert flow.worker.run_once() is False
     root, status = output(flow)
     assert status == "failed"
-    assert json.loads((root / "A/result.json").read_text())["schema_version"] == 1
+    a = json.loads((root / "A/result.json").read_text())
+    assert a["schema_version"] == 13 and a["status"] == "completed"
     result = json.loads((root / "B/result.json").read_text())
-    assert result["schema_version"] == 2 and result["status"] == "failed"
-    assert result["usage"]["calls"] == 1
+    assert result["schema_version"] == 13 and result["status"] == "failed"
+    assert result["usage"]["calls"] == len([r for r in review.requests
+        if json.loads(r.user_content)["mode"] == "intent"]) == 2
+    assert [row["response"] for row in result["partition"]["rejected_review_attempts"]] == [{}, {}]
     receipt = json.loads((root / "B/receipt.json").read_text())
     assert receipt["b_result"] == result
     assert (root / "A/receipt.json").exists()
@@ -100,7 +128,7 @@ def test_code_first_failure_preserves_completed_a_files_and_mode_receipts(intent
     assert flow.analyzer.run_analysis.call_count == 2
 
 
-def test_code_first_unconfigured_result_cannot_publish_even_in_opted_in_fixture(intent_flow):
+def test_code_first_unconfigured_app_preserves_failed_plan_and_publishes_only_status_notice(intent_flow):
     flow = intent_flow
     select_code_first(flow)
     flow.worker.model_client = None
@@ -108,15 +136,21 @@ def test_code_first_unconfigured_result_cannot_publish_even_in_opted_in_fixture(
     flow.config.publish.b_comments_enabled = True
     flow.issue_status["allow_comments"] = True
     assert send_event(flow).status_code == 202
-    assert flow.worker.run_once() is True
+    assert flow.worker.run_once() is False
     root, status = output(flow)
-    assert status == "succeeded"
-    result = json.loads((root / "B/result.json").read_text())
-    assert result["schema_version"] == 2 and result["status"] == "not_run"
-    assert result["usage"]["calls"] == 0
+    assert status == "failed"
+    result = json.loads((root / "execution-plan.json").read_text())
+    assert result["schema_version"] == 13 and result["status"] == "not_run"
+    assert result["usage"]["calls"] == 0 and not (root / "B/result.json").exists()
+    assert (root / "planning-input.json").exists()
     manifest = json.loads((root / "manifest.json").read_text())
-    assert manifest["modes"]["intent"]["publication"]["reason"] == "model_profile_unset"
-    assert not flow.comments and all(method == "GET" for method, _ in flow.calls)
+    assert manifest["error_code"] == "partition_planning_failed:partition_model_profile_unset"
+    assert len(flow.comments) == 1
+    notice = flow.comments[0]["body"]
+    assert "리뷰 미완료" in notice and "최종 판단" in notice
+    assert "#### LLM 리뷰" not in notice and "render returns" not in notice
+    assert [(method, path) for method, path in flow.calls if method != "GET"] == [
+        ("POST", "/repos/org/repo/issues/7/comments")]
     flow.analyzer.run_analysis.assert_not_called()
 
 
@@ -153,6 +187,7 @@ def test_code_first_cli_generates_validated_code_defect_without_trusting_body(tm
 def test_signed_pr_creates_code_first_result_with_exact_git_citations_and_private_receipt(intent_flow):
     flow = intent_flow
     review, planner = code_models(flow)
+    assert flow.config.intent.pipeline == "code-first-v2"
     flow.pr["body"] = None
     assert send_event(flow).status_code == 202 and flow.worker.run_once() is True
     root, status = output(flow)
@@ -160,16 +195,24 @@ def test_signed_pr_creates_code_first_result_with_exact_git_citations_and_privat
     receipt = json.loads((root / "B/receipt.json").read_text())
     manifest = json.loads((root / "manifest.json").read_text())
     assert status == "succeeded" and result["status"] == "completed"
-    assert result["findings"][0]["assessment"] == "code_defect"
+    assert result["schema_version"] == 13
+    assert result["findings"][0]["verdict"] == "concern"
+    assert result["findings"][0]["failure_condition"] == "When label calls render(value).strip(), a dict has no strip attribute."
     citations = result["findings"][0]["citations"]
     assert {row["path"] for row in citations} == {"src/value.py", "src/caller.py"}
     assert all(row["sha"] == flow.pr["head"]["sha"] for row in citations)
     assert any('return {"value": value}' in row["quote"] for row in citations)
     assert any("return render(value).strip()" in row["quote"] for row in citations)
+    task = json.loads((root / "B/input.json").read_text())
+    originals = {item["path"]: item["content"].encode() for item in task["head"]["files"]}
+    for citation in citations:
+        assert citation["quote"] == originals[citation["path"]][citation["start_byte"]:citation["end_byte"]].decode()
     assert receipt["b_result"] == result and receipt["a_result"] is None
-    assert manifest["modes"]["intent"]["result_schema_version"] == 2
+    assert manifest["modes"]["intent"]["result_schema_version"] == 13
     assert manifest["modes"]["intent"]["publication"]["reason"] == "artifact_only"
-    assert len(planner.requests) == 1 and len(review.requests) == 3
+    assert len(review.requests) > 0 and len(planner.requests) > 0
+    plan = json.loads((root / "execution-plan.json").read_text())
+    assert plan["usage"]["calls"] + result["usage"]["calls"] == len(review.requests) + len(planner.requests)
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in (root / "B").iterdir())
     assert not flow.comments and not (root / "A").exists()
     flow.analyzer.run_analysis.assert_not_called()
@@ -183,16 +226,18 @@ def test_code_first_fixture_publishes_updates_same_id_then_reuses_its_own_input_
     flow.issue_status["allow_comments"] = True
     assert send_event(flow).status_code == 202 and flow.worker.run_once() is True
     assert len(flow.comments) == 1 and flow.comments[0]["id"] == 701
-    assert len(review.requests) == 3 and len(planner.requests) == 1
+    initial_calls = len(review.requests), len(planner.requests)
+    assert all(initial_calls)
     flow.pr["body"] = "Changed optional context, not a requirement."
     assert send_event(flow, "code-first-context", "edited").status_code == 202 and flow.worker.run_once() is True
     assert len(flow.comments) == 1 and flow.comments[0]["id"] == 701
-    assert len(review.requests) == 6 and len(planner.requests) == 2
+    edited_calls = len(review.requests), len(planner.requests)
+    assert all(after > before for before, after in zip(initial_calls, edited_calls))
     assert send_event(flow, "code-first-reuse", "edited").status_code == 202 and flow.worker.run_once() is True
     root, status = output(flow)
     mode = json.loads((root / "manifest.json").read_text())["modes"]["intent"]
     assert status == "skipped" and mode["reused"] is True
-    assert len(review.requests) == 6 and len(planner.requests) == 2
+    assert (len(review.requests), len(planner.requests)) == edited_calls
     assert mode["usage"]["calls"] == 0 and not (root / "B/result.json").exists()
     assert [(method, path) for method, path in flow.calls if method != "GET"] == [
         ("POST", "/repos/org/repo/issues/7/comments"), ("PATCH", "/repos/org/repo/issues/comments/701"),

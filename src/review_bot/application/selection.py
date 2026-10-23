@@ -196,6 +196,19 @@ def _selection_record(
     )
 
 
+def is_gradle_java_path(path: str, manifest_paths) -> bool:
+    """Use the nearest immutable build marker; Maven wins at the same level."""
+    path = path.replace("\\", "/")
+    if not path.lower().endswith(".java"):
+        return False
+    for parent in PurePosixPath(path).parents:
+        if str(parent / "pom.xml") in manifest_paths:
+            return False
+        if any(str(parent / name) in manifest_paths for name in ("build.gradle", "build.gradle.kts")):
+            return True
+    return False
+
+
 def constrain_architecture_to_java_gradle(
     snapshot: ReviewSnapshot, pr: PrSnapshot, selection: ModeSelection, reader: RepositoryReader,
 ) -> ModeSelection:
@@ -229,15 +242,7 @@ def constrain_architecture_to_java_gradle(
             manifests = reader.read_tree_blobs(revision, paths=candidates)
             if not isinstance(manifests, dict):
                 raise ValueError("invalid_build_manifest_inventory")
-            for path in paths:
-                for parent in PurePosixPath(path).parents:
-                    if str(parent / "pom.xml") in manifests:
-                        break
-                    if any(str(parent / name) in manifests for name in names[:2]):
-                        supported = True
-                        break
-                if supported:
-                    break
+            supported = any(is_gradle_java_path(path, manifests) for path in paths)
             if supported:
                 break
     except GitHubAuthorizationError:
@@ -250,6 +255,13 @@ def constrain_architecture_to_java_gradle(
     return _selection_record(snapshot, selection.available_modes,
         tuple(mode for mode in selection.selected_modes if mode != "architecture"),
         f"{selection.policy_version}:{policy}")
+
+
+def record_planned_modes(snapshot, available_modes, selected_modes, plan_id):
+    """Record one PR-wide decision made after bounded observations."""
+    if len(set(selected_modes)) != len(selected_modes) or any(m not in available_modes for m in selected_modes):
+        raise ValueError("invalid_planned_modes")
+    return _selection_record(snapshot, available_modes, selected_modes, "partitioned-plan/v4-closed:" + plan_id)
 
 
 class LightweightModeSelector:

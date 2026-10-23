@@ -177,7 +177,7 @@ def _make_dummy_task_and_result(
         review_mode="general",
         pr=pr,
         status="completed",
-        reason="ok",
+        reason="validated",
         summary=summary,
         findings=findings,
         questions=questions,
@@ -670,14 +670,6 @@ class TestMarkdownFormatterAdversarialHardening:
             base_findings=(v,), head_findings=(v,), paths=("src/Huge.java",),
             matching="sig", measurements=(),
         )
-        citations = tuple(
-            Citation(
-                evidence_id=f"ev-{i}", version="head", sha="b" * 40,
-                path="src/Huge.java", begin_line=1, end_line=100,
-                quote=f"public void massiveMethod_{i}() {{\n" + ("    // long comment\n" * 50) + "}",
-            )
-            for i in range(8)
-        )
         findings = tuple(
             ReviewFinding(
                 signal_id="sig-huge",
@@ -688,7 +680,14 @@ class TestMarkdownFormatterAdversarialHardening:
                 reason=f"Detailed reason explanation for finding {i} with massive analysis",
                 recommendation="Split into smaller components",
                 evidence_ids=("ev-0",),
-                citations=citations,
+                citations=tuple(
+                    Citation(
+                        evidence_id=f"ev-{j}", version="head", sha="b" * 40,
+                        path="src/Huge.java", begin_line=1, end_line=100,
+                        quote=f"public void massiveMethod_{i}_{j}() {{\n" + ("    // long comment\n" * 50) + "}",
+                    )
+                    for j in range(8)
+                ),
             )
             for i in range(20)
         )
@@ -702,8 +701,11 @@ class TestMarkdownFormatterAdversarialHardening:
         rendered = format_review_markdown(result, task_input, max_length=60000)
         assert len(rendered) <= 60000
         assert rendered.startswith("<!-- review-bot:architecture:v1 -->")
-        assert "댓글 표시 한도:" in rendered
-        assert "<sub>🤖 자동 생성: review-bot architecture review A</sub>" in rendered
+        assert "리뷰 본문 표시 보류:" in rendered
+        assert "본문 전체를 싣지 못했습니다" in rendered
+        assert "검토 범위: 고정된 HEAD" not in rendered
+        assert "Excessive architectural responsibility" not in rendered
+        assert rendered.count("<details>") == rendered.count("</details>")
 
     def test_syntax_preservation_and_code_fence_balancing(self) -> None:
         """Truncation balancing: unclosed <pre><code> and triple backticks are safely terminated."""
@@ -716,13 +718,6 @@ class TestMarkdownFormatterAdversarialHardening:
             signal_id="sig-1", tool="pmd", change="new",
             base_findings=(), head_findings=(v,), paths=("src/A.java",), matching="m", measurements=(),
         )
-        citations = (
-            Citation(
-                evidence_id="ev-code", version="head", sha="b" * 40,
-                path="src/A.java", begin_line=1, end_line=10,
-                quote="```java\nclass CodeSnippet {\n" + ("    int padding = 1;\n" * 300) + "}\n```",
-            ),
-        )
         findings = tuple(
             ReviewFinding(
                 signal_id="sig-1",
@@ -733,7 +728,11 @@ class TestMarkdownFormatterAdversarialHardening:
                 reason="reason " * 50,
                 recommendation="rec",
                 evidence_ids=("ev-code",),
-                citations=citations,
+                citations=(Citation(
+                    evidence_id="ev-code", version="head", sha="b" * 40,
+                    path="src/A.java", begin_line=1, end_line=10,
+                    quote="```java\nclass CodeSnippet {\n" + ("    int padding = 1;\n" * 300) + "}\n```\n// finding " + str(i),
+                ),),
             )
             for i in range(15)
         )
@@ -745,6 +744,16 @@ class TestMarkdownFormatterAdversarialHardening:
         pre_code_opens = rendered.count("<pre><code>")
         pre_code_closes = rendered.count("</code></pre>")
         assert pre_code_opens == pre_code_closes
+        assert "리뷰 본문 표시 보류:" in rendered
+        assert "Finding 0" not in rendered
+
+        # A fitting review still contains the complete quoted block with safe syntax.
+        fitting, fitting_input = _make_dummy_task_and_result(findings=(findings[0],), signals=(sig,))
+        complete = format_review_markdown(fitting, fitting_input, max_length=15000)
+        assert len(complete) <= 15000 and "Finding 0" in complete
+        assert complete.count("<pre><code>") == complete.count("</code></pre>") == 1
+        assert complete.count("<details>") == complete.count("</details>")
+        assert "```" not in complete
 
     def test_mention_sanitization_and_html_escaping(self) -> None:
         """@-mentions are neutralized with zero-width space (@\\u200b) to avoid GitHub user pings."""
@@ -771,11 +780,13 @@ class TestMarkdownFormatterAdversarialHardening:
         assert "https://" not in bad_sha
 
     def test_stale_warning_banner_injection(self) -> None:
-        """format_review_markdown with stale_reason injects warning banner."""
+        """A stale result displays its freshness failure without a judgement body."""
         result, task_input = _make_dummy_task_and_result(summary="Stale summary")
         md = format_review_markdown(result, task_input, stale_reason="head_sha moved to deadbeef")
-        assert "> ⚠️ **오래된 결과 — 현재 PR 리뷰로 사용하지 마세요.**" in md
+        assert "리뷰 미완료" in md
+        assert "최신 코드와 일치하지 않는 결과" in md
         assert "deadbeef" in md
+        assert "Stale summary" not in md and "#### LLM 리뷰" not in md
 
     def test_actions_artifact_url_validation_adversarial(self) -> None:
         """_a_artifact_link strictly requires credential-free HTTPS address <= 4096 chars."""

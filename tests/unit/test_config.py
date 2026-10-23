@@ -19,7 +19,7 @@ from review_bot.config import (
     validate_active_environment,
 )
 
-EXPECTED_EXAMPLE_HASH = "9e26359acd9f85ec286c422413611353ccb6d052fb6c6c652cd68d6d60252656"
+EXPECTED_EXAMPLE_HASH = "302c91120c6bc4b629edcca09c2d26923b7166bd63a9f3662fff4ec2aa941a5f"
 
 
 def test_load_example_config(valid_config_yaml: str) -> None:

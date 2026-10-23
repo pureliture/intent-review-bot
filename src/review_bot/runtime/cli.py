@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import logging
 import sys
 import tempfile
@@ -358,6 +359,18 @@ def create_parser() -> argparse.ArgumentParser:
         help="Human output language for perspectives-v1 (default: ko)")
     intent_parser.add_argument("--call-timeout-seconds", type=int, default=None,
         help="Explicit per-call model timeout; task, context and token budgets remain unchanged")
+    intent_parser.add_argument("--partition-evaluation", action="store_true",
+        help="Private AST/native-token trial through the service model clients; requires perspectives-v1 and explicit task budgets")
+    intent_parser.add_argument("--measure-only", action="store_true",
+        help="Partition trial only: prepare native-token-fitted spans without any answer generation")
+    intent_parser.add_argument("--input-target-tokens", type=int, default=None,
+        help="Trial full-request input target, capped by each model's hard input limit; default uses that hard limit")
+    intent_parser.add_argument("--max-total-tokens", type=int, default=None,
+        help="Required accumulated task budget for --partition-evaluation")
+    intent_parser.add_argument("--max-calls", type=int, default=None,
+        help="Required generation-call ceiling for --partition-evaluation")
+    intent_parser.add_argument("--task-timeout-seconds", type=int, default=900,
+        help="Partition trial deadline (default 900 seconds)")
 
     return parser
 
@@ -497,7 +510,7 @@ def run_delta(args: argparse.Namespace) -> int:
 def run_offline_review(args: argparse.Namespace) -> int:
     """Execute complete offline review pipeline on a local git repository."""
     repo_path = Path(getattr(args, "repo", None) or ".").resolve()
-    if not (repo_path / ".git").exists():
+    if not (repo_path / ".git").exists() and not (repo_path / "HEAD").is_file():
         sys.stderr.write(f"Error: {repo_path} is not a git repository\n")
         return 1
 
@@ -534,9 +547,12 @@ def run_offline_review(args: argparse.Namespace) -> int:
             return 1
         comparison_base_sha = merge_res.comparison_base_sha
 
-        # Gather snapshots
-        base_code = reader.collect_code_snapshot(comparison_base_sha)
-        head_code = reader.collect_code_snapshot(head_sha)
+        # The trial captures only selected PR sources after analysis identifies
+        # relevant partners. PMD/CPD's own analysis scope remains unchanged.
+        partition_trial = config is not None and config.partition_evaluation.enabled
+        if not partition_trial:
+            base_code = reader.collect_code_snapshot(comparison_base_sha)
+            head_code = reader.collect_code_snapshot(head_sha)
         changed_files = tuple(f.path for f in reader.get_changed_files(comparison_base_sha, head_sha))
         rename_map = reader.get_rename_map(comparison_base_sha, head_sha)
 
@@ -544,7 +560,19 @@ def run_offline_review(args: argparse.Namespace) -> int:
         classification = classify_pr(head_commit.message, ())
 
         # Run PMD analysis via isolated temp trees
-        runner = PmdRunner()
+        if partition_trial:
+            from review_bot.runtime.service import _architecture_analyzer
+            state = os.environ.get(config.service.state_root_env, "")
+            if not state or not Path(state).is_absolute() or not getattr(args, "output", None):
+                sys.stderr.write("Error: private_state_and_output_required_for_partition_review\n")
+                return 1
+            try:
+                runner = _architecture_analyzer(config, Path(state))
+            except (OSError, ValueError, RuntimeError):
+                sys.stderr.write("Error: rootless_analyzer_unavailable\n")
+                return 1
+        else:
+            runner = PmdRunner()
         with tempfile.TemporaryDirectory() as base_tmp, tempfile.TemporaryDirectory() as head_tmp:
             base_blobs = reader.read_tree_blobs(comparison_base_sha)
             for p, content in base_blobs.items():
@@ -578,14 +606,47 @@ def run_offline_review(args: argparse.Namespace) -> int:
         changed_files=changed_files,
         rename_map=rename_map,
     )
-    core_snap = Snapshot(pr=pr_snap, base=base_code, head=head_code)
-    task_input = build_task_input(core_snap, delta, classification)
+    if partition_trial:
+        from review_bot.application.partition_review import prepare_partition_architecture_task
+        try:
+            task_input = prepare_partition_architecture_task(reader, pr_snap, delta, classification)
+        except GitError as exc:
+            sys.stderr.write(f"Error: Git error: {exc}\n")
+            return 1
+    else:
+        core_snap = Snapshot(pr=pr_snap, base=base_code, head=head_code)
+        task_input = build_task_input(core_snap, delta, classification)
 
-    # Review A
-    result = run_review_a_pipeline(task_input, model_client) if model_client is not None else run_review_a_pipeline(task_input)
+    # Review A, including the same opt-in private trial used by the worker.
+    if config is not None and config.partition_evaluation.enabled:
+        from review_bot.application.partition_review import run_planned_partition_review
+        from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
+        from review_bot.domain.partition_review import PartitionReviewLimits
 
-    # Format Markdown
-    formatted_md = format_review_markdown(result, task_input)
+        trial = config.partition_evaluation
+        limits = PartitionReviewLimits(max_total_tokens=trial.max_total_tokens, max_calls=trial.max_calls,
+            input_target_tokens=trial.input_target_tokens, observation_output_tokens=trial.observation_output_tokens,
+            task_timeout_seconds=config.execution.task_timeout_seconds)
+        private_artifacts = IntentArtifacts(Path(args.output), mode="architecture")
+        from review_bot.runtime.model_clients import OPENROUTER_PROFILES, build_selector_client
+        decider = (build_selector_client(profile, config.model)
+            if profile in OPENROUTER_PROFILES else None)
+        plan, result = run_planned_partition_review(task_input, "architecture", model_client,
+            build_planning_client(profile, config.model), limits=limits, language=config.output.language,
+            decision_client=decider)
+        if plan is not None:
+            private_artifacts.save_execution_plan(task_input, plan)
+        if result is None:
+            sys.stderr.write("Error: partition_planning_failed:" + plan.reason + "\n")
+            return 1
+        formatted_md = format_partition_review_markdown(result, task_input)
+        private_artifacts.save(task_input, result, formatted_md)
+        private_artifacts._write(private_artifacts.directory, "analysis.json",
+            json.dumps({"base": asdict(base_run), "head": asdict(head_run)}, ensure_ascii=False, indent=2) + "\n")
+        return 0 if result.status == "completed" or result.reason == "mode_not_selected_in_shared_plan" else 1
+    else:
+        result = run_review_a_pipeline(task_input, model_client) if model_client is not None else run_review_a_pipeline(task_input)
+        formatted_md = format_review_markdown(result, task_input)
 
     # Output handling and artifact persistence
     if getattr(args, "output", None):
@@ -613,11 +674,30 @@ def run_offline_review(args: argparse.Namespace) -> int:
         else:
             print(formatted_md)
 
-    return 0
+    return (0 if result.status == "completed" else 1) if config is not None and config.partition_evaluation.enabled else 0
 
 
 def run_intent(args: argparse.Namespace) -> int:
     """Read-only fixed evaluation; no config, queue, repository, or publisher is composed."""
+    partition_limits = None
+    if not getattr(args, "partition_evaluation", False) and (getattr(args, "measure_only", False) or
+        any(getattr(args, name, None) is not None for name in ("input_target_tokens", "max_total_tokens", "max_calls"))):
+        sys.stderr.write("Error: partition_options_require_partition_evaluation\n")
+        return 1
+    if getattr(args, "partition_evaluation", False):
+        from review_bot.config import PartitionEvaluationConfig
+        from review_bot.domain.partition_review import PartitionReviewLimits
+        try:
+            trial = PartitionEvaluationConfig(enabled=True, input_target_tokens=args.input_target_tokens,
+                max_total_tokens=args.max_total_tokens, max_calls=args.max_calls)
+            if args.pipeline != "perspectives-v1" or type(args.task_timeout_seconds) is not int or args.task_timeout_seconds <= 0:
+                raise ValueError
+            partition_limits = PartitionReviewLimits(max_total_tokens=trial.max_total_tokens,
+                max_calls=trial.max_calls, input_target_tokens=trial.input_target_tokens,
+                task_timeout_seconds=args.task_timeout_seconds, measure_only=getattr(args, "measure_only", False))
+        except (ValueError, TypeError):
+            sys.stderr.write("Error: invalid_partition_evaluation_options\n")
+            return 1
     try:
         text = read_private_intent_input(Path(args.input), max_bytes=MAX_INPUT_BYTES)
         task_input = decode_intent_task_input(text)
@@ -638,11 +718,28 @@ def run_intent(args: argparse.Namespace) -> int:
             from review_bot.application.intent_perspective_review import run_intent_perspective_review
             from review_bot.runtime.model_clients import build_intent_selection_client
 
-            selector = (build_intent_selection_client(args.model_profile, settings) if settings is not None
-                else build_intent_selection_client(args.model_profile))
-            result = run_intent_perspective_review(task_input, model_client, selection_client=selector,
-                language=getattr(args, "language", "ko"))
-            markdown = format_intent_perspective_markdown(result, task_input)
+            if partition_limits is not None:
+                from review_bot.application.partition_review import run_planned_partition_review
+                from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
+                planner = build_planning_client(args.model_profile, settings)
+                from review_bot.runtime.model_clients import OPENROUTER_PROFILES, build_selector_client
+                idecider = (build_selector_client(args.model_profile, settings)
+                    if args.model_profile in OPENROUTER_PROFILES else None)
+                plan, result = run_planned_partition_review(task_input, "intent", model_client, planner,
+                    limits=partition_limits, language=getattr(args, "language", "ko"),
+                    decision_client=idecider)
+                if plan is not None:
+                    artifacts.save_execution_plan(task_input, plan)
+                if result is None:
+                    sys.stderr.write("Error: partition_planning_failed:" + plan.reason + "\n")
+                    return 1
+                markdown = format_partition_review_markdown(result, task_input)
+            else:
+                selector = (build_intent_selection_client(args.model_profile, settings) if settings is not None
+                    else build_intent_selection_client(args.model_profile))
+                result = run_intent_perspective_review(task_input, model_client, selection_client=selector,
+                    language=getattr(args, "language", "ko"))
+                markdown = format_intent_perspective_markdown(result, task_input)
         elif getattr(args, "pipeline", "declared-v1") == "code-first-v2":
             from review_bot.adapters.markdown.code_intent_formatter import format_code_intent_markdown
             from review_bot.application.code_first_intent_review import run_code_first_review
@@ -659,6 +756,8 @@ def run_intent(args: argparse.Namespace) -> int:
         sys.stderr.write("Error: intent_evaluation_failed\n")
         return 1
     print(f"intent: {result.status}/{result.reason}")
+    if partition_limits is not None and (result.status == "measured" or result.reason == "mode_not_selected_in_shared_plan"):
+        return 0
     if getattr(args, "pipeline", "declared-v1") in ("code-first-v2", "perspectives-v1"):
         return 0 if result.status == "completed" else 1
     return 1 if result.status == "failed" else 0

@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
+from review_bot.adapters.openrouter_chat import OpenRouterReviewClient
 from review_bot.application.selection import LightweightModeSelector, ModelModeSelector
 from review_bot.config import ModelConfig, load_review_config_from_str
 from review_bot.ports import JobStore
@@ -17,6 +18,11 @@ from tests.fixtures.intent_review import make_task
 
 @pytest.fixture(autouse=True)
 def offline_macbook(monkeypatch, tmp_path):
+    monkeypatch.delenv("MACBOOK_BEAM_CONTEXT_TOKENS", raising=False)
+    monkeypatch.delenv("MACBOOK_BEAM_BASE_URL", raising=False)
+    monkeypatch.delenv("MACBOOK_TEV4B_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_REVIEW_MODEL", raising=False)
     monkeypatch.setenv("MACBOOK_LFM_BASE_URL", "http://127.0.0.1:18135/v1")
     monkeypatch.setenv("MACBOOK_TEV1_BASE_URL", "http://127.0.0.1:18137/v1")
     monkeypatch.setenv("REVIEW_BOT_MACBOOK_MODEL_STATE_DIR", str(tmp_path / "mac-admission"))
@@ -41,6 +47,21 @@ def test_macbook_profile_has_distinct_local_roles_and_limits():
     assert selector.model == "tev1-0.8b-q8_0"
     assert selector.api_url == "http://127.0.0.1:18137/v1"
     assert selector.timeout_seconds == 17
+
+
+def test_explicit_granite_profile_keeps_local_admission_and_existing_tev(monkeypatch, tmp_path):
+    monkeypatch.setenv("MACBOOK_GRANITE_BASE_URL", "http://127.0.0.1:18139/v1")
+    review = model_clients.build_review_client("macbook-granite-llamacpp", ModelConfig(max_output_bytes=65536))
+    planning = model_clients.build_planning_client("macbook-granite-llamacpp")
+    assert review.model == "granite4.2"
+    assert (review.profile.max_input_tokens, review.profile.max_output_tokens) == (49152, 16384)
+    assert review._context_tokens == 65536 and review._server_generation_slots == 1
+    assert review.request_admission.db_path == tmp_path / "mac-admission/requests.sqlite"
+    assert planning.model == "tev1-0.8b-q8_0"
+    assert planning.profile.max_input_tokens == 28672
+    monkeypatch.delenv("MACBOOK_GRANITE_BASE_URL")
+    with pytest.raises(ValueError, match="MACBOOK_GRANITE_BASE_URL"):
+        model_clients.build_review_client("macbook-granite-llamacpp")
 
 
 @pytest.mark.parametrize("role,variable", [
@@ -109,3 +130,126 @@ def test_no_profile_does_not_enable_macbook_from_environment(monkeypatch):
     monkeypatch.setenv("REVIEW_MODEL_PROFILE", "macbook-llamacpp")
     assert model_clients.build_review_client(None) is None
     assert model_clients.build_selector_client(None) is None
+
+
+def test_explicit_beam_tev4b_profile_composes_distinct_models_without_http(monkeypatch, tmp_path, valid_config_yaml):
+    # Beam bridge is retired: review is OpenRouter (no HTTP at construction),
+    # tev4b roles stay local loopback. MACBOOK_BEAM_BASE_URL is not consulted.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("MACBOOK_TEV4B_BASE_URL", "http://127.0.0.1:18139/v1")
+    monkeypatch.delenv("MACBOOK_BEAM_BASE_URL", raising=False)
+    monkeypatch.delenv("MACBOOK_BEAM_CONTEXT_TOKENS", raising=False)
+    monkeypatch.delenv("OPENROUTER_REVIEW_MODEL", raising=False)
+    settings = ModelConfig(call_timeout_seconds=17, max_output_bytes=1048576)
+    profile = model_clients.BEAM_CLOUD_TEV4B_PROFILE
+    review = model_clients.build_review_client(profile, settings)
+    planning = model_clients.build_planning_client(profile, settings)
+    selector = model_clients.build_selector_client(profile, settings)
+    perspectives = model_clients.build_intent_selection_client(profile, settings)
+    assert isinstance(review, OpenRouterReviewClient)
+    assert review.model == "minimax/minimax-m3.1-flash:free"
+    assert review.profile.provider == "openrouter"
+    assert review.profile.model == "minimax/minimax-m3.1-flash:free"
+    assert (review.profile.max_input_tokens, review.profile.max_output_tokens) == (98394, 32678)
+    assert review.profile.timeout_seconds == 17
+    assert review.profile.max_output_bytes == 1048576
+    assert review.profile.max_attempts == 1
+    assert review.timeout_seconds == 17
+    assert not hasattr(review, "supports_native_input_measurement")
+    assert not hasattr(review, "count_input_tokens")
+    # OPENROUTER_REVIEW_MODEL override composes without HTTP.
+    monkeypatch.setenv("OPENROUTER_REVIEW_MODEL", "custom/override-model:free")
+    overridden = model_clients.build_review_client(profile, settings)
+    assert overridden.model == "custom/override-model:free"
+    assert overridden.profile.model == "custom/override-model:free"
+    assert (overridden.profile.max_input_tokens, overridden.profile.max_output_tokens) == (98394, 32678)
+    monkeypatch.delenv("OPENROUTER_REVIEW_MODEL")
+    # Custom ModelConfig app budget propagates to the OpenRouter review client.
+    budgeted = model_clients.build_review_client(
+        profile, ModelConfig(review_input_tokens=50000, review_output_tokens=10000))
+    assert (budgeted.profile.max_input_tokens, budgeted.profile.max_output_tokens) == (50000, 10000)
+    assert budgeted.model == "minimax/minimax-m3.1-flash:free"
+    for client in (planning, selector, perspectives):
+        assert client.model == "tev1-4b-q8_0"
+        assert client._context_tokens == 131072 and client._server_generation_slots == 1
+        assert client.api_url == "http://127.0.0.1:18139/v1"
+    assert planning.profile.max_input_tokens == 126976
+    assert planning.profile.max_output_tokens == 4096
+    for client in (review, planning, selector, perspectives):
+        assert client.request_admission.db_path == tmp_path / "mac-admission/requests.sqlite"
+    config, _ = load_review_config_from_str(valid_config_yaml.replace("profile: null", "profile: " + profile))
+    worker = WorkerLoop(config, Mock(spec=JobStore))
+    assert isinstance(worker.model_client, OpenRouterReviewClient)
+    assert worker.model_client.model == "minimax/minimax-m3.1-flash:free"
+    assert worker.model_client.profile.max_input_tokens == 98394
+    assert worker.model_client.profile.max_output_tokens == 32678
+    assert worker.model_client.request_cancelled == worker._stop_event.is_set
+    # Retired Beam context cap never silently builds; the legacy base URL is ignored.
+    monkeypatch.setenv("MACBOOK_BEAM_BASE_URL", "http://127.0.0.1:11434")
+    assert model_clients.build_review_client(profile, settings).model == "minimax/minimax-m3.1-flash:free"
+    monkeypatch.delenv("MACBOOK_BEAM_BASE_URL")
+    monkeypatch.setenv("MACBOOK_BEAM_CONTEXT_TOKENS", "131072")
+    with pytest.raises(ValueError, match="MACBOOK_BEAM_CONTEXT_TOKENS"):
+        model_clients.build_review_client(profile)
+    monkeypatch.delenv("MACBOOK_BEAM_CONTEXT_TOKENS")
+    monkeypatch.delenv("OPENROUTER_API_KEY")
+    with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+        model_clients.build_review_client(profile)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.delenv("MACBOOK_TEV4B_BASE_URL")
+    assert model_clients.build_planning_client(profile) is None
+    with pytest.raises(ValueError, match="MACBOOK_TEV4B_BASE_URL"):
+        model_clients.build_selector_client(profile)
+
+
+def test_beam_operating_context_cap_reaches_worker_and_fingerprint_without_lowering_tev(monkeypatch, valid_config_yaml):
+    # Retired Beam cap is replaced by the ModelConfig app budget (no HTTP at construction).
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("MACBOOK_TEV4B_BASE_URL", "http://127.0.0.1:18139/v1")
+    monkeypatch.delenv("MACBOOK_BEAM_BASE_URL", raising=False)
+    monkeypatch.delenv("MACBOOK_BEAM_CONTEXT_TOKENS", raising=False)
+    monkeypatch.delenv("OPENROUTER_REVIEW_MODEL", raising=False)
+    profile = model_clients.BEAM_CLOUD_TEV4B_PROFILE
+    default = model_clients.build_review_client(profile)
+    assert isinstance(default, OpenRouterReviewClient)
+    assert default.model == "minimax/minimax-m3.1-flash:free"
+    assert default.profile.provider == "openrouter"
+    assert default.profile.max_input_tokens == 98394
+    assert default.profile.max_output_tokens == 32678
+    assert not hasattr(default, "count_input_tokens")
+    assert not hasattr(default, "supports_native_input_measurement")
+    custom = model_clients.build_review_client(
+        profile, ModelConfig(review_input_tokens=50000, review_output_tokens=10000))
+    assert custom.profile.max_input_tokens == 50000
+    assert custom.profile.max_output_tokens == 10000
+    planner = model_clients.build_planning_client(profile)
+    assert planner.profile.max_input_tokens == 126976
+    assert planner.profile.max_output_tokens == 4096
+    config, _ = load_review_config_from_str(valid_config_yaml.replace("profile: null", "profile: " + profile))
+    worker = WorkerLoop(config, Mock(spec=JobStore))
+    assert worker.model_client.profile == default.profile
+    assert worker.model_client.model == "minimax/minimax-m3.1-flash:free"
+    task = make_task()
+    default_key = intent_input_fingerprint(task, config, default, planning_client=planner)
+    custom_key = intent_input_fingerprint(task, config, custom, planning_client=planner)
+    assert default_key is not None and custom_key is not None and default_key != custom_key
+    # Any retired cap value never silently falls back to a native capacity.
+    monkeypatch.setenv("MACBOOK_BEAM_CONTEXT_TOKENS", "131072")
+    with pytest.raises(ValueError, match="MACBOOK_BEAM_CONTEXT_TOKENS"):
+        model_clients.build_review_client(profile)
+
+
+@pytest.mark.parametrize("value", ["", "not-an-integer", "32678", "1048577"])
+def test_invalid_beam_operating_context_never_silently_uses_native_capacity(monkeypatch, value):
+    # MACBOOK_BEAM_CONTEXT_TOKENS is retired: any set value must fail closed.
+    # Empty string counts as unset and keeps the default OpenRouter app budget.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.delenv("OPENROUTER_REVIEW_MODEL", raising=False)
+    monkeypatch.setenv("MACBOOK_BEAM_CONTEXT_TOKENS", value)
+    if value == "":
+        review = model_clients.build_review_client(model_clients.BEAM_CLOUD_TEV4B_PROFILE)
+        assert isinstance(review, OpenRouterReviewClient)
+        assert (review.profile.max_input_tokens, review.profile.max_output_tokens) == (98394, 32678)
+        return
+    with pytest.raises(ValueError, match="MACBOOK_BEAM_CONTEXT_TOKENS"):
+        model_clients.build_review_client(model_clients.BEAM_CLOUD_TEV4B_PROFILE)
