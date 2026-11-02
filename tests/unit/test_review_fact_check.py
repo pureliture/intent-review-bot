@@ -22,6 +22,38 @@ def limits(**kwargs):
     return PartitionReviewLimits(max_calls=128, max_total_tokens=1000000, **kwargs)
 
 
+def test_fact_readback_accepts_only_source_inventory_order_changes():
+    task = make_task()
+    result = run_partition_review(task, "intent", PartitionModelClient(), PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed", result.reason
+    changed = deepcopy(result)
+    ledger = changed.partition["fact_verification"]
+    assert len(ledger["accepted_final"]["supplied_quotes"]) > 1
+    ledger["accepted_final"]["supplied_quotes"].reverse()
+    ledger["accepted_final_hash"] = hash_json(ledger["accepted_final"])
+    changed.partition["final"] = deepcopy(ledger["accepted_final"])
+    validate_partition_result(changed, task)
+
+    for mutation in ("missing", "duplicate", "content", "range", "hash"):
+        forged = deepcopy(changed)
+        record = forged.partition["fact_verification"]
+        inventory = record["accepted_final"]["supplied_quotes"]
+        if mutation == "missing":
+            inventory.pop()
+        elif mutation == "duplicate":
+            inventory.append(deepcopy(inventory[0]))
+        elif mutation == "content":
+            inventory[0]["text"] += "forged"
+        elif mutation == "range":
+            inventory[0]["end_byte"] += 1
+        else:
+            inventory[0]["source_hash"] = "0" * 64
+        record["accepted_final_hash"] = hash_json(record["accepted_final"])
+        forged.partition["final"] = deepcopy(record["accepted_final"])
+        with pytest.raises(PartitionError, match="stored_fact_final_changed"):
+            validate_partition_result(forged, task)
+
+
 @pytest.mark.parametrize("suffix,content,symbol,cut", [
     ("py", "def visible():\n    return True\n\ndef hidden_guard():\n    return False\n", "hidden_guard", "def hidden_guard"),
     ("java", "class Worker {\n void visible() {}\n void hiddenGuard() {}\n}\n", "hiddenGuard", " void hiddenGuard"),

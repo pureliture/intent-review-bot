@@ -3,8 +3,9 @@
 Review pipelines own their prompts and validation. This module owns admission,
 usage accounting, retry bounds and cancellation; it does not select review modes.
 
-There is no metering path: no measurement-only request is ever issued for
-any client. Admission checks calls, deadlines and transport bytes only.
+There is no measurement-only generation. Admission checks calls, deadlines and transport bytes.
+Terminal native overflow can explicitly verify a chat-template/tokenizer count
+without inference. Such metadata work never creates model usage or a generation attempt.
 The input-token budget is proven pre-send by each adapter's exact-wire
 byte-upper-bound gate; the response usage is recorded post-send and any
 budget exceedance fails closed.
@@ -102,10 +103,11 @@ class ModelExecutionBudget:
 
     def execute_bounded_output(self, request: ModelRequest, client: ModelClient, profile: ModelProfile, *,
         label: str, reserve_calls: int, reserve_tokens: int,
+        allow_native_tokenizer: bool = False,
     ) -> tuple[Any | None, int]:
         """One known-limit recovery, keeping all input and the total output cap."""
         body, index = self.execute(request, client, profile, label=label,
-            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens)
+            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens, allow_native_tokenizer=allow_native_tokenizer)
         if (body is not None or self.records[index].reason != "model_output_limit"
                 or not self.rejected_outputs.get(index)
                 or getattr(client, "supports_bounded_reasoning", False) is not True
@@ -116,7 +118,7 @@ class ModelExecutionBudget:
         bounded = replace(request,
             reasoning_budget_tokens=request.max_output_tokens - OUTPUT_RECOVERY_FINAL_RESERVE)
         recovered, next_index = self.execute(bounded, client, profile, label=label + ":output_recovery",
-            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens)
+            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens, allow_native_tokenizer=allow_native_tokenizer)
         self.output_recoveries.append({"failed_stage_index": index, "recovery_stage_index": next_index,
             "reason": "known_native_output_limit", "output_limit": request.max_output_tokens,
             "reasoning_budget_tokens": bounded.reasoning_budget_tokens,
@@ -150,15 +152,17 @@ class ModelExecutionBudget:
 
     def measure(self, request: ModelRequest, client: ModelClient, profile: ModelProfile, *,
         label: str, reserve_calls: int, reserve_tokens: int, generate: bool = True,
+        allow_native_tokenizer: bool = False,
     ) -> tuple[bool, int]:
-        """Admission without any measurement call.
+        """Admission without any measurement-only model generation.
 
         Checks fence, call/deadline/transport budgets, then asks the
-        client for its exact-wire admission bound (``admission_bytes``:
-        wire bytes plus the client's framing reserve, a proven token
+        client for its admitted-input bound (``admission_bytes``:
+        prompt-relevant bytes plus the client's framing reserve, a proven token
         upper bound). The input-token budget is therefore proven pre-send
-        without any extra request; the response usage is recorded
-        post-send. Returns (admitted, index).
+        without an extra generation. Explicit terminal overflow verification may
+        use deterministic native metadata endpoints and records its own receipt.
+        Response usage remains generation-only. Returns (admitted, index).
         """
         record = IntentStageRecord(label, prompt_hash=hash_json({"system": request.system_prompt, "schema": request.response_schema}))
         index = len(self.records)
@@ -196,7 +200,22 @@ class ModelExecutionBudget:
                     reason = "token_count_unavailable"
         if reason is None and bound is not None:
             context_limit = min(profile.max_input_tokens or self.limits.max_input_tokens, self.limits.max_input_tokens)
-            if bound > context_limit:
+            verify = getattr(client, "verify_input_admission", None)
+            if bound > context_limit and allow_native_tokenizer and callable(verify):
+                try:
+                    bound = verify(actual)
+                    if type(bound) is not int or bound < 0:
+                        raise ValueError
+                except Exception:
+                    reason, bound = "token_count_unavailable", None
+                if reason is None:
+                    reason = self.guard()
+            receipt = getattr(client, "input_admission_receipt", None)
+            if callable(receipt):
+                verified = receipt(actual)
+                if verified is not None:
+                    record = replace(record, input_admission={**verified, "request_hash": record.request_hash})
+            if bound is not None and bound > context_limit and reason is None:
                 reason = "input_limit_exceeded"
         if reason:
             self.records[index] = replace(record, status="not_run", reason=reason,
@@ -211,9 +230,10 @@ class ModelExecutionBudget:
 
     def execute(self, request: ModelRequest, client: ModelClient, profile: ModelProfile, *,
         label: str, reserve_calls: int, reserve_tokens: int,
+        allow_native_tokenizer: bool = False,
     ) -> tuple[Any | None, int]:
         admitted, index = self.measure(request, client, profile, label=label,
-            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens)
+            reserve_calls=reserve_calls, reserve_tokens=reserve_tokens, allow_native_tokenizer=allow_native_tokenizer)
         if not admitted:
             return None, index
         for number in range(1, profile.max_attempts + 1):

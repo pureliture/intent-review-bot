@@ -434,7 +434,7 @@ def test_architecture_uses_same_executor_and_keeps_analysis_as_evidence():
     from review_bot.application.review_output_contract import render_output_contract
     request = next(req for req in review.requests if json.loads(req.user_content)["stage"] == "review_partition")
     assert request.system_prompt.count(contract.PMD_METRIC_REFERENCE) == 1
-    assert request.system_prompt == (contract.OBSERVE_PROMPT + "\nRepository review judgment and explanation guidance:\n" + instructions
+    assert request.system_prompt == (contract.OBSERVE_PROMPT + "\nRepository review judgment and explanation guidance:\n" + contract.READABLE_REVIEW_GUIDANCE + "\n" + instructions
         + contract.PMD_METRIC_REFERENCE + contract.REVIEW_GROUNDING_RULE + render_output_contract(request.response_schema)
         + "\nWrite every prose value in Korean.")
 

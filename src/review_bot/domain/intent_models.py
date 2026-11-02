@@ -137,6 +137,7 @@ class IntentStageRecord:
     token_measurement_delivery: str = "not_attempted"
     token_measurement_usage: dict[str, int] | None = None
     token_measurement_model_calls: int | None = 0
+    input_admission: dict | None = None
 
 
 @dataclass(frozen=True)

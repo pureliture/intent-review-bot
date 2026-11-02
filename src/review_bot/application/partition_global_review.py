@@ -9,6 +9,7 @@ from review_bot.application import partition_choices as choices
 from review_bot.application.intent_context import bounded_array, bounded_object, bounded_text
 from review_bot.application.partition_integration import prior_context_updates, has_insufficient_judgement
 from review_bot.application.source_partition import PartitionError, make_span
+from review_bot.application.intent_source_scope import scoped_ranges, scope_notice
 from review_bot.application.source_citations import citation_spans, source_blocks
 from review_bot.domain.intent_perspectives import PERSPECTIVES
 
@@ -206,14 +207,15 @@ def prepare(pages, originals, inherited, contexts, meta):
 
 def delivery_references(data, *, full=False, previous=None):
     requested = {r["evidence_id"] for r in (previous or {}).get("source_requests", [])}
-    spans = [make_span(o, 0, len(o.raw), "global_original") for o in data["originals"].values()
-        if full or o.evidence_id in requested]
+    spans = [make_span(o, start, end, "global_original") for o in data["originals"].values()
+        if full or o.evidence_id in requested
+        for start, end in scoped_ranges(o, data["meta"].get("source_scope"))]
     return {**data["references"], **citation_spans(spans, data["originals"])}
 
 
 def payload(data, *, full=False, previous=None):
     originals = data["originals"].values()
-    result = {"result_level": "accepted_integration_page", "observations": [
+    result = {**scope_notice(data["meta"], set(data["originals"])), "result_level": "accepted_integration_page", "observations": [
         {k: deepcopy(v) for k, v in row.items() if k != "reference_ids"} for row in data["rows"]],
         "finding_catalog": [{k: v for k, v in row.items() if k != "raw_finding"} for row in data["findings"]],
         "context_items": deepcopy(data["contexts"]),
@@ -238,13 +240,14 @@ def payload(data, *, full=False, previous=None):
         "path": data["originals"][key].path, "version": data["originals"][key].version,
         "sha": data["originals"][key].sha, "ranges": ranges} for key, ranges in sorted(grouped.items())]
     if full:
-        result["complete_originals"] = source_blocks([make_span(o, 0, len(o.raw), "global_original")
-            for o in originals], data["originals"])
+        result["complete_originals"] = source_blocks([make_span(o, start, end, "global_original")
+            for o in originals for start, end in scoped_ranges(o, data["meta"].get("source_scope"))], data["originals"])
     if previous is not None:
         result["recheck"] = deepcopy(previous)
         requested = {r["evidence_id"] for r in previous.get("source_requests", [])}
-        result["requested_originals"] = source_blocks([make_span(o, 0, len(o.raw), "global_original")
-            for o in originals if o.evidence_id in requested], data["originals"])
+        result["requested_originals"] = source_blocks([make_span(o, start, end, "global_original")
+            for o in originals if o.evidence_id in requested
+            for start, end in scoped_ranges(o, data["meta"].get("source_scope"))], data["originals"])
     return result
 
 

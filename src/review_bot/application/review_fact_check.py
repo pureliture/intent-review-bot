@@ -355,6 +355,7 @@ def quote_spans(value, originals):
 
 
 def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version=VERSION):
+    from review_bot.application.intent_source_scope import scoped_ranges, scope_notice
     if protocol_version not in SUPPORTED_VERSIONS:
         raise PartitionError("fact_protocol_version_unknown")
     by_id = {o.evidence_id: o for o in originals}
@@ -368,7 +369,8 @@ def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version
     paths = {s.path for s in anchors if s.path}
     whole = [o for o in originals if kind == "complete_originals" or o.kind == "pr_text" or o.evidence_id in requested or
         kind == "cited_originals" and (o.evidence_id in selected or o.path in paths)]
-    spans = [make_span(o, 0, len(o.raw), "fact_original") for o in whole]
+    spans = [make_span(o, start, end, "fact_original") for o in whole
+        for start, end in scoped_ranges(o, meta.get("source_scope"))]
     delivered = {s.evidence_id for s in spans}
     spans.extend(s for s in anchors if s.evidence_id not in delivered)
     # Overlapping immutable ranges are one byte cover. Keep every anchor's
@@ -383,7 +385,8 @@ def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version
             merged.append(span)
     spans = merged
     refs = citation_spans(spans, by_id, [asdict(s) for s in anchors])
-    payload = {"items": [{"item_id": row["id"], "original_item": deepcopy(row["item"]),
+    payload = {**scope_notice(meta, {s.evidence_id for s in spans}),
+        "items": [{"item_id": row["id"], "original_item": deepcopy(row["item"]),
             "fields": fields(row)} for row in rows],
         "originals": source_blocks(spans, by_id),
         "citation_catalog": citation_catalog(spans, by_id, [asdict(s) for s in anchors]),
@@ -1728,8 +1731,21 @@ def validate(result, originals, meta):
                 raise PartitionError("stored_fact_source_changed")
         candidate["supplied_quotes"] = deepcopy(ledger.get("accepted_final", original)["supplied_quotes"])
     expected_status = "model_supported" if not interrupted and all(e["status"] == "model_supported" for e in entries) else "unverified"
-    if (ledger["status"] != expected_status or ledger.get("accepted_final") != candidate or
-            ledger.get("accepted_final_hash") != hash_json(candidate) or result.partition.get("final") != candidate):
+    accepted_final = ledger.get("accepted_final")
+    # Batched execution accepts supported items before the next rewrite round;
+    # replay walks each item's whole history. The source inventory can therefore
+    # be inserted in a different order. Compare every complete source record,
+    # preserving duplicates and bytes, while retaining the stored serialization's
+    # original hash and the exact published-final comparison.
+    def inventory_view(value):
+        return {**value, "supplied_quotes": sorted(value["supplied_quotes"],
+            key=lambda span: (span["evidence_id"], span["start_byte"], span["end_byte"]))}
+    try:
+        same_inventory = inventory_view(accepted_final) == inventory_view(candidate)
+    except (KeyError, TypeError):
+        raise PartitionError("stored_fact_final_changed") from None
+    if (ledger["status"] != expected_status or not same_inventory or
+            ledger.get("accepted_final_hash") != hash_json(accepted_final) or result.partition.get("final") != accepted_final):
         raise PartitionError("stored_fact_final_changed")
     return decision_ids
 

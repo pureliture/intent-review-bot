@@ -48,8 +48,10 @@ def format_intent_perspective_markdown(result: IntentPerspectiveResult, task_inp
         "- Scope: the fixed PR input and supplied originals. Target code, builds, and tests were not executed.")
     if private:
         scope += " 외부 게시는 시도하지 않았습니다." if ko else " Publication was not attempted."
-    intro = [marker, title, "", f"- {status} · {_escape(result.reason)}",
-        f"- base: {task.base.sha}; head: {task.head.sha}", scope]
+    intro = [marker, title, ""]
+    if private:
+        intro.extend([f"- {status} · {_escape(result.reason)}",
+            f"- base: {task.base.sha}; head: {task.head.sha}", scope])
     if result.model.get("is_mock"):
         intro.append("- 모의 모델을 사용한 형식 검증 결과입니다. 실제 모델의 리뷰 품질을 입증하지 않습니다." if ko else
             "- Mock model: contract verification only, not evidence of actual model review quality.")

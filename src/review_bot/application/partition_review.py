@@ -33,7 +33,10 @@ from review_bot.application.intent_context import (
     decode_intent_task_input, intent_scope,
 )
 from review_bot.application.source_partition import (
-    PartitionError, SourceOriginal, SourceSpan, make_span, partition_original, verify_partition,
+    PartitionError, SourceOriginal, SourceSpan, make_span, partition_original,
+)
+from review_bot.application.intent_source_scope import (
+    build_source_scope, partition_scoped_original, scoped_ranges, scope_notice, verify_scoped_partition,
 )
 from review_bot.domain.intent_models import IntentReviewLimits, IntentTaskInput
 from review_bot.domain.intent_perspectives import PERSPECTIVES
@@ -619,6 +622,9 @@ def prepare_originals(task, mode):
                     if o.path == location["path"] and o.version == location["version"])
     if len({o.evidence_id for o in originals}) != len(originals):
         raise PartitionError("duplicate_original_id")
+    if isinstance(task, IntentTaskInput):
+        meta["source_scope"] = build_source_scope(originals, task.snapshot.changed_files)
+        meta["limitations"].extend(meta["source_scope"]["boundaries"])
     return originals, meta
 
 
@@ -653,6 +659,7 @@ def _review_observation_spec(group, originals, meta, mode, *, anchors=(), previo
         "review_target_details": relevant, "draft_assessment_keys": list(draft_keys),
         "original_byte_sizes": {o.evidence_id: len(o.raw) for o in originals if o.evidence_id in {u.evidence_id for u in supplied}},
         "perspective_catalog": [asdict(p) for p in PERSPECTIVES if p.id in draft_keys] if intent else [],
+        **scope_notice(meta, {s.evidence_id for s in supplied}),
         **({"source_recheck": previous} if previous is not None else {})}
     schema = _note_schema(tuple(refs), draft_keys, architecture=mode == "architecture",
         has_head_code=any(span.path and span.version == "head" for span in supplied),
@@ -857,7 +864,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
 
     def measure(req, client, current, label, *, for_generation=False):
         admitted, index = budget.measure(req, client, current, label=label,
-            reserve_calls=0, reserve_tokens=0, generate=for_generation)
+            reserve_calls=0, reserve_tokens=0, generate=for_generation,
+            allow_native_tokenizer=label.split(":", 1)[0] in ("global_review", "fact_check", "fact_rewrite"))
         if not admitted:
             if budget.records[index].reason == "input_limit_exceeded":
                 return False
@@ -877,7 +885,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         if not measure(req, client, current, label + ":admission"):
             raise Stop("native_request_exceeds_model_limits")
         raw, index = budget.execute_bounded_output(req, client, current, label=label,
-            reserve_calls=0, reserve_tokens=0)
+            reserve_calls=0, reserve_tokens=0,
+            allow_native_tokenizer=label.split(":", 1)[0] in ("global_review", "fact_check", "fact_rewrite"))
         if raw is None:
             raise Stop(budget.records[index].reason)
         return raw, index
@@ -1000,6 +1009,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         if previous is not None:
             schema = _obj({**schema["properties"], "correction_reason": _text()})
         return request("final_review", {"observations": observation_payload(rows), "original_quotes": source_blocks(supplied, {o.evidence_id: o for o in originals}), "citation_catalog": quote_catalog(supplied, retained),
+            **scope_notice(meta, {s.evidence_id for s in supplied}),
             "source_coverage": source_coverage,
             "target_reference_context": target_context, "target_reference_policy": TARGET_REFERENCE_POLICY,
             **({"source_recheck": {**deepcopy(previous), "target_reference_context": deepcopy(target_context),
@@ -1083,6 +1093,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                 shared_plan_id=prepared_plan.partition["plan_id"], mode_selection_under_evaluation=False,
                 plan_reuse={"reused_group_ids": [], "projections": [], "amendments": []})
         originals, meta = prepare_originals(task, mode)
+        if "source_scope" in meta:
+            partitions["source_scope"] = deepcopy(meta["source_scope"])
         if prepared_plan is not None:
             originals = _attach_common_context(originals, prepared_plan.partition["execution_plan"])
         meta = _review_meta(partitions, meta)
@@ -1119,9 +1131,16 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             inherited = [] if prepared_plan is None else [u for u in prepared_plan.partition["units"]
                 if u["evidence_id"] == original.evidence_id and u["source_hash"] == original.digest]
             parts = tuple(make_span(original, u["start_byte"], u["end_byte"], u["boundary"]) for u in inherited)
+            if parts:
+                try:
+                    verify_scoped_partition(original, parts, meta.get("source_scope"))
+                except PartitionError:
+                    # Architecture can require more source than the diff-based
+                    # common plan. Refit that declared scope before projecting.
+                    parts = ()
             if not parts or not all(fits(part) for part in parts):
-                parts = partition_original(original, fits, before_step=guard)
-            verify_partition(original, parts)
+                parts = partition_scoped_original(original, fits, meta.get("source_scope"), before_step=guard)
+            verify_scoped_partition(original, parts, meta.get("source_scope"))
             units.extend(parts)
         partitions["units"] = [{key: value for key, value in asdict(u).items() if key != "text"} for u in units]
         partitions["source_hashes"] = {o.evidence_id: o.digest for o in originals}
@@ -1259,7 +1278,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             units = sorted((unit for group in groups for unit in group), key=lambda u: (order[u.evidence_id], u.start_byte))
             for original in originals:
                 if original.text:
-                    verify_partition(original, tuple(u for u in units if u.evidence_id == original.evidence_id))
+                    verify_scoped_partition(original, tuple(u for u in units if u.evidence_id == original.evidence_id), meta.get("source_scope"))
             delivery.update(complete=True, groups=[[u.unit_id for u in group] for group in groups])
             changed = delivery["initial_groups"] != delivery["groups"]
             if changed:
@@ -1577,8 +1596,9 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     accepted_retained = list(retained)
                     accepted_request_context = request_context
                     if page_final["source_requests"] and recheck < available_rechecks:
-                        requested_sources = [make_span(o, 0, len(o.raw), "requested_original")
-                            for o in originals if o.evidence_id in {row["evidence_id"] for row in page_final["source_requests"]}]
+                        requested_sources = [make_span(o, start, end, "requested_original")
+                            for o in originals if o.evidence_id in {row["evidence_id"] for row in page_final["source_requests"]}
+                            for start, end in scoped_ranges(o, meta.get("source_scope"))]
                         supplied = final_spans(working, [*source_spans, *retained])
                         roots = [c for row in review_notes for c in row["citations"]]
                         prior_sources = referenced_source_spans(raw, supplied, {o.evidence_id: o for o in originals},
@@ -1951,8 +1971,10 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         "prompts": hashes, "models": {"review": asdict(profile) if profile else None,
         "planner": asdict(planner) if planner else None}}
     identity["consumer_admission_contract"] = CONSUMER_ADMISSION_CONTRACT
+    if "source_scope" in meta:
+        identity["source_scope_policy"] = meta["source_scope"]["policy"]
     identity["implementation"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-        for name in ("partition_review.py", "source_partition.py", "model_execution.py", "model_wire_contract.py", "partition_choices.py", "source_citations.py", "source_quote_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py", "review_fact_check.py", "selection.py")}
+        for name in ("partition_review.py", "source_partition.py", "intent_source_scope.py", "model_execution.py", "model_wire_contract.py", "partition_choices.py", "source_citations.py", "source_quote_citations.py", "partition_integration.py", "partition_global_review.py", "review_output_contract.py", "review_fact_check.py", "selection.py")}
     identity["implementation"].update({"adapters/" + name: hashlib.sha256(
         (Path(__file__).parents[1] / "adapters" / name).read_bytes()).hexdigest()
         for name in ("llama_cpp_local.py", "llama_cpp_macbook.py", "intent_planner.py",
@@ -2751,6 +2773,19 @@ def _validate_capacity_rejections(result):
     if records:
         raise PartitionError("stored_native_capacity_reservation_changed")
     for event in result.stages:
+        receipt = event.input_admission
+        if receipt is not None:
+            if (not isinstance(receipt, dict) or receipt.get("method") != "native_template_tokenizer"
+                    or receipt.get("request_hash") != event.request_hash
+                    or type(receipt.get("input_tokens")) is not int
+                    or receipt["input_tokens"] != event.measured_input_tokens
+                    or receipt.get("tokenizer_requests") != 2 or receipt.get("model_generations") != 0
+                    or any(not isinstance(receipt.get(key), str) or len(receipt[key]) != 64
+                        or any(c not in "0123456789abcdef" for c in receipt[key])
+                        for key in ("payload_sha256", "template_sha256", "prompt_sha256", "tokens_sha256"))
+                    or any(event.status == "completed" and attempt.usage is not None and attempt.usage["input_tokens"] != receipt["input_tokens"]
+                        for attempt in event.attempts)):
+                raise PartitionError("stored_native_input_admission_changed")
         if (event.reason == "input_limit_exceeded" and event.token_measurement == "measured"
                 and event.token_measurement_usage is None):
             raise PartitionError("stored_native_capacity_rejection_missing")
@@ -2792,7 +2827,7 @@ def _validate_consumer_delivery(result, originals, meta, known_units):
         raise PartitionError("stored_consumer_parent_changed")
     for original in by_id.values():
         if original.text:
-            verify_partition(original, tuple(u for u in initial if u.evidence_id == original.evidence_id))
+            verify_scoped_partition(original, tuple(u for u in initial if u.evidence_id == original.evidence_id), meta.get("source_scope"))
     initial_groups = delivery["initial_groups"]
     if sorted(u for group in initial_groups for u in group) != sorted(initial_by_id):
         raise PartitionError("stored_consumer_initial_coverage_changed")
@@ -2930,6 +2965,13 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
         raise PartitionError("invalid_partition_result_status")
     mode = "planning" if result.review_type == "PLAN" else "intent" if result.review_type == "B" else "architecture"
     originals, meta = prepare_originals(task, mode)
+    if result.partition.get("identity", {}).get("source_scope_policy") is not None and "source_scope" not in result.partition:
+        raise PartitionError("stored_source_scope_missing")
+    if "source_scope" in result.partition:
+        if result.partition["source_scope"] != meta.get("source_scope") or result.partition.get("identity", {}).get("source_scope_policy") != meta["source_scope"]["policy"]:
+            raise PartitionError("stored_source_scope_changed")
+    else:
+        meta.pop("source_scope", None)
     meta = _review_meta(result.partition, meta)
     if result.partition.get("shared_plan_id"):
         originals = _attach_common_context(originals, result.partition["shared_plan"])
@@ -2984,7 +3026,7 @@ def validate_partition_result(result: PartitionReviewResult, task) -> None:
         raise PartitionError("duplicate_partition_unit")
     if result.partition.get("units_prepared"):
         for original in originals:
-            verify_partition(original, tuple(u for u in units if u.evidence_id == original.evidence_id))
+            verify_scoped_partition(original, tuple(u for u in units if u.evidence_id == original.evidence_id), meta.get("source_scope"))
     planning_units = _validate_consumer_delivery(result, by_id, meta, known_units)
     if result.status == "measured" and (not result.partition.get("units_prepared") or
         result.reason != "native_input_prepared" or any(r.attempts for r in result.stages)):

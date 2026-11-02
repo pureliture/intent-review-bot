@@ -33,7 +33,8 @@ def test_signed_webhook_runs_perspectives_without_publishing(intent_flow):
     assert receipt["publication"]["reason"] == "artifact_only"
     assert len(model.requests) == result["usage"]["calls"]
     choices = [json.loads(request.user_content) for request in f.planning_model.requests]
-    assert len([row for row in choices if row["stage"] == "select_perspective"]) == 8
+    assert len([row for row in choices if row["stage"] == "select_perspectives"]) == 1
+    assert not any(row["stage"] == "select_perspective" for row in choices)
     assert len(result["perspectives"]) == 8
     for filename in ("partition.json", "perspectives.json", "fact-verification.json", "validation.json"):
         assert (directory / "B" / filename).is_file()

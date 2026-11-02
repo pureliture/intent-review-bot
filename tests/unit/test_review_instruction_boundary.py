@@ -75,4 +75,5 @@ def test_review_guidance_reaches_multi_page_review_but_not_tev_or_factual_contro
         assert guidance not in request.system_prompt and guidance not in request.user_content
         assert request.system_prompt == original.system_prompt
         assert request.response_schema == original.response_schema
-        assert set(request.response_schema["properties"]) == {"choice"}
+        expected = {"selected_perspective_ids"} if json.loads(request.user_content)["stage"] == "select_perspectives" else {"choice"}
+        assert set(request.response_schema["properties"]) == expected

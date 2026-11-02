@@ -18,7 +18,7 @@ def test_compact_code_first_scope_plan_relation_final_and_usage_are_visible():
     result = run_code_first_review(task, CodeFirstModelClient())
     draft = format_code_intent_markdown(result, task)
     assert draft.startswith(DEFAULT_B_MARKER) and draft.count(DEFAULT_B_MARKER) == 1
-    for text in ("Code-first", "not the whole repository", "not executed", "Uncertainty", "Plan:", "conflict", "code\\_defect", "Usage", "hypothesis"):
+    for text in ("code-first", "not the whole repository", "not executed", "Uncertainty", "Plan:", "conflict", "code\\_defect", "Usage", "hypothesis"):
         assert text in draft
     assert f"/blob/{task.head.sha}/src/value.py#L2-L2" in draft
     assert f"/blob/{task.head.sha}/src/caller.py#L4-L4" in draft

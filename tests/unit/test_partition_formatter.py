@@ -17,6 +17,20 @@ def completed(task, mode, client=None):
         limits=PartitionReviewLimits(max_total_tokens=1000000, max_calls=128))
 
 
+def test_completed_comment_preserves_plain_author_question_without_citation_walkthrough_error():
+    def question(payload, body):
+        if payload["stage"] == "final_review":
+            body["questions"] = ["대량 후보 선택 개선 계획이 있나요?"]
+        return body
+    task = make_task()
+    result = completed(task, "intent", PartitionModelClient(transform=question))
+    assert result.status == "completed", result.reason
+    before = deepcopy(asdict(result))
+    markdown = format_partition_review_markdown(result, task, publication_mode="comment")
+    assert "작성자 확인 질문" in markdown and "대량 후보 선택 개선 계획" in markdown
+    assert asdict(result) == before
+
+
 def test_partition_b_completed_no_findings_has_collapsed_perspectives_and_no_internal_metadata():
     task = make_task()
     result = completed(task, "intent")
@@ -41,8 +55,8 @@ def test_partition_a_target_reviews_are_collapsed_and_metrics_are_not_findings()
     assert result.partition["final"]["target_reviews"]
     markdown = format_partition_review_markdown(result, task, publication_mode="comment")
     assert "이 검토 범위에서 추가로 조치할 발견사항은 없습니다." in markdown
-    assert "| 검토 대상으로 선택한 신호 | 0건 |" in markdown
-    assert "<summary>선택한 신호별 검토 근거</summary>" in markdown
+    assert "이번 리뷰에서 표시할 규칙 위반 내역이 없습니다." in markdown
+    assert "<summary>규칙별 검토 근거</summary>" in markdown
     assert "Synthetic explicit review" in markdown
 
 
@@ -160,5 +174,6 @@ def test_walkthrough_table_counts_findings_per_changed_file():
         "citations": [{"path": "a.py"}, {"path": "a.py"}]}]
     table = walkthrough(task, findings, [])
     assert "<summary>변경 파일 둘러보기</summary>" in table
-    assert "| a\\.py | 2건 |" in table
+    assert "| a\\.py | 1건 |" in table
     assert "| b\\.py | 0건 |" in table
+    assert "| a\\.py | 2건 |" in walkthrough(task, [*findings, *findings], [])

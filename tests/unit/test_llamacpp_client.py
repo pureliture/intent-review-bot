@@ -38,6 +38,127 @@ def chat_response(
     }
 
 
+def _deterministic_tokenizer(request):
+    if request.url.path == "/apply-template":
+        assert json.loads(request.content)["messages"]
+        return httpx.Response(200, json={"prompt": "<s>exact native prompt<assistant>"})
+    if request.url.path == "/tokenize":
+        assert json.loads(request.content) == {"content": "<s>exact native prompt<assistant>",
+            "add_special": False, "parse_special": True}
+        return httpx.Response(200, json={"tokens": list(range(42))})
+
+
+def test_terminal_overflow_can_verify_exact_input_without_a_model_generation(adapter, main_request, mock_http):
+    import time
+    from review_bot.application.model_execution import ModelExecutionBudget
+    from review_bot.domain.partition_review import PartitionReviewLimits
+
+    requests = mock_http(_deterministic_tokenizer)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    request = replace(main_request, user_content="한" * 40000)
+    limits = PartitionReviewLimits(max_input_tokens=client.profile.max_input_tokens,
+        max_total_tokens=1000000, max_calls=10, task_timeout_seconds=60)
+    budget = ModelExecutionBudget(limits, time.monotonic() + 60, None)
+    admitted, _ = budget.measure(request, client, client.profile, label="global_review:byte_gate",
+        reserve_calls=0, reserve_tokens=0)
+    assert not admitted and not requests
+    admitted, index = budget.measure(request, client, client.profile, label="global_review:verified_gate",
+        reserve_calls=0, reserve_tokens=0, allow_native_tokenizer=True)
+    assert admitted
+    assert [r.url.path for r in requests] == ["/v1/models", "/props", "/apply-template", "/tokenize"]
+    event = budget.records[index]
+    assert event.measured_input_tokens == 42 and event.token_measurement_model_calls == 0
+    assert event.input_admission["request_hash"] == event.request_hash
+    assert event.input_admission["model_generations"] == 0
+    assert budget.totals() == (0, 0, False)
+    count = len(requests)
+    assert client.admission_bytes(request) == 42 and len(requests) == count
+    body, _ = budget.execute(request, client, client.profile, label="global_review",
+        reserve_calls=0, reserve_tokens=0)
+    assert body == {"ok": True}
+    assert budget.totals() == (1, 47, False)
+    assert sum(r.url.path == "/v1/chat/completions" for r in requests) == 1
+    assert sum(r.url.path == "/tokenize" for r in requests) == 1
+    assert json.loads(requests[-1].content)["messages"][1]["content"] == request.user_content
+
+
+def test_terminal_output_recovery_reverifies_changed_sampler_without_repeating_meter_generations(adapter, main_request, mock_http):
+    import time
+    from review_bot.application.model_execution import ModelExecutionBudget, OUTPUT_RECOVERY_FINAL_RESERVE
+    from review_bot.domain.partition_review import PartitionReviewLimits
+
+    def handler(request):
+        if request.url.path != "/v1/chat/completions":
+            return _deterministic_tokenizer(request)
+        payload = json.loads(request.content)
+        if "reasoning_budget_tokens" not in payload:
+            body = chat_response(None, output_tokens=32678)
+            body["choices"][0]["finish_reason"] = "length"
+            body["choices"][0]["message"]["reasoning_content"] = "Original exhausted reasoning"
+            return httpx.Response(200, json=body)
+        assert payload["reasoning_budget_tokens"] == 32678 - OUTPUT_RECOVERY_FINAL_RESERVE
+        return httpx.Response(200, json=chat_response())
+    requests = mock_http(handler)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    request = replace(main_request, user_content="한" * 40000, max_output_tokens=32678)
+    limits = PartitionReviewLimits(max_input_tokens=client.profile.max_input_tokens,
+        max_total_tokens=1000000, max_calls=2, task_timeout_seconds=60)
+    budget = ModelExecutionBudget(limits, time.monotonic() + 60, None)
+    result, _ = budget.execute_bounded_output(request, client, client.profile, label="global_review",
+        reserve_calls=0, reserve_tokens=0, allow_native_tokenizer=True)
+    assert result == {"ok": True}
+    assert budget.totals() == (2, 42 * 2 + 32678 + 5, False)
+    assert len(budget.output_recoveries) == 1 and budget.output_recoveries[0]["source_input_unchanged"]
+    assert sum(r.url.path == "/tokenize" for r in requests) == 2
+    wires = [json.loads(r.content) for r in requests if r.url.path == "/v1/chat/completions"]
+    assert len(wires) == 2 and wires[0]["messages"] == wires[1]["messages"]
+    assert wires[0]["max_tokens"] == wires[1]["max_tokens"] == 32678
+
+
+@pytest.mark.parametrize("tokens", [[], [True], [-1], [{"id": 1}]])
+def test_invalid_deterministic_tokenizer_response_cannot_admit_input(adapter, main_request, mock_http, tokens):
+    def handler(request):
+        if request.url.path == "/tokenize":
+            return httpx.Response(200, json={"tokens": tokens})
+        return _deterministic_tokenizer(request)
+    requests = mock_http(handler)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    with pytest.raises(PermanentModelError, match="tokenization"):
+        client.verify_input_admission(main_request)
+    assert client.input_admission_receipt(main_request) is None
+    assert not any(r.url.path == "/v1/chat/completions" for r in requests)
+
+
+def test_exact_admission_is_bound_to_payload_and_server_template(adapter, main_request, mock_http):
+    template_changed = False
+    def handler(request):
+        if template_changed and request.url.path == "/props":
+            return httpx.Response(200, json={"default_generation_settings": {"n_ctx": 131072},
+                "total_slots": 2, "chat_template": "changed template"})
+        return _deterministic_tokenizer(request)
+    requests = mock_http(handler)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    request = replace(main_request, user_content="한" * 40000)
+    assert client.verify_input_admission(request) == 42
+    assert client.input_admission_receipt(replace(request, user_content=request.user_content + "x")) is None
+    assert client.input_admission_receipt(replace(request, response_schema={"type": "object"})) is None
+    template_changed = True
+    with pytest.raises(PermanentModelError, match="byte-upper-bound"):
+        client.complete(request)
+    assert not any(r.url.path == "/v1/chat/completions" for r in requests)
+
+
+def test_actual_usage_must_match_verified_prompt_count_and_failure_keeps_usage(adapter, main_request, mock_http):
+    requests = mock_http(_deterministic_tokenizer, tokens=43)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    client.verify_input_admission(main_request)
+    with pytest.raises(PermanentModelError, match="differs from actual") as captured:
+        client.complete(main_request)
+    assert captured.value.delivery == "sent"
+    assert captured.value.usage == {"input_tokens": 43, "output_tokens": 5}
+    assert sum(r.url.path == "/v1/chat/completions" for r in requests) == 1
+
+
 def test_truncated_answer_is_rejected_but_its_valid_native_usage_is_preserved(adapter, main_request, mock_http):
     def truncated(request):
         if request.url.path == "/v1/chat/completions":
@@ -208,7 +329,7 @@ def test_role_contracts_are_explicit_and_construction_is_offline(adapter: Any, m
     bound = review.admission_bytes(main_request)
     assert type(bound) is int
     assert bound == len(json.dumps(
-        review._chat_payload(main_request), ensure_ascii=False, allow_nan=False,
+        {key: value for key, value in review._chat_payload(main_request).items() if key != "response_format"}, ensure_ascii=False, allow_nan=False,
         separators=(",", ":")).encode("utf-8")) + 8192
     assert review.admission_bytes(main_request) == bound
     assert requests == []
@@ -400,7 +521,8 @@ def test_admission_bytes_is_pure_local_proven_upper_bound(
     assert type(bound) is int
     wire = json.dumps(client._chat_payload(request), ensure_ascii=False,
                       allow_nan=False, separators=(",", ":")).encode("utf-8")
-    assert bound == len(wire) + 8192 > len(wire)
+    assert bound == client._context_bytes(client._chat_payload(request)) + 8192
+    assert bound < len(wire) + 8192
     assert client.admission_bytes(request) == bound
     assert client.admission_bytes(main_request) != bound
     assert requests == []
@@ -465,7 +587,7 @@ def test_review_a_uses_large_transport_cap_and_byte_gate(
     assert sum(r.url.path == "/v1/chat/completions" for r in requests) == 1
 
 
-def test_admission_bytes_tracks_prompt_schema_and_input_changes_without_http(
+def test_admission_bytes_tracks_prompt_input_but_not_output_grammar_without_http(
     adapter: Any, mock_http: Any, main_request: ModelRequest,
 ) -> None:
     requests = mock_http(lambda request: pytest.fail("admission_bytes must remain offline"))
@@ -477,7 +599,8 @@ def test_admission_bytes_tracks_prompt_schema_and_input_changes_without_http(
                         replace(main_request, system_prompt="Changed system"),
                         replace(main_request, response_schema=changed_schema))
     }
-    assert len(bounds) == 4
+    assert len(bounds) == 3
+    assert client.admission_bytes(main_request) == client.admission_bytes(replace(main_request, response_schema=changed_schema))
     assert requests == []
 
 
@@ -940,3 +1063,39 @@ def test_concurrent_completions_do_not_share_prompt_counts(
                                                        replace(main_request, user_content="second-prompt"))))
     assert [response.usage["input_tokens"] for response in responses] == [11, 29]
     assert sum(r.url.path == "/v1/chat/completions" for r in requests) == 2
+
+
+def test_large_output_schema_is_not_counted_as_prompt_but_is_sent_unchanged(adapter, main_request, mock_http):
+    from review_bot.application.model_execution import ModelExecutionBudget
+    from review_bot.domain.partition_review import PartitionReviewLimits
+    import time
+
+    request = replace(main_request, response_schema={"type": "object", "properties": {
+        "ok": {"type": "boolean"}, "reference": {"type": "string", "enum": [f"Q{i:012d}" for i in range(8000)]}},
+        "required": ["ok"], "additionalProperties": False})
+    requests = mock_http()
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    full_payload = client._chat_payload(request)
+    assert len(adapter._encode(full_payload)) + 8192 > client.profile.max_input_tokens
+    limits = PartitionReviewLimits(max_input_tokens=client.profile.max_input_tokens, max_calls=8)
+    budget = ModelExecutionBudget(limits, time.monotonic() + 60, None)
+    admitted, _ = budget.measure(request, client, client.profile, label="global_review:admission", generate=True,
+        reserve_calls=0, reserve_tokens=0)
+    assert admitted and requests == []
+    assert client.admission_bytes(request) == client.admission_bytes(main_request)
+    assert request.response_schema == full_payload["response_format"]["json_schema"]["schema"]
+    client.complete(request)
+    sent = json.loads(requests[-1].content)
+    assert sent == full_payload
+    assert [r.url.path for r in requests] == ["/v1/models", "/props", "/v1/chat/completions"]
+
+
+def test_large_actual_prompt_still_fails_before_generation(adapter, main_request, mock_http):
+    requests = mock_http()
+    request = replace(main_request, user_content="X" * 100000)
+    client = adapter.LlamaCppModelClient(api_url=API_URL)
+    assert client.admission_bytes(request) > client.profile.max_input_tokens
+    with pytest.raises(PermanentModelError, match="byte-upper-bound"):
+        client.complete(request)
+    assert all(r.url.path != "/v1/chat/completions" for r in requests)
+    assert request.user_content == "X" * 100000

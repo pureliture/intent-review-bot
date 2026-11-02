@@ -36,12 +36,14 @@ def format_code_intent_markdown(
 
     heading = "### Development intent review" + (" (private draft)" if publication_mode == "artifact_only" else "")
     notice = "Publication: not attempted (artifact_only)." if publication_mode == "artifact_only" else "Output policy: comment; publication is a separate operation."
-    base = [marker, heading, "", f"- Model review: **{result.status}** · `{result.reason}`",
-        f"- Base: `{task.base.sha}`; head: `{task.head.sha}`", f"- {notice}",
+    base = [marker, heading, "", f"- Model review: **{result.status}** · `{result.reason}`"]
+    metadata = [f"- Base: `{task.base.sha}`; head: `{task.head.sha}`", f"- {notice}",
         "- Scope: fixed full files, not the whole repository; code-first, not declared-goal validation.",
         "- Execution: target code, builds, tests and hooks were not executed. Test source is not a test run.",
         "- Uncertainty: purpose is reconstructed, not confirmed developer intent. Validation is not semantic accuracy or approval.",
         "- Relations are not exhaustive; no guarantee of complete correctness."]
+    if publication_mode == "artifact_only":
+        base.extend(metadata)
     if result.model.get("is_mock"):
         base.append("- Mock model: contract evidence only, not actual model review quality.")
     lines = [*base, "", "#### Scope and plan"]
@@ -96,9 +98,7 @@ def format_code_intent_markdown(
     if len(comment) <= max_length:
         return comment
     compact = [marker, heading, "", f"- Model review: **{result.status}** · `{result.reason}`",
-        f"- Base: `{task.base.sha}`; head: `{task.head.sha}`", f"- {notice}",
-        "Code-first, prepared scope only, not the whole repository. Target code, tests and builds were not executed.",
-        "Purpose hypotheses remain uncertain; validation is not correctness or approval.",
+        *(metadata if publication_mode == "artifact_only" else []),
         "Body omitted: comment_limit_exceeded. Complete records remain in private artifacts.",
         "No complete-review or problem-free claim is made by this shortened draft."]
     if result.model.get("is_mock"):

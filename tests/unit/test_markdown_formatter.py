@@ -194,12 +194,12 @@ def test_markdown_formatter_selected_static_template_and_llm_sections() -> None:
     markdown = format_review_markdown(result, task)
     assert markdown.splitlines()[:2] == ["<!-- review-bot:architecture:v1 -->", "### 아키텍처 리뷰"]
     assert "#### 전체 판단" in markdown
-    assert "#### 정적 분석" in markdown
-    assert "| 측정 영역 | 이번 PR 검토 범위 |" in markdown
+    assert "#### PMD/CPD 분석 결과" in markdown
+    assert "| 라인 | 위반 규칙 | 무엇을 보는가 | 분석 결과 |" in markdown
     assert "CognitiveComplexity" in markdown
     assert "5 → 15" in markdown
     assert "#### 리뷰 의견" in markdown
-    assert "관련 정적 신호:" in markdown
+    assert "관련 정적 분석 경고:" in markdown
     assert "https://github.com/owner/repo/blob/" + "b" * 40 in markdown
     assert "#L10-L20" in markdown
     assert "<details>" in markdown
@@ -214,7 +214,7 @@ def test_markdown_formatter_does_not_promote_unadopted_metric_signals() -> None:
     result = replace(result, analysis=replace(result.analysis, signals=(*result.analysis.signals, unrelated)))
     markdown = format_review_markdown(result, task)
     assert "hidden_metric" not in markdown
-    assert "| 검토 대상으로 선택한 신호 | 1건 |" in markdown
+    assert markdown.count('<a id="signal-sig-1">') == 1
 
 
 def test_markdown_formatter_includes_change_relevant_existing_finding() -> None:
@@ -222,7 +222,7 @@ def test_markdown_formatter_includes_change_relevant_existing_finding() -> None:
     signal = replace(task.signals[0].signal, change="existing")
     task = replace(task, signals=(SelectedSignal(signal, "context", "Existing but changed path"),))
     markdown = format_review_markdown(result, task)
-    assert "existing" in markdown and "| 검토 대상으로 선택한 신호 | 1건 |" in markdown
+    assert "**기존**" in markdown and markdown.count('<a id="signal-sig-1">') == 1
 
 
 def test_markdown_formatter_non_comparable_delta_retains_analysis_limit() -> None:
@@ -258,7 +258,7 @@ def test_markdown_formatter_grounded_citations_and_escaping() -> None:
     assert "<summary>인용 원문</summary>" in markdown
     assert "<pre><code>" in markdown and "</code></pre>" in markdown
     assert "@\u200badmin" in markdown and "&lt;b&gt;bold&lt;/b&gt;" in markdown
-    assert markdown.count("<details>") == markdown.count("</details>")
+    assert len(re.findall(r"<details(?: open)?>", markdown)) == markdown.count("</details>")
 
 
 def test_markdown_formatter_no_findings_is_scoped_and_short() -> None:
@@ -280,9 +280,9 @@ def test_markdown_formatter_cpd_retains_all_duplicate_locations() -> None:
     signal = replace(task.signals[0].signal, tool="cpd", head_findings=(duplication,), measurements=())
     task = replace(task, signals=(SelectedSignal(signal, "review", "Changed duplication"),))
     markdown = format_review_markdown(result, task)
-    assert "<summary>CPD · 변경과 관련된 중복 위치</summary>" in markdown
+    assert "##### 중복 코드 (변경 파일이 포함된 구간)" in markdown
     assert "#L10-L21" in markdown and "Other.java#L30-L41" in markdown
-    assert "12 / 80" in markdown
+    assert "| 12 | 80 |" in markdown
 
 
 def test_markdown_formatter_preserves_measurement_precision() -> None:
@@ -302,7 +302,7 @@ def test_markdown_formatter_templates_reorder_whole_sections_without_execution()
     markdown = format_review_markdown(result, task, comment_template="<script>@admin</script>\n{{llm_review}}\n{{summary}}\n{{static_analysis}}")
     assert markdown.splitlines()[0] == "<!-- review-bot:architecture:v1 -->"
     assert "&lt;script&gt;@\u200badmin&lt;/script&gt;" in markdown
-    assert markdown.index("#### 리뷰 의견") < markdown.index("#### 전체 판단") < markdown.index("#### 정적 분석")
+    assert markdown.index("#### 리뷰 의견") < markdown.index("#### 전체 판단") < markdown.index("#### PMD/CPD 분석 결과")
     for invalid in ("{{summary}}", "{{summary}}{{summary}}{{static_analysis}}{{llm_review}}", "{{summary}}{{static_analysis}}{{llm_review}}{{danger}}"):
         with pytest.raises(ValueError, match="invalid_comment_template"):
             format_review_markdown(result, task, comment_template=invalid)
