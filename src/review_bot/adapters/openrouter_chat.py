@@ -113,6 +113,9 @@ def review_wire_payload(request: ModelRequest, *, reasoning_max_tokens: int | No
 class OpenRouterReviewClient:
     """Validation-phase review LLM; one generation per complete, never metered."""
 
+    def set_cancellation_callback(self, callback) -> None:
+        self.request_cancelled = callback
+
     def __init__(self, model: str = REVIEW_MODEL, *, api_key: str = "",
             origin: str | None = None, timeout_seconds: int = 60,
             max_output_bytes: int = 32768, max_attempts: int = 1,

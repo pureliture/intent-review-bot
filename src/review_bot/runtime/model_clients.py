@@ -24,6 +24,7 @@ from review_bot.adapters.openrouter_decisions import (
     OpenRouterDecisionClient,
 )
 from review_bot.adapters.openrouter_chat import REVIEW_MODEL as OPENROUTER_REVIEW_MODEL_DEFAULT
+from review_bot.adapters.openai_compatible import OPENAI_COMPATIBLE_PROFILE, OpenAICompatibleModelClient
 from review_bot.config import ModelConfig
 from review_bot.ports import ModelClient
 
@@ -33,7 +34,7 @@ MACBOOK_PROFILES = (MACBOOK_LLAMACPP_PROFILE, MACBOOK_GRANITE_PROFILE, BEAM_CLOU
 # under one name, mirroring me707-llamacpp (bonsai review + tev1 selection).
 OPENROUTER_PROFILE = "openrouter"
 OPENROUTER_PROFILES = (OPENROUTER_PROFILE, OPENROUTER_REVIEW_PROFILE, OPENROUTER_DECISION_PROFILE)
-MODEL_PROFILES = (OLLAMA_PROFILE, LLAMACPP_PROFILE, *MACBOOK_PROFILES, *OPENROUTER_PROFILES)
+MODEL_PROFILES = (OPENAI_COMPATIBLE_PROFILE, OLLAMA_PROFILE, LLAMACPP_PROFILE, *MACBOOK_PROFILES, *OPENROUTER_PROFILES)
 
 
 def _endpoint(variable: str, profile: str = LLAMACPP_PROFILE) -> str:
@@ -69,12 +70,44 @@ def _llama_cpp_hosts() -> tuple[str, ...]:
     return tuple(host.strip() for host in value.split(",")) if value else ()
 
 
+def _configured_chat(role: str, settings: ModelConfig, *, selection: bool = False):
+    prefix = "REVIEW_BOT_" + role.upper() + "_"
+    def integer(name, default=None):
+        text = os.environ.get(prefix + name)
+        if text is None and default is not None:
+            return default
+        if text is None or not text.isascii() or not text.isdecimal() or int(text) <= 0:
+            raise ValueError(prefix + name + " must be a positive integer")
+        return int(text)
+    thinking = os.environ.get(prefix + "ENABLE_THINKING")
+    if thinking is not None and thinking not in ("true", "false"):
+        raise ValueError(prefix + "ENABLE_THINKING must be true or false")
+    review = role == "review"
+    client = OpenAICompatibleModelClient(
+        api_url=_endpoint(prefix + "BASE_URL", OPENAI_COMPATIBLE_PROFILE),
+        model=_endpoint(prefix + "MODEL", OPENAI_COMPATIBLE_PROFILE),
+        api_key=os.environ.get(prefix + "API_KEY", ""),
+        context_tokens=integer("CONTEXT_TOKENS"),
+        input_tokens=integer("INPUT_TOKENS", settings.review_input_tokens if review else settings.decision_input_tokens),
+        output_tokens=integer("OUTPUT_TOKENS", settings.review_output_tokens if review else settings.decision_output_tokens),
+        timeout_seconds=(settings.review_call_timeout_seconds or settings.call_timeout_seconds) if review else settings.call_timeout_seconds,
+        max_output_bytes=min(settings.max_output_bytes, 512) if selection else settings.max_output_bytes,
+        max_attempts=1 if selection else settings.max_attempts,
+        framing_reserve_tokens=settings.framing_reserve_tokens,
+        max_transport_bytes=settings.max_transport_bytes,
+        enable_thinking=None if thinking is None else thinking == "true")
+    client.request_admission = default_model_admission(settings.max_concurrency)
+    return client
+
+
 def build_review_client(profile: str | None, settings: ModelConfig | None = None) -> ModelClient | None:
     if profile is None:
         return None
     if profile not in MODEL_PROFILES:
         raise ValueError("Unsupported model profile")
     settings = settings or ModelConfig()
+    if profile == OPENAI_COMPATIBLE_PROFILE:
+        return _configured_chat("review", settings)
     options = dict(
         timeout_seconds=settings.call_timeout_seconds, max_output_bytes=settings.max_output_bytes,
         max_attempts=settings.max_attempts,
@@ -113,6 +146,8 @@ def build_selector_client(profile: str | None, settings: ModelConfig | None = No
     if profile not in MODEL_PROFILES:
         raise ValueError("Unsupported model profile")
     settings = settings or ModelConfig()
+    if profile == OPENAI_COMPATIBLE_PROFILE:
+        return _configured_chat("selection", settings, selection=True)
     if profile == BEAM_CLOUD_TEV4B_PROFILE:
         from review_bot.adapters.tev4b import MacBookTev4bDecisionClient
         client = MacBookTev4bDecisionClient(
@@ -150,6 +185,11 @@ def build_planning_client(profile: str | None, settings: ModelConfig | None = No
         raise ValueError("Unsupported model profile")
     from review_bot.adapters.intent_planner import LlamaCppPlanClient, MacBookLlamaCppPlanClient
 
+    if profile == OPENAI_COMPATIBLE_PROFILE:
+        if not os.environ.get("REVIEW_BOT_PLANNING_BASE_URL", "").strip():
+            return None
+        return _configured_chat("planning", settings or ModelConfig())
+
     variable = ("MACBOOK_TEV4B_BASE_URL" if profile == BEAM_CLOUD_TEV4B_PROFILE else
         "MACBOOK_TEV1_BASE_URL" if profile in MACBOOK_PROFILES else
         "OPENROUTER_API_KEY" if profile in OPENROUTER_PROFILES else "ME707_TEV1_BASE_URL")
@@ -186,6 +226,8 @@ def build_intent_selection_client(profile: str | None, settings: ModelConfig | N
     """Construct the explicit closed-choice Tev role for single-run intent review."""
     if profile is None:
         return None
+    if profile == OPENAI_COMPATIBLE_PROFILE:
+        return _configured_chat("selection", settings or ModelConfig(), selection=True)
     if profile == OPENROUTER_DECISION_PROFILE:
         raise ValueError("Intent perspective selection needs text generation; openrouter-decision cannot serve it")
     if profile == OPENROUTER_PROFILE:

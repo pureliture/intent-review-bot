@@ -7,6 +7,7 @@ from dataclasses import asdict
 from importlib import resources
 from pathlib import Path
 
+from review_bot.adapters.chat_json import _json_object
 from review_bot.adapters.markdown.formatter import format_review_markdown
 from review_bot.adapters.markdown.intent_formatter import format_intent_markdown
 from review_bot.adapters.llama_cpp_local import LlamaCppModelClient
@@ -31,7 +32,7 @@ from review_bot.config import shared_plan_enabled
 
 
 def _implementation_hash(*functions) -> str:
-    modules = {inspect.getmodule(function) for function in functions}
+    modules = {inspect.getmodule(function) for function in (*functions, _json_object)}
     return hash_json({module.__name__: hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
         for module in modules})
 
@@ -40,8 +41,14 @@ def _profile(client):
     profile = getattr(client, "profile", None)
     if profile is not None and not isinstance(profile, ModelProfile):
         raise ValueError("invalid_model_profile")
-    return {"profile": asdict(profile) if profile is not None else None,
+    result = {"profile": asdict(profile) if profile is not None else None,
         "endpoint": getattr(client, "api_url", None)}
+    identity = getattr(client, "cache_identity", None)
+    if identity is not None:
+        result["adapter_identity"] = identity
+        module = inspect.getmodule(type(client))
+        result["adapter_implementation"] = hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+    return result
 
 
 def architecture_input_fingerprint(snapshot, classification, config, client, *, title: str, body: str,

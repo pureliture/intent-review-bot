@@ -19,12 +19,9 @@ from typing import Any
 
 from review_bot.adapters.github.auth import GitHubAppAuthError
 from review_bot.adapters.github.intent_sources import collect_intent_sources, intent_sources_current
-from review_bot.adapters.llama_cpp_local import LlamaCppModelClient
 from review_bot.adapters.markdown.formatter import format_review_markdown
 from review_bot.adapters.markdown.intent_formatter import format_intent_markdown
-from review_bot.adapters.openrouter_chat import OpenRouterReviewClient
 from review_bot.adapters.model_http import reset_model_request_context, set_model_request_context
-from review_bot.adapters.ollama_local import OllamaModelClient
 from review_bot.application.classification import classify_pr
 from review_bot.application.context import build_task_input
 from review_bot.application.delta import build_delta
@@ -41,6 +38,7 @@ from review_bot.domain.intent_models import IntentReviewLimits
 from review_bot.domain.models_v1 import AnalysisRun, Snapshot
 from review_bot.domain.status import RunStage, RunStatus
 from review_bot.ports import (
+    ModelLifecycle,
     GitHubAuthorizationError,
     GitHubClient,
     JobStore,
@@ -141,14 +139,14 @@ class WorkerLoop:
         self.lease_duration = lease_duration
 
         self._stop_event = stop_event if stop_event is not None else threading.Event()
-        if isinstance(self.intent_selection_client, LlamaCppModelClient):
-            self.intent_selection_client.request_cancelled = self._stop_event.is_set
-        if isinstance(self.model_client, (OllamaModelClient, LlamaCppModelClient, OpenRouterReviewClient)):
-            self.model_client.request_cancelled = self._stop_event.is_set
-        if self._ollama_selector_client is not None:
-            self._ollama_selector_client.request_cancelled = self._stop_event.is_set
-        if isinstance(self.planning_client, LlamaCppModelClient):
-            self.planning_client.request_cancelled = self._stop_event.is_set
+        if isinstance(self.intent_selection_client, ModelLifecycle):
+            self.intent_selection_client.set_cancellation_callback(self._stop_event.is_set)
+        if isinstance(self.model_client, ModelLifecycle):
+            self.model_client.set_cancellation_callback(self._stop_event.is_set)
+        if isinstance(self._ollama_selector_client, ModelLifecycle):
+            self._ollama_selector_client.set_cancellation_callback(self._stop_event.is_set)
+        if isinstance(self.planning_client, ModelLifecycle):
+            self.planning_client.set_cancellation_callback(self._stop_event.is_set)
         self._lease_lost = False
         self._current_run_id: str | None = None
         self._partition_budget_key = None
@@ -177,31 +175,31 @@ class WorkerLoop:
         """Verify and warm explicitly configured local models before taking a job lease."""
         if self._models_prepared:
             return
-        if isinstance(self.model_client, (OllamaModelClient, LlamaCppModelClient, OpenRouterReviewClient)):
+        if isinstance(self.model_client, ModelLifecycle):
             self.model_client.warmup()
         if self._ollama_selector_client is not None:
             self._ollama_selector_client.warmup()
         if shared_plan_enabled(self.config):
             self._prepare_partition_planner()
-            if isinstance(self.planning_client, LlamaCppModelClient):
+            if isinstance(self.planning_client, ModelLifecycle):
                 self.planning_client.warmup()
         elif getattr(getattr(self.config, "intent", None), "pipeline", None) == "perspectives-v1":
             self._prepare_intent_selector()
-            if isinstance(self.intent_selection_client, LlamaCppModelClient):
+            if isinstance(self.intent_selection_client, ModelLifecycle):
                 self.intent_selection_client.warmup()
         self._models_prepared = True
 
     def _prepare_intent_selector(self) -> None:
         if self.intent_selection_client is None:
             self.intent_selection_client = build_intent_selection_client(self.config.model.profile, self.config.model)
-            if isinstance(self.intent_selection_client, LlamaCppModelClient):
-                self.intent_selection_client.request_cancelled = self._stop_event.is_set
+            if isinstance(self.intent_selection_client, ModelLifecycle):
+                self.intent_selection_client.set_cancellation_callback(self._stop_event.is_set)
 
     def _prepare_partition_planner(self) -> None:
         if self.planning_client is None:
             self.planning_client = build_planning_client(self.config.model.profile, self.config.model)
-            if isinstance(self.planning_client, LlamaCppModelClient):
-                self.planning_client.request_cancelled = self._stop_event.is_set
+            if isinstance(self.planning_client, ModelLifecycle):
+                self.planning_client.set_cancellation_callback(self._stop_event.is_set)
         if self.decision_client is None:
             from review_bot.runtime.model_clients import OPENROUTER_PROFILES
             if self.config.model.profile in OPENROUTER_PROFILES:
@@ -1056,8 +1054,8 @@ class WorkerLoop:
         elif code_first:
             if self.planning_client is None and self.model_client is not None:
                 self.planning_client = build_planning_client(self.config.model.profile, self.config.model)
-                if isinstance(self.planning_client, LlamaCppModelClient):
-                    self.planning_client.request_cancelled = self._stop_event.is_set
+                if isinstance(self.planning_client, ModelLifecycle):
+                    self.planning_client.set_cancellation_callback(self._stop_event.is_set)
             input_fingerprint = intent_input_fingerprint(task_input, self.config, self.model_client,
                 planning_client=self.planning_client, decision_client=self.decision_client)
         else:
