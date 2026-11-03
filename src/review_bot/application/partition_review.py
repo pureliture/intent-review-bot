@@ -23,6 +23,9 @@ from review_bot.application import review_fact_check as fact_check
 from review_bot.application.selection import is_gradle_java_path
 from review_bot.application.partition_integration import native_integration_pages, combine_final_pages, reconcile_final_context, has_insufficient_judgement, prior_context_updates
 from review_bot.application.source_citations import citation_spans, citation_catalog, source_blocks, signal_context_spans, referenced_source_spans
+from review_bot.application.citation_reference_aliases import (
+    alias_model_references, restore_model_references, uses_citation_aliases,
+)
 from review_bot.application.review_output_contract import render_output_contract
 from review_bot.application.code_first_intent_review import _original_text, _originals
 from review_bot.application.model_execution import ModelExecutionBudget, model_profile, OUTPUT_RECOVERY_FINAL_RESERVE
@@ -43,7 +46,7 @@ from review_bot.domain.intent_perspectives import PERSPECTIVES
 from review_bot.domain.models_v1 import ModelRequest, Snapshot, TaskInput
 from review_bot.domain.partition_review import PartitionReviewLimits, PartitionReviewResult
 
-PROMPT_VERSION = "partitioned-review/v18-selected-perspectives-code-references"
+PROMPT_VERSION = "partitioned-review/v20-cardinality-boundary-review"
 READABLE_REVIEW_GUIDANCE = """Explain the review to someone who has not read the implementation.
 Lead with the user's situation, what went wrong, what this change does, and the
 review judgement. Use short sentences in the requested language. The summary
@@ -56,6 +59,12 @@ never imply it was executed. Preserve conditions and uncertainty while simplifyi
 Use the display names '아키텍처 리뷰' and '개발 의도 리뷰' in Korean, or
 'architecture review' and 'development intent review' in English. Do not use
 internal mode letters as review names. Do not claim entire-repository approval.
+For operations that retrieve or return collections, check whether the query or caller
+bounds result count and whether the full list reaches a model or user. If source evidence
+shows an unbounded list with a concrete impact on response size, context use, latency, or
+selection burden, consider a specific improvement such as filtering or pagination. Do not
+infer production result counts or call a collection-size concern a defect without evidence
+of a concrete failure.
 """
 MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
@@ -754,6 +763,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         if reason:
             raise Stop(reason)
 
+    model_reference_aliases = {}
+
     def request(stage, payload, schema, current):
         output = current.max_output_tokens
         if stage == "review_partition" and limits.observation_output_tokens is not None:
@@ -767,15 +778,24 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             prompt = _intent_prompt(prompt, meta)
         if stage == "review_partition":
             prompt += REVIEW_GROUNDING_RULE
-        prompt += render_output_contract(schema)
+        model_payload = {"stage": stage, "mode": mode, "language": language, **payload}
+        model_payload, model_schema, aliases = alias_model_references(model_payload, schema)
+        prompt += render_output_contract(model_schema)
+        if aliases:
+            prompt += ("\nCitation reference_id values are short request-local aliases. Return the exact "
+                "alias supplied; the application maps it to the original source reference. "
+                "Do not reconstruct or emit the original identifier.")
         prompt += "\nWrite every prose value in Korean." if language == "ko" else "\nWrite every prose value in English."
-        return ModelRequest(1, current.model, prompt,
-            json.dumps({"stage": stage, "mode": mode, "language": language, **payload},
+        req = ModelRequest(1, current.model, prompt,
+            json.dumps(model_payload,
                 ensure_ascii=False, separators=(",", ":"), allow_nan=False),
-            current.timeout_seconds, output, schema,
+            current.timeout_seconds, output, model_schema,
             reasoning_budget_tokens=(output - OUTPUT_RECOVERY_FINAL_RESERVE
                 if stage in ("fact_check", "fact_rewrite") and output > OUTPUT_RECOVERY_FINAL_RESERVE
                 and getattr(review_client, "supports_bounded_reasoning", False) is True else None))
+        if aliases:
+            model_reference_aliases[id(req)] = aliases
+        return req
 
     def choice_request(stage, state, options, question):
         return ModelRequest(1, planner.model, choices.SYSTEM,
@@ -863,33 +883,45 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         return True
 
     def measure(req, client, current, label, *, for_generation=False):
-        admitted, index = budget.measure(req, client, current, label=label,
-            reserve_calls=0, reserve_tokens=0, generate=for_generation,
-            allow_native_tokenizer=label.split(":", 1)[0] in ("global_review", "fact_check", "fact_rewrite"))
+        try:
+            admitted, index = budget.measure(req, client, current, label=label,
+                reserve_calls=0, reserve_tokens=0, generate=for_generation,
+                allow_native_tokenizer=label.split(":", 1)[0] in ("global_review", "fact_check", "fact_rewrite"))
+        except Exception:
+            model_reference_aliases.pop(id(req), None)
+            raise
         if not admitted:
+            model_reference_aliases.pop(id(req), None)
             if budget.records[index].reason == "input_limit_exceeded":
                 return False
             raise Stop(budget.records[index].reason)
         # Experimental span sizes never impose a second context limit on live
         # planning, observations or final integration. Native profile admission
         # already accounts for the model's output reservation.
+        accepted = True
         if limits.measure_only and limits.input_target_tokens is not None:
             bound = budget.records[index].measured_input_tokens
-            if bound is None:
-                return True
-            return bound <= min(current.max_input_tokens or limits.max_input_tokens,
-                limits.input_target_tokens)
-        return True
+            if bound is not None:
+                accepted = bound <= min(current.max_input_tokens or limits.max_input_tokens,
+                    limits.input_target_tokens)
+        if not accepted or not for_generation:
+            model_reference_aliases.pop(id(req), None)
+        return accepted
 
     def execute(req, client, current, label):
-        if not measure(req, client, current, label + ":admission"):
-            raise Stop("native_request_exceeds_model_limits")
-        raw, index = budget.execute_bounded_output(req, client, current, label=label,
-            reserve_calls=0, reserve_tokens=0,
-            allow_native_tokenizer=label.split(":", 1)[0] in ("global_review", "fact_check", "fact_rewrite"))
+        try:
+            if not measure(req, client, current, label + ":admission", for_generation=True):
+                raise Stop("native_request_exceeds_model_limits")
+            raw, index = budget.execute_bounded_output(req, client, current, label=label,
+                reserve_calls=0, reserve_tokens=0,
+                allow_native_tokenizer=label.split(":", 1)[0] in ("global_review", "fact_check", "fact_rewrite"))
+        except Exception:
+            model_reference_aliases.pop(id(req), None)
+            raise
+        aliases = model_reference_aliases.pop(id(req), {})
         if raw is None:
             raise Stop(budget.records[index].reason)
-        return raw, index
+        return restore_model_references(raw, aliases), index
 
     def span_payload(spans):
         # Audit-only boundary labels must not change native counts after probes.
@@ -1231,6 +1263,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                         measured.update(request_hash=budget.records[index].request_hash,
                             prompt_hash=hash_json(req.system_prompt), schema_hash=hash_json(req.response_schema),
                             timeout_seconds=witness["timeout_seconds"])
+                    model_reference_aliases.pop(id(req), None)
                 event = budget.records[index]
                 if not accepted and (type(event.measured_input_tokens) is not int
                         or event.measured_input_tokens <= min(profile.max_input_tokens or limits.max_input_tokens, limits.max_input_tokens)):
@@ -1576,7 +1609,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             available_rechecks = limits.max_rechecks
             for recheck in range(available_rechecks + 1):
                 request_value = final_request(working, source_spans, previous, retained)
-                context = json.loads(request_value.user_content)["target_reference_context"]
+                context = restore_model_references(json.loads(request_value.user_content)["target_reference_context"],
+                    model_reference_aliases.get(id(request_value), {}))
                 request_context = {"target_reference_context": context,
                     "target_reference_context_hash": hash_json(context)}
                 try:
@@ -2598,9 +2632,18 @@ def _validate_global_review(result, originals, meta):
                 raise PartitionError("stored_review_instructions_invalid")
             if instructions:
                 prompt += "\nRepository review judgment and explanation guidance:\n" + instructions
-            prompt += render_output_contract(schema)
+            model_payload = {"stage": "global_review", "mode": mode, "language": result.language, **payload}
+            if uses_citation_aliases(result.prompt_version):
+                _, model_schema, aliases = alias_model_references(model_payload, schema)
+            else:
+                model_schema, aliases = schema, {}
+            prompt += render_output_contract(model_schema)
+            if aliases:
+                prompt += ("\nCitation reference_id values are short request-local aliases. Return the exact "
+                    "alias supplied; the application maps it to the original source reference. "
+                    "Do not reconstruct or emit the original identifier.")
             prompt += "\nWrite every prose value in Korean." if result.language == "ko" else "\nWrite every prose value in English."
-            if stage.stage != "global_review:" + delivery + ":admission" or stage.prompt_hash != hash_json({"system": prompt, "schema": schema}):
+            if stage.stage != "global_review:" + delivery + ":admission" or stage.prompt_hash != hash_json({"system": prompt, "schema": model_schema}):
                 raise PartitionError("stored_global_request_changed")
             if position < len(measurements) - 1 and stage.reason != "input_limit_exceeded":
                 raise PartitionError("stored_global_unnecessary_focus")
@@ -2615,7 +2658,7 @@ def _validate_global_review(result, originals, meta):
         index = attempt.get("stage_index")
         if type(index) is not int or not measurements[-1] < index < len(result.stages) or (
             result.stages[index].stage not in ("global_review", "global_review:output_recovery")
-            or not result.stages[index].attempts or result.stages[index].prompt_hash != hash_json({"system": prompt, "schema": schema})):
+            or not result.stages[index].attempts or result.stages[index].prompt_hash != hash_json({"system": prompt, "schema": model_schema})):
             raise PartitionError("stored_global_generation_missing")
         raw = attempt["response"]
         try:
@@ -2705,11 +2748,26 @@ def _validate_review_validation_history(result, known_units, originals, meta):
             keys = _intent_ids(partition) if result.review_type == "B" else [d["target_id"] for d in _relevant_targets(sources, meta)]
             request_packet = item["request"]
             payload = json.loads(request_packet["user_content"])
+            expected_previous = None
+            if prior:
+                old_item, old_payload = prior
+                rejection = rejected_by_stage.get(old_item["stage_index"])
+                if rejection is None or partition["identity"]["limits"]["max_rechecks"] < 1:
+                    raise ValueError
+                expected_previous = {"rejected_response": rejection["response"],
+                    "validation_error": rejection["reason"]}
             anchors = ([] if partition.get("consumer_admission_contract") == CONSUMER_ADMISSION_CONTRACT else
                 [citation for row in notes if row["stage_index"] < index for citation in row["citations"]])
-            if (payload["originals"] != source_blocks([span for span in sources if span.kind != "pr_text"], originals)
-                    or payload["pr_purpose"] != source_blocks([span for span in sources if span.kind == "pr_text"], originals)
-                    or payload["citation_catalog"] != citation_catalog(sources, originals, anchors)):
+            expected_payload, schema = _review_observation_spec(sources, list(originals.values()), meta,
+                partition["operator_selected_mode"], previous=expected_previous, anchors=anchors)
+            expected_content = {"stage": "review_partition", "mode": partition["operator_selected_mode"],
+                "language": result.language, **expected_payload}
+            model_payload = (alias_model_references(expected_content, schema)[0]
+                if uses_citation_aliases(result.prompt_version) else expected_content)
+            if (payload.get("originals") != model_payload["originals"]
+                    or payload.get("pr_purpose") != model_payload["pr_purpose"]
+                    or payload.get("citation_catalog") != model_payload["citation_catalog"]
+                    or payload.get("source_recheck") != model_payload.get("source_recheck")):
                 raise ValueError
             suffix = ":validation_recheck" if prior else ""
             expected_stage = f"review_partition:G{group_index + 1}" + suffix
@@ -2718,19 +2776,11 @@ def _validate_review_validation_history(result, known_units, originals, meta):
                     or payload["stage"] != "review_partition" or payload["draft_assessment_keys"] != list(keys)):
                 raise ValueError
             if prior:
-                old_item, old_payload = prior
-                rejection = rejected_by_stage.get(old_item["stage_index"])
-                if rejection is None or partition["identity"]["limits"]["max_rechecks"] < 1:
-                    raise ValueError
-                expected_previous = {"rejected_response": rejection["response"], "validation_error": rejection["reason"]}
-                restored = dict(payload)
-                if restored.pop("source_recheck", None) != expected_previous or restored != old_payload:
-                    raise ValueError
                 old_request = old_item["request"]
+                if "source_recheck" in old_payload:
+                    raise ValueError
                 if any(request_packet[field] != old_request[field] for field in
                         ("system_prompt", "response_schema", "model", "max_output_tokens")):
-                    raise ValueError
-                if "source_recheck" in old_payload:
                     raise ValueError
             elif "source_recheck" in payload:
                 raise ValueError
@@ -2852,12 +2902,22 @@ def _validate_consumer_delivery(result, originals, meta, known_units):
         prompt = OBSERVE_PROMPT + guidance + (PMD_METRIC_REFERENCE if mode == "architecture" else "")
         if mode == "intent":
             prompt = _intent_prompt(prompt, admission_meta)
-        prompt += REVIEW_GROUNDING_RULE + render_output_contract(schema)
+        prompt += REVIEW_GROUNDING_RULE
+        model_payload = {"stage": "review_partition", "mode": mode, "language": result.language, **payload}
+        if uses_citation_aliases(result.prompt_version):
+            model_payload, model_schema, aliases = alias_model_references(model_payload, schema)
+        else:
+            model_schema, aliases = schema, {}
+        prompt += render_output_contract(model_schema)
+        if aliases:
+            prompt += ("\nCitation reference_id values are short request-local aliases. Return the exact "
+                "alias supplied; the application maps it to the original source reference. "
+                "Do not reconstruct or emit the original identifier.")
         prompt += "\nWrite every prose value in Korean." if result.language == "ko" else "\nWrite every prose value in English."
         output = min(profile.max_output_tokens, limits.observation_output_tokens) if limits.observation_output_tokens is not None else profile.max_output_tokens
         expected = asdict(ModelRequest(1, profile.model, prompt,
-            json.dumps({"stage": "review_partition", "mode": mode, "language": result.language, **payload},
-                ensure_ascii=False, separators=(",", ":"), allow_nan=False), profile.timeout_seconds, output, schema))
+            json.dumps(model_payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
+            profile.timeout_seconds, output, model_schema))
         timeout = item.get("timeout_seconds")
         if type(timeout) is not int or not 0 < timeout <= expected["timeout_seconds"]:
             raise PartitionError("stored_consumer_timeout_changed")
