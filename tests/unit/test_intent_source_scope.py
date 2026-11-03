@@ -190,3 +190,87 @@ def test_architecture_refits_full_signal_source_after_a_narrow_common_plan():
     validate_partition_result(result, architecture)
     assert any("int other()" in request.user_content
         for request in review.requests if json.loads(request.user_content)["stage"] == "review_partition")
+
+
+def test_one_hop_dependency_collection_and_unresolved_reference_boundaries():
+    import hashlib
+    from unittest.mock import Mock
+    from review_bot.application.intent_source_scope import discover_one_hop_dependency_paths
+    from review_bot.application.snapshot import collect_snapshot_material
+    from review_bot.domain.models_v1 import CodeFile
+    from review_bot.ports import MergeBaseResult, RepositoryReader
+
+    base_service = (
+        "package com.example.order;\n"
+        "import com.example.payment.PaymentValidator;\n"
+        "public class OrderService {\n"
+        "    public boolean process(String id) {\n"
+        "        return true;\n"
+        "    }\n"
+        "}\n"
+    )
+    head_service = (
+        "package com.example.order;\n"
+        "import com.example.payment.PaymentValidator;\n"
+        "public class OrderService {\n"
+        "    public boolean process(String id) {\n"
+        "        OrderHelper.audit(id);\n"
+        "        ExternalGateway.send(id);\n"
+        "        return PaymentValidator.validate(id);\n"
+        "    }\n"
+        "}\n"
+    )
+    validator_code = (
+        "package com.example.payment;\n"
+        "public class PaymentValidator {\n"
+        "    public static boolean validate(String id) { return id != null; }\n"
+        "}\n"
+    )
+    helper_code = (
+        "package com.example.order;\n"
+        "public class OrderHelper {\n"
+        "    public static void audit(String id) {}\n"
+        "}\n"
+    )
+    svc_path = "src/main/java/com/example/order/OrderService.java"
+    val_path = "src/main/java/com/example/payment/PaymentValidator.java"
+    hlp_path = "src/main/java/com/example/order/OrderHelper.java"
+
+    candidates = discover_one_hop_dependency_paths(
+        (ChangedFile(svc_path),),
+        (CodeFile(svc_path, base_service, hashlib.sha256(base_service.encode()).hexdigest(), "source"),),
+        (CodeFile(svc_path, head_service, hashlib.sha256(head_service.encode()).hexdigest(), "source"),),
+    )
+    assert val_path in candidates
+    assert hlp_path in candidates
+
+    repo_blobs = {
+        svc_path: head_service.encode(),
+        val_path: validator_code.encode(),
+        hlp_path: helper_code.encode(),
+    }
+    reader = Mock(spec=RepositoryReader)
+    reader.resolve_merge_base.return_value = MergeBaseResult("a" * 40, "a" * 40, "comparable")
+    reader.get_changed_files.return_value = (ChangedFile(svc_path),)
+    reader.get_rename_map.return_value = {}
+    reader.read_tree_blobs.side_effect = lambda sha, *, paths: {
+        p: (base_service.encode() if sha == "a" * 40 and p == svc_path else repo_blobs[p])
+        for p in paths if p in repo_blobs
+    }
+    material = collect_snapshot_material(reader, "a" * 40, "b" * 40)
+    head_paths = {f.path for f in material.head.files}
+    assert {svc_path, val_path, hlp_path} <= head_paths
+
+    originals = [
+        SourceOriginal("S-base", base_service, "source", svc_path, "base", "a" * 40),
+        SourceOriginal("S-head", head_service, "source", svc_path, "head", "b" * 40),
+        SourceOriginal("S-val", validator_code, "context_source", val_path, "head", "b" * 40),
+        SourceOriginal("S-hlp", helper_code, "context_source", hlp_path, "head", "b" * 40),
+    ]
+    scope = build_source_scope(originals, [ChangedFile(svc_path)])
+    assert "validate(String id)" in selected(originals[2], scope)
+    assert "audit(String id)" in selected(originals[3], scope)
+    assert any(
+        item["symbol"] == "ExternalGateway" and item["reason"] == "outside_fixed_corpus"
+        for item in scope.get("unresolved_references", [])
+    )

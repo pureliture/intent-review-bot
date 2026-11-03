@@ -545,7 +545,7 @@ class WorkerLoop:
                     artifacts.write_json("repository-settings.json", self._repository_settings)
                     paths = tuple(sorted({f.path for c in (material.base, material.head) for f in c.files}))
                     planning_task = build_intent_task_input(review_snap, material.base, material.head,
-                        related_paths=tuple(sorted(set(paths) | set(self.config.intent.context_paths))))
+                        related_paths=tuple(self.config.intent.context_paths), context_paths=paths)
                     artifacts.write_json("planning-input.json", planning_task)
                     self._prepare_partition_planner()
                     self._generation_keys["planning"] = shared_review_generation_key(planning_task, self.config,
@@ -1036,8 +1036,10 @@ class WorkerLoop:
             raise _ModeFailure("intent_material_unavailable")
         if artifacts is None:
             raise _ModeFailure("artifact_root_required")
+        extra_paths = tuple(sorted({f.path for c in (material.base, material.head) for f in c.files}))
         task_input = self._partition_task if shared_plan_enabled(self.config) else build_intent_task_input(
-            review_snap, material.base, material.head, related_paths=tuple(self.config.intent.context_paths))
+            review_snap, material.base, material.head,
+            related_paths=tuple(self.config.intent.context_paths), context_paths=extra_paths)
         if task_input is None:
             raise _ModeFailure("partition_plan_input_unavailable")
         marker = self.config.publish.b_marker

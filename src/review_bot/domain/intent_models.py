@@ -8,6 +8,9 @@ from .envelope_v2 import ReviewSnapshot
 from .models_v1 import CodeSnapshot
 
 
+INTENT_TASK_INPUT_SCHEMA_VERSION = 2
+
+
 @dataclass(frozen=True)
 class IntentTaskInput:
     schema_version: int
@@ -16,6 +19,7 @@ class IntentTaskInput:
     head: CodeSnapshot
     reviewed_paths: tuple[str, ...]
     input_hash: str
+    context_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

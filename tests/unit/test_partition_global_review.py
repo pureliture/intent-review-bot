@@ -14,6 +14,29 @@ from tests.fixtures.intent_perspectives import make_task
 from tests.fixtures.partition_review import PartitionModelClient
 
 
+def _without_reference_ids(value):
+    if isinstance(value, dict):
+        return {key: ("<reference>" if key == "reference_id" and isinstance(child, str)
+            else _without_reference_ids(child)) for key, child in value.items()
+            if key not in {"raw_response_hash", "response_hash", "prior_response_hash",
+                "original_check_response_hash", "checker_response_hash"}}
+    if isinstance(value, list):
+        return [_without_reference_ids(child) for child in value]
+    return value
+
+
+def _reference_ids(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "reference_id" and isinstance(child, str):
+                yield child
+            else:
+                yield from _reference_ids(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _reference_ids(child)
+
+
 def _run(*, transform=None, planning_transform=None, full_fits=False, focused_fits=True, max_calls=128, output_cap=512):
     def count(request):
         payload = json.loads(request.user_content)
@@ -66,7 +89,8 @@ def test_bare_global_gap_gets_closed_tev_source_plan_and_original_preserving_rec
     original = next(o for o in prepare_originals(task, "intent")[0]
         if o.path == "src/value.py" and o.version == "head")
     assert plan["requests"][0]["evidence_id"] == original.evidence_id
-    assert calls[1]["recheck"]["prior_response"] == attempts[0]["response"]
+    assert _without_reference_ids(calls[1]["recheck"]["prior_response"]) == _without_reference_ids(attempts[0]["response"])
+    assert all(ref.startswith(("R", "X")) and ref[1:].isdigit() for ref in _reference_ids(calls[1]["recheck"]["prior_response"]))
     assert attempts[0]["response"]["source_requests"] == []
     assert "".join(b["text"] for b in calls[1]["requested_originals"][0]["blocks"]) == original.text
     assert all("state" not in receipt for receipt in calls[1]["recheck"]["source_delivery_plan"]["decision_receipts"])
@@ -192,8 +216,9 @@ def test_all_original_page_responses_and_every_nested_cited_byte_reach_global_mo
     wire = next(json.loads(r.user_content) for r in client.requests if json.loads(r.user_content)["stage"] == "global_review")
     assert len(pages) == len(wire["observations"]) > 1
     for page, row in zip(pages, wire["observations"]):
-        assert row["raw_response"] == page["response"]
-        assert row["raw_response_hash"] == hash_json(page["response"])
+        assert _without_reference_ids(row["raw_response"]) == _without_reference_ids(page["response"])
+        assert row["raw_response_hash"] == hash_json(row["raw_response"])
+        assert all(ref.startswith(("R", "X")) and ref[1:].isdigit() for ref in _reference_ids(row["raw_response"]))
     known = {o.evidence_id: o for o in prepare_originals(task, "intent")[0]}
     refs = {}
     for source in wire["citation_catalog"]:
@@ -370,7 +395,8 @@ def test_global_correction_retains_the_entire_rejected_response():
     assert result.status == "completed", result.reason
     attempts = result.partition["global_review"]["attempts"]
     assert len(attempts) == 2
-    assert calls[1]["recheck"]["rejected_response"] == attempts[0]["response"]
+    assert _without_reference_ids(calls[1]["recheck"]["rejected_response"]) == _without_reference_ids(attempts[0]["response"])
+    assert all(ref.startswith(("R", "X")) and ref[1:].isdigit() for ref in _reference_ids(calls[1]["recheck"]["rejected_response"]))
     assert attempts[0]["validation_error"]
     validate_partition_result(result, task)
 
@@ -388,7 +414,8 @@ def test_global_fixed_original_recheck_retains_previous_response_and_exact_sourc
     assert result.status == "completed", result.reason
     attempts = result.partition["global_review"]["attempts"]
     assert len(attempts) == len(calls) == 2
-    assert calls[1]["recheck"] == attempts[0]["response"]
+    assert _without_reference_ids(calls[1]["recheck"]) == _without_reference_ids(attempts[0]["response"])
+    assert all(ref.startswith(("R", "X")) and ref[1:].isdigit() for ref in _reference_ids(calls[1]["recheck"]))
     requested = attempts[0]["response"]["source_requests"][0]["evidence_id"]
     source = next(o for o in prepare_originals(task, "intent")[0] if o.evidence_id == requested)
     assert len(calls[1]["requested_originals"]) == 1

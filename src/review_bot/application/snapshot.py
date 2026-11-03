@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from review_bot.application.classification import classify_pr
 from review_bot.application.context import hash_json
 from review_bot.application.intent_context import collect_intent_code_snapshot, validate_intent_context_paths
+from review_bot.application.intent_source_scope import MAX_DEPENDENCY_FILES, discover_one_hop_dependency_paths
 from review_bot.application.selection import (
     DeadlineModeSelector, LightweightModeSelector, constrain_architecture_to_java_gradle, select_modes,
 )
@@ -78,6 +79,50 @@ def collect_snapshot_material(
         gate()
         head = collect_intent_code_snapshot(repo_reader, head_sha, paths)
         gate()
+        dep_candidates = discover_one_hop_dependency_paths(
+            changed, base.files, head.files, existing_paths=paths, max_files=MAX_DEPENDENCY_FILES,
+        )
+        if dep_candidates:
+            gate()
+            dep_head = collect_intent_code_snapshot(repo_reader, head_sha, dep_candidates)
+            gate()
+            dep_base = collect_intent_code_snapshot(repo_reader, merge_base.comparison_base_sha, dep_candidates)
+            gate()
+            excluded_dep = {item.path for item in (*dep_head.exclusions, *dep_base.exclusions)}
+            head_by_path = {f.path: f for f in dep_head.files if f.path not in excluded_dep and f.kind != "build"}
+            base_by_path = {f.path: f for f in dep_base.files if f.path not in excluded_dep and f.kind != "build"}
+            admitted_deps: list[str] = []
+            dep_bytes = 0
+            for candidate in dep_candidates:
+                if candidate not in head_by_path and candidate not in base_by_path:
+                    continue
+                size = sum(
+                    len(mapping[candidate].content.encode("utf-8"))
+                    for mapping in (head_by_path, base_by_path)
+                    if candidate in mapping
+                )
+                if len(admitted_deps) >= MAX_DEPENDENCY_FILES or dep_bytes + size > 512 * 1024:
+                    break
+                admitted_deps.append(candidate)
+                dep_bytes += size
+            if admitted_deps:
+                admitted_set = set(admitted_deps)
+                merged_base_files = tuple(sorted(
+                    (*base.files, *(f for p, f in base_by_path.items() if p in admitted_set)),
+                    key=lambda f: f.path,
+                ))
+                merged_head_files = tuple(sorted(
+                    (*head.files, *(f for p, f in head_by_path.items() if p in admitted_set)),
+                    key=lambda f: f.path,
+                ))
+                base_inv = hashlib.sha256(
+                    ":".join(f"{f.path}:{f.content_hash}" for f in merged_base_files).encode()
+                ).hexdigest()
+                head_inv = hashlib.sha256(
+                    ":".join(f"{f.path}:{f.content_hash}" for f in merged_head_files).encode()
+                ).hexdigest()
+                base = CodeSnapshot(base.sha, merged_base_files, base.exclusions, base_inv, base.complete, base.errors)
+                head = CodeSnapshot(head.sha, merged_head_files, head.exclusions, head_inv, head.complete, head.errors)
     stable_evidence = []
     for item in evidence:
         value = asdict(item)
