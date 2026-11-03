@@ -145,6 +145,22 @@ class ModelClient(Protocol):
 
 
 @runtime_checkable
+class ModelLifecycle(Protocol):
+    """Optional runtime preparation/cancellation; independent of provider class."""
+
+    def warmup(self) -> None: ...
+
+    def set_cancellation_callback(self, callback: Callable[[], bool]) -> None: ...
+
+
+@runtime_checkable
+class ModelInputAdmission(Protocol):
+    """Optional local input bound. No generation is allowed for measurement."""
+
+    def admission_bytes(self, request: ModelRequest) -> int | None: ...
+
+
+@runtime_checkable
 class JobStore(Protocol):
     """Port for durable job queue, webhook deduplication, PR generation coalescing, and leasing."""
 

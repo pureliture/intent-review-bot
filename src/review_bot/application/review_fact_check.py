@@ -1354,6 +1354,9 @@ def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources
 
 def validate(result, originals, meta):
     """Replay factual decisions, corrections, source delivery and final assembly."""
+    from review_bot.application.citation_reference_aliases import (
+        alias_model_references, uses_citation_aliases,
+    )
     from review_bot.application.review_output_contract import render_output_contract
     ledger = result.partition.get("fact_verification", {})
     original = result.partition.get("pre_verification_final")
@@ -1422,10 +1425,19 @@ def validate(result, originals, meta):
             payload, schema, refs, spans = request_spec(stage, packet_rows, original, originals, meta,
                 kind=kind, extra=extra, ranges=ranges, whole_claim=record.get("whole_claim_discovery"),
                 protocol_version=protocol_version)
-            prompt = prompt_for(stage, protocol_version) + render_output_contract(schema)
+            model_payload = {"stage": stage, "mode": mode, "language": result.language, **payload}
+            if uses_citation_aliases(result.prompt_version):
+                _, model_schema, aliases = alias_model_references(model_payload, schema)
+            else:
+                model_schema, aliases = schema, {}
+            prompt = prompt_for(stage, protocol_version) + render_output_contract(model_schema)
+            if aliases:
+                prompt += ("\nCitation reference_id values are short request-local aliases. Return the exact "
+                    "alias supplied; the application maps it to the original source reference. "
+                    "Do not reconstruct or emit the original identifier.")
             prompt += "\nWrite every prose value in Korean." if result.language == "ko" else "\nWrite every prose value in English."
             event = result.stages[index]
-            if event.stage != stage + ":" + kind + ":admission" or event.prompt_hash != hash_json({"system": prompt, "schema": schema}):
+            if event.stage != stage + ":" + kind + ":admission" or event.prompt_hash != hash_json({"system": prompt, "schema": model_schema}):
                 raise PartitionError("stored_fact_request_changed")
             capacity = next((item for item in result.partition.get("native_capacity_rejections", [])
                 if item["stage_index"] == index), None)
@@ -1455,7 +1467,7 @@ def validate(result, originals, meta):
                 rejected = [item for item in result.partition.get("rejected_model_outputs", []) if item["stage_index"] == failed_index]
                 output_limit = result.partition["identity"]["models"]["review"]["max_output_tokens"]
                 if (failed.reason != "model_output_limit" or failed.stage not in (stage, stage + ":output_recovery") or
-                        failed.prompt_hash != hash_json({"system": prompt, "schema": schema}) or not failed.attempts or not rejected or
+                        failed.prompt_hash != hash_json({"system": prompt, "schema": model_schema}) or not failed.attempts or not rejected or
                         any(attempt.delivery != "sent" or attempt.reason != "model_output_limit" or attempt.usage is None or
                             attempt.usage["output_tokens"] != output_limit for attempt in failed.attempts) or
                         failure.get("attempt_request_hashes") != [attempt.request_hash for attempt in failed.attempts] or
@@ -1568,7 +1580,7 @@ def validate(result, originals, meta):
             if type(event_index) is not int or not index < event_index < len(result.stages):
                 raise PartitionError("stored_fact_generation_missing")
             event = result.stages[event_index]
-            if event.stage not in (stage, stage + ":output_recovery") or not event.attempts or event.prompt_hash != hash_json({"system": prompt, "schema": schema}):
+            if event.stage not in (stage, stage + ":output_recovery") or not event.attempts or event.prompt_hash != hash_json({"system": prompt, "schema": model_schema}):
                 raise PartitionError("stored_fact_generation_changed")
             try:
                 cites = response_citations(record["response"], refs)

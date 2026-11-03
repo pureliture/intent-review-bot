@@ -463,3 +463,50 @@ Quit and reopen the existing Ollama app after setting them. They affect all mode
 - Budgets are operator config, no redeploy: `ModelConfig` fields `review_input_tokens=98394`, `review_output_tokens=32678`, `decision_input_tokens=126976`, `decision_output_tokens=4096`, `framing_reserve_tokens=8192`, `max_transport_bytes=16777216`, `require_token_count=False` (retired). Model IDs via env (`OPENROUTER_REVIEW_MODEL`, `OPENROUTER_DECISION_MODEL`, `OPENROUTER_API_KEY`).
 
 These are implementation and configuration contracts. The current commit's live PR, semantic quality and actual App publication evidence remain separate from synthetic adapter checks.
+
+### 설정으로 교체하는 OpenAI 호환 모델 서버
+
+`model.profile: openai-compatible` 또는 CLI `--model-profile openai-compatible`을 명시하면,
+역할별 연결을 운영자 환경변수에서 구성한다. 생성자와 `warmup()`은 네트워크나 생성을 실행하지 않는다.
+서버의 브랜드, 슬롯 수, `/props`, 모델 카탈로그, `/apply-template`, `/tokenize`는 요구하지 않는다.
+실제 요청은 설정한 base URL의 `/chat/completions` 하나를 사용하고, 응답의 모델 ID·JSON 본문·종료 사유·사용량을 검증한다.
+준비 성공은 실제 서버의 구조화 출력 지원을 검증했다는 의미가 아니다.
+
+| 환경변수 접두사 | 역할 |
+| --- | --- |
+| `REVIEW_BOT_REVIEW_` | 주 리뷰 |
+| `REVIEW_BOT_PLANNING_` | 공통 계획·계획 내부 선택 |
+| `REVIEW_BOT_SELECTION_` | 별도 모드·관점 선택을 사용하는 경로 |
+
+각 역할에 `BASE_URL`, `MODEL`, `CONTEXT_TOKENS`를 설정한다. `API_KEY`는 선택적인 Bearer 인증키다.
+`INPUT_TOKENS`, `OUTPUT_TOKENS`는 선택적인 앱 예산이며 생략하면 기존 `ModelConfig`의 역할별 한도를 따른다.
+CONTEXT_TOKENS는 운영자가 확인해 지정한 서버 용량이며 자동 탐지한 값이 아니다.
+서버 컨텍스트를 크게 설정해도 앱 예산은 자동으로 증가하지 않는다. 앱 입력·출력 예산 합계는 서버 컨텍스트 이하여야 한다.
+`ENABLE_THINKING`은 해당 서버가 `chat_template_kwargs.enable_thinking`을 지원할 때만 `true` 또는 `false`로 명시한다.
+미설정이면 서버 전용 추론 필드를 보내지 않는다. 자동 공급자·모델·역할 fallback은 없다.
+
+```bash
+# model.profile: openai-compatible 또는 CLI --model-profile openai-compatible
+export REVIEW_BOT_REVIEW_BASE_URL="http://<review-host>:11435/v1"
+export REVIEW_BOT_REVIEW_MODEL="qwen3.8-flash-next-iq3_xxs"
+export REVIEW_BOT_REVIEW_CONTEXT_TOKENS=262144
+# 기본 앱 예산: input 98394 / output 32678
+export REVIEW_BOT_PLANNING_BASE_URL="http://<planning-host>:11437/v1"
+export REVIEW_BOT_PLANNING_MODEL="tev1-4b-q8_0"
+export REVIEW_BOT_PLANNING_CONTEXT_TOKENS=131072
+export REVIEW_BOT_PLANNING_ENABLE_THINKING=false
+# 별도 선택 경로를 사용할 때는 SELECTION 역할도 명시적으로 구성한다.
+```
+
+설정은 대상 PR의 저장소 설정 파일이 아닌 운영 프로세스 환경에서만 읽는다.
+주소에는 사용자명·암호·query·fragment를 넣을 수 없다. 인증키와 원격 오류 본문은 결과나 예외 메시지에 기록하지 않는다.
+프록시 환경을 상속하거나 HTTP redirect를 따르지 않으며 TLS 인증서 검증을 유지한다.
+
+입력 검사는 전체 전송 JSON 바이트와 framing reserve를 이용한 보수적인 기존 상한이다.
+네이티브 토크나이저 API가 없는 서버에 임의로 측정 요청을 보내거나 한도를 느슨하게 하지 않는다.
+상한을 넘으면 기존 분할·미완료 처리로 연결된다. 따라서 다른 서버에서 동일 PR이 반드시 완료된다고 보장하지 않는다.
+잘린 출력과 사용량 불명은 성공으로 바꾸지 않는다. 기존 SQLite admission, 작업 deadline, 취소 처리를 함께 사용한다.
+
+모델·주소·입출력 예산·전송 옵션은 재사용 식별에 반영한다. API 키는 식별 자료에 포함하지 않는다.
+역할 설정을 바꾼 뒤에는 프로세스를 다시 시작해 새 클라이언트를 구성한다.
+기존 `me707-llamacpp`, Ollama, OpenRouter 프로필의 서버별 검증 계약은 그대로 유지한다.

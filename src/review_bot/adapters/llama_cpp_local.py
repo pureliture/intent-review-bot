@@ -18,6 +18,8 @@ from review_bot.adapters.model_http import mark_model_request_sent, model_reques
 from review_bot.application.architecture_review import ModelProfile, PermanentModelError, TransientModelError, ModelOutputLimitError
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
 
+from review_bot.adapters.chat_json import _encode, _json_object, _check_output_fields, _count
+
 LLAMACPP_PROFILE = "me707-llamacpp"
 REVIEW_MODEL = "bonsai2-27b"
 OUTPUT_RECOVERY_MESSAGE = "The reasoning budget is exhausted. Finish the complete schema JSON now using the supplied originals and citations."
@@ -30,64 +32,6 @@ _SELECTOR_OUTPUT_TOKENS = 64
 _MAX_INPUT_BYTES = 16 * 1024 * 1024
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _MAX_SELECTOR_OUTPUT_BYTES = 4096
-
-
-def _encode(value: Any) -> bytes:
-    try:
-        return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
-    except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
-        raise PermanentModelError("Invalid llama.cpp request JSON") from None
-
-
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("Duplicate JSON key")
-        result[key] = value
-    return result
-
-
-def _nonfinite(value: str) -> None:
-    raise ValueError("Non-finite JSON number")
-
-
-def _finite_float(value: str) -> float:
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError("Non-finite JSON number")
-    return result
-
-
-def _check_json_strings(value: Any) -> None:
-    if isinstance(value, str):
-        value.encode("utf-8")
-    elif isinstance(value, dict):
-        for key, child in value.items():
-            key.encode("utf-8")
-            _check_json_strings(child)
-    elif isinstance(value, list):
-        for child in value:
-            _check_json_strings(child)
-
-
-def _json_object(value: bytes | str) -> dict[str, Any]:
-    try:
-        text = value.decode("utf-8") if isinstance(value, bytes) else value
-        text.encode("utf-8")
-        result = json.loads(text, object_pairs_hook=_unique_object, parse_constant=_nonfinite, parse_float=_finite_float)
-        if not isinstance(result, dict):
-            raise ValueError("Expected JSON object")
-        _check_json_strings(result)
-        return result
-    except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
-        raise PermanentModelError("Invalid llama.cpp response JSON") from None
-
-
-def _count(value: Any) -> int:
-    if type(value) is not int or value < 0:
-        raise PermanentModelError("Invalid llama.cpp token count")
-    return value
 
 
 def _positive_integer(value: Any) -> bool:
@@ -151,24 +95,11 @@ def _endpoint(api_url: str, allowed_hosts: tuple[str, ...] | list[str] = ()) -> 
         raise ValueError(message) from None
 
 
-def _check_output_fields(value: Any, schema: Any) -> None:
-    if not isinstance(schema, dict):
-        return
-    if isinstance(value, dict):
-        properties = schema.get("properties", {})
-        if not isinstance(properties, dict):
-            raise PermanentModelError("Invalid llama.cpp output schema")
-        if schema.get("additionalProperties") is False and set(value) - set(properties):
-            raise PermanentModelError("Unexpected llama.cpp model output fields")
-        for key, child in value.items():
-            _check_output_fields(child, properties.get(key))
-    elif isinstance(value, list):
-        for child in value:
-            _check_output_fields(child, schema.get("items"))
-
-
 class _LlamaCppClient:
     _server_generation_slots = 2
+
+    def set_cancellation_callback(self, callback) -> None:
+        self.request_cancelled = callback
 
     def __init__(
         self, model: str, api_url: str, timeout_seconds: int, *, role_model: str,

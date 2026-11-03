@@ -38,6 +38,9 @@ def _count(value: Any) -> int:
 
 
 class _LocalOllamaClient:
+    def set_cancellation_callback(self, callback) -> None:
+        self.request_cancelled = callback
+
     def __init__(self, model: str, api_url: str, timeout_seconds: int) -> None:
         url = httpx.URL(api_url)
         try:

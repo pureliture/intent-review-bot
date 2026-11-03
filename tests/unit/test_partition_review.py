@@ -19,6 +19,40 @@ def limits(**kwargs):
     return PartitionReviewLimits(max_total_tokens=1000000, max_calls=128, **kwargs)
 
 
+def _without_reference_ids(value):
+    if isinstance(value, dict):
+        return {key: ("<reference>" if key == "reference_id" and isinstance(child, str)
+            else _without_reference_ids(child)) for key, child in value.items()
+            if key not in {"raw_response_hash", "response_hash", "prior_response_hash",
+                "original_check_response_hash", "checker_response_hash"}}
+    if isinstance(value, list):
+        return [_without_reference_ids(child) for child in value]
+    return value
+
+
+def _reference_ids(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "reference_id" and isinstance(child, str):
+                yield child
+            else:
+                yield from _reference_ids(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _reference_ids(child)
+
+
+def _outside_target_reference(task, page, target):
+    from review_bot.application.partition_review import prepare_originals
+    from review_bot.application.source_citations import citation_spans
+    from review_bot.application.source_partition import make_span
+    originals, _ = prepare_originals(task, "intent")
+    by_id = {original.evidence_id: original for original in originals}
+    spans = [make_span(by_id[row["evidence_id"]], row["start_byte"], row["end_byte"], "test")
+        for row in page["final"]["supplied_quotes"]]
+    return next(reference for reference, span in citation_spans(spans, by_id).items() if span.path != target)
+
+
 def _output_limited_review_client(*, known_usage=True, repeated_limit=False):
     from review_bot.application.architecture_review import ModelOutputLimitError
     review = PartitionModelClient()
@@ -183,7 +217,11 @@ def test_initial_group_judgements_and_all_their_references_reach_final_without_s
     assert all(tuple(row["raw_response"]["draft_assessments"]) == PERSPECTIVE_IDS for row in roots)
     assert len(roots[0]["citations"]) >= 48
     final = next(json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "final_review")
-    assert final["observations"][0]["raw_response"] == roots[0]["raw_response"]
+    wire_response = final["observations"][0]["raw_response"]
+    canonical_response = roots[0]["raw_response"]
+    assert _without_reference_ids(wire_response) == _without_reference_ids(canonical_response)
+    assert all(value.startswith("R") and value[1:].isdigit() for value in _reference_ids(wire_response))
+    assert all(value.startswith("Q") for value in _reference_ids(canonical_response))
     validate_partition_result(result, task)
 
 
@@ -294,6 +332,27 @@ def test_outside_span_citation_and_stored_quote_tampering_are_rejected():
     result.perspectives[0]["citations"][0]["quote"] = "fabricated"
     with pytest.raises(PartitionError, match="quote_mismatch|assembly_mismatch|single_page_conclusion_changed|stored_fact_final_changed|stored_fact_acceptance_changed"):
         validate_partition_result(result, task)
+
+
+def test_model_wire_uses_short_citation_aliases_and_restores_original_ids():
+    task = make_task()
+    review = PartitionModelClient(group_all=True)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+
+    assert result.status == "completed", result.reason
+    validate_partition_result(result, task)
+    request = next(req for req in review.requests
+        if json.loads(req.user_content)["stage"] == "review_partition")
+    payload = json.loads(request.user_content)
+    aliases = {item["reference_id"] for source in payload["citation_catalog"] for item in source["ranges"]}
+    allowed = request.response_schema["properties"]["citations"]["items"]["properties"]["reference_id"]["enum"]
+    assert aliases and all(value.startswith("R") and value[1:].isdigit() for value in aliases)
+    assert set(allowed) <= aliases
+
+    original = result.partition["review_observations"][0]["raw_response"]["citations"][0]["reference_id"]
+    assert original.startswith("Q") and len(original) > 10
+    assert original not in request.user_content
+    assert original not in json.dumps(request.response_schema)
 
 
 def test_job_fence_cancels_before_any_model_call():
@@ -436,6 +495,7 @@ def test_architecture_uses_same_executor_and_keeps_analysis_as_evidence():
     assert request.system_prompt.count(contract.PMD_METRIC_REFERENCE) == 1
     assert request.system_prompt == (contract.OBSERVE_PROMPT + "\nRepository review judgment and explanation guidance:\n" + contract.READABLE_REVIEW_GUIDANCE + "\n" + instructions
         + contract.PMD_METRIC_REFERENCE + contract.REVIEW_GROUNDING_RULE + render_output_contract(request.response_schema)
+        + "\nCitation reference_id values are short request-local aliases. Return the exact alias supplied; the application maps it to the original source reference. Do not reconstruct or emit the original identifier."
         + "\nWrite every prose value in Korean.")
 
 def test_raw_pmd_member_and_class_findings_survive_observation_final_and_global_requests():
@@ -605,18 +665,20 @@ def test_draft_grounding_gets_one_bounded_recheck_with_unchanged_sources_and_exa
         assert "HEAD code reference" in draft["properties"]["citations"]["description"]
     assert "Draft concern and conditional_risk require BOTH" in requests[0].system_prompt
     rejected = result.partition["rejected_review_attempts"]
-    assert len(rejected) == 1 and rejected[0]["response"] == rejected_response[0]
-    assert rejected[0]["reason"] == previous["validation_error"]
+    assert len(rejected) == 1
+    assert _without_reference_ids(rejected[0]["response"]) == _without_reference_ids(rejected_response[0])
+    assert rejected[0]["reason"].startswith("draft_concern_without_head_failure_evidence:")
+    assert previous["validation_error"].startswith("draft_concern_without_head_failure_evidence:")
     assert result.stages[rejected[0]["stage_index"]].status == "failed"
     accepted = result.partition["review_observations"][0]["raw_response"]["draft_assessments"]
     assert accepted[target_key]["verdict"] == "conditional_risk" and accepted[target_key]["failure_condition"]
-    assert {key: value for key, value in accepted.items() if key != target_key} == {
-        key: value for key, value in rejected_response[0]["draft_assessments"].items() if key != target_key}
+    assert _without_reference_ids({key: value for key, value in accepted.items() if key != target_key}) == _without_reference_ids({
+        key: value for key, value in rejected[0]["response"]["draft_assessments"].items() if key != target_key})
     validate_partition_result(result, task)
 
     altered = deepcopy(result)
     row = altered.partition["review_observations"][0]
-    row["raw_response"]["draft_assessments"][target_key] = deepcopy(rejected_response[0]["draft_assessments"][target_key])
+    row["raw_response"]["draft_assessments"][target_key] = deepcopy(rejected[0]["response"]["draft_assessments"][target_key])
     from review_bot.application.partition_review import hash_json
     row["raw_response_hash"] = hash_json(row["raw_response"])
     with pytest.raises(PartitionError, match="draft_concern_without_head_failure_evidence"):
@@ -792,7 +854,8 @@ def test_untracked_provisional_insufficiency_is_preserved_for_final_source_corre
     final = next(json.loads(request.user_content) for request in client.requests
         if json.loads(request.user_content)["stage"] == "final_review")
     assert all(row["draft_validation_issues"] == expected for row in final["observations"])
-    assert [row["raw_response"] for row in final["observations"]] == [row["raw_response"] for row in rows]
+    assert [_without_reference_ids(row["raw_response"]) for row in final["observations"]] == [
+        _without_reference_ids(row["raw_response"]) for row in rows]
     assert not result.partition["final"]["missing_context"]
     validate_partition_result(result, task)
     rows[0]["draft_validation_issues"] = []
@@ -829,9 +892,11 @@ def test_later_invalid_group_preserves_prior_raw_outputs_and_the_rejected_reply(
         PartitionModelClient(), limits=limits())
     assert result.status == "failed"
     kept = result.partition["review_observations"]
-    assert len(kept) == 2 and [row["raw_response"] for row in kept] == seen[:2]
+    assert len(kept) == 2 and [_without_reference_ids(row["raw_response"]) for row in kept] == [
+        _without_reference_ids(row) for row in seen[:2]]
     rejected = result.partition["rejected_review_attempts"]
-    assert len(rejected) == 2 and [row["response"] for row in rejected] == seen[2:]
+    assert len(rejected) == 2 and [_without_reference_ids(row["response"]) for row in rejected] == [
+        _without_reference_ids(row) for row in seen[2:]]
     assert all(row["reason"] == "citation_reference_not_supplied" for row in rejected)
     validate_partition_result(result, task)
 
@@ -899,7 +964,8 @@ def test_context_only_architecture_rechecks_eight_intent_perspectives_once_with_
     assert json.loads(contexts[0].user_content)["original_quotes"] == retry["original_quotes"]
     rejected = result.partition["rejected_final_attempts"]
     assert len(rejected) == 1 and rejected[0]["reason"] == expected
-    assert rejected[0]["response"] == rejected_response[0] and len(rejected[0]["response"]["perspectives"]) == 8
+    assert _without_reference_ids(rejected[0]["response"]) == _without_reference_ids(rejected_response[0])
+    assert len(rejected[0]["response"]["perspectives"]) == 8
     for request in contexts:
         schema = request.response_schema["properties"]["perspectives"]
         assert schema == {"type": "array", "items": {"type": "object", "properties": {},
@@ -1150,8 +1216,12 @@ def test_final_request_preserves_original_results_and_full_sources():
     assert result.status == "completed", result.reason
     final = next(json.loads(r.user_content) for r in client.requests if json.loads(r.user_content)["stage"] == "final_review")
     assert final["original_quotes"] and final["citation_catalog"]
-    assert [row["raw_response"] for row in final["observations"]] == [row["raw_response"] for row in result.partition["review_observations"]]
-    assert [row["raw_response_hash"] for row in final["observations"]] == [row["raw_response_hash"] for row in result.partition["review_observations"]]
+    stored = result.partition["review_observations"]
+    assert [_without_reference_ids(row["raw_response"]) for row in final["observations"]] == [
+        _without_reference_ids(row["raw_response"]) for row in stored]
+    from review_bot.application.context import hash_json
+    assert [row["raw_response_hash"] for row in final["observations"]] == [
+        hash_json(row["raw_response"]) for row in final["observations"]]
     assert all("raw_response" in row for row in final["observations"])
     delivered = {(row["evidence_id"], row["start_byte"], row["end_byte"]) for row in final["original_quotes"]}
     assert all(any(key == unit["evidence_id"] and begin <= unit["start_byte"] < unit["end_byte"] <= end
@@ -1179,8 +1249,12 @@ def test_experimental_small_target_does_not_compress_a_fitting_live_request():
     assert len(result.partition["integration_pages"]) == 1
     assert not result.partition["reductions"]
     final = next(json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "final_review")
-    assert [row["raw_response"] for row in final["observations"]] == [row["raw_response"] for row in result.partition["review_observations"]]
-    assert [row["raw_response_hash"] for row in final["observations"]] == [row["raw_response_hash"] for row in result.partition["review_observations"]]
+    stored = result.partition["review_observations"]
+    assert [_without_reference_ids(row["raw_response"]) for row in final["observations"]] == [
+        _without_reference_ids(row["raw_response"]) for row in stored]
+    from review_bot.application.context import hash_json
+    assert [row["raw_response_hash"] for row in final["observations"]] == [
+        hash_json(row["raw_response"]) for row in final["observations"]]
     validate_partition_result(result, task)
 
 
@@ -1259,10 +1333,10 @@ def test_rejected_grounding_is_rechecked_once_without_rewriting_the_rejected_res
     finals = [json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "final_review"]
     assert len(finals) == 2
     assert finals[0]["original_quotes"] == finals[1]["original_quotes"]
-    assert finals[0]["observations"] == finals[1]["observations"]
+    assert _without_reference_ids(finals[0]["observations"]) == _without_reference_ids(finals[1]["observations"])
     rejected = result.partition["rejected_final_attempts"]
     assert len(rejected) == 1 and rejected[0]["reason"] == "concern_without_head_failure_evidence"
-    assert finals[1]["source_recheck"]["rejected_response"] == rejected[0]["response"]
+    assert _without_reference_ids(finals[1]["source_recheck"]["rejected_response"]) == _without_reference_ids(rejected[0]["response"])
     assert result.partition["final"]["correction_reason"]
     assert result.usage["usage_complete"]
     validate_partition_result(result, task)
@@ -1287,7 +1361,7 @@ def test_reviewed_target_without_citations_is_rechecked_once_and_never_accepted_
     assert len(finals) == 2
     rejected = result.partition["rejected_final_attempts"]
     assert len(rejected) == 1 and rejected[0]["reason"] == "missing_partition_citation"
-    assert rejected[0]["response"] == rejected_response[0]
+    assert _without_reference_ids(rejected[0]["response"]) == _without_reference_ids(rejected_response[0])
     assert finals[1]["source_recheck"]["validation_error"] == "missing_partition_citation"
     assert all(row["citations"] for row in result.partition["final"]["target_reviews"].values())
     validate_partition_result(result, task)
@@ -1331,8 +1405,11 @@ def test_target_review_mixed_citations_get_one_exact_recheck_without_erasing_raw
         f"json_path=$.target_reviews[{json.dumps(target)}].citations[2].reference_id;"
         f"target_id={target};reference_id={ref};expected=target_reference")
     rejected = result.partition["rejected_final_attempts"]
-    assert len(rejected) == 1 and rejected[0]["reason"] == expected
-    assert rejected[0]["response"] == rejected_response[0]
+    assert len(rejected) == 1
+    canonical_ref = rejected[0]["response"]["target_reviews"][target]["citations"][2]["reference_id"]
+    expected_canonical = expected.replace(f"reference_id={ref};", f"reference_id={canonical_ref};")
+    assert rejected[0]["reason"] == expected_canonical
+    assert _without_reference_ids(rejected[0]["response"]) == _without_reference_ids(rejected_response[0])
     assert len(rejected[0]["response"]["target_reviews"][target]["citations"]) == 3
     assert finals[1]["source_recheck"]["validation_error"] == expected
     assert finals[1]["source_recheck"]["rejected_response"] == rejected_response[0]
@@ -1391,7 +1468,8 @@ def test_repeated_target_reference_rejection_preserves_precise_stage_reason_and_
     assert result.status == "failed" and result.reason.startswith("target_review_citation_outside_target:")
     rejected = result.partition["rejected_final_attempts"]
     assert len(rejected) == len(bad) == 2
-    assert [item["response"] for item in rejected] == bad
+    assert [_without_reference_ids(item["response"]) for item in rejected] == [
+        _without_reference_ids(response) for response in bad]
     assert result.stages[-1].reason == rejected[-1]["reason"] == result.reason
 
 
@@ -1408,9 +1486,8 @@ def test_target_reference_metadata_is_optional_for_legacy_but_never_weakens_exis
         page.pop("target_reference_context_hash")
         validate_partition_result(changed, task)
         # Absence of supplementary metadata never permits another target's ref.
-        payload = next(json.loads(req.user_content) for req in review.requests if json.loads(req.user_content)["stage"] == "final_review")
         target = next(iter(page["response"]["target_reviews"]))
-        outside = next(source["ranges"][0]["reference_id"] for source in payload["citation_catalog"] if source["path"] != target)
+        outside = _outside_target_reference(task, page, target)
         page["response"]["target_reviews"][target]["citations"] = [{"reference_id": outside}]
         with pytest.raises(PartitionError, match="stored_target_review_evidence_invalid"):
             validate_partition_result(changed, task)
@@ -1449,17 +1526,18 @@ def test_two_allowed_disposition_citations_get_exact_feedback_in_the_existing_si
     finals = [json.loads(req.user_content) for req in review.requests if json.loads(req.user_content)["stage"] == "final_review"]
     assert len(finals) == 2
     rejected = result.partition["rejected_final_attempts"]
-    assert len(rejected) == 1 and rejected[0]["response"] == rejected_response[0]
+    assert len(rejected) == 1
+    assert _without_reference_ids(rejected[0]["response"]) == _without_reference_ids(rejected_response[0])
     observation = next(iter(rejected_response[0]["observation_dispositions"]))
     citations = rejected[0]["response"]["observation_dispositions"][observation]["citations"]
-    assert len(citations) == 2 and all(c["reference_id"] in allowed_references for c in citations)
+    assert len(citations) == 2 and all(c["reference_id"].startswith("Q") for c in citations)
     expected = ("observation_disposition_citation_count:"
         f"json_path=$.observation_dispositions.{observation}.citations;"
         f"observation_id={observation};expected=1;actual=2")
     assert rejected[0]["reason"] == finals[1]["source_recheck"]["validation_error"] == expected
     assert finals[1]["source_recheck"]["rejected_response"] == rejected_response[0]
     assert finals[0]["original_quotes"] == finals[1]["original_quotes"]
-    assert finals[0]["observations"] == finals[1]["observations"]
+    assert _without_reference_ids(finals[0]["observations"]) == _without_reference_ids(finals[1]["observations"])
     accepted = result.partition["final"]["observation_dispositions"]
     assert len(accepted) == 1 and len(accepted[0]["citations"]) == 1
     assert asdict(task) == original_task
@@ -1501,8 +1579,8 @@ def test_model_can_request_one_frozen_original_recheck_and_preserve_the_initial_
     assert len(finals) == 2
     history = result.partition["source_recheck_requests"]
     assert len(history) == 1 and history[0]["admitted"] is True
-    assert finals[1]["source_recheck"]["prior_response"] == history[0]["response"]
-    assert finals[1]["observations"] == finals[0]["observations"]
+    assert _without_reference_ids(finals[1]["source_recheck"]["prior_response"]) == _without_reference_ids(history[0]["response"])
+    assert _without_reference_ids(finals[1]["observations"]) == _without_reference_ids(finals[0]["observations"])
     assert not result.partition["final"]["source_requests"]
     assert result.partition["final"]["correction_reason"]
     validate_partition_result(result, task)
@@ -1578,20 +1656,25 @@ def test_overflowing_recheck_delivers_requested_originals_and_every_prior_reply_
         return replace(code, files=files, inventory_hash=inventory)
 
     task = build_intent_task_input(task.snapshot, extend(task.base), extend(task.head), related_paths=task.reviewed_paths)
-    prior_ref = None
+    prior_span = None
 
     def request_and_correct(payload, body):
-        nonlocal prior_ref
+        nonlocal prior_span
         if payload["stage"] == "final_review":
             if "source_recheck" not in payload:
                 original = next(row for row in payload["fixed_original_inventory"]
                     if row["path"] == "src/value.py" and row["version"] == "head")
                 body["source_requests"] = [{"evidence_id": original["evidence_id"], "reason": "Compare frozen head with this original interpretation."}]
                 base = next(row for row in payload["citation_catalog"] if row["path"] == "src/value.py" and row["version"] == "base")
-                prior_ref = base["ranges"][-1]["reference_id"]
+                selected = base["ranges"][-1]
+                prior_span = {"evidence_id": base["evidence_id"],
+                    "start_byte": selected["start_byte"], "end_byte": selected["end_byte"]}
             # This quote was NOT in the initial group's citations. Its exact
             # range must survive coalescing and the focused recheck too.
-            body["perspectives"][0]["citations"] = [{"reference_id": prior_ref}]
+            selected = next(span for source in payload["citation_catalog"] for span in source["ranges"]
+                if {"evidence_id": source["evidence_id"], "start_byte": span["start_byte"],
+                    "end_byte": span["end_byte"]} == prior_span)
+            body["perspectives"][0]["citations"] = [{"reference_id": selected["reference_id"]}]
         return body
 
     def measured(request):
@@ -1606,11 +1689,13 @@ def test_overflowing_recheck_delivers_requested_originals_and_every_prior_reply_
     assert result.status == "completed", result.reason
     validate_partition_result(result, task)
     finals = [json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "final_review"]
-    assert len(finals) == 2 and finals[1]["observations"] == finals[0]["observations"]
+    assert len(finals) == 2 and _without_reference_ids(finals[1]["observations"]) == _without_reference_ids(finals[0]["observations"])
     history = result.partition["source_recheck_requests"][0]
     assert history["admitted"] and history["delivery"] == "requested_originals_with_retained_citations"
-    assert finals[1]["source_recheck"]["prior_response"] == history["response"]
-    assert prior_ref in {row["reference_id"] for entry in finals[1]["citation_catalog"] for row in entry["ranges"]}
+    assert _without_reference_ids(finals[1]["source_recheck"]["prior_response"]) == _without_reference_ids(history["response"])
+    assert any(entry["evidence_id"] == prior_span["evidence_id"] and any(
+        {"evidence_id": entry["evidence_id"], "start_byte": span["start_byte"], "end_byte": span["end_byte"]} == prior_span
+        for span in entry["ranges"]) for entry in finals[1]["citation_catalog"])
     assert any(row["path"] == "src/value.py" and row["version"] == "head" and row["start_byte"] == 0
         and row["end_byte"] == len(text.encode()) for row in finals[1]["original_quotes"])
     assert any(row["path"] == "src/value.py" and row["version"] == "base" and row["end_byte"] == len(text.encode())

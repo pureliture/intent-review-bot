@@ -22,6 +22,17 @@ def limits(**kwargs):
     return PartitionReviewLimits(max_calls=128, max_total_tokens=1000000, **kwargs)
 
 
+def _without_reference_ids(value):
+    if isinstance(value, dict):
+        return {key: ("<reference>" if key == "reference_id" and isinstance(child, str)
+            else _without_reference_ids(child)) for key, child in value.items()
+            if key not in {"raw_response_hash", "response_hash", "prior_response_hash",
+                "original_check_response_hash", "checker_response_hash"}}
+    if isinstance(value, list):
+        return [_without_reference_ids(child) for child in value]
+    return value
+
+
 def test_fact_readback_accepts_only_source_inventory_order_changes():
     task = make_task()
     result = run_partition_review(task, "intent", PartitionModelClient(), PartitionModelClient(group_all=True), limits=limits())
@@ -398,8 +409,6 @@ def test_wire_reference_definitions_preserve_complete_a_b_fact_response_contract
             if isinstance(value, dict):
                 if set(value) == {"reference_id"}:
                     yield value["reference_id"]
-                elif set(value) == {"source_id", "quote"}:
-                    yield value["source_id"]
                 for child in value.values():
                     yield from reference_ids(child)
             elif isinstance(value, list):
@@ -413,8 +422,24 @@ def test_wire_reference_definitions_preserve_complete_a_b_fact_response_contract
             elif isinstance(value, list):
                 for child in value:
                     yield from enums(child)
+        def reference_enums(value, parent=""):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key == "reference_id" and isinstance(child, dict):
+                        yield from child.get("enum", [])
+                    else:
+                        yield from reference_enums(child, key)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from reference_enums(child, parent)
         allowed = set(enums(restored))
-        assert set(reference_ids(packet["response"])) <= allowed
+        allowed_references = list(reference_enums(restored))
+        assert all(value.startswith("R") and value[1:].isdigit() for value in allowed_references)
+        wire = json.loads(request.user_content)
+        supplied_references = [span["reference_id"] for source in wire.get("citation_catalog", [])
+            for span in source["ranges"]]
+        assert all(value[0] in ("R", "X") and value[1:].isdigit() for value in supplied_references)
+        assert all(value.startswith("Q") for value in reference_ids(packet["response"]))
         assert "__FOREIGN_REFERENCE__" not in allowed
         # All per-item supported-only enums and conditional rules also survive
         # exact expansion, including IDs that exist elsewhere in the catalog.
@@ -756,7 +781,7 @@ def test_checker_receives_literal_prose_and_exact_claim_rules_without_repairing_
     assert "keep the unresolved limitation explicit for the factual recheck" in facts.REWRITE_PROMPT
     assert "silently remove the disputed assertion" in facts.REWRITE_PROMPT
     assert result.partition["identity"]["prompts"]["fact_check"] == hash_json(facts.CHECK_PROMPT)
-    assert result.prompt_version == "partitioned-review/v18-selected-perspectives-code-references"
+    assert result.prompt_version == "partitioned-review/v20-cardinality-boundary-review"
     assert result.model["is_mock"] is True  # no semantic accuracy claim from this fixture
 
 
@@ -830,7 +855,7 @@ def test_unverifiable_fact_reads_existing_test_original_and_rechecks_same_item_w
     supplied = next(s for s in checks[1]["originals"] if s["path"] == path and s["version"] == "head")
     assert "".join(b["text"] for b in supplied["blocks"]) == content
     rewritten = next(json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "fact_rewrite")
-    assert rewritten["recheck"]["original_check_response"] == first["check"]["response"]
+    assert _without_reference_ids(rewritten["recheck"]["original_check_response"]) == _without_reference_ids(first["check"]["response"])
     assert rewritten["recheck"]["source_delivery_plan"]["parent_plan_id"] == first["source_plan"]["parent_plan_id"]
 
 
@@ -843,9 +868,9 @@ def test_contradicted_compound_fact_carries_explicit_source_through_rewrite_and_
     assert first["source_plan"]["gaps"] == [request["reason"] for request in first["check"]["response"]["source_requests"]]
     assert second["input_source_requests"] == first["check"]["response"]["source_requests"]
     rewrite = next(json.loads(r.user_content) for r in review.requests if json.loads(r.user_content)["stage"] == "fact_rewrite")
-    assert rewrite["recheck"]["original_check_response"]["items"] == {
-        "summary": first["check"]["response"]["items"]["summary"]}
-    assert rewrite["recheck"]["original_check_response_hash"] == hash_json(first["check"]["response"])
+    assert _without_reference_ids(rewrite["recheck"]["original_check_response"]["items"]) == _without_reference_ids({
+        "summary": first["check"]["response"]["items"]["summary"]})
+    assert rewrite["recheck"]["original_check_response_hash"] == hash_json(rewrite["recheck"]["original_check_response"])
     assert rewrite["recheck"]["original_check_response"]["source_requests"] == first["check"]["response"]["source_requests"]
     assert any(source["path"] == path for source in rewrite["originals"])
     assert result.summary == result.partition["fact_verification"]["items"][0]["original"]
@@ -1146,7 +1171,8 @@ def test_two_factual_errors_share_rewrite_and_batch_recheck_with_id_coverage(rew
     assert set(next(iter(rewrites[0]["recheck"]["checker_outputs"].values()))["original_check_response"]["items"]) == {
         row["item_id"] for row in rewrites[0]["items"]}
     full_output = result.partition["fact_verification"]["items"][0]["attempts"][0]["check"]["response"]
-    assert next(iter(rewrites[0]["recheck"]["checker_outputs"].values()))["original_check_response_hash"] == hash_json(full_output)
+    checker_context = next(iter(rewrites[0]["recheck"]["checker_outputs"].values()))
+    assert checker_context["original_check_response_hash"] == hash_json(checker_context["original_check_response"])
     assert len(checks) == 2 and {row["item_id"] for row in checks[1]["items"]} == failing
     assert all(row["original_item"]["reasoning"] == corrected for row in checks[1]["items"])
     ledger = result.partition["fact_verification"]
@@ -1206,7 +1232,7 @@ def test_oversized_original_requires_direct_whole_claim_recheck_after_complete_d
         focused = next(json.loads(request.user_content) for request in client.requests
             if json.loads(request.user_content).get("whole_claim_recheck"))
         assert focused["items"][0]["original_item"] == literal
-        assert focused["whole_claim_recheck"]["pages"] == call["discovery"]["pages"]
+        assert _without_reference_ids(focused["whole_claim_recheck"]["pages"]) == _without_reference_ids(call["discovery"]["pages"])
         assert sum(len(block["text"].encode()) for source in facts.materialize_source_texts(focused) for block in source["blocks"]) < len(content.encode())
         for mutation in ("discovery_cover", "focused_evidence"):
             changed = deepcopy(result)

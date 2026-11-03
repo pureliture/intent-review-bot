@@ -27,7 +27,7 @@ from review_bot.application.context import hash_json
 from review_bot.application.intent_context import MAX_INPUT_BYTES, IntentInputError, strict_json_loads
 from review_bot.domain.intent_models import IntentModelAttempt, IntentStageRecord
 from review_bot.domain.models_v1 import ModelRequest, ModelResponse
-from review_bot.ports import ModelClient
+from review_bot.ports import ModelClient, ModelInputAdmission
 
 MAX_OUTPUT_BYTES = 65536
 MAX_ATTEMPTS = 3
@@ -189,8 +189,7 @@ class ModelExecutionBudget:
         bound: int | None = None
         if reason is None:
             try:
-                admission = getattr(client, "admission_bytes", None)
-                bound = admission(actual) if callable(admission) else None
+                bound = client.admission_bytes(actual) if isinstance(client, ModelInputAdmission) else None
             except Exception:
                 bound = None
                 reason = "token_count_unavailable"

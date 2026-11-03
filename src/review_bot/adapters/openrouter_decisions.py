@@ -185,6 +185,9 @@ def _validate_decision_answer(answer: Any, choices: dict[str, tuple[str, ...]],
 class OpenRouterDecisionClient:
     """Validation-phase decision1 selector; typed judgments, never text."""
 
+    def set_cancellation_callback(self, callback) -> None:
+        self.request_cancelled = callback
+
     def __init__(self, model: str = DECISION_MODEL, *, api_key: str = "",
             origin: str | None = None, timeout_seconds: int = 60,
             app_input_tokens: int = APP_INPUT_TOKENS,
