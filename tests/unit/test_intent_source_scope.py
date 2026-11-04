@@ -364,4 +364,6 @@ def test_configured_context_paths_never_become_reviewed_targets():
     originals, meta = prepare_originals(task, "intent")
     assert meta["targets"] == ["src/A.java"]
     assert "src/Ctx.java" in {o.path for o in originals if o.kind == "context_source"}
+    # Unchanged build manifests only decide Gradle eligibility; they are neither targets nor citable originals.
     assert "build.gradle" not in meta["targets"]
+    assert "build.gradle" not in {o.path for o in originals}
