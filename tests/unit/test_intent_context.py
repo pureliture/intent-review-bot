@@ -276,3 +276,40 @@ def test_unrequested_repository_material_is_not_part_of_the_b_input_byte_limit()
     head = replace(task.head, files=(*task.head.files, unrelated), inventory_hash="")
     scoped = build_intent_task_input(task.snapshot, task.base, head, related_paths=(task.head.files[1].path,))
     assert scoped == task
+
+
+def test_schema_v2_separates_reviewed_paths_from_context_paths_and_accepts_legacy_v1() -> None:
+    from review_bot.application.partition_review import prepare_originals
+
+    task = make_task()
+    dep_file = CodeFile("src/dep.py", "class Helper:\n    pass\n", digest("class Helper:\n    pass\n"), "source")
+    gradle_file = CodeFile("build.gradle", "plugins { id 'java' }\n", digest("plugins { id 'java' }\n"), "build")
+    base = replace(task.base, files=(*task.base.files, dep_file, gradle_file), inventory_hash="")
+    head = replace(task.head, files=(*task.head.files, dep_file, gradle_file), inventory_hash="")
+    v2_task = build_intent_task_input(
+        task.snapshot,
+        base,
+        head,
+        related_paths=(task.head.files[1].path,),
+        context_paths=("src/dep.py", "build.gradle"),
+    )
+    assert v2_task.schema_version == 2
+    assert v2_task.reviewed_paths == ("src/request.py", "tests/test_request.py")
+    assert v2_task.context_paths == ("build.gradle", "src/dep.py")
+    assert decode_intent_task_input(json.dumps(asdict(v2_task))) == v2_task
+    originals, meta = prepare_originals(v2_task, "intent")
+    assert meta["targets"] == ["src/request.py", "tests/test_request.py"]
+    assert "build.gradle" not in meta["targets"]
+    assert "src/dep.py" not in meta["targets"]
+    assert not any(o.path == "build.gradle" for o in originals)
+    assert any(o.path == "src/dep.py" and o.kind == "context_source" and o.version == "head" for o in originals)
+
+    legacy_payload = wire(v2_task)
+    legacy_payload["schema_version"] = 1
+    legacy_payload["reviewed_paths"] = sorted([*v2_task.reviewed_paths, *v2_task.context_paths])
+    legacy_payload.pop("context_paths")
+    legacy_decoded = decode_intent_task_input(rehash(legacy_payload))
+    assert legacy_decoded.schema_version == 1
+    legacy_originals, legacy_meta = prepare_originals(legacy_decoded, "intent")
+    assert "build.gradle" not in legacy_meta["targets"]
+    assert not any(o.path == "build.gradle" for o in legacy_originals)

@@ -11,12 +11,13 @@ from typing import Any
 
 from review_bot.application.context import hash_json
 from review_bot.domain.envelope_v2 import ChangedFile, EnvelopeEvidence, ReviewSnapshot, UnavailableSource
-from review_bot.domain.intent_models import IntentTaskInput
+from review_bot.domain.intent_models import INTENT_TASK_INPUT_SCHEMA_VERSION, IntentTaskInput
 from review_bot.domain.models_v1 import CodeFile, CodeSnapshot, SourceExclusion
 from review_bot.ports import RepositoryReader
 
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_PATHS = 5000
+MAX_DEPENDENCY_NOTES = 128
 TEXT_KINDS = frozenset({"pr_text", "issue_text"})
 CODE_KINDS = frozenset({"source", "test_source", "test_run"})
 _ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
@@ -419,11 +420,12 @@ def intent_scope(task: IntentTaskInput) -> dict[str, object]:
         if change.change_type not in ("removed", "deleted"):
             required.append(("head", change.path))
         missing.extend(f"{version}:{path}:missing" for version, path in required if path not in present[version])
-    for path in task.reviewed_paths:
+    for path in (*task.reviewed_paths, *task.context_paths):
         if path not in present["base"] | present["head"]:
             missing.append(f"context:{path}:missing")
     evidence = build_intent_evidence(task)
-    return {"reviewed_paths": list(task.reviewed_paths), "repository_wide": False,
+    return {"reviewed_paths": list(task.reviewed_paths), "context_paths": list(task.context_paths),
+        "repository_wide": False,
         "complete": not missing, "missing": sorted(set(missing)), "versions": versions,
         "evidence_ids": [item.id for item in evidence], "unavailable_context": list(unavailable_context(task)),
         "tests_executed_by_bot": False, "test_run_evidence_ids": [item.id for item in evidence if item.kind == "test_run"],
@@ -431,9 +433,19 @@ def intent_scope(task: IntentTaskInput) -> dict[str, object]:
 
 
 def _decode_input(value: Any, *, check_hash: bool = True) -> IntentTaskInput:
-    raw = _record(IntentTaskInput, value)
-    if type(raw["schema_version"]) is not int or raw["schema_version"] != 1:
+    if not isinstance(value, dict):
+        raise IntentInputError("invalid_fields")
+    version = value.get("schema_version")
+    if type(version) is not int or version not in (1, INTENT_TASK_INPUT_SCHEMA_VERSION):
         raise IntentInputError("unsupported_intent_version")
+    all_fields = {field.name for field in fields(IntentTaskInput)}
+    legacy_without_context = version == 1 and "context_paths" not in value
+    optional_defaults = {"dependency_notes": []}
+    if legacy_without_context:
+        optional_defaults["context_paths"] = []
+    absent = {key for key in optional_defaults if key not in value}
+    bounded_object(value, all_fields - absent)
+    raw = {**optional_defaults, **value}
     snapshot = _decode_snapshot(raw["snapshot"])
     base = _decode_code(raw["base"])
     head = _decode_code(raw["head"])
@@ -441,17 +453,30 @@ def _decode_input(value: Any, *, check_hash: bool = True) -> IntentTaskInput:
     _unique(paths)
     if paths != tuple(sorted(paths)):
         raise IntentInputError("unordered_reviewed_paths")
+    context_paths = tuple(safe_relative_path(path) for path in bounded_array(raw["context_paths"], maximum=MAX_PATHS))
+    _unique(context_paths)
+    if context_paths != tuple(sorted(context_paths)) or (set(paths) & set(context_paths)):
+        raise IntentInputError("invalid_context_paths")
+    allowed_paths = set(paths) | set(context_paths)
     changed = {path for item in snapshot.changed_files for path in (item.path, item.previous_path) if path}
-    if not changed <= set(paths) or any(file.path not in paths for code in (base, head) for file in code.files):
+    if not changed <= set(paths) or any(file.path not in allowed_paths for code in (base, head) for file in code.files):
         raise IntentInputError("code_outside_scope")
     if base.sha != (snapshot.comparison_base_sha or snapshot.target_base_sha) or head.sha != snapshot.head_sha:
         raise IntentInputError("code_sha_mismatch")
     if base.sha == head.sha and {file.path: file.content_hash for file in base.files} != {file.path: file.content_hash for file in head.files}:
         raise IntentInputError("inconsistent_code_version")
-    task = IntentTaskInput(1, snapshot, base, head, paths, raw["input_hash"])
+    notes = tuple(bounded_text(item, maximum=512) for item in bounded_array(raw["dependency_notes"], maximum=MAX_DEPENDENCY_NOTES))
+    _unique(notes)
+    if notes != tuple(sorted(notes)):
+        raise IntentInputError("unordered_dependency_notes")
+    task = IntentTaskInput(version, snapshot, base, head, paths, raw["input_hash"], context_paths, notes)
     build_intent_evidence(task)
     payload = asdict(task)
     payload.pop("input_hash")
+    if "dependency_notes" in absent:
+        payload.pop("dependency_notes", None)
+    if version == 1 and not context_paths:
+        payload.pop("context_paths", None)
     expected = hash_json(payload)
     if check_hash and _digest(task.input_hash) != expected:
         raise IntentInputError("input_hash_mismatch")
@@ -459,7 +484,7 @@ def _decode_input(value: Any, *, check_hash: bool = True) -> IntentTaskInput:
 
 
 def decode_intent_task_input(value: str | dict[str, Any]) -> IntentTaskInput:
-    """Decode and verify a fixed B v1 input, without repository/network access."""
+    """Decode and verify a fixed B v1/v2 input, without repository/network access."""
     if isinstance(value, dict):
         try:
             value = json.dumps(value, ensure_ascii=False, allow_nan=False)
@@ -474,12 +499,20 @@ def decode_intent_task_input(value: str | dict[str, Any]) -> IntentTaskInput:
 
 
 def build_intent_task_input(
-    snapshot: ReviewSnapshot, base: CodeSnapshot, head: CodeSnapshot, *, related_paths: tuple[str, ...] = (),
+    snapshot: ReviewSnapshot,
+    base: CodeSnapshot,
+    head: CodeSnapshot,
+    *,
+    related_paths: tuple[str, ...] = (),
+    context_paths: tuple[str, ...] = (),
+    dependency_notes: tuple[str, ...] = (),
 ) -> IntentTaskInput:
     """Prepare full files in the declared B scope; never shrink it for a model limit."""
     snapshot = _decode_snapshot(strict_json_loads(json.dumps(asdict(snapshot), ensure_ascii=False, allow_nan=False)))
-    paths = tuple(sorted(set(validate_intent_context_paths(related_paths)) |
-        {path for item in snapshot.changed_files for path in (item.path, item.previous_path) if path}))
+    changed_paths = {path for item in snapshot.changed_files for path in (item.path, item.previous_path) if path}
+    reviewed_paths = tuple(sorted(set(validate_intent_context_paths(tuple(related_paths))) | changed_paths))
+    extra_context = tuple(sorted(set(validate_intent_context_paths(tuple(context_paths))) - set(reviewed_paths)))
+    paths = tuple(sorted(set(reviewed_paths) | set(extra_context)))
     scoped = []
     for code in (base, head):
         if not isinstance(code, CodeSnapshot) or type(code.complete) is not bool:
@@ -506,5 +539,6 @@ def build_intent_task_input(
         inventory = hashlib.sha256(":".join(f"{file.path}:{file.content_hash}" for file in included).encode()).hexdigest()
         prepared = CodeSnapshot(code.sha, included, excluded, inventory, complete, errors)
         scoped.append(_decode_code(strict_json_loads(json.dumps(asdict(prepared), ensure_ascii=False, allow_nan=False))))
-    task = IntentTaskInput(1, snapshot, scoped[0], scoped[1], paths, "")
+    task = IntentTaskInput(INTENT_TASK_INPUT_SCHEMA_VERSION, snapshot, scoped[0], scoped[1], reviewed_paths, "", extra_context,
+        tuple(sorted(set(dependency_notes))))
     return _decode_input(strict_json_loads(json.dumps(asdict(task), ensure_ascii=False, allow_nan=False)), check_hash=False)

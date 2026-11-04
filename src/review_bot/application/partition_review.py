@@ -543,16 +543,36 @@ def prepare_partition_architecture_task(reader, pr, delta, classification, *, be
     return build_task_input(Snapshot(pr, base, head), scoped_delta, classification)
 
 
+_BUILD_MANIFEST_NAMES = frozenset({"build.gradle", "build.gradle.kts", "pom.xml", "settings.gradle", "settings.gradle.kts"})
+
+
 def prepare_originals(task, mode):
     """One immutable declared corpus, without model-selected repository expansion."""
     if mode in ("intent", "planning") and isinstance(task, IntentTaskInput):
         task = decode_intent_task_input(asdict(task))
-        originals = [SourceOriginal(item["id"], _original_text(item), item["kind"],
-            item["locator"].get("path", ""), item["locator"].get("version", ""),
-            item["locator"].get("sha", "")) for item in _originals(task).values()]
+        changed_paths = {p for c in task.snapshot.changed_files for p in (c.path, c.previous_path) if p}
+        context_set = set(task.context_paths) | {
+            p for p in task.reviewed_paths
+            if p not in changed_paths and p.rsplit("/", 1)[-1].lower() in _BUILD_MANIFEST_NAMES
+        }
+        review_targets = [p for p in task.reviewed_paths if p not in context_set]
+        head_paths = {f.path for f in task.head.files}
+        originals = []
+        for item in _originals(task).values():
+            path = item["locator"].get("path", "")
+            version = item["locator"].get("version", "")
+            kind = item["kind"]
+            if path and path in context_set:
+                if path not in changed_paths and path.rsplit("/", 1)[-1].lower() in _BUILD_MANIFEST_NAMES:
+                    continue
+                if path not in changed_paths and version == "base" and path in head_paths:
+                    continue
+                kind = "context_source"
+            originals.append(SourceOriginal(item["id"], _original_text(item), kind, path, version, item["locator"].get("sha", "")))
         meta = {"input_hash": task.input_hash, "snapshot_id": task.snapshot.snapshot_id,
             "base_sha": task.base.sha, "head_sha": task.head.sha,
-            "targets": list(task.reviewed_paths), "target_paths": {p: [p] for p in task.reviewed_paths},
+            "targets": review_targets, "target_paths": {p: [p] for p in review_targets},
+            "context_paths": sorted(context_set),
             "limitations": [f"{u.source}:{u.reason}" for u in task.snapshot.unavailable_sources],
             "complete": intent_scope(task)["complete"], "comparison_status": task.snapshot.comparison_status}
         meta["target_details"] = [{"target_id": path, "paths": [path], "tool": "source_review",
@@ -632,7 +652,7 @@ def prepare_originals(task, mode):
     if len({o.evidence_id for o in originals}) != len(originals):
         raise PartitionError("duplicate_original_id")
     if isinstance(task, IntentTaskInput):
-        meta["source_scope"] = build_source_scope(originals, task.snapshot.changed_files)
+        meta["source_scope"] = build_source_scope(originals, task.snapshot.changed_files, task.dependency_notes)
         meta["limitations"].extend(meta["source_scope"]["boundaries"])
     return originals, meta
 
@@ -1044,8 +1064,9 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             **scope_notice(meta, {s.evidence_id for s in supplied}),
             "source_coverage": source_coverage,
             "target_reference_context": target_context, "target_reference_policy": TARGET_REFERENCE_POLICY,
-            **({"source_recheck": {**deepcopy(previous), "target_reference_context": deepcopy(target_context),
-                    "target_reference_policy": TARGET_REFERENCE_POLICY},
+            **({"source_recheck": {**deepcopy(previous), **(
+                    {"target_reference_context": deepcopy(target_context), "target_reference_policy": TARGET_REFERENCE_POLICY}
+                    if "rejected_response" in previous else {})},
                 "recheck_instruction": "Recheck the earlier interpretation and any requested originals against the SAME frozen base/head sources and diff. A defect fixed in head is not a current concern. Preserve genuine remaining concerns with actual head code and failure conditions. Correct the interpretation or its evidence; never fabricate evidence to retain the old verdict. Explain every correction in correction_reason. Clear source_requests only when the necessary recheck is satisfied."} if previous is not None else {}),
             "delivery_scope": "An unchanged original group result is attached; this request may contain only part of its original source. Other parts are reviewed on other integration pages. Do not claim missing PR input solely because it is on another page.",
             "review_targets": targets, "review_target_details": meta.get("target_details", []), "input_limitations": meta["limitations"],
@@ -1476,9 +1497,16 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             pieces = partition_original(local, lambda part: fits([absolute(part)]), before_step=guard)
             return [absolute(part) for part in pieces]
         integration_start = len(budget.records)
-        batches = native_integration_pages(review_notes, final_spans,
-            lambda rows, spans: measure(final_request(rows, spans), review_client, profile, "final_review:admission"),
-            refine_integration_source)
+        effective_integration_limit = min(profile.max_input_tokens or limits.max_input_tokens, limits.max_input_tokens)
+        def integration_fits(rows, spans):
+            current_profile = profile
+            if effective_integration_limit >= 4096:
+                if len(rows) > 1:
+                    current_profile = replace(profile, max_input_tokens=int(effective_integration_limit * 0.70))
+                elif len(spans) > 1 or any(s.end_byte - s.start_byte > 1024 for s in spans):
+                    current_profile = replace(profile, max_input_tokens=int(effective_integration_limit * 0.85))
+            return measure(final_request(rows, spans), review_client, current_profile, "final_review:admission")
+        batches = native_integration_pages(review_notes, final_spans, integration_fits, refine_integration_source)
         if len(batches) > 1:
             delivery = [{"observation_ids": [row["observation_id"] for row in batch["inputs"]],
                 "sources": span_payload(final_spans(batch["inputs"], batch["sources"]))} for batch in batches]
@@ -1607,7 +1635,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             previous, retained, accepted_retained = None, [], []
             accepted_request_context = {}
             available_rechecks = limits.max_rechecks
-            for recheck in range(available_rechecks + 1):
+            recheck = 0
+            while recheck <= available_rechecks:
                 request_value = final_request(working, source_spans, previous, retained)
                 context = restore_model_references(json.loads(request_value.user_content)["target_reference_context"],
                     model_reference_aliases.get(id(request_value), {}))
@@ -1656,6 +1685,45 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                                 measurements.append(len(budget.records) - first_record)
                                 fits = measure(final_request(working, expanded, requested, next_retained), review_client, profile,
                                     "source_recheck:focused_admission", for_generation=True)
+                            if not fits and (len(requested_sources) > 1 or any(s.end_byte - s.start_byte > 1024 for s in requested_sources)):
+                                split_chunks, current_chunk = [], []
+                                for req_span in requested_sources:
+                                    measurements.append(len(budget.records) - first_record)
+                                    single_fits = measure(final_request(working, [req_span], requested, next_retained),
+                                        review_client, profile, "source_recheck:split_admission", for_generation=True)
+                                    if single_fits:
+                                        parts = [req_span]
+                                    elif req_span.end_byte - req_span.start_byte > 1024:
+                                        def part_fits(pieces):
+                                            measurements.append(len(budget.records) - first_record)
+                                            return measure(final_request(working, pieces, requested, next_retained),
+                                                review_client, profile, "source_recheck:split_admission", for_generation=True)
+                                        try:
+                                            parts = refine_integration_source(req_span, part_fits)
+                                        except PartitionError:
+                                            parts = []
+                                    else:
+                                        parts = []
+                                    if not parts:
+                                        split_chunks, current_chunk = [], []
+                                        break
+                                    for part in parts:
+                                        if current_chunk:
+                                            measurements.append(len(budget.records) - first_record)
+                                            if measure(final_request(working, [*current_chunk, part], requested, next_retained),
+                                                    review_client, profile, "source_recheck:split_admission", for_generation=True):
+                                                current_chunk.append(part)
+                                                continue
+                                            split_chunks.append(current_chunk)
+                                        current_chunk = [part]
+                                if current_chunk:
+                                    split_chunks.append(current_chunk)
+                                if split_chunks:
+                                    expanded = split_chunks[0]
+                                    delivery = "split_requested_originals_with_retained_citations"
+                                    fits = True
+                                    if len(split_chunks) > 1:
+                                        available_rechecks = max(available_rechecks, recheck + len(split_chunks))
                         except Stop as error:
                             unavailable = str(error)
                             if unavailable not in ("call_limit_exceeded", "task_token_limit_exceeded", "task_deadline_exceeded"):
@@ -1673,6 +1741,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                         if fits:
                             budget.records[index] = replace(budget.records[index], status="completed", reason="source_recheck_requested")
                             previous, source_spans, retained = requested, expanded, next_retained
+                            recheck += 1
                             continue
                     break
                 except (PartitionError, ValueError) as error:
@@ -1686,6 +1755,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     if recheck == available_rechecks:
                         raise
                     previous = {"rejected_response": deepcopy(raw), "validation_error": reason}
+                    recheck += 1
             budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
             final_pages.append(page_final)
             partitions["integration_pages"].append({"inputs": deepcopy(working),
