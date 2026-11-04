@@ -63,7 +63,7 @@ def code_models(flow):
                 span = next(row for row in source["blocks"] if text in row["text"])
                 refs.append({"reference_id": span["reference_id"]})
             body["findings"] = [{"verdict": "concern", "basis": "observed_structure",
-                "target_ids": ["src/value.py", "src/caller.py"],
+                "target_ids": ["src/value.py"],
                 "statement": "render returns a dict while label still requires its string interface.",
                 "reasoning": "The producer changed its return type; the unchanged caller invokes strip on that result.",
                 "failure_condition": "When label calls render(value).strip(), a dict has no strip attribute.",

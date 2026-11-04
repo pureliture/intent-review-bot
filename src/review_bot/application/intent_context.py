@@ -17,6 +17,7 @@ from review_bot.ports import RepositoryReader
 
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_PATHS = 5000
+MAX_DEPENDENCY_NOTES = 128
 TEXT_KINDS = frozenset({"pr_text", "issue_text"})
 CODE_KINDS = frozenset({"source", "test_source", "test_run"})
 _ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
@@ -439,11 +440,12 @@ def _decode_input(value: Any, *, check_hash: bool = True) -> IntentTaskInput:
         raise IntentInputError("unsupported_intent_version")
     all_fields = {field.name for field in fields(IntentTaskInput)}
     legacy_without_context = version == 1 and "context_paths" not in value
+    optional_defaults = {"dependency_notes": []}
     if legacy_without_context:
-        bounded_object(value, all_fields - {"context_paths"})
-        raw = {**value, "context_paths": []}
-    else:
-        raw = bounded_object(value, all_fields)
+        optional_defaults["context_paths"] = []
+    absent = {key for key in optional_defaults if key not in value}
+    bounded_object(value, all_fields - absent)
+    raw = {**optional_defaults, **value}
     snapshot = _decode_snapshot(raw["snapshot"])
     base = _decode_code(raw["base"])
     head = _decode_code(raw["head"])
@@ -463,10 +465,16 @@ def _decode_input(value: Any, *, check_hash: bool = True) -> IntentTaskInput:
         raise IntentInputError("code_sha_mismatch")
     if base.sha == head.sha and {file.path: file.content_hash for file in base.files} != {file.path: file.content_hash for file in head.files}:
         raise IntentInputError("inconsistent_code_version")
-    task = IntentTaskInput(version, snapshot, base, head, paths, raw["input_hash"], context_paths)
+    notes = tuple(bounded_text(item, maximum=512) for item in bounded_array(raw["dependency_notes"], maximum=MAX_DEPENDENCY_NOTES))
+    _unique(notes)
+    if notes != tuple(sorted(notes)):
+        raise IntentInputError("unordered_dependency_notes")
+    task = IntentTaskInput(version, snapshot, base, head, paths, raw["input_hash"], context_paths, notes)
     build_intent_evidence(task)
     payload = asdict(task)
     payload.pop("input_hash")
+    if "dependency_notes" in absent:
+        payload.pop("dependency_notes", None)
     if version == 1 and not context_paths:
         payload.pop("context_paths", None)
     expected = hash_json(payload)
@@ -497,6 +505,7 @@ def build_intent_task_input(
     *,
     related_paths: tuple[str, ...] = (),
     context_paths: tuple[str, ...] = (),
+    dependency_notes: tuple[str, ...] = (),
 ) -> IntentTaskInput:
     """Prepare full files in the declared B scope; never shrink it for a model limit."""
     snapshot = _decode_snapshot(strict_json_loads(json.dumps(asdict(snapshot), ensure_ascii=False, allow_nan=False)))
@@ -530,5 +539,6 @@ def build_intent_task_input(
         inventory = hashlib.sha256(":".join(f"{file.path}:{file.content_hash}" for file in included).encode()).hexdigest()
         prepared = CodeSnapshot(code.sha, included, excluded, inventory, complete, errors)
         scoped.append(_decode_code(strict_json_loads(json.dumps(asdict(prepared), ensure_ascii=False, allow_nan=False))))
-    task = IntentTaskInput(INTENT_TASK_INPUT_SCHEMA_VERSION, snapshot, scoped[0], scoped[1], reviewed_paths, "", extra_context)
+    task = IntentTaskInput(INTENT_TASK_INPUT_SCHEMA_VERSION, snapshot, scoped[0], scoped[1], reviewed_paths, "", extra_context,
+        tuple(sorted(set(dependency_notes))))
     return _decode_input(strict_json_loads(json.dumps(asdict(task), ensure_ascii=False, allow_nan=False)), check_hash=False)

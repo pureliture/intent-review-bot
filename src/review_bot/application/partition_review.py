@@ -652,7 +652,7 @@ def prepare_originals(task, mode):
     if len({o.evidence_id for o in originals}) != len(originals):
         raise PartitionError("duplicate_original_id")
     if isinstance(task, IntentTaskInput):
-        meta["source_scope"] = build_source_scope(originals, task.snapshot.changed_files)
+        meta["source_scope"] = build_source_scope(originals, task.snapshot.changed_files, task.dependency_notes)
         meta["limitations"].extend(meta["source_scope"]["boundaries"])
     return originals, meta
 

@@ -20,6 +20,7 @@ class IntentTaskInput:
     reviewed_paths: tuple[str, ...]
     input_hash: str
     context_paths: tuple[str, ...] = ()
+    dependency_notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -21,6 +21,7 @@ POLICY = "diff-symbols/v1"
 MAX_DEPTH = 5
 MAX_DEPENDENCY_SYMBOLS = 128
 MAX_DEPENDENCY_FILES = 32
+MAX_DEPENDENCY_BYTES = 512 * 1024
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_FULL_CONTEXT_SOURCE_BYTES = 16 * 1024
 
@@ -38,7 +39,7 @@ _JAVA_BUILTIN_TYPES = frozenset({
     "List", "Map", "Set", "Collection", "Iterable", "Iterator", "Optional",
     "Stream", "Collectors", "Arrays", "Collections", "Objects", "UUID",
     "Instant", "Duration", "LocalDate", "LocalDateTime", "ZonedDateTime",
-    "OffsetDateTime", "BigDecimal", "BigInteger", " Path", "File", "CompletableFuture",
+    "OffsetDateTime", "BigDecimal", "BigInteger", "Path", "File", "CompletableFuture",
     "Mono", "Flux", "Logger", "LoggerFactory", "Test", "BeforeEach", "AfterEach",
     "ParameterizedTest", "ValueSource", "MethodSource", "DisplayName", "Nested",
     "Mock", "InjectMocks", "Captor", "ExtendWith", "Autowired", "Component",
@@ -46,8 +47,9 @@ _JAVA_BUILTIN_TYPES = frozenset({
     "Bean", "Value", "Transactional", "Slf4j", "Getter", "Setter", "Builder",
     "Data", "RequiredArgsConstructor", "AllArgsConstructor", "NoArgsConstructor",
 })
+_PYTHON_STDLIB_MODULES = frozenset(getattr(sys, "stdlib_module_names", ()))
 _PYTHON_EXTERNAL_MODULES = frozenset({
-    *getattr(sys, "stdlib_module_names", ()),
+    *_PYTHON_STDLIB_MODULES,
     "pytest", "pydantic", "fastapi", "starlette", "httpx", "yaml", "uvicorn",
     "tree_sitter", "tree_sitter_java", "tree_sitter_python", "requests",
     "sqlalchemy", "numpy", "pandas",
@@ -179,6 +181,15 @@ def _java_source_roots(path: str, package_name: str) -> list[str]:
     return roots
 
 
+@dataclass(frozen=True)
+class DependencyDiscovery:
+    paths: tuple[str, ...]
+    labels: dict
+    satisfied: frozenset
+    externals: tuple[str, ...]
+    truncated: tuple[str, ...]
+
+
 def discover_one_hop_dependency_paths(
     changed_files,
     base_files,
@@ -186,7 +197,7 @@ def discover_one_hop_dependency_paths(
     *,
     existing_paths=(),
     max_files: int = MAX_DEPENDENCY_FILES,
-) -> tuple[str, ...]:
+) -> "DependencyDiscovery":
     """Resolve 1-hop syntactic repository file candidates from changed Java/Python files."""
     by_base = {f.path: f for f in base_files}
     by_head = {f.path: f for f in head_files}
@@ -197,15 +208,25 @@ def discover_one_hop_dependency_paths(
     prod_imported: list[str] = []
     test_candidates: list[str] = []
 
+    cur = [""]
+    labels: dict[str, str] = {}
+    satisfied: set[str] = set()
+
     def add_candidate(bucket: list[str], candidate: str) -> None:
         try:
             clean = safe_relative_path(candidate)
         except Exception:
             return
-        if clean in excluded or intent_path_exclusion(clean):
+        if intent_path_exclusion(clean):
             return
+        if clean in excluded:
+            satisfied.add(cur[0])
+            return
+        labels.setdefault(clean, cur[0])
         if clean not in bucket:
             bucket.append(clean)
+
+    externals: set[str] = set()
 
     for change in changed_files:
         old_path = change.previous_path or change.path
@@ -242,17 +263,25 @@ def discover_one_hop_dependency_paths(
             pkg_name = pkg_match.group(1) if pkg_match else ""
             roots = _java_source_roots(target_file.path, pkg_name)
             explicit_types: set[str] = set()
+            external_types: set[str] = set()
             wildcard_pkgs: list[str] = []
             for imp_match in re.finditer(r"^\s*import\s+(static\s+)?([\w.*]+)\s*;", target_file.content, re.M):
                 is_static = bool(imp_match.group(1))
                 target_imp = imp_match.group(2)
                 if target_imp.startswith(_JAVA_EXTERNAL_PREFIXES):
+                    ext_parts = target_imp.split(".")
+                    if is_static and len(ext_parts) >= 2 and ext_parts[-2][:1].isupper():
+                        ext_parts = ext_parts[:-1]
+                    if ext_parts[-1][:1].isupper():
+                        external_types.add(ext_parts[-1])
+                        externals.add(ext_parts[-1])
                     continue
                 if target_imp.endswith(".*"):
                     base_imp = target_imp[:-2]
                     if is_static and "." in base_imp and base_imp.rsplit(".", 1)[-1][:1].isupper():
                         pkg_part, cls_name = base_imp.rsplit(".", 1)
                         explicit_types.add(cls_name)
+                        cur[0] = cls_name
                         for root in roots:
                             rel = f"{pkg_part.replace('.', '/')}/{cls_name}.java"
                             add_candidate(primary_bucket if cls_name in referenced_names else secondary_bucket, f"{root}/{rel}" if root else rel)
@@ -266,6 +295,7 @@ def discover_one_hop_dependency_paths(
                 if not cls_name[:1].isupper():
                     continue
                 explicit_types.add(cls_name)
+                cur[0] = cls_name
                 rel_path = "/".join(parts) + ".java"
                 bucket = primary_bucket if cls_name in referenced_names else secondary_bucket
                 for root in roots:
@@ -274,17 +304,20 @@ def discover_one_hop_dependency_paths(
             declared_names = {s.name for s in syms if s.name}
             type_refs = sorted(
                 name for name in referenced_names
-                if name[:1].isupper() and name not in _JAVA_BUILTIN_TYPES and name not in explicit_types and name not in declared_names
+                if name[:1].isupper() and name not in _JAVA_BUILTIN_TYPES and name not in explicit_types
+                and name not in external_types and name not in declared_names
             )
             if pkg_name:
                 pkg_rel = pkg_name.replace(".", "/")
                 for type_name in type_refs:
+                    cur[0] = type_name
                     for root in roots:
                         rel = f"{pkg_rel}/{type_name}.java"
                         add_candidate(primary_bucket, f"{root}/{rel}" if root else rel)
             for wild_pkg in wildcard_pkgs:
                 wild_rel = wild_pkg.replace(".", "/")
                 for type_name in type_refs:
+                    cur[0] = type_name
                     for root in roots:
                         rel = f"{wild_rel}/{type_name}.java"
                         add_candidate(secondary_bucket, f"{root}/{rel}" if root else rel)
@@ -294,6 +327,7 @@ def discover_one_hop_dependency_paths(
                 mod_spec = from_match.group(1).strip()
                 imported_clause = from_match.group(2).strip().strip("()")
                 imported_items = [item.strip().split(" as ")[0].strip() for item in imported_clause.split(",") if item.strip()]
+                cur[0] = mod_spec
                 if mod_spec.startswith("."):
                     dots = len(mod_spec) - len(mod_spec.lstrip("."))
                     rel_mod = mod_spec[dots:]
@@ -313,7 +347,10 @@ def discover_one_hop_dependency_paths(
                 else:
                     top_pkg = mod_spec.split(".", 1)[0]
                     if top_pkg in _PYTHON_EXTERNAL_MODULES:
+                        if top_pkg not in _PYTHON_STDLIB_MODULES:
+                            externals.add(top_pkg)
                         continue
+                    cur[0] = mod_spec
                     rel_mod = mod_spec.replace(".", "/")
                     roots = ["src", ""] if target_file.path.startswith(("src/", "tests/")) else [""]
                     for root in roots:
@@ -330,7 +367,10 @@ def discover_one_hop_dependency_paths(
                         continue
                     top_pkg = mod_spec.split(".", 1)[0]
                     if top_pkg in _PYTHON_EXTERNAL_MODULES:
+                        if top_pkg not in _PYTHON_STDLIB_MODULES:
+                            externals.add(top_pkg)
                         continue
+                    cur[0] = mod_spec
                     rel_mod = mod_spec.replace(".", "/")
                     roots = ["src", ""] if target_file.path.startswith(("src/", "tests/")) else [""]
                     for root in roots:
@@ -343,12 +383,16 @@ def discover_one_hop_dependency_paths(
         for candidate in group:
             if candidate not in ordered:
                 ordered.append(candidate)
-            if len(ordered) >= max_files * 2:
-                return tuple(ordered)
-    return tuple(ordered)
+    # Bound the probe list; labels whose every candidate is cut are reported as limit exclusions.
+    cap = max_files * 8
+    kept, cut = ordered[:cap], ordered[cap:]
+    return DependencyDiscovery(
+        tuple(kept), dict(labels), frozenset(satisfied),
+        tuple(sorted(externals)), tuple(cut),
+    )
 
 
-def build_source_scope(originals, changes):
+def build_source_scope(originals, changes, dependency_notes=()):
     """Select all changed syntax units, then at most five reference hops.
 
     Changed units are mandatory. Dependency caps never discard them; exceeding a
@@ -456,9 +500,16 @@ def build_source_scope(originals, changes):
             else:
                 result.append([start, end])
         return result
+    for note in dependency_notes:
+        reason, _, symbol = note.partition(":")
+        if not symbol:
+            continue
+        unresolved_by_symbol.setdefault(symbol, reason)
+        if reason in {"dependency_file_limit", "dependency_byte_limit"}:
+            boundaries.add("dependency_expansion_limit")
     unresolved_list = [
         {"symbol": sym, "reason": reason}
-        for sym, reason in sorted(unresolved_by_symbol.items())[:64]
+        for sym, reason in sorted(unresolved_by_symbol.items(), key=lambda item: (item[1] == "external_dependency", item[0]))[:64]
     ]
     return {"policy": POLICY, "max_depth": MAX_DEPTH,
         "max_dependency_symbols": MAX_DEPENDENCY_SYMBOLS, "max_dependency_files": MAX_DEPENDENCY_FILES,

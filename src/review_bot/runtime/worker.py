@@ -543,9 +543,10 @@ class WorkerLoop:
                     artifacts = RunArtifacts(self.artifact_root, run)
                     artifacts.save_common(snapshot=review_snap, selection=mode_sel, config_hash=self.config.config_hash)
                     artifacts.write_json("repository-settings.json", self._repository_settings)
-                    paths = tuple(sorted({f.path for c in (material.base, material.head) for f in c.files}))
+                    paths = tuple(sorted({f.path for c in (material.base, material.head) for f in c.files}
+                        | set(self.config.intent.context_paths)))
                     planning_task = build_intent_task_input(review_snap, material.base, material.head,
-                        related_paths=tuple(self.config.intent.context_paths), context_paths=paths)
+                        context_paths=paths, dependency_notes=material.dependency_notes)
                     artifacts.write_json("planning-input.json", planning_task)
                     self._prepare_partition_planner()
                     self._generation_keys["planning"] = shared_review_generation_key(planning_task, self.config,
@@ -1036,10 +1037,11 @@ class WorkerLoop:
             raise _ModeFailure("intent_material_unavailable")
         if artifacts is None:
             raise _ModeFailure("artifact_root_required")
-        extra_paths = tuple(sorted({f.path for c in (material.base, material.head) for f in c.files}))
+        extra_paths = tuple(sorted({f.path for c in (material.base, material.head) for f in c.files}
+            | set(self.config.intent.context_paths)))
         task_input = self._partition_task if shared_plan_enabled(self.config) else build_intent_task_input(
             review_snap, material.base, material.head,
-            related_paths=tuple(self.config.intent.context_paths), context_paths=extra_paths)
+            context_paths=extra_paths, dependency_notes=material.dependency_notes)
         if task_input is None:
             raise _ModeFailure("partition_plan_input_unavailable")
         marker = self.config.publish.b_marker

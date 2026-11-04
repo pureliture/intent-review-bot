@@ -8,8 +8,12 @@ from datetime import UTC, datetime
 
 from review_bot.application.classification import classify_pr
 from review_bot.application.context import hash_json
-from review_bot.application.intent_context import collect_intent_code_snapshot, validate_intent_context_paths
-from review_bot.application.intent_source_scope import MAX_DEPENDENCY_FILES, discover_one_hop_dependency_paths
+from review_bot.application.intent_context import (
+    MAX_DEPENDENCY_NOTES, collect_intent_code_snapshot, validate_intent_context_paths,
+)
+from review_bot.application.intent_source_scope import (
+    MAX_DEPENDENCY_BYTES, MAX_DEPENDENCY_FILES, discover_one_hop_dependency_paths,
+)
 from review_bot.application.selection import (
     DeadlineModeSelector, LightweightModeSelector, constrain_architecture_to_java_gradle, select_modes,
 )
@@ -44,6 +48,7 @@ class SnapshotMaterial:
     head: CodeSnapshot | None = None
     captured_at: str | None = None
     as_of: str | None = None
+    dependency_notes: tuple[str, ...] = ()
 
 
 def collect_snapshot_material(
@@ -64,6 +69,7 @@ def collect_snapshot_material(
     changed = ()
     renames = {}
     base = head = None
+    dependency_notes: tuple[str, ...] = ()
     gate()
     if merge_base.is_comparable:
         changed = repo_reader.get_changed_files(merge_base.comparison_base_sha, head_sha)
@@ -79,9 +85,14 @@ def collect_snapshot_material(
         gate()
         head = collect_intent_code_snapshot(repo_reader, head_sha, paths)
         gate()
-        dep_candidates = discover_one_hop_dependency_paths(
+        discovery = discover_one_hop_dependency_paths(
             changed, base.files, head.files, existing_paths=paths, max_files=MAX_DEPENDENCY_FILES,
         )
+        dep_candidates = discovery.paths
+        notes = {f"external_dependency:{name}" for name in discovery.externals}
+        existing: set[str] = set()
+        admitted_deps: list[str] = []
+        limit_reason: dict[str, str] = {}
         if dep_candidates:
             gate()
             dep_head = collect_intent_code_snapshot(repo_reader, head_sha, dep_candidates)
@@ -91,18 +102,22 @@ def collect_snapshot_material(
             excluded_dep = {item.path for item in (*dep_head.exclusions, *dep_base.exclusions)}
             head_by_path = {f.path: f for f in dep_head.files if f.path not in excluded_dep and f.kind != "build"}
             base_by_path = {f.path: f for f in dep_base.files if f.path not in excluded_dep and f.kind != "build"}
-            admitted_deps: list[str] = []
             dep_bytes = 0
             for candidate in dep_candidates:
                 if candidate not in head_by_path and candidate not in base_by_path:
                     continue
+                existing.add(candidate)
                 size = sum(
                     len(mapping[candidate].content.encode("utf-8"))
                     for mapping in (head_by_path, base_by_path)
                     if candidate in mapping
                 )
-                if len(admitted_deps) >= MAX_DEPENDENCY_FILES or dep_bytes + size > 512 * 1024:
-                    break
+                if len(admitted_deps) >= MAX_DEPENDENCY_FILES:
+                    limit_reason[candidate] = "dependency_file_limit"
+                    continue
+                if dep_bytes + size > MAX_DEPENDENCY_BYTES:
+                    limit_reason[candidate] = "dependency_byte_limit"
+                    continue
                 admitted_deps.append(candidate)
                 dep_bytes += size
             if admitted_deps:
@@ -123,17 +138,39 @@ def collect_snapshot_material(
                 ).hexdigest()
                 base = CodeSnapshot(base.sha, merged_base_files, base.exclusions, base_inv, base.complete, base.errors)
                 head = CodeSnapshot(head.sha, merged_head_files, head.exclusions, head_inv, head.complete, head.errors)
+        by_label: dict[str, list[str]] = {}
+        for candidate, label in discovery.labels.items():
+            by_label.setdefault(label, []).append(candidate)
+        truncated = set(discovery.truncated)
+        admitted_set = set(admitted_deps)
+        for label, label_paths in by_label.items():
+            if label in discovery.satisfied or admitted_set & set(label_paths):
+                found = [p for p in label_paths if p in admitted_set]
+                if len([p for p in found if p.endswith(".java")]) > 1:
+                    notes.add(f"ambiguous_candidates:{label}")
+                continue
+            reasons = [limit_reason[p] for p in label_paths if p in limit_reason]
+            if reasons:
+                notes.add(f"{reasons[0]}:{label}")
+            elif any(p in truncated for p in label_paths):
+                notes.add(f"dependency_file_limit:{label}")
+            else:
+                notes.add(f"outside_fixed_corpus:{label}")
+        dependency_notes = tuple(sorted(notes))[:MAX_DEPENDENCY_NOTES]
     stable_evidence = []
     for item in evidence:
         value = asdict(item)
         value["locator"].pop("retrieved_at", None)
         stable_evidence.append(value)
-    digest = hash_json({"comparison": asdict(merge_base), "changed_files": [asdict(item) for item in changed],
+    digest_input = {"comparison": asdict(merge_base), "changed_files": [asdict(item) for item in changed],
         "related_paths": sorted(related_paths), "evidence": stable_evidence,
         "unavailable_sources": [asdict(item) for item in unavailable_sources],
-        "base": asdict(base) if base is not None else None, "head": asdict(head) if head is not None else None})
+        "base": asdict(base) if base is not None else None, "head": asdict(head) if head is not None else None}
+    if dependency_notes:
+        digest_input["dependency_notes"] = list(dependency_notes)
+    digest = hash_json(digest_input)
     return SnapshotMaterial(merge_base, tuple(changed), renames, tuple(evidence), tuple(unavailable_sources),
-        digest, base, head, captured_at, as_of)
+        digest, base, head, captured_at, as_of, dependency_notes)
 
 
 def assemble_pr_snapshot(

@@ -240,7 +240,7 @@ def test_one_hop_dependency_collection_and_unresolved_reference_boundaries():
         (ChangedFile(svc_path),),
         (CodeFile(svc_path, base_service, hashlib.sha256(base_service.encode()).hexdigest(), "source"),),
         (CodeFile(svc_path, head_service, hashlib.sha256(head_service.encode()).hexdigest(), "source"),),
-    )
+    ).paths
     assert val_path in candidates
     assert hlp_path in candidates
 
@@ -274,3 +274,94 @@ def test_one_hop_dependency_collection_and_unresolved_reference_boundaries():
         item["symbol"] == "ExternalGateway" and item["reason"] == "outside_fixed_corpus"
         for item in scope.get("unresolved_references", [])
     )
+
+
+def _py_material(sources, repo, *, base_sources=None):
+    from unittest.mock import Mock
+    from review_bot.application.snapshot import collect_snapshot_material
+    from review_bot.ports import MergeBaseResult, RepositoryReader
+
+    head_blobs = {**repo, **{p: c.encode() for p, c in sources.items()}}
+    base_blobs = {**repo, **{p: c.encode() for p, c in (base_sources or sources).items()}}
+    reader = Mock(spec=RepositoryReader)
+    reader.resolve_merge_base.return_value = MergeBaseResult("a" * 40, "a" * 40, "comparable")
+    reader.get_changed_files.return_value = tuple(ChangedFile(p) for p in sources)
+    reader.get_rename_map.return_value = {}
+    reader.read_tree_blobs.side_effect = lambda sha, *, paths: {
+        p: (base_blobs if sha == "a" * 40 else head_blobs)[p]
+        for p in paths if p in (base_blobs if sha == "a" * 40 else head_blobs)
+    }
+    return collect_snapshot_material(reader, "a" * 40, "b" * 40)
+
+
+def test_missing_and_external_python_imports_are_reported_not_silently_complete():
+    path = "app/svc.py"
+    source = "from boto3 import client\nfrom pkg.helper import run\nimport requests\nimport os\n\ndef go():\n    return client, run\n"
+    material = _py_material({path: source}, {}, base_sources={path: "def go():\n    return 1\n"})
+    assert "outside_fixed_corpus:boto3" in material.dependency_notes
+    assert "outside_fixed_corpus:pkg.helper" in material.dependency_notes
+    assert "external_dependency:requests" in material.dependency_notes
+    assert not any(note.endswith(":os") for note in material.dependency_notes)
+    originals = [SourceOriginal("S-head", source, "source", path, "head", "b" * 40),
+        SourceOriginal("S-base", "def go():\n    return 1\n", "source", path, "base", "a" * 40)]
+    scope = build_source_scope(originals, [ChangedFile(path)], material.dependency_notes)
+    reasons = {item["symbol"]: item["reason"] for item in scope["unresolved_references"]}
+    assert reasons["boto3"] == "outside_fixed_corpus" and reasons["requests"] == "external_dependency"
+
+
+def test_dependency_file_and_byte_limits_are_recorded_as_boundaries():
+    from review_bot.application.intent_source_scope import MAX_DEPENDENCY_FILES
+
+    count = MAX_DEPENDENCY_FILES + 2
+    path = "app/svc.py"
+    source = "".join(f"from lib.m{i} import f{i}\n" for i in range(count)) + "\ndef go():\n    return 2\n"
+    repo = {f"lib/m{i}.py": f"def f{i}():\n    return {i}\n".encode() for i in range(count)}
+    material = _py_material({path: source}, repo, base_sources={path: "def go():\n    return 1\n"})
+    limited = [n for n in material.dependency_notes if n.startswith("dependency_file_limit:")]
+    assert len(limited) == 2
+    assert len([f for f in material.head.files if f.path.startswith("lib/")]) == MAX_DEPENDENCY_FILES
+    scope = build_source_scope([SourceOriginal("S", source, "source", path, "head", "b" * 40)],
+        [ChangedFile(path)], material.dependency_notes)
+    assert "dependency_expansion_limit" in scope["boundaries"]
+
+    big = {"lib/big1.py": b"x = '" + b"a" * 400_000 + b"'\n", "lib/big2.py": b"y = '" + b"b" * 400_000 + b"'\n"}
+    source = "from lib.big1 import x\nfrom lib.big2 import y\n\ndef go():\n    return x, y\n"
+    material = _py_material({path: source}, big, base_sources={path: "def go():\n    return 1\n"})
+    assert any(n.startswith("dependency_byte_limit:") for n in material.dependency_notes)
+
+
+def test_explicit_external_java_import_is_not_an_internal_candidate():
+    from review_bot.application.intent_source_scope import discover_one_hop_dependency_paths
+    from review_bot.domain.models_v1 import CodeFile
+
+    path = "src/main/java/com/example/A.java"
+    source = ("package com.example;\nimport java.nio.file.Path;\nclass A {\n"
+        "    Path p() { return Path.of(\"x\"); }\n}\n")
+    head = (CodeFile(path, source, "0" * 64, "source"),)
+    found = discover_one_hop_dependency_paths((ChangedFile(path),), (), head)
+    assert "Path" in found.externals
+    assert "Path" not in found.labels.values()
+    assert not any(candidate.endswith("/Path.java") for candidate in found.paths)
+
+
+def test_configured_context_paths_never_become_reviewed_targets():
+    from dataclasses import replace
+    from review_bot.application.intent_context import build_intent_task_input
+    from review_bot.application.partition_review import prepare_originals
+    from tests.fixtures.code_first_intent_review import make_task
+    from tests.unit.test_context_and_architecture_review import _make_snapshot
+
+    base = {"src/A.java": "class A { int run() { return 0; } }\n", "build.gradle": "plugins {}\n",
+        "src/Ctx.java": "class Ctx {}\n"}
+    head = {**base, "src/A.java": "class A { int run() { return 1; } }\n"}
+    material = _make_snapshot(base, head)
+    snapshot = replace(make_task().snapshot, target_base_sha=material.base.sha, comparison_base_sha=material.base.sha,
+        head_sha=material.head.sha, changed_files=(ChangedFile("src/A.java"),))
+    task = build_intent_task_input(snapshot, replace(material.base, inventory_hash=""),
+        replace(material.head, inventory_hash=""), context_paths=("build.gradle", "src/Ctx.java"))
+    assert task.reviewed_paths == ("src/A.java",)
+    assert task.context_paths == ("build.gradle", "src/Ctx.java")
+    originals, meta = prepare_originals(task, "intent")
+    assert meta["targets"] == ["src/A.java"]
+    assert "src/Ctx.java" in {o.path for o in originals if o.kind == "context_source"}
+    assert "build.gradle" not in meta["targets"]
