@@ -104,11 +104,12 @@ class FakeAgentRunner:
 def _architecture_body(task):
     originals, meta = prepare_originals(task, "architecture")
     source = next(item for item in originals if item.path == "src/A.java" and item.version == "head")
-    return {"summary": "Reviewed architecture.", "findings": [{
+    citation = {"path": source.path, "version": "head", "quote": "void run()"}
+    return {"summary": "Reviewed architecture.", "summary_citations": [deepcopy(citation)], "findings": [{
         "statement": "A concrete defect.", "reasoning": "The supplied implementation has this behavior.",
         "failure_condition": "When the method is called.", "verdict": "concern",
         "basis": "observed_structure", "target_ids": [meta["targets"][0]],
-        "citations": [{"path": source.path, "version": "head", "quote": "void run()"}],
+        "citations": [deepcopy(citation)],
     }]}
 
 
@@ -116,11 +117,13 @@ def _intent_body(task):
     originals, _meta = prepare_originals(task, "intent")
     source = next(item for item in originals if item.path == "src/value.py" and item.version == "head")
     quote = next(line for line in source.text.splitlines() if line.strip())
-    return {"summary": "Compared purpose and implementation.", "questions": [], "perspectives": [
+    citation = {"path": source.path, "version": "head", "quote": quote}
+    return {"summary": "Compared purpose and implementation.", "summary_citations": [deepcopy(citation)],
+        "questions": [], "perspectives": [
         {"perspective_id": identifier, "assessments": [{
             "verdict": "aligned", "statement": f"Assessment for {identifier}.",
             "reasoning": "Compared the stated intent with supplied source.",
-            "failure_condition": "", "citations": [{"path": source.path, "version": "head", "quote": quote}],
+            "failure_condition": "", "citations": [deepcopy(citation)],
         }]} for identifier in PERSPECTIVE_IDS
     ]}
 
@@ -327,6 +330,64 @@ def test_agent_fact_verification_without_review_client_is_not_configured(tmp_pat
     markdown = format_partition_review_markdown(result, task, publication_mode="artifact_only")
     assert "No factual-review model is configured." in markdown
     validate_partition_result(result, task)
+
+
+def test_agent_summary_citations_are_bound_to_stored_code_citations(tmp_path):
+    task = _pmd_partition_task()
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+    result = run_agent_review(task, "architecture", runner, language="en", instructions="")
+
+    validate_partition_result(result, task)
+    citations = result.partition["final"]["summary_citations"]
+    originals, _meta = prepare_originals(task, "architecture")
+    originals_by_id = {item.evidence_id: item for item in originals}
+    assert len(citations) == 1
+    citation = citations[0]
+    source = originals_by_id[citation["evidence_id"]]
+    assert source.path and source.version == "head"
+    assert citation["quote"] == "void run()"
+    assert "summary_citations" in runner.contract
+    assert runner.contract_json["required_keys"]["envelope"][1] == "summary_citations"
+    assert runner.contract_json["citation_rules"]["summary_citations_required"] is True
+
+
+def test_bad_summary_citation_is_rejected_and_repaired_once(tmp_path):
+    task = _pmd_partition_task()
+    first = _architecture_body(task)
+    first["summary_citations"][0]["quote"] = "this quote is not in the source"
+    corrected = _architecture_body(task)
+    runner = FakeAgentRunner(tmp_path, first, repair_output=corrected)
+    result = _run(task, "architecture", tmp_path, first, runner=runner)
+
+    assert runner.repair_calls == 1
+    assert result.partition["agent"]["repair_attempted"]
+    assert result.partition["agent"]["rejected_before"] == [
+        {"kind": "envelope", "index": 0, "reason": "agent_summary_citations_invalid"}]
+    assert result.status == "completed"
+    assert result.partition["final"]["summary_citations"][0]["quote"] == "void run()"
+    validate_partition_result(result, task)
+
+
+def test_missing_summary_citations_fail_without_a_second_repair(tmp_path):
+    task = _pmd_partition_task()
+    body = _architecture_body(task)
+    del body["summary_citations"]
+    runner = FakeAgentRunner(tmp_path, body)
+    result = _run(task, "architecture", tmp_path, body, runner=runner)
+
+    assert runner.repair_calls == 1
+    assert result.status == "failed"
+    assert result.reason == "agent_output_summary_citations_missing"
+    validate_partition_result(result, task)
+
+
+def test_tampered_stored_summary_citation_is_rejected(tmp_path):
+    task = _pmd_partition_task()
+    result = _run(task, "architecture", tmp_path, _architecture_body(task))
+    altered = deepcopy(result)
+    altered.partition["final"]["summary_citations"][0]["end_byte"] += 1
+    with pytest.raises(PartitionError, match="agent_citation_tampered"):
+        validate_partition_result(altered, task)
 
 
 def test_agent_uses_result_file_instead_of_stdout(tmp_path):

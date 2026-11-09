@@ -146,7 +146,37 @@ function checkCitations(citations, parts, contract, allowEmpty) {
   });
 }
 
+function hasCodeFiles() {
+  const pending = ["head", "base"].map((version) => path.join(workspace, version));
+  while (pending.length > 0) {
+    const current = pending.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch (cause) {
+      if (cause.code === "ENOENT") continue;
+      throw cause;
+    }
+    for (const entry of entries) {
+      if (entry.isFile()) return true;
+      if (entry.isDirectory()) pending.push(path.join(current, entry.name));
+    }
+  }
+  return false;
+}
+
+function checkSummaryCitations(result, contract) {
+  if (!object(result) || !Array.isArray(result.summary_citations)
+      || (result.summary_citations.length === 0 && hasCodeFiles())) {
+    error(["summary_citations"], "agent_output_summary_citations_missing");
+    return false;
+  }
+  checkCitations(result.summary_citations, ["summary_citations"], contract, !hasCodeFiles());
+  return true;
+}
+
 function checkArchitecture(result, contract) {
+  if (!checkSummaryCitations(result, contract)) return;
   if (!exactKeys(result, contract.required_keys.envelope, [])) return;
   nonemptyString(result.summary, ["summary"]);
   if (!Array.isArray(result.findings)) {
@@ -187,6 +217,7 @@ function checkArchitecture(result, contract) {
 }
 
 function checkIntent(result, contract) {
+  if (!checkSummaryCitations(result, contract)) return;
   if (!exactKeys(result, contract.required_keys.envelope, [])) return;
   nonemptyString(result.summary, ["summary"]);
   if (!Array.isArray(result.questions)) {

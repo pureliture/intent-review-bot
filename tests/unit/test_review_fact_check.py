@@ -1022,6 +1022,29 @@ def test_requested_fact_original_is_complete_even_in_focused_citation_delivery()
         facts.delivery([row], final, [code, test, purpose], {}, kind="cited_ranges", extra=extra)
 
 
+def test_summary_citations_of_a_zero_finding_agent_final_are_delivered_for_the_summary_row():
+    from review_bot.application.source_partition import SourceOriginal, make_span
+    code = SourceOriginal("S-code", "one\ntwo\nthree\nfour\n", "source", "src/A.py", "head", "a" * 40)
+    purpose = SourceOriginal("S-purpose", "Frozen full purpose", "pr_text", "", "", "")
+    span = make_span(code, 4, 8, "test")
+    citation = {"evidence_id": span.evidence_id, "start_byte": span.start_byte, "end_byte": span.end_byte,
+        "sha": span.sha, "path": span.path, "version": span.version, "begin_line": span.begin_line,
+        "end_line": span.end_line, "quote": span.text}
+    final = {"summary": "No defect in the changed lines.", "summary_citations": [citation],
+        "findings": [], "perspectives": [], "questions": [], "supplied_quotes": []}
+    row = {"id": "summary", "kind": "summary", "item": final["summary"]}
+
+    payload, refs, _ = facts.delivery([row], final, [code, purpose], {}, kind="cited_originals")
+
+    supplied = {s["evidence_id"]: "".join(b["text"] for b in s["blocks"]) for s in payload["originals"]}
+    assert supplied[code.evidence_id] == code.text
+    catalog = {(source["evidence_id"], entry["start_byte"], entry["end_byte"])
+        for source in payload["citation_catalog"] for entry in source["ranges"]}
+    assert (span.evidence_id, span.start_byte, span.end_byte) in catalog
+    assert any(reference.evidence_id == span.evidence_id and reference.start_byte == span.start_byte
+        and reference.end_byte == span.end_byte for reference in refs.values())
+
+
 @pytest.mark.parametrize("corrupt", ["outside", "already_delivered", "duplicate", "empty_reason"])
 def test_invalid_fact_source_request_is_a_readable_partial_without_source_expansion(corrupt):
     task, result, review, _, _ = _fixed_test_repair(corrupt_request=corrupt)
