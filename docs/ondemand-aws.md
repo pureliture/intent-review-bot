@@ -1,7 +1,8 @@
-# On-demand review: Lambda intake → one-shot Linux VM (AWS reference)
+# On-demand review: Lambda intake → one-shot Linux VM
 
-This is a **reference design with code and local emulation tests**. It has not been deployed: no AWS account,
-GitHub App webhook, or real EC2 instance was used to verify it. `deploy/aws/template.yaml` passes `cfn-lint`.
+Terraform in `deploy/terraform/` is the recommended deployment path. The CloudFormation template at
+`deploy/aws/template.yaml` is retained as an equivalent reference. LocalStack is used for free service emulation;
+no real AWS account, EC2 worker, or GitHub delivery has been used to verify this deployment.
 
 ## Flow
 
@@ -54,10 +55,86 @@ included.
   source code are not stored.
 - IAM: intake/recovery may run instances only from the given launch template, pass only the worker role, describe
   instances for orphan reconciliation, and terminate only instances tagged `review-bot:managed=true`. The worker
-  policy covers only the job table plus self-termination.
+  policy covers only the job table, its own managed-instance termination, the GitHub App and OpenRouter secrets,
+  session-bucket `sessions/` objects, and its CloudWatch log group.
+- Terraform creates secret containers only. It does not create secret versions or store values in state. The operator
+  writes the webhook secret, GitHub App JSON (`app_id` and `private_key`), and OpenRouter key with
+  `aws secretsmanager put-secret-value`.
 - The VM receives only the job ID in user data. GitHub App credentials and models belong in the operator-owned AMI or
   secret store. OpenRouter is a supported production model profile; its API key is obtained from the operator's
   secret store and is not placed in user data.
+
+## Terraform deployment
+
+Prerequisites: Terraform 1.6 or newer, Docker, Packer with the Amazon plugin, an AWS account/region, an existing VPC
+and subnet with outbound HTTPS access, an operator-built Ubuntu 24.04 AMI, and a GitHub App with the required
+repository permissions. The Terraform module does not create a VPC or subnet. Its worker security group has no
+ingress and permits only outbound TCP 443. The launch template requires IMDSv2, a hop limit of one, encrypted gp3
+root storage, and terminate-on-shutdown behavior.
+The module creates the Lambda and worker CloudWatch log groups by default, with 30-day retention; set
+`create_log_groups = false` only when testing against an emulator without the Logs service. The LocalStack example
+uses that opt-out because the reused LocalStack instance has Logs disabled.
+
+1. Build the x86_64 Python 3.11 Lambda package. The script uses the Lambda base image, installs only the application
+   wheel plus `boto3` and `pydantic`, and proves `review_bot.runtime.aws_lambda` imports inside that image:
+
+   ```bash
+   deploy/scripts/build_lambda_zip.sh
+   ```
+
+   This produces `deploy/terraform/dist/lambda.zip` and `review_bot.whl` for the Packer build.
+
+2. Initialize Packer and build the AMI in the target AWS environment. Limit the temporary SSH rule to the operator's
+   source IP. The Packer source filter is restricted to Canonical owner `099720109477`.
+
+   ```bash
+   packer init deploy/packer/review-bot.pkr.hcl
+   packer build \
+     -var 'subnet_id=subnet-REPLACE' \
+     -var 'ssh_source_cidr=YOUR_PUBLIC_IP/32' \
+     -var 'repo_source_path=.' \
+     -var 'review_bot_wheel_path=deploy/terraform/dist/review_bot.whl' \
+     deploy/packer/review-bot.pkr.hcl
+   ```
+
+   The image installs the project wheel, JDK 21, the locked PMD 7.3.0 tool bundle, a dedicated rootless Docker daemon
+   for PMD/CPD, and the agent/proxy images. Agent/proxy containers use the separate Docker daemon with the runner's
+   read-only root, internal network, capability, PID, memory, and no-new-privileges restrictions; neither container
+   receives a Docker socket. It enables a systemd oneshot bootstrap. The worker reads its job ID and secret ARNs
+   from IMDSv2 user data and instance tags, writes secret files with mode `0600` under `/run/review-bot`, and runs
+   `review-bot-ondemand --job-id` as the rootless worker user. The bootstrap always requests immediate shutdown in
+   an exit trap; the launcher's independent `MaxVmSeconds` shutdown timer remains a backstop. The OpenRouter key stays
+   in its file until the Docker proxy launch and is never placed in the agent container or user data.
+
+3. Copy `deploy/terraform/terraform.tfvars.example` to `deploy/terraform/terraform.tfvars`, then set the AMI ID, VPC
+   ID, subnet ID, Lambda ZIP path, and GitHub allowlists. Run Terraform once to create the secret containers and
+   infrastructure:
+
+   ```bash
+   cp deploy/terraform/terraform.tfvars.example deploy/terraform/terraform.tfvars
+   terraform -chdir=deploy/terraform init
+   terraform -chdir=deploy/terraform apply
+   ```
+
+   Secret values cannot be set before their Terraform-created containers exist. After the first apply, supply values
+   directly through Secrets Manager (not Terraform variables or state):
+
+   ```bash
+   aws secretsmanager put-secret-value --secret-id "$(terraform -chdir=deploy/terraform output -raw webhook_secret_arn)" --secret-string file://webhook-secret.txt
+   aws secretsmanager put-secret-value --secret-id "$(terraform -chdir=deploy/terraform output -raw github_app_secret_arn)" --secret-string file://github-app.json
+   aws secretsmanager put-secret-value --secret-id "$(terraform -chdir=deploy/terraform output -raw openrouter_secret_arn)" --secret-string file://openrouter-key.txt
+   ```
+
+   `github-app.json` must contain `{"app_id":"…","private_key":"-----BEGIN RSA PRIVATE KEY-----\n…"}`
+   (the private key's newlines must be JSON-escaped). Keep these local input files private. Secret values are fetched
+   at worker boot and are not included in EC2 user data or Terraform state.
+
+4. Register the output URL as the GitHub App webhook URL, use `application/json`, subscribe to pull-request events,
+   and configure the same webhook secret value. The URL is public by design; the Lambda validates GitHub's HMAC
+   signature before accepting a request.
+
+`deploy/terraform/examples/localstack/` shows provider endpoint overrides and uses LocalStack's existing default VPC
+and subnet. It is for emulation only and must not be used as a production variable file.
 
 ## Verification
 
@@ -67,7 +144,6 @@ uv run --group aws pytest tests/unit/test_aws_ondemand.py             # moto Dyn
 uvx --from "cfn-lint>=1.20,<2" cfn-lint deploy/aws/template.yaml      # template lint
 ```
 
-Not verified: a real AWS deployment, Lambda cold start/packaging, EC2 boot time, the AMI contents, GitHub
-redelivery timing, and real GitHub/model calls from an EC2 worker. The AMI must install the `review-bot-ondemand`
-console script, operator configuration (default `/etc/review-bot/operator.yaml`), and private state directory
-(`/var/lib/review-bot` by default).
+Not verified: a real AMI build or boot, a real AWS Terraform apply, or actual GitHub webhook delivery. LocalStack does
+not boot EC2 or run the worker bootstrap; Lambda invocation, EC2 `RunInstances`, lifecycle calls, and AWS APIs are
+emulated there.
