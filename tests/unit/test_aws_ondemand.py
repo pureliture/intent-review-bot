@@ -207,6 +207,36 @@ def test_ec2_managed_instance_listing_paginates():
     }
 
 
+def test_ec2_launcher_adds_bootstrap_tags_without_overriding_job_tags(aws):
+    coordinator, ec2, _ = aws
+    launcher = Ec2VmLauncher(
+        ec2,
+        coordinator.launcher.launch_template_id,
+        instance_tags={
+            "review-bot:job-table": "jobs",
+            "review-bot:managed": "false",
+            "review-bot:job-id": "0" * 64,
+        },
+    )
+    job_id = "a" * 64
+    vm_id = launcher.launch(job_id, max_lifetime_seconds=600, launch_token="launch-token")
+    instance = next(
+        instance
+        for reservation in ec2.describe_instances()["Reservations"]
+        for instance in reservation["Instances"]
+        if instance["InstanceId"] == vm_id
+    )
+    tags = {tag["Key"]: tag["Value"] for tag in instance["Tags"]}
+    assert tags["review-bot:managed"] == "true"
+    assert tags["review-bot:job-id"] == job_id
+    assert tags["review-bot:job-table"] == "jobs"
+    user_data = base64.b64decode(
+        ec2.describe_instance_attribute(InstanceId=vm_id, Attribute="userData")["UserData"]["Value"]
+    ).decode()
+    assert f"# review-bot-ondemand --job-id {job_id}" in user_data
+    assert "exec /opt/review-bot/bin/review-bot-ondemand" not in user_data
+
+
 def test_concurrent_claims_on_dynamodb_yield_single_owner(aws):
     coordinator, _, _ = aws
     build_intake_handler(coordinator, lambda: SECRET)(webhook())

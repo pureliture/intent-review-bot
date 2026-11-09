@@ -80,8 +80,14 @@ def _coordinator_from_environment() -> OnDemandCoordinator:  # pragma: no cover 
 
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
     store = DynamoDbJobStore(boto3.client("dynamodb", region_name=region), os.environ["REVIEW_BOT_JOB_TABLE"])
+    instance_tags = json.loads(os.environ.get("REVIEW_BOT_INSTANCE_TAGS", "{}"))
+    if not isinstance(instance_tags, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in instance_tags.items()
+    ):
+        raise ValueError("REVIEW_BOT_INSTANCE_TAGS must be a string mapping")
     launcher = Ec2VmLauncher(boto3.client("ec2", region_name=region),
-        os.environ.get("REVIEW_BOT_LAUNCH_TEMPLATE_ID", ""))
+        os.environ.get("REVIEW_BOT_LAUNCH_TEMPLATE_ID", ""), instance_tags=instance_tags)
     return OnDemandCoordinator(store, launcher, clock=time.time,
         max_vm_lifetime_seconds=int(os.environ.get("REVIEW_BOT_MAX_VM_SECONDS", "3600")))
 

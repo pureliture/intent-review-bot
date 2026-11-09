@@ -58,8 +58,31 @@ class DockerPiAgentRunner:
         self.repo_root = repo_root or Path(__file__).resolve().parents[3]
         self._active_runs: dict[str, _ActiveRun] = {}
 
-    def _docker(self, args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess:
-        return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout, check=False)
+    def _docker(self, args: list[str], *, timeout: int = 30,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        options = {"capture_output": True, "text": True, "timeout": timeout, "check": False}
+        agent_docker_host = os.environ.get("REVIEW_BOT_AGENT_DOCKER_HOST")
+        if env is not None or agent_docker_host:
+            docker_env = dict(env if env is not None else os.environ)
+            if agent_docker_host:
+                docker_env["DOCKER_HOST"] = agent_docker_host
+                docker_env.pop("DOCKER_CONTEXT", None)
+            options["env"] = docker_env
+        return subprocess.run(["docker", *args], **options)
+
+    @staticmethod
+    def _openrouter_api_key() -> str:
+        key_path = os.environ.get("OPENROUTER_API_KEY_FILE")
+        if key_path:
+            try:
+                key = Path(key_path).read_text(encoding="utf-8").strip()
+            except OSError:
+                key = ""
+        else:
+            key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+        if not key:
+            raise AgentRunError("openrouter_api_key_missing")
+        return key
 
     @staticmethod
     def _runtime_uid_gid() -> tuple[int, int]:
@@ -203,8 +226,7 @@ class DockerPiAgentRunner:
         if request.mode not in ("architecture", "intent") or request.skill_id != (
                 "review-architecture" if request.mode == "architecture" else "review-intent"):
             raise AgentRunError("invalid_request")
-        if not os.environ.get("OPENROUTER_API_KEY"):
-            raise AgentRunError("openrouter_api_key_missing")
+        openrouter_api_key = self._openrouter_api_key()
         skill = agent_skill_path(request.mode)
         source_skills_dir = agent_skills_dir()
         checker_path = agent_checker_path()
@@ -255,7 +277,11 @@ class DockerPiAgentRunner:
             created = self._docker(["network", "create", "--internal", "--driver", "bridge", network])
             if created.returncode != 0:
                 raise AgentRunError("docker_network_failed")
-            proxy = self._docker(self._proxy_argv(network, proxy_name, request.model, ledger_dir))
+            proxy_env = os.environ.copy()
+            proxy_env["OPENROUTER_API_KEY"] = openrouter_api_key
+            proxy = self._docker(
+                self._proxy_argv(network, proxy_name, request.model, ledger_dir), env=proxy_env
+            )
             if proxy.returncode != 0:
                 raise AgentRunError("proxy_start_failed")
             connected = self._docker(["network", "connect", "--alias", "llm-proxy", network, proxy_name])
