@@ -13,6 +13,7 @@ from review_bot.adapters.github.auth import GitHubAppAuthError
 from review_bot.application.publication import publish_review_comment
 from review_bot.application.architecture_review import MockModelClient
 from review_bot.application.repository_review_settings import RepositoryReviewSettings
+from review_bot.application.source_partition import PartitionError
 from review_bot.domain.models_v1 import ModelResponse, PmdViolation
 from review_bot.runtime.artifacts import RunArtifacts
 from tests.conftest import SyntheticGitRepo
@@ -278,7 +279,8 @@ def test_b_actual_replay_formatter_failure_preserves_raw_checkpoint_and_publishe
     assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
     root, status, modes = receipts(flow)
     receipt = json.loads((root / "B/receipt.json").read_text())
-    assert status == "failed" and receipt["error_code"] == "intent_artifact_error:PartitionError"
+    assert status == "failed" and receipt["error_code"].startswith("intent_artifact_error:PartitionError:")
+    assert receipt["error_code"].rsplit(":", 1)[-1].islower()
     assert receipt["b_result"]["status"] == "partial_review"
     assert receipt["b_result"]["reason"] == "factual_verification_incomplete"
     assert receipt["b_result"]["partition"] == raw_result[0].partition
@@ -286,6 +288,36 @@ def test_b_actual_replay_formatter_failure_preserves_raw_checkpoint_and_publishe
     assert_status_notice(flow.comments[0]["body"])
     assert len(writes(flow)) == 1 and all(args[1] != "intent" for args in cached)
     assert not (root / "B/comment.md").exists()
+
+
+def test_partition_error_code_is_retained_in_intent_artifact_error(intent_flow, monkeypatch):
+    flow = intent_flow
+    opt_in(flow)
+
+    def fail_output(*args, **kwargs):
+        raise PartitionError("stored_consumer_admission_changed")
+
+    monkeypatch.setattr(RunArtifacts, "save_intent", fail_output)
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
+    root, status, _ = receipts(flow)
+    receipt = json.loads((root / "B/receipt.json").read_text())
+    assert status == "failed"
+    assert receipt["error_code"] == "intent_artifact_error:PartitionError:stored_consumer_admission_changed"
+
+
+def test_partition_error_free_form_message_stays_out_of_intent_error_code(intent_flow, monkeypatch):
+    flow = intent_flow
+    opt_in(flow)
+
+    def fail_output(*args, **kwargs):
+        raise PartitionError("Stored Consumer admission changed")
+
+    monkeypatch.setattr(RunArtifacts, "save_intent", fail_output)
+    assert send_event(flow).status_code == 202 and flow.worker.run_once() is False
+    root, status, _ = receipts(flow)
+    receipt = json.loads((root / "B/receipt.json").read_text())
+    assert status == "failed"
+    assert receipt["error_code"] == "intent_artifact_error:PartitionError"
 
 
 @pytest.mark.parametrize("method", ["find_marker_comment", "create_comment", "update_comment"])

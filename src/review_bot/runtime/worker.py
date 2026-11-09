@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import socket
 import tempfile
@@ -32,6 +33,7 @@ from review_bot.application.declared_intent_review import run_review_b_pipeline
 from review_bot.application.selection import DeadlineModeSelector, LightweightModeSelector, ModelModeSelector
 from review_bot.application.snapshot import assemble_snapshot_bundle, collect_snapshot_material
 from review_bot.application.repository_review_settings import RepositoryReviewSettings, SettingsResolution
+from review_bot.application.source_partition import PartitionError
 from review_bot.config import ReviewBotConfig, shared_plan_enabled
 from review_bot.domain.envelope_v2 import ExecutionReceipt, PublicationReceipt, RunRecord
 from review_bot.domain.intent_models import IntentReviewLimits
@@ -54,6 +56,15 @@ from review_bot.runtime.stored_partition_review import decode_stored_partition_r
 from review_bot.runtime.model_clients import build_intent_selection_client, build_planning_client, build_review_client, build_selector_client
 
 logger = logging.getLogger("review_bot.worker")
+_PARTITION_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _exception_error_code(prefix: str, exc: Exception) -> str:
+    code = f"{prefix}:{type(exc).__name__}"
+    message = str(exc)
+    if isinstance(exc, PartitionError) and _PARTITION_ERROR_CODE.fullmatch(message):
+        return code + ":" + message
+    return code
 
 
 class _RunAborted(Exception):
@@ -639,7 +650,8 @@ class WorkerLoop:
                 except Exception as exc:
                     self._require_active(run, deadline)
                     prefix = "worker" if mode_sel.selected_modes == ("architecture",) else mode
-                    error_code = str(exc) if isinstance(exc, (_ModeFailure, IntentInputError)) else f"{prefix}_pipeline_error:{type(exc).__name__}"
+                    error_code = str(exc) if isinstance(exc, (_ModeFailure, IntentInputError)) else _exception_error_code(
+                        f"{prefix}_pipeline_error", exc)
                     receipt = ExecutionReceipt(2, mode, mode_sel.selection_id, review_snap.snapshot_id,
                         run.generation, run.fingerprint, "failed", error_code=error_code,
                         publication=self._publish_failure_notice(run, mode, review_snap, error_code, deadline, draft=draft))
@@ -966,7 +978,7 @@ class WorkerLoop:
         except Exception as exc:
             self._require_active(run, deadline)
             prefix = "worker" if mode_sel.selected_modes == ("architecture",) else "architecture"
-            error_code = f"{prefix}_pipeline_error:{type(exc).__name__}"
+            error_code = _exception_error_code(f"{prefix}_pipeline_error", exc)
             return replace(core_receipt, execution_status="failed", error_code=error_code,
                 publication=self._publish_failure_notice(run, "architecture", review_snap, error_code, deadline, draft=draft))
         self._require_active(run, deadline)
@@ -1144,7 +1156,7 @@ class WorkerLoop:
             raise
         except Exception as exc:
             self._require_active(run, deadline)
-            error_code = f"intent_artifact_error:{type(exc).__name__}"
+            error_code = _exception_error_code("intent_artifact_error", exc)
             return replace(core_receipt, execution_status="failed", error_code=error_code,
                 publication=self._publish_failure_notice(run, "intent", review_snap, error_code, deadline, draft=draft))
         self._stage(run, RunStage.PUBLISH, deadline)
