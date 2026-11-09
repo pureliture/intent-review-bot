@@ -71,6 +71,9 @@ MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
 MAX_MODEL_CITATIONS = 32
 CONSUMER_ADMISSION_CONTRACT = "selected-review-native/v1"
+FINAL_FINDING_VERDICTS = ("concern", "improvement", "insufficient_context")
+FINAL_FINDING_BASES = ("criterion", "observed_structure", "analysis_signal")
+FINAL_PERSPECTIVE_VERDICTS = ("aligned", "concern", "conditional_risk", "insufficient_context", "not_apply")
 REVIEW_GROUNDING_RULE = ("\nDraft concern and conditional_risk require BOTH a nonempty concrete failure_condition "
                 "and at least one citation to supplied HEAD code with a nonempty file path. PR prose, static reports "
                 "and base-only code cannot establish a HEAD failure. Keep every original and cite only supplied "
@@ -422,12 +425,12 @@ def _architecture_source_paths(changed, signals):
 def _final_schema(ids, mode, targets, contexts=(), target_references=None, original_ids=(), perspective_ids=PERSPECTIVE_IDS):
     cite = _citation_schema(ids)
     judgement = _obj({"perspective_id": {"type": "string", "enum": list(perspective_ids)},
-        "verdict": {"type": "string", "enum": ["aligned", "concern", "conditional_risk", "insufficient_context", "not_apply"]},
+        "verdict": {"type": "string", "enum": list(FINAL_PERSPECTIVE_VERDICTS)},
         "statement": _text(), "reasoning": _text(), "failure_condition": _text(True),
         "citations": {**_array(cite, MAX_MODEL_CITATIONS), "minItems": 1}})
     finding = _obj({"statement": _text(), "reasoning": _text(), "failure_condition": _text(True),
-        "verdict": {"type": "string", "enum": ["concern", "improvement", "insufficient_context"]},
-        "basis": {"type": "string", "enum": ["criterion", "observed_structure", "analysis_signal"]},
+        "verdict": {"type": "string", "enum": list(FINAL_FINDING_VERDICTS)},
+        "basis": {"type": "string", "enum": list(FINAL_FINDING_BASES)},
         "target_ids": {**_array({"type": "string", "enum": list(targets)}, 32), "minItems": 1 if mode == "architecture" else 0}, "citations": {**_array(cite, MAX_MODEL_CITATIONS), "minItems": 1}})
     updates = _obj({key: _obj({"state": {"type": "string", "enum": ["unresolved", "resolved", "not_required"]},
         "reason": _text(), "citations": _array(cite, MAX_MODEL_CITATIONS)}) for key in contexts})
@@ -1593,8 +1596,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             for value in bounded_array(body["perspectives"], maximum=8):
                 row = bounded_object(value, {"perspective_id", "verdict", "statement", "reasoning", "failure_condition", "citations"})
                 identifier = row["perspective_id"]
-                if identifier not in _intent_ids(partitions) or identifier in seen or row["verdict"] not in (
-                    "aligned", "concern", "conditional_risk", "insufficient_context", "not_apply"):
+                if identifier not in _intent_ids(partitions) or identifier in seen or row["verdict"] not in FINAL_PERSPECTIVE_VERDICTS:
                     raise PartitionError("invalid_partition_perspective")
                 seen.add(identifier)
                 clean = {**row, "citations": final_citations(row["citations"], supplied)}
@@ -1609,9 +1611,9 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             findings = []
             for value in bounded_array(body["findings"], maximum=20):
                 row = bounded_object(value, {"statement", "reasoning", "failure_condition", "verdict", "basis", "target_ids", "citations"})
-                if row["verdict"] not in ("concern", "improvement", "insufficient_context"):
+                if row["verdict"] not in FINAL_FINDING_VERDICTS:
                     raise PartitionError("invalid_finding_verdict")
-                if row["basis"] not in ("criterion", "observed_structure", "analysis_signal"):
+                if row["basis"] not in FINAL_FINDING_BASES:
                     raise PartitionError("invalid_finding_basis")
                 targets = bounded_array(row["target_ids"], maximum=32)
                 if any(t not in page_targets for t in targets):
@@ -3127,6 +3129,9 @@ def _validate_consumer_delivery(result, originals, meta, known_units):
 
 def validate_partition_result(result: PartitionReviewResult, task) -> None:
     """Recheck immutable originals, coverage and extracted quotes before output."""
+    if isinstance(result, PartitionReviewResult) and result.partition.get("engine") == "pi-agent":
+        from review_bot.application.agent_review import validate_agent_partition_result
+        return validate_agent_partition_result(result, task)
     if type(result) is not PartitionReviewResult or result.schema_version != 13 or result.review_type not in ("A", "B", "PLAN"):
         raise PartitionError("invalid_partition_result")
     if result.status not in ("planned", "measured", "completed", "partial_review", "failed", "not_run"):

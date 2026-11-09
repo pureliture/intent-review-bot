@@ -310,6 +310,33 @@ class PartitionEvaluationConfig(BaseModel):
         return self
 
 
+class AgentEngineConfig(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    image_tag: str = Field(default="review-bot-pi-agent:0.73.1", min_length=1, max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+    model_id: str = Field(default="stealth/crouton-alpha", min_length=1, max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/-]*$")
+    timeout_seconds: int = Field(ge=1, le=3600, default=900)
+    max_proxy_calls: int = Field(ge=1, le=512, default=40)
+    max_output_tokens: int = Field(ge=1, le=32768, default=4096)
+    session_store_dir: str = Field(min_length=1, max_length=1024,
+        default="~/.local/share/review-bot/agent-sessions")
+
+    @field_validator("session_store_dir")
+    @classmethod
+    def validate_session_store_dir(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("session_store_dir cannot contain NUL")
+        return value
+
+    @field_validator("image_tag")
+    @classmethod
+    def validate_image_tag(cls, value: str) -> str:
+        if ":" not in value.rsplit("/", 1)[-1]:
+            raise ValueError("image_tag must include a tag")
+        return value
+
+
 class CodeInputConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
     versions: list[str] = Field(default_factory=lambda: ["comparison_base", "head"])
@@ -354,6 +381,8 @@ class ReviewBotConfig(BaseModel):
     service: ServiceConfig
     publish: PublishConfig = Field(default_factory=PublishConfig)
     model: ModelConfig
+    review_engine: Literal["partition", "agent"] = "partition"
+    agent_engine: AgentEngineConfig = Field(default_factory=AgentEngineConfig)
     architecture: ArchitectureConfig = Field(default_factory=ArchitectureConfig)
     intent: IntentConfig = Field(default_factory=IntentConfig)
     partition_evaluation: PartitionEvaluationConfig = Field(default_factory=PartitionEvaluationConfig)
@@ -372,11 +401,12 @@ class ReviewBotConfig(BaseModel):
             raise ValueError("architecture configuration is required for architecture-only execution")
         if self.execution.mode == "github_app" and "mode" not in self.publish.model_fields_set:
             self.publish.mode = "comment"
-        if self.partition_evaluation.enabled and self.publish.mode != "artifact_only" and self.execution.mode != "github_app":
+        if self.review_engine == "partition" and self.partition_evaluation.enabled and self.publish.mode != "artifact_only" and self.execution.mode != "github_app":
             raise ValueError("partition evaluation requires artifact_only publication")
-        if self.partition_evaluation.enabled and "intent" in self.execution.available_modes and self.intent.pipeline != "perspectives-v1":
+        if (self.review_engine == "partition" and self.partition_evaluation.enabled
+                and "intent" in self.execution.available_modes and self.intent.pipeline != "perspectives-v1"):
             raise ValueError("partition intent evaluation requires perspectives-v1")
-        if self.intent.pipeline == "perspectives-v1":
+        if self.review_engine == "partition" and self.intent.pipeline == "perspectives-v1":
             private_output = self.publish.mode == "artifact_only" and not self.publish.b_comments_enabled
             app_comments = (
                 self.execution.mode == "github_app" and self.execution.backend == "github_app"
@@ -425,6 +455,8 @@ def compute_config_hash(data: dict[str, Any] | BaseModel) -> str:
         raw_dict = {key: value for key, value in raw_dict.items() if key != "partition_evaluation"}
     if isinstance(raw_dict.get("intent"), dict) and raw_dict["intent"].get("pipeline") == "declared-v1":
         raw_dict = {**raw_dict, "intent": {key: value for key, value in raw_dict["intent"].items() if key != "pipeline"}}
+    if raw_dict.get("review_engine", "partition") == "partition":
+        raw_dict = {key: value for key, value in raw_dict.items() if key not in ("review_engine", "agent_engine")}
     execution = raw_dict.get("execution")
     if (
         raw_dict.get("schema_version") == 2 and isinstance(execution, dict)

@@ -34,6 +34,25 @@ def test_load_example_config(valid_config_yaml: str) -> None:
     assert config_hash == EXPECTED_EXAMPLE_HASH
 
 
+def test_agent_engine_config_is_opt_in_and_strict(valid_config_yaml: str) -> None:
+    config, _ = load_review_config_from_str(valid_config_yaml)
+    assert config.review_engine == "partition"
+    assert config.agent_engine.model_id == "stealth/crouton-alpha"
+    assert config.agent_engine.timeout_seconds > 0
+
+    enabled = valid_config_yaml.replace("schema_version: 2", "schema_version: 2\nreview_engine: agent", 1)
+    config, _ = load_review_config_from_str(enabled)
+    assert config.review_engine == "agent"
+
+    invalid_engine = enabled.replace("review_engine: agent", "review_engine: autonomous")
+    with pytest.raises(ConfigValidationError):
+        load_review_config_from_str(invalid_engine)
+
+    invalid_limits = enabled.replace("review_engine: agent", "review_engine: agent\nagent_engine:\n  max_proxy_calls: 0")
+    with pytest.raises(ConfigValidationError):
+        load_review_config_from_str(invalid_limits)
+
+
 def test_load_example_config_from_file() -> None:
     specs_path = (
         Path(__file__).resolve().parent.parent.parent.parent

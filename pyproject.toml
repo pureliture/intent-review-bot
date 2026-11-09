@@ -28,6 +28,7 @@ packages = ["src/review_bot"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "tooling/tools.lock.json" = "review_bot/resources/pmd/tools.lock.json"
+"deploy/agent-sandbox" = "review_bot/resources/agent-sandbox"
 
 [dependency-groups]
 aws = [

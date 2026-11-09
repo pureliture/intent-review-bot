@@ -7,6 +7,7 @@ edited or replaced by metric-derived defect claims.
 from __future__ import annotations
 
 import html
+import json
 import re
 from collections import defaultdict
 from collections.abc import Mapping
@@ -111,6 +112,23 @@ def execution_trace(result, *, context: Mapping | None = None, ko: bool = True) 
         f"- {'모드 · 상태' if ko else 'Mode · status'}: {escape(result.review_type)} · {_code(result.status)}"
             + (f" ({_code(result.reason)})" if result.reason and result.reason != result.status else ""),
     ]
+    partition = result.partition if isinstance(result.partition, Mapping) else {}
+    agent = partition.get("agent") if partition.get("engine") == "pi-agent" else None
+    if isinstance(agent, Mapping):
+        agent_usage = agent.get("usage", {})
+        session = agent.get("session", {})
+        lines.append(f"- Engine: {_code('pi-agent')}")
+        lines.append(f"- pi version / skill: {_code(agent.get('pi_version', unknown))} / "
+            f"{_code(agent.get('skill_sha256', unknown))}")
+        lines.append(f"- Agent model: {_code(agent.get('model', unknown))}")
+        if isinstance(agent_usage, Mapping):
+            lines.append(f"- Agent usage: input {_usage_text(agent_usage.get('input_tokens', agent_usage.get('input')), ko)} · "
+                f"output {_usage_text(agent_usage.get('output_tokens', agent_usage.get('output')), ko)} · "
+                f"total {_usage_text(agent_usage.get('total_tokens', agent_usage.get('total')), ko)} tokens")
+            if isinstance(agent_usage.get("cost"), Mapping):
+                lines.append(f"- Agent cost: {_code(json.dumps(agent_usage['cost'], sort_keys=True))}")
+        if isinstance(session, Mapping) and isinstance(session.get("sha256"), str):
+            lines.append(f"- Session SHA-256: {_code(session['sha256'])}")
     for role, value in context.get("models", {}).items() if isinstance(context.get("models"), Mapping) else ():
         lines.append(f"- {escape(role)}: {_code(value)}")
     lines.append(f"- {'리뷰 모델' if ko else 'Review model'}: {_code(model.get('provider', unknown))} / "
