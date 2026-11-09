@@ -85,8 +85,8 @@ class JobStorePort(Protocol):
 
 
 class VmLauncherPort(Protocol):
-    def launch(self, job_id: str, *, max_lifetime_seconds: int) -> str:
-        """Start a one-shot VM for ``job_id``; returns the provider instance id."""
+    def launch(self, job_id: str, *, max_lifetime_seconds: int, launch_token: str) -> str:
+        """Start a one-shot VM for ``job_id``; ``launch_token`` makes a retried request idempotent."""
 
     def terminate(self, vm_id: str) -> None: ...
 
@@ -157,7 +157,8 @@ class OnDemandCoordinator:
         if job is None:
             return None
         try:
-            vm_id = self.launcher.launch(job_id, max_lifetime_seconds=self.max_vm_lifetime_seconds)
+            vm_id = self.launcher.launch(job_id, max_lifetime_seconds=self.max_vm_lifetime_seconds,
+                launch_token=f"{job_id[:40]}-{job.version}")
         except Exception as exc:
             self._settle(job_id, lambda j: {"state": "queued", "reason": f"launch_failed:{type(exc).__name__}"}
                 if j.state == "launching" and j.vm_id is None else None)

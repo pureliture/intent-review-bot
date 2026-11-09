@@ -22,8 +22,8 @@ class Launcher:
         self.terminated: list[str] = []
         self.fail = False
 
-    def launch(self, job_id: str, *, max_lifetime_seconds: int) -> str:
-        assert max_lifetime_seconds > 0
+    def launch(self, job_id: str, *, max_lifetime_seconds: int, launch_token: str) -> str:
+        assert max_lifetime_seconds > 0 and launch_token.startswith(job_id[:40])
         if self.fail:
             raise RuntimeError("capacity")
         self.launched.append(job_id)
