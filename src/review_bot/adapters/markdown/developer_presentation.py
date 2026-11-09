@@ -68,20 +68,95 @@ def compose(sections: Mapping[str, str], template: str | None = None) -> str:
 
 
 def finish(marker: str, title: str, sections: Mapping[str, str], *, scope: str,
-    template: str | None = None, max_length: int = 60000, footer: str = "") -> str:
+    template: str | None = None, max_length: int = 60000, footer: str = "", trace: str = "") -> str:
     if type(max_length) is not int or not 1000 <= max_length <= 60000:
         raise ValueError("invalid_comment_length")
     intro = f"{marker}\n### {title}\n\n"
     rendered = intro + compose(sections, template) + ("\n\n" + scope if scope else "")
     if footer:
         rendered += "\n\n" + footer
+    if trace:
+        rendered += "\n\n" + trace
     if len(rendered) + 1 > max_length:
         # Never publish a shortened subset of conclusions as a complete review.
         rendered = (intro + "> 리뷰 본문 표시 보류: 댓글 길이 한도를 초과했습니다.\n\n본문 전체를 싣지 못했습니다."
-            + ("\n\n" + scope if scope else ""))
+            + ("\n\n" + scope if scope else "") + ("\n\n" + trace if trace else ""))
     if len(rendered) + 1 > max_length:
         raise ValueError("comment_notice_too_large")
     return rendered + "\n"
+
+
+def _usage_text(value, ko: bool) -> str:
+    return str(value) if type(value) is int else ("미반환" if ko else "not returned")
+
+
+def _code(value) -> str:
+    text = str(value).replace("`", "'").replace("\r", " ").replace("\n", " ")
+    return f"`{text}`"
+
+
+def execution_trace(result, *, context: Mapping | None = None, ko: bool = True) -> str:
+    """Folded execution record built only from metadata: no prompts, responses or source text."""
+    context = context or {}
+    model = result.model if isinstance(result.model, Mapping) else {}
+    profile = model.get("profile") if isinstance(model.get("profile"), Mapping) else {}
+    unknown = "미반환" if ko else "not returned"
+    lines = []
+    for key, name in (("repository", "저장소" if ko else "Repository"), ("pr_number", "PR"),
+            ("run_id", "실행 ID" if ko else "Run ID")):
+        if context.get(key) not in (None, ""):
+            lines.append(f"- {name}: {_code(context[key])}")
+    lines += [
+        f"- base / head: {_code(result.base_sha)} / {_code(result.head_sha)}",
+        f"- {'리뷰 키' if ko else 'Review key'}: {_code(result.run_key[:16])}",
+        f"- {'모드 · 상태' if ko else 'Mode · status'}: {escape(result.review_type)} · {_code(result.status)}"
+            + (f" ({_code(result.reason)})" if result.reason and result.reason != result.status else ""),
+    ]
+    for role, value in context.get("models", {}).items() if isinstance(context.get("models"), Mapping) else ():
+        lines.append(f"- {escape(role)}: {_code(value)}")
+    lines.append(f"- {'리뷰 모델' if ko else 'Review model'}: {_code(model.get('provider', unknown))} / "
+        f"{_code(model.get('model', unknown))}" + (" · mock" if model.get("is_mock") else ""))
+    if profile:
+        lines.append(f"- {'모델 한도' if ko else 'Model limits'}: input {_usage_text(profile.get('max_input_tokens'), ko)} · "
+            f"output {_usage_text(profile.get('max_output_tokens'), ko)} tokens · timeout {_usage_text(profile.get('timeout_seconds'), ko)}s")
+    lines.append(f"- prompt: {_code(result.prompt_version)} · {_code(result.prompt_hash[:12])}")
+    groups: dict[str, dict[str, int]] = {}
+    for record in result.stages:
+        name = record.stage.split(":", 1)[0]
+        row_ = groups.setdefault(name, {"admissions": 0, "calls": 0, "completed": 0, "failed": 0, "retries": 0,
+            "duration_ms": 0, "input": 0, "output": 0, "unknown": 0})
+        if record.stage.endswith(":admission") or not record.attempts:
+            row_["admissions"] += 1
+            continue
+        row_["retries"] += max(0, len(record.attempts) - 1)
+        for attempt in record.attempts:
+            row_["calls"] += 1
+            row_["completed" if attempt.status == "completed" else "failed"] += 1
+            row_["duration_ms"] += attempt.duration_ms if type(attempt.duration_ms) is int else 0
+            if attempt.usage is None or attempt.delivery == "unknown":
+                row_["unknown"] += 1
+            else:
+                row_["input"] += attempt.usage.get("input_tokens", 0)
+                row_["output"] += attempt.usage.get("output_tokens", 0)
+    header = ("| 단계 | 사전검사 | 호출 | 완료 | 실패·중단 | 재시도 | 소요(ms) | 입력 토큰 | 출력 토큰 | 사용량 미반환 |" if ko else
+        "| Stage | Admission checks | Calls | Completed | Failed/interrupted | Retries | Duration (ms) | Input tokens | Output tokens | Usage not returned |")
+    table = [header, "|" + "---|" * 10]
+    for name, v in groups.items():
+        table.append(f"| {escape(name)} | {v['admissions']} | {v['calls']} | {v['completed']} | {v['failed']} | {v['retries']} | "
+            f"{v['duration_ms']} | {v['input']} | {v['output']} | {v['unknown']} |")
+    usage = result.usage if isinstance(result.usage, Mapping) else {}
+    complete = usage.get("usage_complete") is True and not usage.get("unknown_usage_attempts")
+    total = (f"- {'합계' if ko else 'Total'}: {'호출' if ko else 'calls'} {_usage_text(usage.get('model_calls'), ko)} · "
+        f"{'알려진 입력/출력 토큰' if ko else 'known input/output tokens'} {_usage_text(usage.get('known_input_tokens'), ko)} / "
+        f"{_usage_text(usage.get('known_output_tokens'), ko)} · "
+        + (("사용량 모두 반환됨" if ko else "usage complete") if complete else
+           (f"사용량 미반환 호출 {usage.get('unknown_usage_attempts', unknown)}건 (0으로 집계하지 않음)" if ko else
+            f"{usage.get('unknown_usage_attempts', unknown)} calls without usage (not counted as zero)")))
+    publication = context.get("publication")
+    if isinstance(publication, str) and publication:
+        total += f"\n- {'게시' if ko else 'Publication'}: {escape(publication)}"
+    body = "\n".join(lines) + "\n\n" + "\n".join(table) + "\n\n" + total
+    return details("리뷰 실행 내역" if ko else "Review execution trace", body)
 
 
 _STATUS_REASONS = {

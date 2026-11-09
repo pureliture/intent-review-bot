@@ -261,6 +261,19 @@ class WorkerLoop:
         bundle = self._repository_settings.bundle
         return {"presentation": dict(bundle.presentation), "comment_template": bundle.comment_template(mode)}
 
+    def _trace_options(self, formatter, run, snapshot):
+        if getattr(formatter, "__name__", "") != "format_partition_review_markdown":
+            return {}
+        selector = self._ollama_selector_client or getattr(getattr(self.mode_selector, "selector", None), "client", None)
+        models = {}
+        for role, client in (("decision", selector), ("intent_selection", self.decision_client),
+                ("planning", self.planning_client), ("review", self.model_client)):
+            model = getattr(client, "model", None)
+            if isinstance(model, str) and model:
+                models[role] = model
+        return {"trace_context": {"repository": getattr(snapshot, "repository", ""), "pr_number": run.pr_number,
+            "run_id": run.run_id, "models": models}}
+
     def _settings_notice(self, markdown):
         if self._repository_settings.diagnostic is None:
             return markdown
@@ -938,7 +951,7 @@ class WorkerLoop:
                 max_length=self.config.output.max_comment_characters,
                 artifact_notice="전체 A 자료는 비공개 서비스 결과 파일에 보존됩니다." if artifacts is not None else None,
                 **({"publication_mode": "comment" if writes_comment else "artifact_only"} if shared_plan_enabled(self.config) else {}),
-                **self._presentation_options("architecture"))
+                **self._presentation_options("architecture"), **self._trace_options(formatter, run, review_snap))
             markdown = self._settings_notice(markdown)
             self._require_active(run, deadline)
             if artifacts is not None:
@@ -1119,7 +1132,7 @@ class WorkerLoop:
             markdown = formatter(result, task_input, marker=marker,
                 max_length=min(60000, self.config.output.max_comment_characters),
                 publication_mode="comment" if reason is None else "artifact_only",
-                **self._presentation_options("intent"))
+                **self._presentation_options("intent"), **self._trace_options(formatter, run, review_snap))
             markdown = self._settings_notice(markdown)
             self._require_active(run, deadline)
             artifacts.save_intent(task_input, result, markdown)

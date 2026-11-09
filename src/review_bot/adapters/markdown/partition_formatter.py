@@ -82,7 +82,7 @@ def _format_private_partition_markdown(result: PartitionReviewResult, task, **_o
 
 def format_partition_review_markdown(result: PartitionReviewResult, task, *,
     publication_mode: str = "artifact_only", marker: str | None = None, max_length: int = 60000,
-    presentation=None, comment_template: str | None = None, **options,
+    presentation=None, comment_template: str | None = None, trace_context=None, **options,
 ) -> str:
     """Render a validated artifact or a developer comment; never publish it."""
     if publication_mode == "artifact_only":
@@ -91,7 +91,7 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
         raise ValueError("invalid_partition_formatter_options")
     from review_bot.adapters.markdown.developer_presentation import (
         BUILTIN_COMMENT_TEMPLATES, actionable_intent_findings, findings_section, finish, intent_lead, label, perspective_section, review_summary, walkthrough,
-        selected_signals, static_analysis, status_sections,
+        selected_signals, static_analysis, status_sections, execution_trace,
     )
     from review_bot.domain.markers import DEFAULT_B_MARKER
     from review_bot.adapters.markdown.formatter import DEFAULT_A_MARKER
@@ -104,7 +104,7 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
         final = result.partition.get("final", {})
         unreviewed = list(final.get("missing_context", ())) + list(result.validation_errors)
         return finish(marker, title, status_sections(result, ko=result.language == "ko", unreviewed=unreviewed),
-            scope="", max_length=max_length)
+            scope="", max_length=max_length, trace=execution_trace(result, context=trace_context, ko=result.language == "ko"))
     summary = review_summary(result.summary, task, is_mock=result.model.get("is_mock"))
     sections = {"summary": summary}
     if architecture:
@@ -130,4 +130,5 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
         sections["llm_review"] = findings_section(findings, result.questions, task, presentation=presentation)
         sections["perspectives"] = perspective_section(result.perspectives, task, presentation)
     footer = label(presentation, "footer_notice", "")
-    return finish(marker, title, sections, scope="", template=comment_template if comment_template is not None else BUILTIN_COMMENT_TEMPLATES["architecture" if architecture else "intent"], max_length=max_length, footer=footer)
+    return finish(marker, title, sections, scope="", template=comment_template if comment_template is not None else BUILTIN_COMMENT_TEMPLATES["architecture" if architecture else "intent"], max_length=max_length, footer=footer,
+        trace=execution_trace(result, context=trace_context, ko=result.language == "ko"))
