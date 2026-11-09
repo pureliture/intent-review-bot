@@ -348,6 +348,15 @@ def create_parser() -> argparse.ArgumentParser:
         help="Process a single claimed run and exit",
     )
 
+    ondemand_parser = subparsers.add_parser(
+        "ondemand-run", help="Claim and execute one on-demand review job",
+    )
+    ondemand_parser.add_argument("--job-id", required=True)
+    ondemand_parser.add_argument("--vm-id", default=None, help="Override the IMDSv2 instance identity")
+    ondemand_parser.add_argument("--config",
+        default=os.environ.get("REVIEW_BOT_CONFIG", "/etc/review-bot/operator.yaml"),
+        help="Path to operator review-config.yaml")
+
     admission_parser = subparsers.add_parser(
         "model-admission", help="Inspect or resolve model HTTP admission slots",
     )
@@ -834,6 +843,12 @@ def run_model_admission(args: argparse.Namespace) -> int:
     return 0 if resolved else 1
 
 
+def run_ondemand_cli(args: argparse.Namespace) -> int:
+    from review_bot.runtime.ondemand_entrypoint import run_ondemand
+
+    return run_ondemand(args.job_id, vm_id=args.vm_id, config_path=args.config)
+
+
 def main(args: list[str] | None = None) -> int:
     parser = create_parser()
     parsed = parser.parse_args(args)
@@ -869,10 +884,17 @@ def main(args: list[str] | None = None) -> int:
     if parsed.subcommand == "worker":
         return _cmd_worker(parsed)
 
+    if parsed.subcommand == "ondemand-run":
+        return run_ondemand_cli(parsed)
+
     if parsed.subcommand == "model-admission":
         return run_model_admission(parsed)
 
     return 1
+
+
+def ondemand_main() -> int:
+    return main(["ondemand-run", *sys.argv[1:]])
 
 
 if __name__ == "__main__":

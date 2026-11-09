@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import re
 
+from review_bot.application.ondemand import ManagedInstance
+
 _JOB_ID = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -36,3 +38,27 @@ class Ec2VmLauncher:
 
     def terminate(self, vm_id: str) -> None:
         self.client.terminate_instances(InstanceIds=[vm_id])
+
+    def list_managed_instances(self) -> list[ManagedInstance]:
+        instances = []
+        filters = [
+            {"Name": f"tag:{self.tag_prefix}:managed", "Values": ["true"]},
+            {"Name": f"tag:{self.tag_prefix}:job-id", "Values": ["*"]},
+            {"Name": "instance-state-name", "Values": ["pending", "running"]},
+        ]
+        token = None
+        while True:
+            request = {"Filters": filters}
+            if token is not None:
+                request["NextToken"] = token
+            page = self.client.describe_instances(**request)
+            for reservation in page.get("Reservations", []):
+                for instance in reservation.get("Instances", []):
+                    tags = {tag.get("Key"): tag.get("Value") for tag in instance.get("Tags", [])}
+                    vm_id = instance.get("InstanceId")
+                    job_id = tags.get(f"{self.tag_prefix}:job-id")
+                    if isinstance(vm_id, str) and isinstance(job_id, str) and job_id:
+                        instances.append(ManagedInstance(vm_id, job_id))
+            token = page.get("NextToken")
+            if not token:
+                return instances

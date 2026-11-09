@@ -834,3 +834,66 @@ def test_signed_cli_intake_to_real_worker_with_mock_github(
         assert len(github.updated_comments) == (1 if operation == "update" else 0)
     for job_store in dependencies.opened:
         job_store.close.assert_called_once_with()
+
+
+def test_ondemand_service_enqueues_and_processes_one_worker_run(
+    service_config, worker_pipeline_ports, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from review_bot.adapters.github.client import MockGitHubClient
+    from review_bot.application.ondemand import ReviewJob
+    from review_bot.application.repository_review_settings import RepositoryReviewSettings, SettingsResolution
+    from review_bot.runtime import service
+
+    service_config.raw["execution"]["available_modes"] = ["architecture"]
+    service_config.raw["publish"]["mode"] = "artifact_only"
+    write_config(service_config)
+    github = MockGitHubClient()
+    github.set_pull_request(7, repository="org/repo")
+    github.pull_requests[7]["base"]["repo"] = {"id": 99, "full_name": "org/repo"}
+    github.pull_requests[7].update(title="Synthetic architecture change", body="Synthetic PR", draft=False)
+
+    class Adapters:
+        def __init__(self, _config, _cache_root):
+            pass
+
+        def github_client(self, _run):
+            return github
+
+        def repository_reader(self, _run, _pr_data, _client):
+            return worker_pipeline_ports["repo_reader"]
+
+        def review_settings(self, *_args, **_kwargs):
+            return SettingsResolution(RepositoryReviewSettings())
+
+    monkeypatch.setattr(service, "_ClaimedAppAdapters", Adapters)
+    monkeypatch.setattr(service, "_architecture_analyzer",
+        lambda _config, _root: worker_pipeline_ports["analyzer"])
+    monkeypatch.setattr(service, "WorkerLoop", shared_fixture_worker)
+    job = ReviewJob("a" * 64, 44, 99, 7, "a" * 40, "b" * 40, "running",
+        time.time(), time.time(), vm_id="i-1234abcd")
+
+    mode_results, trace = service.execute_ondemand_review(
+        str(service_config.path), job, lambda: True,
+    )
+
+    assert mode_results == {"architecture": "completed", "intent": "not_selected"}
+    assert trace["worker_completed"] is True and trace["selected_modes"] == ["architecture"]
+    state = service_config.state / "ondemand" / job.job_id
+    connection = sqlite3.connect(state / "jobs.sqlite")
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+        assert connection.execute("SELECT status FROM runs").fetchone()[0] == "succeeded"
+    finally:
+        connection.close()
+
+    github.set_pull_request(8, repository="org/repo", head_sha="c" * 40)
+    github.pull_requests[8]["base"]["repo"] = {"id": 99, "full_name": "org/repo"}
+    mismatched = ReviewJob("b" * 64, 44, 99, 8, "a" * 40, "b" * 40, "running",
+        time.time(), time.time(), vm_id="i-abcd1234")
+    analyzer_calls = worker_pipeline_ports["analyzer"].run_analysis.call_count
+    mismatch_results, mismatch_trace = service.execute_ondemand_review(
+        str(service_config.path), mismatched, lambda: True,
+    )
+    assert mismatch_results == {"architecture": "failed", "intent": "failed"}
+    assert mismatch_trace["worker_completed"] is False
+    assert worker_pipeline_ports["analyzer"].run_analysis.call_count == analyzer_calls

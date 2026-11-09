@@ -9,12 +9,14 @@ conditional write on ``version`` so no shared SQLite or single host is assumed.
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 ACTIVE_STATES = ("queued", "launching", "running")
 FINAL_STATES = ("succeeded", "partial", "failed", "superseded", "cancelled", "dead_letter")
 REVIEW_ACTIONS = ("opened", "synchronize", "reopened", "edited", "labeled", "unlabeled", "ready_for_review")
+logger = logging.getLogger(__name__)
 
 
 def job_key(installation_id: int, repository_id: int, pr_number: int, base_sha: str, head_sha: str) -> str:
@@ -55,6 +57,13 @@ class ReviewJob:
     delivery_id: str = ""
     trace: dict | None = None
     mode_results: dict = field(default_factory=dict)
+    termination_error: str | None = None
+
+
+@dataclass(frozen=True)
+class ManagedInstance:
+    vm_id: str
+    job_id: str
 
 
 @dataclass(frozen=True)
@@ -89,6 +98,8 @@ class VmLauncherPort(Protocol):
         """Start a one-shot VM for ``job_id``; ``launch_token`` makes a retried request idempotent."""
 
     def terminate(self, vm_id: str) -> None: ...
+
+    def list_managed_instances(self) -> list[ManagedInstance]: ...
 
 
 class StaleLease(RuntimeError):
@@ -147,9 +158,27 @@ class OnDemandCoordinator:
         for job in self.store.list_for_pr(event.repository_id, event.pr_number):
             if job.job_id == keep or job.state not in ACTIVE_STATES:
                 continue
-            if self._settle(job.job_id, lambda j: {"state": state, "reason": reason} if j.state in ACTIVE_STATES else None):
+            finished = self._settle(job.job_id, lambda j: {"state": state, "reason": reason,
+                "termination_error": None} if j.state in ACTIVE_STATES else None)
+            if finished is not None:
                 changed.append(job.job_id)
+                self.release_vm(finished)
         return tuple(changed)
+
+    def _terminate_job_vm(self, job: ReviewJob) -> None:
+        if not job.vm_id:
+            return
+        try:
+            self.launcher.terminate(job.vm_id)
+        except Exception as exc:
+            code = type(exc).__name__
+            logger.warning("VM termination failed for job %s (%s)", job.job_id, code)
+            self._settle(job.job_id, lambda current: {"termination_error": code}
+                if current.vm_id == job.vm_id else None)
+        else:
+            if job.termination_error is not None:
+                self._settle(job.job_id, lambda current: {"termination_error": None}
+                    if current.vm_id == job.vm_id and current.termination_error is not None else None)
 
     def launch(self, job_id: str) -> ReviewJob | None:
         job = self._settle(job_id, lambda j: {"state": "launching", "reason": "vm_requested"}
@@ -224,8 +253,7 @@ class OnDemandCoordinator:
         return self._owned(job_id, worker_id, change)
 
     def release_vm(self, job: ReviewJob) -> None:
-        if job.vm_id:
-            self.launcher.terminate(job.vm_id)
+        self._terminate_job_vm(job)
 
     # Scheduled recovery (serverless)
     def recover(self) -> list[tuple[str, str]]:
@@ -243,12 +271,27 @@ class OnDemandCoordinator:
                     "reason": "vm_lost" if lost_vm else "launch_timeout"})
             if self._cas(job, **changes) is None:
                 continue
-            if job.vm_id:
-                try:
-                    self.launcher.terminate(job.vm_id)
-                except Exception:
-                    pass
             actions.append((job.job_id, "dead_letter" if exhausted else "requeued"))
+        for instance in self.launcher.list_managed_instances():
+            job = self.store.get(instance.job_id)
+            if job is not None and job.state not in FINAL_STATES:
+                if job.vm_id == instance.vm_id:
+                    continue
+                if (job.vm_id is None and job.termination_error is None
+                        and job.reason not in ("vm_lost", "launch_timeout")):
+                    continue
+            try:
+                self.launcher.terminate(instance.vm_id)
+            except Exception as exc:
+                logger.warning("Orphan VM termination failed for job %s (%s)",
+                    instance.job_id, type(exc).__name__)
+                if job is not None:
+                    self._settle(instance.job_id, lambda current: {"termination_error": type(exc).__name__}
+                        if current.termination_error != type(exc).__name__ else None)
+            else:
+                if job is not None and job.termination_error is not None:
+                    self._settle(instance.job_id, lambda current: {"termination_error": None}
+                        if current.termination_error is not None else None)
         return actions
 
 

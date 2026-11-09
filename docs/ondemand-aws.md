@@ -15,13 +15,15 @@ GitHub PR ─▶│ FastAPI webhook ─▶ SQLite runs/lease ─▶ WorkerLoop �
             │  · allowlists      · job_id = H(inst,repo,pr,base,head)  · shutdown -h +TTL,       │
             │  · closed → cancel · newer head → superseded               shutdown = terminate    │
             │                                                                                   │
-            │ one-shot VM: claim (lease) ─▶ heartbeat ─▶ review (local SQLite, local models)    │
+            │ one-shot VM: review-bot-ondemand ─▶ claim ─▶ heartbeat ─▶ review (private SQLite)│
             │   ─▶ is_current() gate before publish ─▶ record_trace ─▶ complete ─▶ terminate     │
             │                                                                                   │
-            │ EventBridge 5 min ─▶ recovery Lambda: lost lease / stuck launch → requeue+relaunch │
-            │                                        attempts ≥ max → dead_letter               │
+            │ EventBridge 5 min ─▶ recovery: lost lease / stuck launch → requeue+relaunch       │
+            │                           terminal/missing/detached managed VMs → terminate       │
             └───────────────────────────────────────────────────────────────────────────────────┘
-local model path (tested): VM-local Ollama on 127.0.0.1 → tev1:0.8b-128k (decision) + granite4.2:128k (review)
+The VM entrypoint reads its own identity using IMDSv2, verifies the fetched PR head still matches the claimed
+job's head SHA, and executes one WorkerLoop run. Its GitHub App
+credentials and model keys are supplied by the operator's AMI/secret bootstrap.
 ```
 
 ## Contract (`review_bot.application.ondemand`)
@@ -30,12 +32,13 @@ local model path (tested): VM-local Ollama on 127.0.0.1 → tev1:0.8b-128k (deci
 |---|---|
 | Duplicate delivery | `record_delivery` insert-if-absent. Same digest → `duplicate_delivery`, different digest → `replay_mismatch` (HTTP 409). |
 | Duplicate job | `job_id` hashes installation, repository, PR, base and head. `put_new` is insert-if-absent, so at most one VM per head is started. |
-| PR update | A new head/base marks active jobs of the PR `superseded`; their `is_current()` turns false before any publication. |
-| PR closed | Active jobs become `cancelled`. |
+| PR update | A new head/base marks active jobs of the PR `superseded`; their `is_current()` turns false before any publication, then their VM is terminated. |
+| PR closed | Active jobs become `cancelled` and their VMs are terminated. A termination error is retained without reverting the state; recovery retries it. |
 | Lease | `claim` sets `running` with an owner and expiry. Only the owner may `heartbeat`, `record_trace`, or `complete`. A different VM can take over only after the lease expires. |
 | Durability | `complete` is rejected until the metadata-only trace is stored, so the trace outlives the VM. |
 | A/B state | `mode_results` are kept per mode. All `completed` → `succeeded`; only failures → `failed`; otherwise `partial`. |
-| VM loss | `recover()` requeues an expired `running` job or a `launching` job past its timeout, terminates the old VM, and dead-letters the job after `max_attempts`. |
+| VM loss | `recover()` requeues an expired `running` job or a `launching` job past its timeout, terminates the detached VM, and dead-letters the job after `max_attempts`. It also terminates managed instances whose job is missing or terminal, and instances no longer referenced by an active job. |
+| Failed claim | `review-bot ondemand-run --job-id <id>` terminates its own instance when it cannot claim; it never releases a different job's recorded VM. |
 | Launch idempotency | `launch_token = job_id[:40]-version` is used as the EC2 `ClientToken`. |
 | Concurrency | Every transition is a version-conditional write. No shared SQLite. A VM may keep a private SQLite for its own run. |
 
@@ -49,10 +52,12 @@ included.
   `X-Hub-Signature-256`, has a 1 MiB limit, and must pass the installation/repository allowlists.
 - Stored data is metadata only (`ReviewJob`, trace counts, model IDs, usage). Raw payloads, prompts, responses and
   source code are not stored.
-- IAM: intake may run instances only from the given launch template, pass only the worker role, and terminate only
-  instances tagged `review-bot:managed=true`. The worker policy covers only the job table plus self-termination.
+- IAM: intake/recovery may run instances only from the given launch template, pass only the worker role, describe
+  instances for orphan reconciliation, and terminate only instances tagged `review-bot:managed=true`. The worker
+  policy covers only the job table plus self-termination.
 - The VM receives only the job ID in user data. GitHub App credentials and models belong in the operator-owned AMI or
-  secret store. External model APIs are not used.
+  secret store. OpenRouter is a supported production model profile; its API key is obtained from the operator's
+  secret store and is not placed in user data.
 
 ## Verification
 
@@ -63,4 +68,6 @@ uvx --from "cfn-lint>=1.20,<2" cfn-lint deploy/aws/template.yaml      # template
 ```
 
 Not verified: a real AWS deployment, Lambda cold start/packaging, EC2 boot time, the AMI contents, GitHub
-redelivery timing, and integrating `runtime.ondemand_vm.run_job` with `WorkerLoop.process_run` on a real VM.
+redelivery timing, and real GitHub/model calls from an EC2 worker. The AMI must install the `review-bot-ondemand`
+console script, operator configuration (default `/etc/review-bot/operator.yaml`), and private state directory
+(`/var/lib/review-bot` by default).

@@ -78,8 +78,10 @@ def _coordinator_from_environment() -> OnDemandCoordinator:  # pragma: no cover 
     from review_bot.adapters.aws.dynamodb_job_store import DynamoDbJobStore
     from review_bot.adapters.aws.ec2_launcher import Ec2VmLauncher
 
-    store = DynamoDbJobStore(boto3.client("dynamodb"), os.environ["REVIEW_BOT_JOB_TABLE"])
-    launcher = Ec2VmLauncher(boto3.client("ec2"), os.environ["REVIEW_BOT_LAUNCH_TEMPLATE_ID"])
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    store = DynamoDbJobStore(boto3.client("dynamodb", region_name=region), os.environ["REVIEW_BOT_JOB_TABLE"])
+    launcher = Ec2VmLauncher(boto3.client("ec2", region_name=region),
+        os.environ.get("REVIEW_BOT_LAUNCH_TEMPLATE_ID", ""))
     return OnDemandCoordinator(store, launcher, clock=time.time,
         max_vm_lifetime_seconds=int(os.environ.get("REVIEW_BOT_MAX_VM_SECONDS", "3600")))
 

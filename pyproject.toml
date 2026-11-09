@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 review-bot = "review_bot.runtime.cli:main"
+review-bot-ondemand = "review_bot.runtime.cli:ondemand_main"
 
 [build-system]
 requires = ["hatchling"]

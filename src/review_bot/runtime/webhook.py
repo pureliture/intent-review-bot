@@ -6,7 +6,7 @@ import json
 import os
 import sqlite3
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse
@@ -27,6 +27,7 @@ def create_webhook_app(
     config: ReviewBotConfig | Any,
     job_store: JobStore,
     secret: str | None = None,
+    enqueue_pr_request: Callable[[DeliveryRecord, PrRequestRecord], None] | None = None,
 ) -> FastAPI:
     """Factory creating configured FastAPI webhook application."""
     app = FastAPI(title="review-bot Webhook Receiver", version="0.1.0")
@@ -58,6 +59,8 @@ def create_webhook_app(
                 job_store.accept_cancellation(delivery)
             elif pr_request is None:
                 job_store.record_delivery(delivery)
+            elif enqueue_pr_request is not None:
+                enqueue_pr_request(delivery, pr_request)
             else:
                 job_store.accept_delivery(delivery, pr_request)
         except sqlite3.IntegrityError:
