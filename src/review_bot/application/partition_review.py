@@ -3129,7 +3129,8 @@ def _validate_consumer_delivery(result, originals, meta, known_units):
 
 def validate_partition_result(result: PartitionReviewResult, task) -> None:
     """Recheck immutable originals, coverage and extracted quotes before output."""
-    if isinstance(result, PartitionReviewResult) and result.partition.get("engine") == "pi-agent":
+    if (isinstance(result, PartitionReviewResult) and isinstance(result.partition, dict)
+            and result.partition.get("engine") == "pi-agent"):
         from review_bot.application.agent_review import validate_agent_partition_result
         return validate_agent_partition_result(result, task)
     if type(result) is not PartitionReviewResult or result.schema_version != 13 or result.review_type not in ("A", "B", "PLAN"):

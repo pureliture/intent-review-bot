@@ -5,19 +5,36 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 UPSTREAM = "https://openrouter.ai/api/v1/chat/completions"
+_MAX_USAGE_SCAN_BYTES = 16_777_216
 
 
 class ProxyState:
-    def __init__(self, model: str, call_budget: int, max_output_tokens: int) -> None:
+    def __init__(self, model: str, call_budget: int, max_output_tokens: int,
+        ledger_path: str | None = None) -> None:
         self.model = model
         self.remaining = call_budget
         self.max_output_tokens = max_output_tokens
+        self.ledger_path = ledger_path
+        self.calls = 0
         self.lock = threading.Lock()
+
+    def next_call(self) -> int:
+        with self.lock:
+            self.calls += 1
+            return self.calls
+
+    def record(self, row: dict) -> None:
+        if self.ledger_path is None:
+            return
+        with self.lock:
+            with open(self.ledger_path, "a", encoding="utf-8") as ledger:
+                ledger.write(json.dumps(row, sort_keys=True) + "\n")
 
 
 def authorize_request(path: str, payload: dict, state: ProxyState) -> tuple[int, dict | None]:
@@ -37,7 +54,74 @@ def authorize_request(path: str, payload: dict, state: ProxyState) -> tuple[int,
             payload[key] = min(value, state.max_output_tokens)
     if "max_tokens" not in payload and "max_completion_tokens" not in payload:
         payload["max_tokens"] = state.max_output_tokens
+    usage_options = payload.get("usage")
+    payload["usage"] = {**usage_options, "include": True} if isinstance(usage_options, dict) else {"include": True}
     return 200, payload
+
+
+def usage_record(payload: object) -> dict | None:
+    if not isinstance(payload, dict) or not isinstance(payload.get("usage"), dict):
+        return None
+    usage = payload["usage"]
+    result = {}
+    for source, destination in (
+        ("prompt_tokens", "prompt_tokens"),
+        ("completion_tokens", "completion_tokens"),
+        ("total_tokens", "total_tokens"),
+    ):
+        value = usage.get(source)
+        if type(value) is int and value >= 0:
+            result[destination] = value
+    cost = usage.get("cost")
+    if isinstance(cost, dict):
+        result["cost"] = {str(key): value for key, value in cost.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)}
+    elif isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        result["cost"] = {"total": cost}
+    return result or None
+
+
+class ResponseUsageCapture:
+    def __init__(self, content_type: str) -> None:
+        self.event_stream = "text/event-stream" in content_type.lower()
+        self.pending = bytearray()
+        self.raw = bytearray()
+        self.usage: dict | None = None
+
+    def feed(self, chunk: bytes) -> None:
+        if self.event_stream:
+            self.pending.extend(chunk)
+            while b"\n" in self.pending:
+                line, _, remainder = self.pending.partition(b"\n")
+                self.pending[:] = remainder
+                self._event_line(bytes(line))
+        elif len(self.raw) < _MAX_USAGE_SCAN_BYTES:
+            self.raw.extend(chunk[:_MAX_USAGE_SCAN_BYTES - len(self.raw)])
+
+    def _event_line(self, line: bytes) -> None:
+        line = line.strip()
+        if not line.startswith(b"data:"):
+            return
+        data = line[5:].strip()
+        if not data or data == b"[DONE]":
+            return
+        try:
+            value = json.loads(data)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        self.usage = usage_record(value) or self.usage
+
+    def result(self) -> dict | None:
+        if self.event_stream:
+            if self.pending:
+                self._event_line(bytes(self.pending))
+            return self.usage
+        if len(self.raw) >= _MAX_USAGE_SCAN_BYTES:
+            return self.usage
+        try:
+            return usage_record(json.loads(self.raw))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return self.usage
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -72,24 +156,43 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return
             request = Request(UPSTREAM, data=json.dumps(authorized).encode("utf-8"),
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
+            call = self.state.next_call()
+            started = time.monotonic()
+            usage = None
+            status_code = 502
             try:
                 response = urlopen(request, timeout=600)
             except HTTPError as error:
                 response = error
-            self.send_response(getattr(response, "status", None) or getattr(response, "code", 502))
-            self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
-            length_header = response.headers.get("Content-Length")
-            if length_header and length_header.isdigit():
-                self.send_header("Content-Length", length_header)
-            self.send_header("Connection", "close")
-            self.end_headers()
-            while True:
-                chunk = response.read1(65536) if hasattr(response, "read1") else response.read(65536)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-            self.close_connection = True
+            except (URLError, TimeoutError):
+                self.state.record({"call": call, "status": status_code,
+                    "duration_ms": int((time.monotonic() - started) * 1000)})
+                self._reply(502, {"error": "upstream_unavailable"})
+                return
+            try:
+                status_code = getattr(response, "status", None) or getattr(response, "code", 502)
+                content_type = response.headers.get("Content-Type", "application/json")
+                capture = ResponseUsageCapture(content_type)
+                self.send_response(status_code)
+                self.send_header("Content-Type", content_type)
+                length_header = response.headers.get("Content-Length")
+                if length_header and length_header.isdigit():
+                    self.send_header("Content-Length", length_header)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                while True:
+                    chunk = response.read1(65536) if hasattr(response, "read1") else response.read(65536)
+                    if not chunk:
+                        break
+                    capture.feed(chunk)
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                usage = capture.result()
+                self.close_connection = True
+            finally:
+                response.close()
+                self.state.record({"call": call, "status": status_code, "duration_ms": int(
+                    (time.monotonic() - started) * 1000), **(usage or {})})
         except (ValueError, TypeError, URLError, TimeoutError):
             self._reply(502, {"error": "upstream_unavailable"})
 
@@ -107,7 +210,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     state = ProxyState(os.environ["MODEL_ID"], int(os.environ["MAX_PROXY_CALLS"]),
-        int(os.environ["MAX_OUTPUT_TOKENS"]))
+        int(os.environ["MAX_OUTPUT_TOKENS"]), os.environ.get("USAGE_LEDGER_PATH"))
     handler = type("ConfiguredProxyHandler", (ProxyHandler,), {"state": state})
     ThreadingHTTPServer(("0.0.0.0", 8080), handler).serve_forever()
 

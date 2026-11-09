@@ -46,6 +46,16 @@ class AgentRunResponse:
     usage: dict[str, Any]
     pi_version: str
     exit_status: int
+    session_id: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentRunFinalization:
+    session_jsonl: bytes
+    usage: dict[str, Any]
+    agent_reported_usage: dict[str, Any]
+    proxy_ledger_path: str
+    duration_ms: int
 
 
 class AgentRunError(RuntimeError):
@@ -61,6 +71,11 @@ class AgentRunner(Protocol):
     def run(self, request: AgentRunRequest) -> AgentRunResponse:
         ...
 
+    def repair(self, request: AgentRunRequest, session_id: str, message: str) -> AgentRunResponse:
+        ...
+
+    def finish(self, session_id: str) -> AgentRunFinalization:
+        ...
 
 @dataclass(frozen=True)
 class MergeBaseResult:

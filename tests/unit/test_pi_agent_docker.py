@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -75,3 +76,47 @@ def test_docker_runner_rejects_skill_mode_mismatch(tmp_path):
     runner = DockerPiAgentRunner(AgentEngineConfig())
     with pytest.raises(AgentRunError, match="invalid_request"):
         runner.run(AgentRunRequest("architecture", tmp_path, "review-intent", "model", 1))
+
+
+def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardown(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if "review-bot-agent-proxy:1" in argv:
+            mount = next(item for item in argv if ":/ledger:rw" in item)
+            ledger_dir = Path(mount.split(":/ledger:rw")[0])
+            (ledger_dir / "usage.jsonl").write_text(
+                '{"call":1,"status":200,"prompt_tokens":23,"completion_tokens":7,'
+                '"total_tokens":30,"cost":{"total":0.0025}}\n', encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, "proxy-id", "")
+        if "review-bot-pi-agent:0.73.1" in argv:
+            mount = next(item for item in argv if ":/sessions:rw" in item)
+            session_dir = Path(mount.split(":/sessions:rw")[0])
+            (session_dir / "session.jsonl").write_text(
+                '{"type":"session","id":"session-123"}\n', encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, '{"summary":"ok"}', "")
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = DockerPiAgentRunner(AgentEngineConfig(session_store_dir=str(tmp_path / "sessions")))
+    request = AgentRunRequest("architecture", workspace, "review-architecture",
+        "stealth/crouton-alpha", 20)
+    first = runner.run(request)
+    repaired = runner.repair(request, first.session_id, "item_index=0 reason=agent_output_invalid")
+    result = runner.finish(first.session_id)
+
+    agents = [argv for argv in calls if "review-bot-pi-agent:0.73.1" in argv]
+    proxies = [argv for argv in calls if "review-bot-agent-proxy:1" in argv]
+    assert first.session_id == repaired.session_id == "session-123"
+    assert len(agents) == 2 and len(proxies) == 1
+    assert agents[1][agents[1].index("--session") + 1] == "session-123"
+    assert agents[0][agents[0].index("--network") + 1] == agents[1][agents[1].index("--network") + 1]
+    assert "OPENROUTER_API_KEY" not in agents[0] and "test-only-secret" not in json.dumps(agents)
+    assert result.usage["input_tokens"] == 23 and result.usage["output_tokens"] == 7
+    assert result.usage["cost"]["total"] == 0.0025
+    assert result.proxy_ledger_path.endswith("usage.jsonl")
+    assert any(argv[1:3] == ["network", "rm"] for argv in calls)

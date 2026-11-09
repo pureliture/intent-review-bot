@@ -109,12 +109,14 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
     sections = {"summary": summary}
     if architecture:
         target_reviews = result.partition.get("final", {}).get("target_reviews", {})
-        signals = selected_signals(task, result.findings)
+        signal_reviews = target_reviews if result.partition.get("engine") == "pi-agent" else None
+        signals = selected_signals(task, result.findings, signal_reviews)
         walk = walkthrough(task, result.findings, result.questions, signals=signals)
         if walk:
             sections["summary"] = summary + "\n\n" + walk
         target_reviews = result.partition.get("final", {}).get("target_reviews", {})
-        signals = selected_signals(task, result.findings)
+        signal_reviews = target_reviews if result.partition.get("engine") == "pi-agent" else None
+        signals = selected_signals(task, result.findings, signal_reviews)
         sections["static_analysis"] = static_analysis(task, signals, presentation=presentation)
         sections["llm_review"] = findings_section(result.findings, result.questions, task,
             signals=signals, target_reviews=target_reviews, presentation=presentation)

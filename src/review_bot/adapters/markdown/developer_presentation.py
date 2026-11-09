@@ -9,7 +9,7 @@ from __future__ import annotations
 import html
 import json
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 
@@ -117,50 +117,83 @@ def execution_trace(result, *, context: Mapping | None = None, ko: bool = True) 
     if isinstance(agent, Mapping):
         agent_usage = agent.get("usage", {})
         session = agent.get("session", {})
+        limits = agent.get("limits", {})
         lines.append(f"- Engine: {_code('pi-agent')}")
         lines.append(f"- pi version / skill: {_code(agent.get('pi_version', unknown))} / "
             f"{_code(agent.get('skill_sha256', unknown))}")
         lines.append(f"- Agent model: {_code(agent.get('model', unknown))}")
+        if isinstance(limits, Mapping):
+            lines.append(f"- Agent limits: timeout {_usage_text(limits.get('timeout_seconds'), ko)}s · "
+                f"max proxy calls {_usage_text(limits.get('max_proxy_calls'), ko)} · "
+                f"max output tokens {_usage_text(limits.get('max_output_tokens'), ko)}")
         if isinstance(agent_usage, Mapping):
             lines.append(f"- Agent usage: input {_usage_text(agent_usage.get('input_tokens', agent_usage.get('input')), ko)} · "
                 f"output {_usage_text(agent_usage.get('output_tokens', agent_usage.get('output')), ko)} · "
                 f"total {_usage_text(agent_usage.get('total_tokens', agent_usage.get('total')), ko)} tokens")
             if isinstance(agent_usage.get("cost"), Mapping):
                 lines.append(f"- Agent cost: {_code(json.dumps(agent_usage['cost'], sort_keys=True))}")
+        repair_label = "attempted" if agent.get("repair_attempted") else "not needed"
+        lines.append(f"- Agent repair: {repair_label} · rejected before/after "
+            f"{agent.get('before_rejected_count', 0)}/{agent.get('after_rejected_count', 0)}")
+        rejected = agent.get("rejected", [])
+        if isinstance(rejected, list):
+            codes = Counter(item.get("reason") for item in rejected
+                if isinstance(item, Mapping) and isinstance(item.get("reason"), str))
+            code_text = ", ".join(f"{_code(code)} × {count}" for code, count in sorted(codes.items()))
+            lines.append(f"- Rejected items: {len(rejected)}" + (f" · {code_text}" if code_text else ""))
+        rejected_before = agent.get("rejected_before", [])
+        if isinstance(rejected_before, list) and rejected_before:
+            before_codes = Counter(item.get("reason") for item in rejected_before
+                if isinstance(item, Mapping) and isinstance(item.get("reason"), str))
+            code_text = ", ".join(f"{_code(code)} × {count}" for code, count in sorted(before_codes.items()))
+            lines.append(f"- Initial rejection codes: {code_text}")
         if isinstance(session, Mapping) and isinstance(session.get("sha256"), str):
             lines.append(f"- Session SHA-256: {_code(session['sha256'])}")
     for role, value in context.get("models", {}).items() if isinstance(context.get("models"), Mapping) else ():
         lines.append(f"- {escape(role)}: {_code(value)}")
     lines.append(f"- {'리뷰 모델' if ko else 'Review model'}: {_code(model.get('provider', unknown))} / "
         f"{_code(model.get('model', unknown))}" + (" · mock" if model.get("is_mock") else ""))
-    if profile:
+    if profile and not isinstance(agent, Mapping):
         lines.append(f"- {'모델 한도' if ko else 'Model limits'}: input {_usage_text(profile.get('max_input_tokens'), ko)} · "
             f"output {_usage_text(profile.get('max_output_tokens'), ko)} tokens · timeout {_usage_text(profile.get('timeout_seconds'), ko)}s")
     lines.append(f"- prompt: {_code(result.prompt_version)} · {_code(result.prompt_hash[:12])}")
-    groups: dict[str, dict[str, int]] = {}
-    for record in result.stages:
-        name = record.stage.split(":", 1)[0]
-        row_ = groups.setdefault(name, {"admissions": 0, "calls": 0, "completed": 0, "failed": 0, "retries": 0,
-            "duration_ms": 0, "input": 0, "output": 0, "unknown": 0})
-        if record.stage.endswith(":admission") or not record.attempts:
-            row_["admissions"] += 1
-            continue
-        row_["retries"] += max(0, len(record.attempts) - 1)
-        for attempt in record.attempts:
-            row_["calls"] += 1
-            row_["completed" if attempt.status == "completed" else "failed"] += 1
-            row_["duration_ms"] += attempt.duration_ms if type(attempt.duration_ms) is int else 0
-            if attempt.usage is None or attempt.delivery == "unknown":
-                row_["unknown"] += 1
-            else:
-                row_["input"] += attempt.usage.get("input_tokens", 0)
-                row_["output"] += attempt.usage.get("output_tokens", 0)
     header = ("| 단계 | 사전검사 | 호출 | 완료 | 실패·중단 | 재시도 | 소요(ms) | 입력 토큰 | 출력 토큰 | 사용량 미반환 |" if ko else
         "| Stage | Admission checks | Calls | Completed | Failed/interrupted | Retries | Duration (ms) | Input tokens | Output tokens | Usage not returned |")
     table = [header, "|" + "---|" * 10]
-    for name, v in groups.items():
-        table.append(f"| {escape(name)} | {v['admissions']} | {v['calls']} | {v['completed']} | {v['failed']} | {v['retries']} | "
-            f"{v['duration_ms']} | {v['input']} | {v['output']} | {v['unknown']} |")
+    if isinstance(agent, Mapping):
+        agent_usage = agent.get("usage", {})
+        agent_usage = agent_usage if isinstance(agent_usage, Mapping) else {}
+        calls = agent_usage.get("model_calls", 0)
+        calls = calls if type(calls) is int else 0
+        call_rows = agent_usage.get("calls", [])
+        failed = sum(1 for item in call_rows if isinstance(item, Mapping) and item.get("status") != 200)
+        unknown = agent_usage.get("unknown_usage_attempts", 0)
+        unknown = unknown if type(unknown) is int else 0
+        table.append(f"| agent_review | 0 | {calls} | {calls - failed} | {failed} | "
+            f"{int(bool(agent.get('repair_attempted')))} | {agent.get('duration_ms', 0)} | "
+            f"{agent_usage.get('input_tokens', 0)} | {agent_usage.get('output_tokens', 0)} | {unknown} |")
+    else:
+        groups: dict[str, dict[str, int]] = {}
+        for record in result.stages:
+            name = record.stage.split(":", 1)[0]
+            row_ = groups.setdefault(name, {"admissions": 0, "calls": 0, "completed": 0, "failed": 0, "retries": 0,
+                "duration_ms": 0, "input": 0, "output": 0, "unknown": 0})
+            if record.stage.endswith(":admission") or not record.attempts:
+                row_["admissions"] += 1
+                continue
+            row_["retries"] += max(0, len(record.attempts) - 1)
+            for attempt in record.attempts:
+                row_["calls"] += 1
+                row_["completed" if attempt.status == "completed" else "failed"] += 1
+                row_["duration_ms"] += attempt.duration_ms if type(attempt.duration_ms) is int else 0
+                if attempt.usage is None or attempt.delivery == "unknown":
+                    row_["unknown"] += 1
+                else:
+                    row_["input"] += attempt.usage.get("input_tokens", 0)
+                    row_["output"] += attempt.usage.get("output_tokens", 0)
+        for name, v in groups.items():
+            table.append(f"| {escape(name)} | {v['admissions']} | {v['calls']} | {v['completed']} | {v['failed']} | {v['retries']} | "
+                f"{v['duration_ms']} | {v['input']} | {v['output']} | {v['unknown']} |")
     usage = result.usage if isinstance(result.usage, Mapping) else {}
     complete = usage.get("usage_complete") is True and not usage.get("unknown_usage_attempts")
     total = (f"- {'합계' if ko else 'Total'}: {'호출' if ko else 'calls'} {_usage_text(usage.get('model_calls'), ko)} · "
