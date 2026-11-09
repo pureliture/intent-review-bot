@@ -7,9 +7,11 @@ import json
 import os
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -58,6 +60,52 @@ def test_offline_fixed_service_rejects_absent_api_auth(service_config, monkeypat
     monkeypatch.delenv("REVIEW_BOT_API_TOKEN", raising=False)
     assert main(["webhook", "--config", str(service_config.path)]) == 1
     assert "REVIEW_BOT_API_TOKEN" in capsys.readouterr().err
+
+
+def test_model_admission_status_absent_db_is_read_only(tmp_path, monkeypatch, capsys):
+    from review_bot.runtime.cli import main
+
+    state_dir = tmp_path / "missing-state"
+    monkeypatch.setenv("REVIEW_BOT_MODEL_STATE_DIR", str(state_dir))
+    assert main(["model-admission", "status"]) == 0
+    assert capsys.readouterr().out.strip() == "no admission state"
+    assert not state_dir.exists()
+
+
+def test_model_admission_resolve_requires_confirmation_without_db_change(tmp_path, monkeypatch):
+    from review_bot.adapters.model_http import default_model_admission
+    from review_bot.runtime.cli import main
+
+    state_dir = tmp_path / "admission-state"
+    monkeypatch.setenv("REVIEW_BOT_MODEL_STATE_DIR", str(state_dir))
+    admission = default_model_admission()
+    with admission.request(deadline=time.monotonic() + 2, generates=True) as ticket:
+        ticket.mark_sent()
+    before = admission.snapshot()
+    assert main(["model-admission", "resolve", "--token", ticket.token]) == 2
+    assert admission.snapshot() == before
+
+
+def test_model_admission_resolve_preserves_other_slots_and_reports_unknown_tokens(tmp_path, monkeypatch):
+    from review_bot.adapters.model_http import default_model_admission
+    from review_bot.runtime.cli import main
+
+    state_dir = tmp_path / "admission-state"
+    monkeypatch.setenv("REVIEW_BOT_MODEL_STATE_DIR", str(state_dir))
+    admission = default_model_admission()
+    tokens = []
+    for _ in range(2):
+        with admission.request(deadline=time.monotonic() + 2, generates=True) as ticket:
+            ticket.mark_sent()
+        tokens.append(ticket.token)
+    assert len(admission.snapshot()) == 2
+    assert main(["model-admission", "resolve", "--token", tokens[0], "--confirmed-idle"]) == 0
+    assert [row[0] for row in admission.snapshot()] == [tokens[1]]
+    assert main(["model-admission", "resolve", "--token", tokens[0], "--confirmed-idle"]) == 1
+    assert main(["model-admission", "resolve", "--token", uuid4().hex, "--confirmed-idle"]) == 1
+    assert [row[0] for row in admission.snapshot()] == [tokens[1]]
+    assert main(["model-admission", "resolve", "--token", "invalid", "--confirmed-idle"]) == 2
+    assert [row[0] for row in admission.snapshot()] == [tokens[1]]
 
 
 def test_mixed_mode_service_requires_a_pinned_analyzer_image(service_config):

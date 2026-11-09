@@ -521,6 +521,41 @@ def test_two_expired_uncertain_generations_still_block_new_admission(db_path):
     assert admission.resolve_uncertain(tokens[1], confirmed_idle=True)
 
 
+@pytest.mark.parametrize("expired_state", ["uncertain", "sent"])
+def test_remote_admission_reclaims_expired_generation_slots(db_path, expired_state):
+    admission = SQLiteModelAdmission(db_path, max_concurrency=1)
+    with admission.request(deadline=_deadline(), generates=True) as ticket:
+        ticket.mark_sent()
+    token = ticket.token
+    if expired_state == "sent":
+        with closing(sqlite3.connect(db_path, isolation_level=None)) as connection:
+            connection.execute("UPDATE model_admission SET state = 'sent' WHERE token = ?", (token,))
+    _expire(db_path, token)
+
+    remote = SQLiteModelAdmission(db_path, max_concurrency=1, reclaim_expired_remote=True)
+    with remote.request(deadline=_deadline(), generates=False) as replacement:
+        assert replacement.token != token
+        assert [(row[0], row[1]) for row in _rows(db_path)] == [(replacement.token, "reserved")]
+    assert _rows(db_path) == []
+
+
+def test_remote_admission_keeps_nonexpired_uncertain_generation_slots(db_path):
+    admission = SQLiteModelAdmission(db_path, max_concurrency=1)
+    with admission.request(deadline=_deadline(), generates=True) as ticket:
+        ticket.mark_sent()
+    remote = SQLiteModelAdmission(db_path, max_concurrency=1, poll_interval=0.005,
+        reclaim_expired_remote=True)
+    with pytest.raises(TimeoutError):
+        with remote.request(deadline=_deadline(0.03), generates=True):
+            pytest.fail("non-expired uncertain generation was reclaimed")
+    assert _rows(db_path)[0][:2] == (ticket.token, "uncertain")
+
+
+def test_snapshot_of_absent_database_creates_no_files(db_path):
+    assert SQLiteModelAdmission(db_path).snapshot() == []
+    assert not db_path.parent.exists()
+
+
 @pytest.mark.parametrize("generates,mark_sent,state", [(True, False, "reserved"), (True, True, "sent"), (False, True, "metadata")])
 def test_process_crash_only_allows_reclaim_of_non_generating_work(db_path, generates, mark_sent, state):
     context = multiprocessing.get_context("spawn")
