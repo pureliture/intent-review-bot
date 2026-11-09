@@ -479,6 +479,24 @@ def _target_reference_context(targets, target_paths, references, supplied, origi
         for target in targets}
 
 
+def _undelivered_ranges(ranges, delivered):
+    """Byte ranges of ``ranges`` not covered by already delivered ``(start, end)`` ranges."""
+    result = []
+    for start, end in ranges:
+        cursor = start
+        for low, high in sorted(delivered):
+            if high <= cursor or low >= end:
+                continue
+            if low > cursor:
+                result.append((cursor, low))
+            cursor = max(cursor, high)
+            if cursor >= end:
+                break
+        if cursor < end:
+            result.append((cursor, end))
+    return result
+
+
 def _source_requests(values, originals):
     result, seen = [], set()
     for value in bounded_array(values, maximum=32):
@@ -1636,6 +1654,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             accepted_request_context = {}
             available_rechecks = limits.max_rechecks
             recheck = 0
+            recheck_delivered = {}
             while recheck <= available_rechecks:
                 request_value = final_request(working, source_spans, previous, retained)
                 context = restore_model_references(json.loads(request_value.user_content)["target_reference_context"],
@@ -1661,7 +1680,20 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     if page_final["source_requests"] and recheck < available_rechecks:
                         requested_sources = [make_span(o, start, end, "requested_original")
                             for o in originals if o.evidence_id in {row["evidence_id"] for row in page_final["source_requests"]}
-                            for start, end in scoped_ranges(o, meta.get("source_scope"))]
+                            for start, end in _undelivered_ranges(scoped_ranges(o, meta.get("source_scope")),
+                                recheck_delivered.get(o.evidence_id, ()))]
+                        if not requested_sources:
+                            # Every requested byte was already sent by an earlier recheck of
+                            # this page. Re-sending it cannot make progress (issue #18); the
+                            # open request stays visible as unresolved context.
+                            partitions.setdefault("source_recheck_requests", []).append({"response": deepcopy(raw),
+                                **deepcopy(request_context), "final": deepcopy(page_final), "response_hash": hash_json(raw),
+                                "page_index": len(final_pages), "retained_citations": span_payload(retained),
+                                "delivery": "no_undelivered_requested_originals", "candidate_measurement_stages": [],
+                                "parent_integration_plan_id": partitions.get("integration_plan_id"),
+                                "stage_index": index - first_record, "requests": deepcopy(page_final["source_requests"]),
+                                "admitted": False, "reason": "requested_originals_already_delivered"})
+                            break
                         supplied = final_spans(working, [*source_spans, *retained])
                         roots = [c for row in review_notes for c in row["citations"]]
                         prior_sources = referenced_source_spans(raw, supplied, {o.evidence_id: o for o in originals},
@@ -1740,6 +1772,10 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                             "admitted": fits, **({"reason": unavailable} if not fits else {})})
                         if fits:
                             budget.records[index] = replace(budget.records[index], status="completed", reason="source_recheck_requested")
+                            requested_ids = {span.evidence_id for span in requested_sources}
+                            for span in expanded:
+                                if span.evidence_id in requested_ids:
+                                    recheck_delivered.setdefault(span.evidence_id, []).append((span.start_byte, span.end_byte))
                             previous, source_spans, retained = requested, expanded, next_retained
                             recheck += 1
                             continue
