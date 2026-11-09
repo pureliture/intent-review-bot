@@ -271,8 +271,9 @@ class WorkerLoop:
             model = getattr(client, "model", None)
             if isinstance(model, str) and model:
                 models[role] = model
+        # Only deterministic values: a per-run id would make identical reviews differ and defeat reuse.
         return {"trace_context": {"repository": getattr(snapshot, "repository", ""), "pr_number": run.pr_number,
-            "run_id": run.run_id, "models": models}}
+            "models": models}}
 
     def _settings_notice(self, markdown):
         if self._repository_settings.diagnostic is None:

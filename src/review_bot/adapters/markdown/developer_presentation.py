@@ -108,7 +108,6 @@ def execution_trace(result, *, context: Mapping | None = None, ko: bool = True) 
             lines.append(f"- {name}: {_code(context[key])}")
     lines += [
         f"- base / head: {_code(result.base_sha)} / {_code(result.head_sha)}",
-        f"- {'리뷰 키' if ko else 'Review key'}: {_code(result.run_key[:16])}",
         f"- {'모드 · 상태' if ko else 'Mode · status'}: {escape(result.review_type)} · {_code(result.status)}"
             + (f" ({_code(result.reason)})" if result.reason and result.reason != result.status else ""),
     ]
