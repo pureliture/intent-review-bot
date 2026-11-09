@@ -12,8 +12,10 @@ from review_bot.adapters.markdown.partition_formatter import format_partition_re
 from review_bot.application.agent_review import run_agent_review
 from review_bot.application.partition_review import PERSPECTIVE_IDS, prepare_originals, validate_partition_result
 from review_bot.application.source_partition import PartitionError
+from review_bot.domain.partition_review import PartitionReviewLimits
 from review_bot.ports import AgentRunError, AgentRunFinalization, AgentRunResponse
 from tests.fixtures.intent_perspectives import make_task as make_intent_task
+from tests.fixtures.partition_review import PartitionModelClient
 from tests.unit.test_partition_review import _pmd_partition_task
 
 
@@ -148,6 +150,7 @@ def test_agent_architecture_result_validates_formats_with_exact_citations_and_tr
     assert "contract.json" in runner.workspace
     assert "target_ids may be empty only when basis is observed_structure" in runner.contract
     assert "Every finding and assessment needs at least one citation" in runner.contract
+    assert "empty intent assessments list means no distinct finding" in runner.contract
     assert runner.contract_json["mode"] == "architecture"
     assert runner.contract_json["allowed_target_ids"] == prepare_originals(task, "architecture")[1]["targets"]
     assert runner.contract_json["required_keys"]["finding"][-1] == "citations"
@@ -165,6 +168,165 @@ def test_agent_intent_result_validates_and_formats_all_perspectives(tmp_path):
     assert "Assessment for problem\\_success\\." in markdown
     assert "src/value.py" in markdown and "/blob/" in markdown
     assert "Engine: `pi-agent`" in markdown
+
+
+def test_intent_empty_assessment_perspective_is_completed_and_omitted_from_comment(tmp_path):
+    task = make_intent_task()
+    body = _intent_body(task)
+    body["perspectives"][0]["assessments"] = []
+    result = _run(task, "intent", tmp_path, body)
+
+    validate_partition_result(result, task)
+    markdown = format_partition_review_markdown(result, task, publication_mode="comment")
+    private_markdown = format_partition_review_markdown(result, task)
+    assert result.status == "completed"
+    assert result.perspectives[0]["assessments"] == []
+    assert "Assessment for problem_success." not in markdown
+    assert "Assessment for " in markdown
+    assert result.perspectives[0]["perspective_id"] not in private_markdown
+
+
+def test_intent_all_empty_assessments_are_partial(tmp_path):
+    task = make_intent_task()
+    body = _intent_body(task)
+    for perspective in body["perspectives"]:
+        perspective["assessments"] = []
+    result = _run(task, "intent", tmp_path, body)
+
+    validate_partition_result(result, task)
+    assert result.status == "partial_review"
+    assert result.reason == "agent_perspectives_incomplete"
+    assert len(result.perspectives) == len(PERSPECTIVE_IDS)
+    assert all(not item["assessments"] for item in result.perspectives)
+
+
+def test_agent_fact_verification_supported_items_are_retained(tmp_path):
+    task = make_intent_task()
+    review_client = PartitionModelClient()
+    result = run_agent_review(task, "intent", FakeAgentRunner(tmp_path, _intent_body(task)),
+        language="en", instructions="", review_client=review_client,
+        fact_limits=PartitionReviewLimits(max_calls=128, max_total_tokens=1_000_000))
+
+    validate_partition_result(result, task)
+    assert result.status == "completed"
+    assert result.partition["fact_verification"]["status"] == "model_supported"
+    assert any(row["item_id"] == "perspectives:0:0"
+        for row in result.partition["fact_verification"]["items"])
+    assert (result.partition["pre_verification_final"]["perspectives"][0]["assessments"][0]["statement"]
+        == result.perspectives[0]["assessments"][0]["statement"])
+
+
+def test_agent_fact_verification_rewrites_contradicted_assessment(tmp_path):
+    task = _pmd_partition_task()
+    contradicted = False
+
+    def transform(payload, body):
+        nonlocal contradicted
+        if payload["stage"] == "fact_check":
+            row_id = "findings:0"
+            if not contradicted and row_id in body.get("items", {}):
+                contradicted = True
+                body["items"][row_id]["reasoning"] = {
+                    "state": "contradicted", "reason": "The source contradicts this explanation.",
+                    "citations": body["items"][row_id]["reasoning"]["citations"]}
+        elif payload["stage"] == "fact_rewrite":
+            replacements = (body.get("items", {}).values() if "items" in body else [body])
+            for replacement in replacements:
+                replacement["replacement"]["reasoning"] = "Rewritten against the supplied source."
+        return body
+
+    review_client = PartitionModelClient(transform=transform)
+    result = run_agent_review(task, "architecture", FakeAgentRunner(tmp_path, _architecture_body(task)),
+        language="en", instructions="", review_client=review_client,
+        fact_limits=PartitionReviewLimits(max_calls=128, max_total_tokens=1_000_000))
+
+    validate_partition_result(result, task)
+    entry = next(row for row in result.partition["fact_verification"]["items"] if row["item_id"] == "findings:0")
+    assert len(entry["attempts"]) == 2
+    assert result.findings[0]["reasoning"] == "Rewritten against the supplied source."
+
+
+def test_agent_fact_rewrite_of_nested_assessment_uses_only_code_citations(tmp_path):
+    task = make_intent_task()
+    contradicted = False
+
+    def transform(payload, body):
+        nonlocal contradicted
+        if payload["stage"] == "fact_check":
+            rewrite_row = body["items"]["perspectives:0:0"]
+            if not contradicted:
+                contradicted = True
+                rewrite_row["reasoning"] = {
+                    "state": "contradicted", "reason": "The source contradicts this explanation.",
+                    "citations": rewrite_row["reasoning"]["citations"]}
+            non_code = next(source for source in payload["citation_catalog"]
+                if not source["path"] or source["version"] not in ("head", "base"))
+            if "perspectives:1:0" in body["items"]:
+                body["items"]["perspectives:1:0"]["statement"]["citations"] = [
+                    {"reference_id": non_code["ranges"][0]["reference_id"]}]
+        elif payload["stage"] == "fact_rewrite":
+            code_source = next(source for source in payload["citation_catalog"]
+                if source["path"] and source["version"] in ("head", "base"))
+            reference = code_source["ranges"][0]["reference_id"]
+            replacements = body.get("items", {}).values() if "items" in body else [body]
+            for item in replacements:
+                item["replacement"]["reasoning"] = "Rewritten against the supplied source."
+                item["replacement"]["citations"] = [{"reference_id": reference}]
+                item["correction_citations"] = [{"reference_id": reference}]
+        return body
+
+    review_client = PartitionModelClient(transform=transform)
+    result = run_agent_review(task, "intent", FakeAgentRunner(tmp_path, _intent_body(task)),
+        language="en", instructions="", review_client=review_client,
+        fact_limits=PartitionReviewLimits(max_calls=128, max_total_tokens=1_000_000))
+
+    validate_partition_result(result, task)
+    entry = next(row for row in result.partition["fact_verification"]["items"]
+        if row["item_id"] == "perspectives:0:0")
+    assert len(entry["attempts"]) == 2
+    assert result.perspectives[0]["assessments"][0]["reasoning"] == "Rewritten against the supplied source."
+    originals, _ = prepare_originals(task, "intent")
+    originals_by_id = {source.evidence_id: source for source in originals}
+    for perspective in result.perspectives:
+        for assessment in perspective["assessments"]:
+            for citation in assessment["citations"]:
+                source = originals_by_id[citation["evidence_id"]]
+                assert source.path and source.version in ("head", "base")
+                assert (citation["path"], citation["version"]) == (source.path, source.version)
+    rewrite_payload = next(json.loads(request.user_content) for request in review_client.requests
+        if json.loads(request.user_content)["stage"] == "fact_rewrite")
+    assert all(source["path"] and source["version"] in ("head", "base")
+        for source in rewrite_payload["citation_catalog"])
+
+
+def test_agent_fact_check_failure_is_partial_and_ledger_tampering_fails_replay(tmp_path):
+    task = make_intent_task()
+
+    def fail_fact_check(payload, body):
+        return {"invalid": "response"} if payload["stage"] == "fact_check" else body
+
+    result = run_agent_review(task, "intent", FakeAgentRunner(tmp_path, _intent_body(task)),
+        language="en", instructions="", review_client=PartitionModelClient(transform=fail_fact_check),
+        fact_limits=PartitionReviewLimits(max_calls=128, max_total_tokens=1_000_000))
+
+    assert result.status == "partial_review"
+    assert result.reason == "factual_verification_incomplete"
+    validate_partition_result(result, task)
+
+    altered = deepcopy(result)
+    altered.partition["fact_verification"]["original_final_hash"] = "0" * 64
+    with pytest.raises(PartitionError, match="stored_fact_verification_missing"):
+        validate_partition_result(altered, task)
+
+
+def test_agent_fact_verification_without_review_client_is_not_configured(tmp_path):
+    task = make_intent_task()
+    result = _run(task, "intent", tmp_path, _intent_body(task))
+
+    assert result.partition["fact_verification"] == "not_configured"
+    markdown = format_partition_review_markdown(result, task, publication_mode="artifact_only")
+    assert "No factual-review model is configured." in markdown
+    validate_partition_result(result, task)
 
 
 def test_agent_uses_result_file_instead_of_stdout(tmp_path):

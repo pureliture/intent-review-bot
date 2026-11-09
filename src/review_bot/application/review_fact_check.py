@@ -299,6 +299,21 @@ def items(final):
     """Stable identities; no selection by severity, prose length or quote count."""
     rows = [{"id": "summary", "kind": "summary", "item": final["summary"]}]
     for kind in ("findings", "perspectives", "questions"):
+        if kind == "perspectives" and any(
+                isinstance(item, dict) and isinstance(item.get("assessments"), list)
+                for item in final[kind]):
+            for perspective_index, perspective in enumerate(final[kind]):
+                if not isinstance(perspective, dict) or not isinstance(perspective.get("assessments"), list):
+                    continue
+                for assessment_index, assessment in enumerate(perspective["assessments"]):
+                    rows.append({
+                        "id": f"perspectives:{perspective_index}:{assessment_index}",
+                        "kind": kind,
+                        "item": deepcopy(assessment),
+                        "perspective_index": perspective_index,
+                        "assessment_index": assessment_index,
+                    })
+            continue
         rows.extend({"id": kind + ":" + str(i), "kind": kind, "item": deepcopy(item)}
             for i, item in enumerate(final[kind]))
     return rows
@@ -454,7 +469,7 @@ def delivery(rows, final, originals, meta, *, kind, extra=None, protocol_version
 
 
 def request_spec(stage, rows, final, originals, meta, *, kind, extra=None, ranges=None, whole_claim=None,
-        protocol_version=VERSION):
+        protocol_version=VERSION, final_citation_source_ids=None):
     payload, refs, spans = delivery(rows, final, originals, meta, kind=kind, extra=extra,
         protocol_version=protocol_version)
     architecture_rewrite = stage == "fact_rewrite" and not final.get("perspectives")
@@ -500,13 +515,32 @@ def request_spec(stage, rows, final, originals, meta, *, kind, extra=None, range
     inventory = unread_inventory(originals, spans)
     payload["fixed_original_inventory"] = inventory
     refs = CitationContext(refs, originals, spans, protocol_version)
+    allowed = (set(final_citation_source_ids)
+        if stage == "fact_rewrite" and final_citation_source_ids is not None else None)
+    if allowed is not None:
+        allowed_refs = {key: span for key, span in refs.items()
+            if span.evidence_id in allowed
+            and _unique_source_quote(refs.originals[span.evidence_id], span.start_byte, span.end_byte)}
+        payload["citation_catalog"] = [
+            {**source, "ranges": [entry for entry in source["ranges"]
+                if entry["reference_id"] in allowed_refs]}
+            for source in payload["citation_catalog"]
+            if source["evidence_id"] in allowed
+            and any(entry["reference_id"] in allowed_refs for entry in source["ranges"])]
+        refs = CitationContext(
+            allowed_refs,
+            [original for original in refs.originals.values() if original.evidence_id in allowed],
+            [span for span in refs.delivered_spans if span.evidence_id in allowed],
+            protocol_version)
     if _quote_protocol(refs):
         by_id = {o.evidence_id: o for o in originals}
         payload["citation_sources"] = [{"source_id": key, "path": by_id[key].path,
             "version": by_id[key].version, "sha": by_id[key].sha, "source_hash": by_id[key].digest,
             "delivered_ranges": [{"start_byte": span.start_byte, "end_byte": span.end_byte}
                 for span in spans if span.evidence_id == key]}
-            for key in dict.fromkeys(span.evidence_id for span in spans)]
+            for key in dict.fromkeys(span.evidence_id for span in spans)
+            if any(span.evidence_id == key for span in refs.values())
+            if allowed is None or key in allowed]
         if "citation_grounding_rule" in payload["canonical_facts"]:
             payload["canonical_facts"]["citation_grounding_rule"] = payload["canonical_facts"]["citation_grounding_rule"].replace(
                 "checker references", "checker quotations").replace("references extend", "quotations extend")
@@ -874,6 +908,9 @@ def assemble_rewrites(rows, children):
 def apply_item(final, row, replacement):
     if row["kind"] == "summary":
         final["summary"] = replacement
+    elif "assessment_index" in row:
+        final["perspectives"][row["perspective_index"]]["assessments"][row["assessment_index"]] = {
+            key: deepcopy(value) for key, value in replacement.items() if key != "perspective_id"}
     else:
         final[row["kind"]][int(row["id"].split(":")[1])] = replacement
 
@@ -917,6 +954,11 @@ def original_support_reference_ids(row, refs):
         return None
     return [key for key, span in refs.items() if any(start <= span.start_byte < span.end_byte <= end
         for start, end in union.get(span.evidence_id, []))]
+
+
+def _unique_source_quote(original, start_byte, end_byte):
+    quote = original.raw[start_byte:end_byte]
+    return bool(quote) and original.raw.find(quote) == start_byte and original.raw.find(quote, start_byte + 1) < 0
 
 
 def citation_binding_issues(row, assessments, originals, cited_evidence, *, protocol_version=VERSION):
@@ -1254,7 +1296,7 @@ def deduplicate_exact_citation_arrays(raw):
     return result, changes
 
 
-def attach_supported_code(row, record, originals):
+def attach_supported_code(row, record, originals, *, final_citation_source_ids=None):
     """Materialize this item's checked reference IDs, without another model call.
 
     This changes only citation attachment. Original prose and raw assessments
@@ -1269,6 +1311,12 @@ def attach_supported_code(row, record, originals):
     seen = {(c["evidence_id"], c["start_byte"], c["end_byte"]) for c in item["citations"]}
     for cite in record["check"]["cited_evidence"]:
         original = by_id[cite["evidence_id"]]
+        if (final_citation_source_ids is not None
+                and cite["evidence_id"] not in final_citation_source_ids):
+            continue
+        if (final_citation_source_ids is not None
+                and not _unique_source_quote(original, cite["start_byte"], cite["end_byte"])):
+            continue
         identity = (cite["evidence_id"], cite["start_byte"], cite["end_byte"])
         key = "Q" + hash_json((original.evidence_id, original.digest, *identity[1:]))[:12]
         if key in supported and identity not in seen:
@@ -1277,7 +1325,8 @@ def attach_supported_code(row, record, originals):
     return item
 
 
-def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources, max_rewrites, ledger, language="en"):
+def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources, max_rewrites, ledger, language="en",
+    final_citation_source_ids=None):
     """Callbacks own native admission, usage, fencing and task budgets."""
     ledger.update(version=VERSION, execution_policy_version=EXECUTION_POLICY_VERSION,
         original_final=deepcopy(final), original_final_hash=hash_json(final),
@@ -1324,7 +1373,9 @@ def run(final, originals, meta, *, mode, check, rewrite, choose, resolve_sources
                 originals=originals, cited_evidence=record["check"]["cited_evidence"],
                 delivered_ranges=record["check"]["delivered_ranges"])
             if not record["issues"] or number == max_rewrites:
-                accepted = attach_supported_code(current, record, originals) if not record["issues"] else deepcopy(current["item"])
+                accepted = (attach_supported_code(current, record, originals,
+                    final_citation_source_ids=final_citation_source_ids)
+                    if not record["issues"] else deepcopy(current["item"]))
                 entry.update(status="unverified" if record["issues"] else "model_supported", accepted=accepted)
                 apply_item(candidate, current, accepted)
                 retain_sources(candidate, quote_spans(accepted, {o.evidence_id: o for o in originals}))
@@ -1378,6 +1429,9 @@ def validate(result, originals, meta):
     candidate, decision_ids = deepcopy(original), []
     decisions = {d["decision_id"]: d for d in result.partition["decisions"]}
     mode = result.partition["operator_selected_mode"]
+    final_citation_source_ids = ({source.evidence_id for source in originals
+        if source.path and source.version in ("head", "base")}
+        if result.partition.get("engine") == "pi-agent" else None)
     limit = result.partition["identity"]["limits"]["max_rechecks"] + 1
 
     def batch_records(call, stage):
@@ -1425,7 +1479,7 @@ def validate(result, originals, meta):
                 raise PartitionError("stored_fact_delivery_changed")
             payload, schema, refs, spans = request_spec(stage, packet_rows, original, originals, meta,
                 kind=kind, extra=extra, ranges=ranges, whole_claim=record.get("whole_claim_discovery"),
-                protocol_version=protocol_version)
+                protocol_version=protocol_version, final_citation_source_ids=final_citation_source_ids)
             model_payload = {"stage": stage, "mode": mode, "language": result.language, **payload}
             if uses_citation_aliases(result.prompt_version):
                 _, model_schema, aliases = alias_model_references(model_payload, schema)
@@ -1672,7 +1726,9 @@ def validate(result, originals, meta):
                 if any(key in attempt for key in ("source_plan", "citation_repair", "rewrite")):
                     raise PartitionError("stored_unnecessary_fact_source_plan")
                 expected_status = "model_supported" if not expected_issues else "unverified"
-                accepted = attach_supported_code(current, attempt, originals) if protocol_version == VERSION and not expected_issues else current["item"]
+                accepted = (attach_supported_code(current, attempt, originals,
+                    final_citation_source_ids=final_citation_source_ids)
+                    if protocol_version == VERSION and not expected_issues else current["item"])
                 if number != len(attempts) - 1 or entry.get("status") != expected_status or entry.get("accepted") != accepted:
                     raise PartitionError("stored_fact_acceptance_changed")
                 apply_item(candidate, row, accepted)
