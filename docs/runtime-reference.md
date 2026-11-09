@@ -442,6 +442,13 @@ Tev routing is on the worker PR-metadata path, not the local Git-review CLI. Def
 - `/v1/systemone` limits the JSON body to **64 KiB** independently of the model context. The existing selector metadata limit still applies; oversized or invalid requests retain architecture review.
 - The 128k Granite model used **25.874 GiB** with the original cache settings and **16.064 GiB** with `q8_0` KV cache and Flash Attention. Tev used about **1 GiB**; loading Granite first allowed both 128k models to remain resident on this 32 GiB Mac. Check `ollama ps` and memory pressure before concurrent workloads. A five-minute keep-alive does not prevent eviction.
 - Local calls were verified on macOS with Ollama 0.40.1. Ubuntu, full-size inputs, review quality and live GitHub publication require separate validation. Default pytest uses mock HTTP boundaries, not a live Ollama server.
+- **Ubuntu (x86_64, 8 vCPU, 31 GiB, no GPU, Ollama 0.40.15):** `tev1:0.8b-128k` (`c3ec9bb7d84e`, Q8_0) and `granite4.2:128k` (`e84aa7737309`, 8.8B Q4_K_M) passed adapter `verify()`/`warmup()`. Two `/v1/systemone` decisions took 3.5–4.8 s; Tev reported `output_tokens=0`. A small schema-bound `/api/chat` review took 82.5 s on CPU (51 input / 70 output tokens). The adapter rejected a 1 s timeout, invalid selector metadata, a role/model mismatch, a non-loopback endpoint, a `-cloud` tag and an oversized input before sending. Full-size inputs and review quality were not measured.
+
+| OS | Local Ollama path | Status |
+|---|---|---|
+| Ubuntu x86_64 (cloud worker baseline) | Ollama 0.40.15, CPU only | Real inference verified for both roles (small inputs) |
+| macOS (Apple Silicon) | Ollama 0.40.1 | Verified earlier (see above) |
+| Windows | — | Not verified; unsupported for the worker |
 
 On macOS, these **global, user-approved** cache settings were used for the verification:
 ```bash
