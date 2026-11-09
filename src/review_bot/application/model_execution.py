@@ -22,6 +22,7 @@ from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from review_bot.adapters.byte_budget import effective_output_reservation
 from review_bot.application.architecture_review import ModelProfile, TransientModelError, ModelOutputLimitError, ModelInputCapacityError, PermanentModelError
 from review_bot.application.context import hash_json
 from review_bot.application.intent_context import MAX_INPUT_BYTES, IntentInputError, strict_json_loads
@@ -169,11 +170,12 @@ class ModelExecutionBudget:
         self.records.append(record)
         reason = self.guard()
         calls, tokens, unknown = self.operational_totals()
+        output_reservation = effective_output_reservation(request.max_output_tokens, profile.provider)
         if reason is None and unknown:
             reason = "usage_unavailable"
         if reason is None and calls + int(generate) + reserve_calls > self.limits.max_calls:
             reason = "call_limit_exceeded"
-        if reason is None and tokens + request.max_output_tokens + reserve_tokens > self.limits.max_total_tokens:
+        if reason is None and tokens + output_reservation + reserve_tokens > self.limits.max_total_tokens:
             reason = "task_token_limit_exceeded"
         remaining = self.deadline - time.monotonic()
         if reason is None and remaining < 1:
@@ -238,11 +240,12 @@ class ModelExecutionBudget:
         for number in range(1, profile.max_attempts + 1):
             reason = self.guard()
             calls, tokens, unknown = self.operational_totals()
+            output_reservation = effective_output_reservation(request.max_output_tokens, profile.provider)
             if reason is None and unknown:
                 reason = "usage_unavailable"
             if reason is None and calls + 1 + reserve_calls > self.limits.max_calls:
                 reason = "call_limit_exceeded"
-            if reason is None and tokens + request.max_output_tokens + reserve_tokens > self.limits.max_total_tokens:
+            if reason is None and tokens + output_reservation + reserve_tokens > self.limits.max_total_tokens:
                 reason = "task_token_limit_exceeded"
             remaining = self.deadline - time.monotonic()
             if reason is None and remaining < 1:
@@ -283,8 +286,9 @@ class ModelExecutionBudget:
                     retry = False
                     self.records[index] = replace(self.records[index], status="not_run", reason=reason)
                     return None, index
+                output_reservation = effective_output_reservation(actual.max_output_tokens, profile.provider)
                 if (isinstance(error, ModelOutputLimitError) and delivery == "sent" and usage is not None
-                        and usage["output_tokens"] == actual.max_output_tokens):
+                        and usage["output_tokens"] == output_reservation):
                     reason = "model_output_limit"
                     output = getattr(error, "rejected_output", None)
                     if (isinstance(output, dict) and set(output) == {"finish_reason", "content", "reasoning_content"}
@@ -294,7 +298,7 @@ class ModelExecutionBudget:
                             and len(json.dumps(output, ensure_ascii=False).encode("utf-8")) <= MAX_REJECTED_OUTPUT_BYTES):
                         self.rejected_outputs.setdefault(index, []).append({"attempt": number,
                             "request_hash": hash_json(asdict(actual)), "usage": deepcopy(usage),
-                            "output_limit": actual.max_output_tokens,
+                            "output_limit": output_reservation,
                             "output": deepcopy(output), "output_hash": hash_json(output)})
                 retry = isinstance(error, (TimeoutError, TransientModelError)) and usage is not None and delivery != "unknown"
             if reason == "received" and usage is None:
@@ -304,7 +308,8 @@ class ModelExecutionBudget:
             # per-request reservations (e.g. mandatory reasoning headroom), so
             # the request value alone is not the effective cap. The adapter
             # still enforces its own exact wire cap pre- and post-send.
-            output_limit = max(request.max_output_tokens or 0, profile.max_output_tokens or 0)
+            output_limit = effective_output_reservation(
+                max(request.max_output_tokens or 0, profile.max_output_tokens or 0), profile.provider)
             if usage is not None and (usage["input_tokens"] > context_limit
                     or usage["output_tokens"] > output_limit):
                 reason, retry = "usage_limit_exceeded", False

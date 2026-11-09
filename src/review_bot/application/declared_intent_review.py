@@ -8,6 +8,7 @@ from dataclasses import asdict, fields, replace
 from datetime import UTC, datetime
 from typing import Any
 
+from review_bot.adapters.byte_budget import effective_output_reservation
 from review_bot.application.context import hash_json
 from review_bot.application.intent_context import (
     CODE_KINDS,
@@ -345,7 +346,8 @@ def _execute_stage(
         token_measurement="not_attempted", measured_input_tokens=None,
         token_measurement_request_hash=None, token_measurement_delivery="not_attempted",
         token_measurement_model_calls=0, token_measurement_usage=None)
-    if request_bytes > min(profile.max_input_bytes, MAX_INPUT_BYTES) or profile.max_output_tokens > limits.max_total_tokens:
+    output_limit = effective_output_reservation(profile.max_output_tokens, profile.provider)
+    if request_bytes > min(profile.max_input_bytes, MAX_INPUT_BYTES) or output_limit > limits.max_total_tokens:
         return None, replace(record, status="not_run", reason="input_limit_exceeded")
     # No measurement call exists. The input-token budget is proven pre-send
     # by the adapter's exact-wire byte-upper-bound gate inside complete();
@@ -377,7 +379,7 @@ def _execute_stage(
             reason = "invalid_model_response"
         elif reason == "received" and usage is None:
             reason = "usage_unavailable"
-        elif reason == "received" and (usage["input_tokens"] > input_limit or usage["output_tokens"] > profile.max_output_tokens
+        elif reason == "received" and (usage["input_tokens"] > input_limit or usage["output_tokens"] > output_limit
                 or usage["input_tokens"] + usage["output_tokens"] > limits.max_total_tokens):
             reason = "usage_limit_exceeded"
         attempts.append(IntentModelAttempt(attempt, "completed" if reason == "received" else "failed", delivery, reason,

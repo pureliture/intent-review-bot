@@ -13,11 +13,8 @@ from __future__ import annotations
 
 from review_bot.application.architecture_review import PermanentModelError
 
-# Adapters whose models mandate reasoning (or other per-call overhead) may
-# floor tiny per-request output reservations up to this wire cap so that
-# reasoning plus content fits. Validators must allow choice-sized outputs
-# up to this floor; the response schema still bounds actual content.
-ADMISSION_OUTPUT_FLOOR_TOKENS = 512
+# stealth/crouton-alpha: uniqueItems returned "Provider returned error"; 512 (2/2) and 768 (1/2) ended finish_reason=length/content=None; 1024, 1536, 2048, 4096 completed (~/eval/select_payload.json).
+ADMISSION_OUTPUT_FLOOR_TOKENS = 2048
 # Closed choices are tiny requests (<= 64 output tokens) answered by
 # mandatory-reasoning models. Reasoning alone burns hundreds of tokens, so
 # choice wires get a larger floor. Content stays schema-bound to one small
@@ -30,6 +27,15 @@ CHOICE_WIRE_FLOOR_TOKENS = 2048
 # request envelopes) that is not part of our wire bytes. A post-send usage
 # check fails closed if real framing ever exceeds it.
 FRAMING_RESERVE_TOKENS = 8192
+
+
+def effective_output_reservation(max_output_tokens: int, provider: str) -> int:
+    if provider != "openrouter":
+        return max_output_tokens
+    floor = ADMISSION_OUTPUT_FLOOR_TOKENS
+    if max_output_tokens <= _CHOICE_REQUEST_CEILING_TOKENS:
+        floor = max(floor, CHOICE_WIRE_FLOOR_TOKENS)
+    return max(max_output_tokens, floor)
 
 
 def precheck_byte_budget(wire_len: int, max_output_tokens: int, *, app_input_tokens: int,

@@ -292,7 +292,8 @@ def test_capacity_authority_keeps_native_wire_separate_from_supported_operating_
     snapshot = deepcopy((record, packet, profile, request))
     payload, maximum = review_wire_payload(request)
     assert payload["model"] == request.model == profile.model
-    assert maximum == request.max_output_tokens == output_tokens
+    from review_bot.adapters.byte_budget import effective_output_reservation
+    assert maximum == effective_output_reservation(request.max_output_tokens, "openrouter") == max(output_tokens, 2048)
     assert payload["max_tokens"] == maximum
     assert profile.max_input_tokens + profile.max_output_tokens == context_tokens
     assert packet["admission_bound"] == record.measured_input_tokens
@@ -336,7 +337,8 @@ def _check_admission_authority(record, packet, profile, request):
         payload, maximum = review_wire_payload(request)
     except Exception as error:
         raise ValueError("invalid_admission_wire") from error
-    if maximum != request.max_output_tokens or payload["model"] != request.model:
+    from review_bot.adapters.byte_budget import effective_output_reservation
+    if maximum != effective_output_reservation(request.max_output_tokens, "openrouter") or payload["model"] != request.model:
         raise ValueError("invalid_admission_wire")
     if set(packet) != {"admission_bound", "witness_hash", "request_hash"}:
         raise ValueError("invalid_admission_witness")

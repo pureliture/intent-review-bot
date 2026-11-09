@@ -2212,7 +2212,9 @@ def test_selected_consumer_native400_keeps_unknown_reservation_and_fresh_childre
             if payload["stage"] == "review_partition":
                 # Prove the OpenRouter wire builder is the exact-wire source.
                 wire, maximum = review_wire_payload(request)
-                assert wire["model"] == request.model and maximum == request.max_output_tokens
+                from review_bot.adapters.byte_budget import effective_output_reservation
+                assert wire["model"] == request.model and maximum == effective_output_reservation(
+                    request.max_output_tokens, "openrouter")
                 assert isinstance(wire["messages"], list) and wire["stream"] is False
                 size = sum(len(block["text"].encode()) for source in payload.get("originals", []) for block in source["blocks"])
                 if size > 400:

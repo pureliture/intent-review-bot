@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
+from review_bot.adapters.byte_budget import effective_output_reservation
 from review_bot.application.architecture_review import ModelProfile
 from review_bot.application import partition_choices as choices
 from review_bot.application import partition_global_review as global_review
@@ -1994,7 +1995,8 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     known = (str(error) == "model_output_limit" and event.reason == "model_output_limit" and
                         bool(event.attempts) and bool(rejected) and not budget.operational_totals()[2] and
                         all(attempt.delivery == "sent" and attempt.usage is not None and
-                            attempt.usage["output_tokens"] == req.max_output_tokens for attempt in event.attempts))
+                            attempt.usage["output_tokens"] == effective_output_reservation(
+                                req.max_output_tokens, profile.provider) for attempt in event.attempts))
                     if len(packet_rows) < 2 or not known:
                         raise
                     packet["split"] = "items"

@@ -12,6 +12,7 @@ import ast
 import json
 import re
 
+from review_bot.adapters.byte_budget import effective_output_reservation
 from review_bot.application.context import hash_json
 from review_bot.application import partition_choices as choices
 from review_bot.application.source_partition import PartitionError, make_span
@@ -1465,7 +1466,9 @@ def validate(result, originals, meta):
                     raise PartitionError("stored_fact_output_split_without_known_limit")
                 failed = result.stages[failed_index]
                 rejected = [item for item in result.partition.get("rejected_model_outputs", []) if item["stage_index"] == failed_index]
-                output_limit = result.partition["identity"]["models"]["review"]["max_output_tokens"]
+                review_profile = result.partition["identity"]["models"]["review"]
+                output_limit = effective_output_reservation(
+                    review_profile["max_output_tokens"], review_profile["provider"])
                 if (failed.reason != "model_output_limit" or failed.stage not in (stage, stage + ":output_recovery") or
                         failed.prompt_hash != hash_json({"system": prompt, "schema": model_schema}) or not failed.attempts or not rejected or
                         any(attempt.delivery != "sent" or attempt.reason != "model_output_limit" or attempt.usage is None or
