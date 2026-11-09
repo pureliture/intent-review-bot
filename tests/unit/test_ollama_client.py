@@ -260,8 +260,9 @@ def test_external_or_ambiguous_endpoint_is_rejected(api_url: str) -> None:
     for client_type in (OllamaModelClient, OllamaDecisionClient):
         with pytest.raises(ValueError):
             client_type(api_url=api_url)
-        with pytest.raises(ValueError):
-            client_type(model="kimi-k2.6:cloud")
+        for cloud_model in ("kimi-k2.6:cloud", "gpt-oss:120b-cloud"):
+            with pytest.raises(ValueError):
+                client_type(model=cloud_model)
 
 
 def test_tev_port_uses_systemone_not_chat(mock_http: Any, decision_request: ModelRequest) -> None:
