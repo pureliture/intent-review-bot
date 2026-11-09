@@ -20,6 +20,11 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
     def fake_run(argv, **kwargs):
         calls.append(argv)
         if "review-agent-" in " ".join(argv) and "review-bot-pi-agent:0.73.1" in argv:
+            skills_mount = next(item for item in argv if item.endswith(":/skills:ro"))
+            skills_dir = Path(skills_mount.split(":/skills:ro")[0])
+            assert (skills_dir / "review-architecture" / "SKILL.md").is_file()
+            assert (skills_dir / "review-intent" / "SKILL.md").is_file()
+            assert (skills_dir / "check_output.mjs").is_file()
             return subprocess.CompletedProcess(argv, 1, "", "agent failed")
         return subprocess.CompletedProcess(argv, 0, "ok", "")
 
@@ -41,9 +46,17 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
     assert "/tmp:rw,exec" in agent[agent.index("--tmpfs") + 1]
     assert agent[agent.index("--user") + 1] != "0:0"
     assert any(":/workspace:ro" in arg for arg in agent if arg.startswith(str(workspace)))
-    assert any(":/skill/SKILL.md:ro" in arg for arg in agent)
+    assert any(":/skills:ro" in arg for arg in agent)
+    assert not any(":/skills/check_output.mjs:ro" in arg for arg in agent)
+    assert any(":/out:rw" in arg for arg in agent)
     assert any(":/agent:ro" in arg for arg in agent)
     assert any(":/sessions:rw" in arg for arg in agent)
+    assert agent[agent.index("--skill") + 1] == "/skills/review-architecture/SKILL.md"
+    assert "bash" in agent[agent.index("--tools") + 1].split(",")
+    writable_mounts = [arg for arg in agent if arg.startswith("/") and arg.endswith(":rw")]
+    assert len(writable_mounts) == 2
+    assert any(":/out:rw" in arg for arg in writable_mounts)
+    assert any(":/sessions:rw" in arg for arg in writable_mounts)
     assert "PI_CODING_AGENT_DIR=/agent" in agent
     assert "OPENROUTER_API_KEY" not in agent and "test-only-secret" not in json.dumps(agent)
     assert not any("docker.sock" in argument for argument in agent)
@@ -94,6 +107,10 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
                 '"total_tokens":30,"cost":{"total":0.0025}}\n', encoding="utf-8")
             return subprocess.CompletedProcess(argv, 0, "proxy-id", "")
         if "review-bot-pi-agent:0.73.1" in argv:
+            skills_mount = next(item for item in argv if item.endswith(":/skills:ro"))
+            skills_dir = Path(skills_mount.split(":/skills:ro")[0])
+            assert (skills_dir / "review-architecture" / "SKILL.md").is_file()
+            assert (skills_dir / "check_output.mjs").is_file()
             mount = next(item for item in argv if ":/sessions:rw" in item)
             session_dir = Path(mount.split(":/sessions:rw")[0])
             (session_dir / "session.jsonl").write_text(
@@ -119,4 +136,9 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
     assert result.usage["input_tokens"] == 23 and result.usage["output_tokens"] == 7
     assert result.usage["cost"]["total"] == 0.0025
     assert result.proxy_ledger_path.endswith("usage.jsonl")
+    out_mounts = [next(arg for arg in argv if ":/out:rw" in arg) for argv in agents]
+    assert out_mounts[0] == out_mounts[1]
+    skills_mounts = [next(arg for arg in argv if arg.endswith(":/skills:ro")) for argv in agents]
+    assert skills_mounts[0] == skills_mounts[1]
+    assert agents[0][agents[0].index("--skill") + 1] == "/skills/review-architecture/SKILL.md"
     assert any(argv[1:3] == ["network", "rm"] for argv in calls)

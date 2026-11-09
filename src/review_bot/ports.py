@@ -47,6 +47,7 @@ class AgentRunResponse:
     pi_version: str
     exit_status: int
     session_id: str | None = None
+    output_path: Path | None = None
 
 
 @dataclass(frozen=True)

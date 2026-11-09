@@ -31,6 +31,12 @@ class FakeAgentRunner:
         self.config = SimpleNamespace(max_proxy_calls=12, max_output_tokens=2048)
         self.workspace = None
         self.contract = ""
+        self.contract_json = {}
+        self.output_path = tmp_path / "fake-out" / "result.json"
+        self.omit_output = False
+        self.repair_omit_output = None
+        self.oversize_output = False
+        self.repair_oversize_output = None
         self.request = None
         self.repair_calls = 0
         self.repair_message = None
@@ -49,17 +55,29 @@ class FakeAgentRunner:
             for path in request.workspace_dir.rglob("*") if path.is_file()
         }
         self.contract = (request.workspace_dir / "CONTRACT.md").read_text(encoding="utf-8")
+        self.contract_json = json.loads((request.workspace_dir / "contract.json").read_text(encoding="utf-8"))
         if self.error:
             raise self.error
         body = self.output(request) if callable(self.output) else self.output
-        if isinstance(body, dict):
-            body = json.dumps(body, ensure_ascii=False)
-        if isinstance(body, bytes):
-            body = body.decode()
-        return AgentRunResponse(body, self.session, {
+        return self._response(body, self.omit_output, self.oversize_output, "fake-session", {
             "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
             "model_calls": 1, "cost": {"total": 0.01},
-        }, "0.73.1", 0, "fake-session")
+        })
+
+    def _response(self, body, omit_output, oversize_output, session_id, usage):
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        if omit_output:
+            self.output_path.unlink(missing_ok=True)
+        elif oversize_output:
+            self.output_path.write_bytes(b"x" * 1_048_577)
+        else:
+            if isinstance(body, dict):
+                body = json.dumps(body, ensure_ascii=False)
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            self.output_path.write_bytes(body or b"")
+        return AgentRunResponse("DONE", self.session, usage, "0.73.1", 0,
+            session_id, self.output_path)
 
     def repair(self, request, session_id, message):
         self.repair_calls += 1
@@ -68,11 +86,10 @@ class FakeAgentRunner:
             raise self.repair_error
         body = self.repair_output if self.repair_output is not None else self.output
         body = body(request) if callable(body) else body
-        if isinstance(body, dict):
-            body = json.dumps(body, ensure_ascii=False)
-        if isinstance(body, bytes):
-            body = body.decode()
-        return AgentRunResponse(body, self.session, {}, "0.73.1", 0, session_id)
+        return self._response(body,
+            self.omit_output if self.repair_omit_output is None else self.repair_omit_output,
+            self.oversize_output if self.repair_oversize_output is None else self.repair_oversize_output,
+            session_id, {})
 
     def finish(self, session_id):
         self.finished.append(session_id)
@@ -128,8 +145,13 @@ def test_agent_architecture_result_validates_formats_with_exact_citations_and_tr
     assert result.partition["engine"] == "pi-agent"
     assert "head/src/A.java" in runner.workspace and "base/src/A.java" in runner.workspace
     assert {"PR.md", "signals.json", "CONTRACT.md"} <= runner.workspace
+    assert "contract.json" in runner.workspace
     assert "target_ids may be empty only when basis is observed_structure" in runner.contract
     assert "Every finding and assessment needs at least one citation" in runner.contract
+    assert runner.contract_json["mode"] == "architecture"
+    assert runner.contract_json["allowed_target_ids"] == prepare_originals(task, "architecture")[1]["targets"]
+    assert runner.contract_json["required_keys"]["finding"][-1] == "citations"
+    assert runner.contract_json["citation_rules"]["empty_target_ids_basis"] == "observed_structure"
 
 
 def test_agent_intent_result_validates_and_formats_all_perspectives(tmp_path):
@@ -145,10 +167,10 @@ def test_agent_intent_result_validates_and_formats_all_perspectives(tmp_path):
     assert "Engine: `pi-agent`" in markdown
 
 
-def test_agent_accepts_one_optional_json_fence(tmp_path):
+def test_agent_uses_result_file_instead_of_stdout(tmp_path):
     task = _pmd_partition_task()
-    body = json.dumps(_architecture_body(task))
-    result = _run(task, "architecture", tmp_path, f"```json\n{body}\n```")
+    body = _architecture_body(task)
+    result = _run(task, "architecture", tmp_path, body)
     assert result.status == "completed"
     validate_partition_result(result, task)
 
@@ -157,8 +179,47 @@ def test_malformed_agent_json_fails_closed(tmp_path):
     task = _pmd_partition_task()
     runner = FakeAgentRunner(tmp_path, "not json")
     result = _run(task, "architecture", tmp_path, "not json", runner=runner)
-    assert result.status == "failed" and result.reason == "agent_output_invalid"
+    assert result.status == "failed" and result.reason == "agent_output_json_invalid"
     assert runner.repair_calls == 1 and runner.finished == ["fake-session"]
+    validate_partition_result(result, task)
+
+
+def test_missing_output_file_is_repaired_with_specific_code(tmp_path):
+    task = _pmd_partition_task()
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+    runner.omit_output = True
+    result = _run(task, "architecture", tmp_path, runner.output, runner=runner)
+
+    assert result.status == "failed" and result.reason == "agent_output_missing"
+    assert result.partition["agent"]["rejected_before"][0]["reason"] == "agent_output_missing"
+    assert "agent_output_missing" in runner.repair_message
+    assert "/out/result.json" in runner.repair_message
+    assert "node /skills/check_output.mjs" in runner.repair_message
+    validate_partition_result(result, task)
+
+
+def test_oversize_output_file_is_rejected_and_repaired(tmp_path):
+    task = _pmd_partition_task()
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+    runner.oversize_output = True
+    result = _run(task, "architecture", tmp_path, runner.output, runner=runner)
+
+    assert result.status == "failed" and result.reason == "agent_output_too_large"
+    assert result.partition["agent"]["rejected_before"][0]["reason"] == "agent_output_too_large"
+    validate_partition_result(result, task)
+
+
+def test_json_parse_diagnostic_is_sent_in_repair_message(tmp_path):
+    task = _pmd_partition_task()
+    corrected = _architecture_body(task)
+    runner = FakeAgentRunner(tmp_path, "{", repair_output=corrected)
+    result = _run(task, "architecture", tmp_path, "{", runner=runner)
+
+    assert result.status == "completed"
+    assert "agent_output_json_invalid" in runner.repair_message
+    assert "offset=" in runner.repair_message and "context=" in runner.repair_message
+    assert "node /skills/check_output.mjs" in runner.repair_message
+    assert "DONE" in runner.repair_message
     validate_partition_result(result, task)
 
 
@@ -319,9 +380,11 @@ def test_repair_success_replaces_first_output_and_never_sends_rejected_prose(tmp
     assert result.partition["agent"]["before_rejected_count"] == 1
     assert result.partition["agent"]["after_rejected_count"] == 0
     assert "agent_finding_unknown_target" in runner.repair_message
+    assert "code=agent_finding_unknown_target" in runner.repair_message
     assert "item_index=0" in runner.repair_message
     assert "A concrete defect." not in runner.repair_message
-    assert "full corrected JSON" in runner.repair_message
+    assert "/out/result.json" in runner.repair_message
+    assert "node /skills/check_output.mjs" in runner.repair_message
     assert runner.repair_calls == 1 and runner.finished == ["fake-session"]
     validate_partition_result(result, task)
 
@@ -333,7 +396,7 @@ def test_repair_failure_is_failed_and_does_not_attempt_a_second_repair(tmp_path)
     runner = FakeAgentRunner(tmp_path, first, repair_output="still not json")
     result = _run(task, "architecture", tmp_path, first, runner=runner)
 
-    assert result.status == "failed" and result.reason == "agent_output_invalid"
+    assert result.status == "failed" and result.reason == "agent_output_json_invalid"
     assert runner.repair_calls == 1
     assert result.partition["agent"]["repair_attempted"]
     assert result.partition["agent"]["after_rejected_count"] == 1
