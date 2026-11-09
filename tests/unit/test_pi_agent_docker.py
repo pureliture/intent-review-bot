@@ -11,6 +11,13 @@ from review_bot.config import AgentEngineConfig
 from review_bot.ports import AgentRunError, AgentRunRequest
 
 
+def test_docker_runner_resolves_relative_session_store_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    runner = DockerPiAgentRunner(AgentEngineConfig(session_store_dir="relative-ledger"))
+    assert runner.session_store_dir == (tmp_path / "relative-ledger").resolve()
+    assert runner.session_store_dir.is_absolute()
+
+
 def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

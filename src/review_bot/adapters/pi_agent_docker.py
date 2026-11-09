@@ -54,7 +54,7 @@ class DockerPiAgentRunner:
         self.config = config
         self.model_id = config.model_id
         self.timeout_seconds = config.timeout_seconds
-        self.session_store_dir = Path(config.session_store_dir).expanduser()
+        self.session_store_dir = Path(config.session_store_dir).expanduser().resolve()
         self.repo_root = repo_root or Path(__file__).resolve().parents[3]
         self._active_runs: dict[str, _ActiveRun] = {}
 

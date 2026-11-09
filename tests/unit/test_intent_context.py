@@ -146,6 +146,23 @@ def test_scoped_reader_rejects_unrequested_blobs_instead_of_quietly_reviewing_th
         collect_intent_code_snapshot(reader, HEAD_SHA, ("app.py",))
 
 
+def test_scoped_reader_records_blob_read_failures_as_incomplete_scope():
+    reader = Mock(spec=RepositoryReader)
+    reader.read_tree_blobs.side_effect = RuntimeError("missing blob")
+    code = collect_intent_code_snapshot(reader, HEAD_SHA, ("app.py",))
+    assert code.files == ()
+    assert code.errors == ("git_blob_read_failed:RuntimeError",)
+    assert code.complete is False
+
+    task = make_task()
+    base = replace(task.base, files=(), inventory_hash=code.inventory_hash,
+        complete=code.complete, errors=code.errors)
+    scoped = build_intent_task_input(task.snapshot, base, task.head)
+    scope = intent_scope(scoped)
+    assert scope["complete"] is False
+    assert "base:incomplete_prepared_scope" in scope["missing"]
+
+
 def test_material_digest_covers_scoped_files_text_versions_and_missing_sources_but_not_read_time():
     from review_bot.application.snapshot import collect_snapshot_material
     from review_bot.domain.envelope_v2 import UnavailableSource

@@ -685,6 +685,20 @@ def test_literal_metric_values_do_not_assert_a_meaning_category(prose):
     assert "summary" in schema["properties"]["items"]["required"]  # value check is still required
 
 
+def test_fact_check_schema_without_delivered_references_allows_only_empty_citations():
+    row = {"id": "summary", "kind": "summary", "item": "The change improves behavior."}
+    refs = facts.CitationContext({}, [], [], facts.VERSION)
+    schema = facts.check_schema([row], refs, source_ids=())
+    citations = schema["properties"]["items"]["properties"]["summary"]["properties"]["text"]["properties"]["citations"]
+    assert citations == {
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 0,
+        "maxItems": 0,
+    }
+    assert '"enum": []' not in json.dumps(schema)
+
+
 def test_literal_grammar_never_skips_a_meaning_claim_next_to_values():
     row = {"id": "summary", "kind": "summary", "item": "TCC 0.07이다. Therefore coupling is low."}
     assert [s["state"]["target_metric"] for s in facts.metric_specs(row)] == ["TCC"]

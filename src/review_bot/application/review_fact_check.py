@@ -290,6 +290,8 @@ def text(empty=False):
 
 
 def cite_schema(refs, *, required=False):
+    if not refs:
+        return {"type": "array", "items": {"type": "string"}, "minItems": 0, "maxItems": 0}
     allowed = (_quote_object_schema(dict.fromkeys(span.evidence_id for span in refs.delivered_spans), refs)
         if _quote_protocol(refs) else obj({"reference_id": {"type": "string", "enum": list(refs)}}))
     return {"type": "array", "items": allowed, "minItems": 1 if required else 0, "maxItems": 32}
