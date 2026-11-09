@@ -213,7 +213,8 @@ function checkIntent(result, contract) {
       error([...at, "perspective_id"], "agent_output_perspective_invalid");
     }
     seenPerspectives.add(perspective.perspective_id);
-    if (!Array.isArray(perspective.assessments) || perspective.assessments.length === 0
+    if (!Array.isArray(perspective.assessments)
+        || (perspective.assessments.length === 0 && contract.citation_rules.empty_assessments_allowed !== true)
         || perspective.assessments.length > contract.max_items.assessments_per_perspective) {
       error([...at, "assessments"], "agent_output_assessments_invalid");
       return;

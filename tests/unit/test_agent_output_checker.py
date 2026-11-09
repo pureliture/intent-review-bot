@@ -114,6 +114,23 @@ def test_checker_allows_empty_citations_only_for_insufficient_context(tmp_path):
     assert result.stdout == "OK\n"
 
 
+def test_checker_accepts_empty_assessments_for_required_perspective(tmp_path):
+    contract = _contract_json("intent", {"targets": []})
+    result = _run_checker(tmp_path, "intent", {
+        "summary": "Review.",
+        "perspectives": [{
+            "perspective_id": contract["allowed_perspective_ids"][0],
+            "assessments": [],
+        }],
+        "questions": [],
+    })
+
+    assert contract["citation_rules"]["empty_assessments_allowed"] is True
+    assert contract["citation_rules"]["empty_assessments_meaning"] == "no_distinct_finding"
+    assert result.returncode == 0
+    assert result.stdout == "OK\n"
+
+
 def test_checker_accepts_valid_file_with_exact_unique_quote(tmp_path):
     result = _run_checker(tmp_path, "architecture", {
         "summary": "Review.",
