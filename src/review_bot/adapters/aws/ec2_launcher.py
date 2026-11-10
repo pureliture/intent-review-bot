@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 
 from review_bot.application.ondemand import ManagedInstance
+from review_bot.adapters.vm_user_data import one_shot_user_data
 
 _JOB_ID = re.compile(r"^[0-9a-f]{64}$")
 
@@ -23,11 +24,7 @@ class Ec2VmLauncher:
     def launch(self, job_id: str, *, max_lifetime_seconds: int, launch_token: str) -> str:
         if not _JOB_ID.match(job_id) or type(max_lifetime_seconds) is not int or not 60 <= max_lifetime_seconds <= 6 * 3600:
             raise ValueError("invalid_launch_request")
-        minutes = max(1, max_lifetime_seconds // 60)
-        user_data = ("#!/bin/bash\nset -eu\n"
-            f"shutdown -h +{minutes}\n"
-            f"# review-bot-max-lifetime-seconds {max_lifetime_seconds}\n"
-            f"# review-bot-ondemand --job-id {job_id}\n")
+        user_data = one_shot_user_data(job_id, max_lifetime_seconds)
         tags = {
             **self.instance_tags,
             f"{self.tag_prefix}:job-id": job_id,

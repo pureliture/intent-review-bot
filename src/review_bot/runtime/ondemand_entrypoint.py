@@ -73,6 +73,7 @@ def run_ondemand(
     *,
     vm_id: str | None = None,
     config_path: str | None = None,
+    vm_lifetime_seconds: int | None = None,
     coordinator: OnDemandCoordinator | None = None,
     execute: Callable[[ReviewJob, Callable[[], bool]], tuple[dict[str, str], dict]] | None = None,
 ) -> int:
@@ -86,8 +87,17 @@ def run_ondemand(
             from review_bot.runtime.service import execute_ondemand_review
 
             def execute_review(job, is_current):
-                return execute_ondemand_review(config_path, job, is_current,
-                    vm_lifetime_seconds=read_vm_lifetime_seconds())
+                lifetime = (
+                    vm_lifetime_seconds
+                    if vm_lifetime_seconds is not None
+                    else read_vm_lifetime_seconds()
+                )
+                return execute_ondemand_review(
+                    config_path,
+                    job,
+                    is_current,
+                    vm_lifetime_seconds=lifetime,
+                )
 
             execute = execute_review
         result = run_job(coordinator, job_id, self_vm_id, execute, self_vm_id=self_vm_id)

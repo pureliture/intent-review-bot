@@ -66,3 +66,27 @@ def test_cli_no_args_prints_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert ret == 0
     captured = capsys.readouterr()
     assert "usage: review-bot" in captured.out
+
+
+def test_ondemand_run_rejects_lifetime_below_minimum() -> None:
+    with pytest.raises(SystemExit) as exc:
+        main([
+            "ondemand-run",
+            "--job-id", "a" * 64,
+            "--vm-lifetime-seconds", "59",
+        ])
+    assert exc.value.code == 2
+
+
+def test_ondemand_recover_prints_json(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from review_bot.runtime import aws_lambda
+
+    coordinator = object()
+    monkeypatch.setattr(aws_lambda, "_coordinator_from_environment", lambda: coordinator)
+    monkeypatch.setattr(
+        aws_lambda,
+        "build_recovery_handler",
+        lambda actual: (lambda: {"recovered": int(actual is coordinator), "relaunched": 1}),
+    )
+    assert main(["ondemand-recover"]) == 0
+    assert capsys.readouterr().out.strip() == '{"recovered": 1, "relaunched": 1}'

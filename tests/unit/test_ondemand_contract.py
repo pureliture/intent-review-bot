@@ -381,7 +381,43 @@ def test_ondemand_cli_parses_job_and_vm_id(monkeypatch):
     assert main(["ondemand-run", "--job-id", "a" * 64, "--vm-id", "i-1234abcd"]) == 0
     assert calls == [("a" * 64, {
         "vm_id": "i-1234abcd", "config_path": "/etc/review-bot/operator.yaml",
+        "vm_lifetime_seconds": None,
     })]
     monkeypatch.setattr(sys, "argv", ["review-bot-ondemand", "--job-id", "b" * 64, "--vm-id", "i-abcd1234"])
     assert ondemand_main() == 0
     assert calls[-1][0] == "b" * 64
+
+
+def test_ondemand_lifetime_override_bypasses_imds(monkeypatch):
+    from types import SimpleNamespace
+
+    from review_bot.runtime import aws_lambda, ondemand_entrypoint, service
+    from review_bot.runtime.cli import main
+
+    lifetimes = []
+    monkeypatch.setattr(aws_lambda, "_coordinator_from_environment", lambda: object())
+    monkeypatch.setattr(
+        ondemand_entrypoint,
+        "read_vm_lifetime_seconds",
+        lambda: pytest.fail("IMDS lifetime was read despite an explicit override"),
+    )
+    monkeypatch.setattr(
+        service,
+        "execute_ondemand_review",
+        lambda config_path, job, is_current, *, vm_lifetime_seconds: (
+            lifetimes.append(vm_lifetime_seconds) or ({}, {})
+        ),
+    )
+
+    def run_job(coordinator, job_id, vm_id, execute, *, self_vm_id):
+        execute(SimpleNamespace(job_id=job_id), lambda: True)
+        return None
+
+    monkeypatch.setattr(ondemand_entrypoint, "run_job", run_job)
+    assert main([
+        "ondemand-run",
+        "--job-id", "a" * 64,
+        "--vm-id", "rb-" + "b" * 20,
+        "--vm-lifetime-seconds", "600",
+    ]) == 0
+    assert lifetimes == [600]
