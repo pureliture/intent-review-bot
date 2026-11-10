@@ -4,6 +4,8 @@ Read `/workspace/CONTRACT.md`, `/workspace/contract.json`, and `/workspace/claim
 
 For each listed claim and each listed field, independently compare the exact field text with the frozen implementation under `/workspace/head/` and `/workspace/base/`. You may read the files you need; do not assume the generation agent's citations prove the claim. The `cited` entries are starting points only. Use `/workspace/PR.md` only as additional factual context, never as implementation evidence.
 
+Verify only the fields present in claims.json; hypothetical condition fields are intentionally not listed, so do not add verdicts for them.
+
 Return exactly one verdict for every listed field:
 - `supported`: the cited source code directly supports every factual assertion in the field.
 - `contradicted`: the frozen sources contradict at least one factual assertion.
