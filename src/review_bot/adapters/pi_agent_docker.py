@@ -1,9 +1,11 @@
 """Docker-isolated pi-agent runner with a credential-holding, bounded proxy."""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +14,8 @@ import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
+from glob import glob
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +33,97 @@ from review_bot.ports import (
     AgentRunResponse,
 )
 
-PROXY_IMAGE = "review-bot-agent-proxy:1"
 PI_VERSION = "0.73.1"
 _SHELL_CPU_SECONDS = 120
+
+
+def _proxy_copy_sources(dockerfile: str) -> tuple[str, ...]:
+    sources: list[str] = []
+    pending = ""
+    for raw_line in dockerfile.splitlines():
+        line = raw_line.strip()
+        if not pending and (not line or line.startswith("#")):
+            continue
+        pending += line.removesuffix("\\").strip() + " "
+        if line.endswith("\\"):
+            continue
+        instruction, _, arguments = pending.partition(" ")
+        pending = ""
+        if instruction.upper() != "COPY":
+            continue
+        if arguments.lstrip().startswith("["):
+            operands = json.loads(arguments)
+            if not isinstance(operands, list) or not all(
+                isinstance(operand, str) for operand in operands
+            ):
+                raise ValueError("invalid COPY instruction")
+        else:
+            operands = shlex.split(arguments, comments=True)
+        while operands and operands[0].startswith("--"):
+            option = operands.pop(0)
+            if option.startswith("--from="):
+                operands = []
+                break
+        if operands:
+            if len(operands) < 2:
+                raise ValueError("invalid COPY instruction")
+            sources.extend(operands[:-1])
+    if pending:
+        raise ValueError("unterminated Dockerfile instruction")
+    return tuple(sources)
+
+
+def _proxy_build_inputs() -> tuple[tuple[str, Path], ...]:
+    source_dir = Path(__file__).resolve().parents[3] / "deploy" / "agent-sandbox"
+    packaged_dir = Path(str(files("review_bot").joinpath("resources", "agent-sandbox")))
+    dockerfile_path = source_dir / "Dockerfile.proxy"
+    if not dockerfile_path.is_file():
+        dockerfile_path = packaged_dir / "Dockerfile.proxy"
+    if not dockerfile_path.is_file():
+        raise FileNotFoundError("agent proxy Dockerfile is unavailable")
+
+    inputs: dict[str, Path] = {"Dockerfile.proxy": dockerfile_path}
+    for source in _proxy_copy_sources(dockerfile_path.read_text(encoding="utf-8")):
+        relative_source = Path(source)
+        if relative_source.is_absolute() or ".." in relative_source.parts:
+            raise ValueError(f"invalid proxy Dockerfile COPY source: {source}")
+        matches: list[tuple[Path, Path]] = []
+        for candidate_dir in (source_dir, packaged_dir):
+            for match in glob(str(candidate_dir / source), recursive=True):
+                matched_path = Path(match)
+                if matched_path.is_dir():
+                    matches.extend(
+                        (candidate_dir, path)
+                        for path in matched_path.rglob("*")
+                        if path.is_file()
+                    )
+                elif matched_path.is_file():
+                    matches.append((candidate_dir, matched_path))
+            if matches:
+                break
+        if not matches:
+            raise FileNotFoundError(f"agent proxy Dockerfile COPY source is unavailable: {source}")
+        for candidate_dir, path in matches:
+            resolved_path = path.resolve()
+            if not resolved_path.is_relative_to(candidate_dir.resolve()):
+                raise ValueError(f"proxy Dockerfile COPY source escapes its context: {source}")
+            name = path.relative_to(candidate_dir).as_posix()
+            inputs.setdefault(name, path)
+    return tuple(sorted(inputs.items()))
+
+
+def proxy_image_tag() -> str:
+    inputs = _proxy_build_inputs()
+    digest = hashlib.sha256()
+    digest.update(len(inputs).to_bytes(8, "big"))
+    for name, path in inputs:
+        name_bytes = name.encode("utf-8")
+        content = path.read_bytes()
+        digest.update(len(name_bytes).to_bytes(8, "big"))
+        digest.update(name_bytes)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return f"review-bot-agent-proxy:src-{digest.hexdigest()[:12]}"
 
 
 @dataclass
@@ -118,7 +210,7 @@ class DockerPiAgentRunner:
         return argv
 
     def _proxy_argv(self, network: str, name: str, model: str, ledger_dir: Path,
-        upstream_session_id: str) -> list[str]:
+        upstream_session_id: str, image_tag: str) -> list[str]:
         uid, gid = self._runtime_uid_gid()
         argv = [
             "run", "-d", "--name", name, "--network", "bridge", "--read-only",
@@ -134,7 +226,7 @@ class DockerPiAgentRunner:
         ]
         if self.config.max_output_tokens is not None:
             argv.extend(["--env", f"MAX_OUTPUT_TOKENS={self.config.max_output_tokens}"])
-        argv.extend(["--env", "USAGE_LEDGER_PATH=/ledger/usage.jsonl", PROXY_IMAGE])
+        argv.extend(["--env", "USAGE_LEDGER_PATH=/ledger/usage.jsonl", image_tag])
         return argv
 
     def _upstream_api_key(self) -> str:
@@ -268,6 +360,10 @@ class DockerPiAgentRunner:
         checker_path = agent_checker_path()
         if not skill.is_file() or not source_skills_dir.is_dir() or not checker_path.is_file():
             raise AgentRunError("agent_skill_unavailable")
+        proxy_image = proxy_image_tag()
+        image_check = self._docker(["image", "inspect", proxy_image])
+        if image_check.returncode != 0:
+            raise AgentRunError("proxy_image_missing")
         suffix = uuid.uuid4().hex[:16]
         network = f"review-agent-net-{suffix}"
         proxy_name = f"review-agent-proxy-{suffix}"
@@ -326,7 +422,7 @@ class DockerPiAgentRunner:
             proxy_env = os.environ.copy()
             proxy_env["UPSTREAM_API_KEY"] = upstream_api_key
             proxy = self._docker(self._proxy_argv(network, proxy_name, request.model, ledger_dir,
-                upstream_session_id), env=proxy_env)
+                upstream_session_id, proxy_image), env=proxy_env)
             if proxy.returncode != 0:
                 raise AgentRunError("proxy_start_failed")
             connected = self._docker(["network", "connect", "--alias", "llm-proxy", network, proxy_name])

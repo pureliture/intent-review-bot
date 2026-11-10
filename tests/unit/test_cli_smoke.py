@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from review_bot import __version__
+from review_bot.adapters.pi_agent_docker import proxy_image_tag
 from review_bot.runtime.cli import create_parser, main
 
 
@@ -52,6 +53,12 @@ def test_cli_main_invocation(capsys: pytest.CaptureFixture[str]) -> None:
     assert ret == 0
     captured = capsys.readouterr()
     assert "review-bot subcommand 'offline' initialized." in captured.out
+
+
+def test_cli_agent_proxy_image(capsys: pytest.CaptureFixture[str]) -> None:
+    expected = proxy_image_tag()
+    assert main(["agent-proxy-image"]) == 0
+    assert capsys.readouterr().out.strip() == expected
 
 
 def test_cli_no_args_prints_help(capsys: pytest.CaptureFixture[str]) -> None:

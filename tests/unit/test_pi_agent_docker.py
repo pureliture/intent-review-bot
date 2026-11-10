@@ -10,7 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from review_bot.adapters.pi_agent_docker import DockerPiAgentRunner
+from review_bot.adapters import pi_agent_docker
+from review_bot.adapters.pi_agent_docker import DockerPiAgentRunner, proxy_image_tag
 from review_bot.application.agent_review import _SEARCH_SCOPE_RULE, _initial_agent_prompt
 from review_bot.config import AgentEngineConfig
 from review_bot.ports import AgentRunError, AgentRunRequest, AgentRunResponse
@@ -21,6 +22,48 @@ def test_docker_runner_resolves_relative_session_store_dir(tmp_path, monkeypatch
     runner = DockerPiAgentRunner(AgentEngineConfig(session_store_dir="relative-ledger"))
     assert runner.session_store_dir == (tmp_path / "relative-ledger").resolve()
     assert runner.session_store_dir.is_absolute()
+
+
+def test_proxy_image_tag_is_stable():
+    tag = proxy_image_tag()
+    digest = tag.removeprefix("review-bot-agent-proxy:src-")
+    assert len(digest) == 12
+    assert all(character in "0123456789abcdef" for character in digest)
+    assert proxy_image_tag() == tag
+
+
+def test_proxy_image_tag_changes_when_llm_proxy_changes(tmp_path, monkeypatch):
+    inputs = []
+    for name, source in pi_agent_docker._proxy_build_inputs():
+        destination = tmp_path / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+        inputs.append((name, destination))
+    monkeypatch.setattr(pi_agent_docker, "_proxy_build_inputs", lambda: tuple(inputs))
+
+    initial_tag = proxy_image_tag()
+    assert proxy_image_tag() == initial_tag
+    proxy_source = tmp_path / "llm_proxy.py"
+    proxy_source.write_bytes(proxy_source.read_bytes() + b"\n")
+    assert proxy_image_tag() != initial_tag
+
+
+def test_missing_proxy_image_fails_before_starting_containers(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 1, "", "image not found")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = DockerPiAgentRunner(AgentEngineConfig())
+    request = AgentRunRequest("architecture", tmp_path, "review-architecture", "model", 10)
+
+    with pytest.raises(AgentRunError, match="proxy_image_missing"):
+        runner.run(request)
+
+    assert calls == [["docker", "image", "inspect", proxy_image_tag()]]
 
 
 def test_docker_runner_tracks_concurrent_sessions_safely(tmp_path, monkeypatch):
@@ -143,7 +186,7 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
     assert "PI_CODING_AGENT_DIR=/agent" in agent
     assert "OPENROUTER_API_KEY" not in agent and "test-only-secret" not in json.dumps(agent)
     assert not any("docker.sock" in argument for argument in agent)
-    proxy = next(argv for argv in calls if "review-bot-agent-proxy:1" in argv)
+    proxy = next(argv for argv in calls if argv[1] == "run" and proxy_image_tag() in argv)
     assert "UPSTREAM_API_KEY" in proxy
     assert not any(arg.startswith("MAX_OUTPUT_TOKENS=") for arg in proxy)
     assert not any(arg.startswith("UPSTREAM_API_KEY=") for arg in proxy)
@@ -214,7 +257,7 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
-        if "review-bot-agent-proxy:1" in argv:
+        if argv[1] == "run" and proxy_image_tag() in argv:
             mount = next(item for item in argv if ":/ledger:rw" in item)
             ledger_dir = Path(mount.split(":/ledger:rw")[0])
             (ledger_dir / "usage.jsonl").write_text(
@@ -252,7 +295,7 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
     verifier_finalization = runner.finish(verifier.session_id)
 
     agents = [argv for argv in calls if "review-bot-pi-agent:0.73.1" in argv]
-    proxies = [argv for argv in calls if "review-bot-agent-proxy:1" in argv]
+    proxies = [argv for argv in calls if argv[1] == "run" and proxy_image_tag() in argv]
     assert first.session_id == repaired.session_id == "session-123"
     assert verifier.session_id == "session-verify"
     assert len(agents) == 3 and len(proxies) == 2
@@ -341,7 +384,8 @@ def test_provider_key_file_is_sent_only_to_proxy(tmp_path, monkeypatch,
     with pytest.raises(AgentRunError, match="agent_crashed") as error:
         runner.run(AgentRunRequest("architecture", workspace, "review-architecture", "model-id", 10))
 
-    proxy_call = next((argv, kwargs) for argv, kwargs in calls if "review-bot-agent-proxy:1" in argv)
+    proxy_call = next((argv, kwargs) for argv, kwargs in calls
+        if argv[1] == "run" and proxy_image_tag() in argv)
     proxy, proxy_kwargs = proxy_call
     agent = next(argv for argv, _ in calls if "review-bot-pi-agent:0.73.1" in argv)
     assert "UPSTREAM_API_KEY" in proxy
@@ -349,7 +393,7 @@ def test_provider_key_file_is_sent_only_to_proxy(tmp_path, monkeypatch,
     assert f"PROVIDER={provider}" in proxy
     assert proxy_kwargs["env"]["UPSTREAM_API_KEY"] == selected_key
     assert all("env" not in kwargs for argv, kwargs in calls
-        if "review-bot-agent-proxy:1" not in argv)
+        if not (argv[1] == "run" and proxy_image_tag() in argv))
     assert all(selected_key not in argument for argv, _ in calls for argument in argv)
     assert selected_key not in json.dumps(agent)
     assert fallback_key not in json.dumps(agent)
@@ -400,7 +444,7 @@ def test_pi_and_proxy_receive_explicit_output_token_cap(tmp_path, monkeypatch):
     with pytest.raises(AgentRunError, match="agent_crashed"):
         runner.run(AgentRunRequest("architecture", workspace, "review-architecture", "model-id", 10))
 
-    proxy = next(argv for argv in calls if "review-bot-agent-proxy:1" in argv)
+    proxy = next(argv for argv in calls if argv[1] == "run" and proxy_image_tag() in argv)
     assert "MAX_OUTPUT_TOKENS=8192" in proxy
 
 
