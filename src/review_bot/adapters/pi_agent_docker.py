@@ -129,6 +129,7 @@ def proxy_image_tag() -> str:
 @dataclass
 class _ActiveRun:
     network: str
+    egress_network: str
     proxy_name: str
     agent_name: str
     config_dir: Path
@@ -209,11 +210,11 @@ class DockerPiAgentRunner:
         argv.extend(["--print", prompt])
         return argv
 
-    def _proxy_argv(self, network: str, name: str, model: str, ledger_dir: Path,
+    def _proxy_argv(self, egress_network: str, name: str, model: str, ledger_dir: Path,
         upstream_session_id: str, image_tag: str) -> list[str]:
         uid, gid = self._runtime_uid_gid()
         argv = [
-            "run", "-d", "--name", name, "--network", "bridge", "--read-only",
+            "run", "-d", "--name", name, "--network", egress_network, "--read-only",
             "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=32m",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--pids-limit", "64", "--memory", "256m", "--user", f"{uid}:{gid}",
@@ -366,6 +367,7 @@ class DockerPiAgentRunner:
             raise AgentRunError("proxy_image_missing")
         suffix = uuid.uuid4().hex[:16]
         network = f"review-agent-net-{suffix}"
+        egress_network = f"review-agent-egress-{suffix}"
         proxy_name = f"review-agent-proxy-{suffix}"
         agent_name = f"review-agent-{suffix}"
         upstream_session_id = f"ses_{uuid.uuid4().hex}"
@@ -419,9 +421,12 @@ class DockerPiAgentRunner:
             created = self._docker(["network", "create", "--internal", "--driver", "bridge", network])
             if created.returncode != 0:
                 raise AgentRunError("docker_network_failed")
+            egress_created = self._docker(["network", "create", "--driver", "bridge", egress_network])
+            if egress_created.returncode != 0:
+                raise AgentRunError("docker_network_failed")
             proxy_env = os.environ.copy()
             proxy_env["UPSTREAM_API_KEY"] = upstream_api_key
-            proxy = self._docker(self._proxy_argv(network, proxy_name, request.model, ledger_dir,
+            proxy = self._docker(self._proxy_argv(egress_network, proxy_name, request.model, ledger_dir,
                 upstream_session_id, proxy_image), env=proxy_env)
             if proxy.returncode != 0:
                 raise AgentRunError("proxy_start_failed")
@@ -430,7 +435,7 @@ class DockerPiAgentRunner:
                 raise AgentRunError("proxy_network_failed")
             now = time.monotonic()
             run = _ActiveRun(
-                network, proxy_name, agent_name, config_dir, session_dir, ledger_path, ledger_dir,
+                network, egress_network, proxy_name, agent_name, config_dir, session_dir, ledger_path, ledger_dir,
                 request, request.workspace_dir.resolve(), skills_dir.resolve(), output_dir,
                 config_temporary, session_temporary, skills_temporary, output_temporary,
                 now, now + max(1, request.timeout_seconds),
@@ -438,7 +443,7 @@ class DockerPiAgentRunner:
             return suffix, run
         except Exception:
             try:
-                self._cleanup_names(agent_name, proxy_name, network)
+                self._cleanup_names(agent_name, proxy_name, network, egress_network)
             finally:
                 config_temporary.cleanup()
                 session_temporary.cleanup()
@@ -495,7 +500,7 @@ class DockerPiAgentRunner:
         except AgentRunError:
             if "run" in locals():
                 try:
-                    self._cleanup_names(run.agent_name, run.proxy_name, run.network)
+                    self._cleanup_names(run.agent_name, run.proxy_name, run.network, run.egress_network)
                 finally:
                     run.config_temporary.cleanup()
                     run.session_temporary.cleanup()
@@ -505,7 +510,7 @@ class DockerPiAgentRunner:
         except (OSError, subprocess.SubprocessError):
             if "run" in locals():
                 try:
-                    self._cleanup_names(run.agent_name, run.proxy_name, run.network)
+                    self._cleanup_names(run.agent_name, run.proxy_name, run.network, run.egress_network)
                 finally:
                     run.config_temporary.cleanup()
                     run.session_temporary.cleanup()
@@ -531,7 +536,7 @@ class DockerPiAgentRunner:
         duration_ms = int((time.monotonic() - run.started) * 1000)
         session = run.session_jsonl
         try:
-            self._cleanup_names(run.agent_name, run.proxy_name, run.network)
+            self._cleanup_names(run.agent_name, run.proxy_name, run.network, run.egress_network)
             try:
                 usage = self._proxy_usage(run.ledger_path, session)
             except OSError:
@@ -544,7 +549,7 @@ class DockerPiAgentRunner:
             run.skills_temporary.cleanup()
             run.output_temporary.cleanup()
 
-    def _cleanup_names(self, agent_name: str, proxy_name: str, network: str) -> None:
+    def _cleanup_names(self, agent_name: str, proxy_name: str, network: str, egress_network: str) -> None:
         failures = []
         for name in (agent_name, proxy_name):
             removed = False
@@ -558,17 +563,18 @@ class DockerPiAgentRunner:
                     continue
             if not removed:
                 failures.append(name)
-        removed = False
-        for _attempt in range(2):
-            try:
-                result = self._docker(["network", "rm", network], timeout=15)
-                if (result.returncode == 0 or "no such network" in result.stderr.lower()
-                        or "not found" in result.stderr.lower()):
-                    removed = True
-                    break
-            except (OSError, subprocess.SubprocessError):
-                continue
-        if not removed:
-            failures.append(network)
+        for network_name in (network, egress_network):
+            removed = False
+            for _attempt in range(2):
+                try:
+                    result = self._docker(["network", "rm", network_name], timeout=15)
+                    if (result.returncode == 0 or "no such network" in result.stderr.lower()
+                            or "not found" in result.stderr.lower()):
+                        removed = True
+                        break
+                except (OSError, subprocess.SubprocessError):
+                    continue
+            if not removed:
+                failures.append(network_name)
         if failures:
             raise AgentRunError("docker_cleanup_failed")

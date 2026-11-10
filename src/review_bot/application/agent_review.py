@@ -397,7 +397,11 @@ def _finding(raw, index, targets, by_path, originals_by_id, delivered_spans, see
                 or any(not isinstance(target, str) or target not in targets for target in target_ids)
                 or len(target_ids) != len(set(target_ids))):
             raise PartitionError("agent_finding_unknown_target")
-        citations = _stored_citations(raw["citations"], by_path, originals_by_id, delivered_spans)
+        citations = _stored_citations(raw["citations"], by_path, originals_by_id, delivered_spans,
+            allow_empty=raw["verdict"] == "concern")
+        if raw["verdict"] == "concern" and not any(
+                citation["path"] and citation["version"] == "head" for citation in citations):
+            raise PartitionError("agent_concern_head_citation_missing")
         if not citations:
             raise PartitionError("agent_finding_citations_missing")
         identity = hash_json({"statement": statement, "citations": citations})
@@ -422,7 +426,10 @@ def _assessment(raw, index, kind, by_path, originals_by_id, delivered_spans, see
         reasoning = _text(raw["reasoning"])
         condition = _text(raw["failure_condition"], empty=True)
         citations = _stored_citations(raw["citations"], by_path, originals_by_id, delivered_spans,
-            allow_empty=raw["verdict"] == "insufficient_context")
+            allow_empty=raw["verdict"] in ("insufficient_context", "concern", "conditional_risk"))
+        if (raw["verdict"] in ("concern", "conditional_risk") and not any(
+                citation["path"] and citation["version"] == "head" for citation in citations)):
+            raise PartitionError("agent_concern_head_citation_missing")
         identity = hash_json({"statement": statement, "citations": citations})
         if identity in seen:
             raise PartitionError("duplicate")
@@ -939,6 +946,11 @@ def _withdraw_items(final: dict, row_ids: dict, row_ids_to_withdraw: list[str], 
         for index in sorted(indexes, reverse=True):
             values.pop(index)
             ids.pop(index)
+    if mode == "intent" and not any(
+            perspective["assessments"] for perspective in final["perspectives"]):
+        final["missing_context"] = sorted(set(final["missing_context"]) | {
+            "agent_perspectives_incomplete",
+        })
 
 
 def _validate_revision(body: dict, row_id: str, item: Any, mode: str, meta: dict,
@@ -1189,6 +1201,8 @@ def run_agent_review(task, mode: str, runner: AgentRunner, *, language: str, ins
     if mode not in ("architecture", "intent") or language not in ("ko", "en"):
         raise ValueError("invalid_agent_review_options")
     originals, meta = prepare_originals(task, mode)
+    input_failure = ("incomplete_code_input" if not meta["complete"] else
+        "incomparable_input" if meta["comparison_status"] != "comparable" else None)
     skill_id = _SKILLS[mode]
     skill_bytes = agent_skill_path(mode).read_bytes()
     skill_sha = hashlib.sha256(skill_bytes).hexdigest()
@@ -1209,52 +1223,55 @@ def run_agent_review(task, mode: str, runner: AgentRunner, *, language: str, ins
     valid_final = False
     first_diagnostics: list[str] = []
     try:
-        timeout = _stage_timeout(deadline, timeout_seconds)
-        limits = _configured_limits(runner, timeout)
-        request = AgentRunRequest(mode, workspace, skill_id, model, timeout)
-        response = runner.run(request)
-        if not isinstance(response, AgentRunResponse) or response.exit_status != 0 or not response.session_id:
-            raise AgentRunError("agent_session_unavailable")
-        session_id = response.session_id
-        try:
-            first_final, first_rejected = _parse_agent_output(
-                response.output_path, mode, meta, originals, delivered_spans)
-        except AgentOutputError as error:
-            first_final, first_rejected = None, [{"kind": "envelope", "index": 0, "reason": error.code}]
-            first_diagnostics = [error.detail] if error.detail else []
-        except (ValueError, TypeError, json.JSONDecodeError):
-            first_final, first_rejected = None, [{"kind": "envelope", "index": 0,
-                "reason": "agent_output_schema_invalid"}]
-        rejected_before = list(first_rejected)
-        repair_attempted = bool(first_rejected)
-        if first_final is not None and mode == "intent" and "agent_perspectives_incomplete" in first_final["missing_context"]:
-            repair_attempted = True
-            if not rejected_before:
-                accepted_ids = {row["perspective_id"] for row in first_final["perspectives"]}
-                rejected_before = [{"kind": "perspective", "index": index,
-                    "reason": "agent_perspective_missing"}
-                    for index, identifier in enumerate(PERSPECTIVE_IDS) if identifier not in accepted_ids]
-        if repair_attempted:
-            response = runner.repair(request, session_id, _repair_message(rejected_before, first_diagnostics),
-                timeout_seconds=_stage_timeout(deadline, timeout_seconds))
-            if not isinstance(response, AgentRunResponse) or response.exit_status != 0:
-                raise AgentRunError("agent_repair_failed")
-            try:
-                final, rejected = _parse_agent_output(response.output_path, mode, meta, originals, delivered_spans)
-                valid_final = True
-            except (AgentOutputError, ValueError, TypeError, json.JSONDecodeError) as error:
-                code = error.code if isinstance(error, AgentOutputError) else "agent_output_schema_invalid"
-                final, rejected, status, reason = _empty_final(delivered_spans), [
-                    {"kind": "envelope", "index": 0, "reason": code}], "failed", code
-        elif first_final is not None:
-            final, rejected = first_final, first_rejected
-            valid_final = True
+        if input_failure is not None:
+            status, reason = "failed", input_failure
         else:
-            rejected, status, reason = first_rejected, "failed", first_rejected[0]["reason"]
-        if valid_final:
-            status = "partial_review" if mode == "intent" and "agent_perspectives_incomplete" in final["missing_context"] else "completed"
-            reason = ("agent_perspectives_incomplete" if status == "partial_review"
-                else "agent_items_rejected" if rejected else "completed")
+            timeout = _stage_timeout(deadline, timeout_seconds)
+            limits = _configured_limits(runner, timeout)
+            request = AgentRunRequest(mode, workspace, skill_id, model, timeout)
+            response = runner.run(request)
+            if not isinstance(response, AgentRunResponse) or response.exit_status != 0 or not response.session_id:
+                raise AgentRunError("agent_session_unavailable")
+            session_id = response.session_id
+            try:
+                first_final, first_rejected = _parse_agent_output(
+                    response.output_path, mode, meta, originals, delivered_spans)
+            except AgentOutputError as error:
+                first_final, first_rejected = None, [{"kind": "envelope", "index": 0, "reason": error.code}]
+                first_diagnostics = [error.detail] if error.detail else []
+            except (ValueError, TypeError, json.JSONDecodeError):
+                first_final, first_rejected = None, [{"kind": "envelope", "index": 0,
+                    "reason": "agent_output_schema_invalid"}]
+            rejected_before = list(first_rejected)
+            repair_attempted = bool(first_rejected)
+            if first_final is not None and mode == "intent" and "agent_perspectives_incomplete" in first_final["missing_context"]:
+                repair_attempted = True
+                if not rejected_before:
+                    accepted_ids = {row["perspective_id"] for row in first_final["perspectives"]}
+                    rejected_before = [{"kind": "perspective", "index": index,
+                        "reason": "agent_perspective_missing"}
+                        for index, identifier in enumerate(PERSPECTIVE_IDS) if identifier not in accepted_ids]
+            if repair_attempted:
+                response = runner.repair(request, session_id, _repair_message(rejected_before, first_diagnostics),
+                    timeout_seconds=_stage_timeout(deadline, timeout_seconds))
+                if not isinstance(response, AgentRunResponse) or response.exit_status != 0:
+                    raise AgentRunError("agent_repair_failed")
+                try:
+                    final, rejected = _parse_agent_output(response.output_path, mode, meta, originals, delivered_spans)
+                    valid_final = True
+                except (AgentOutputError, ValueError, TypeError, json.JSONDecodeError) as error:
+                    code = error.code if isinstance(error, AgentOutputError) else "agent_output_schema_invalid"
+                    final, rejected, status, reason = _empty_final(delivered_spans), [
+                        {"kind": "envelope", "index": 0, "reason": code}], "failed", code
+            elif first_final is not None:
+                final, rejected = first_final, first_rejected
+                valid_final = True
+            else:
+                rejected, status, reason = first_rejected, "failed", first_rejected[0]["reason"]
+            if valid_final:
+                status = "partial_review" if mode == "intent" and "agent_perspectives_incomplete" in final["missing_context"] else "completed"
+                reason = ("agent_perspectives_incomplete" if status == "partial_review"
+                    else "agent_items_rejected" if rejected else "completed")
     except AgentRunError as error:
         final, rejected, status, reason = _empty_final(delivered_spans), [], "failed", f"agent_run_failed:{error.code}"
     if response is None:
@@ -1609,7 +1626,8 @@ def validate_agent_partition_result(result: PartitionReviewResult, task) -> None
     if (result.usage != _agent_usage(agent["usage"])
             or (agent["before_rejected_count"] > 0 and not agent["repair_attempted"])):
         raise PartitionError("agent_usage_or_repair_metadata_mismatch")
-    if (result.status == "failed" and not re.fullmatch(
+    if (result.status == "failed" and result.reason not in (
+            "incomplete_code_input", "incomparable_input") and not re.fullmatch(
             r"(?:agent_[a-z][a-z0-9_]{0,127}|agent_run_failed:[a-z][a-z0-9_]{0,63})",
             result.reason)):
         raise PartitionError("invalid_agent_failure_reason")
@@ -1725,6 +1743,10 @@ def validate_agent_partition_result(result: PartitionReviewResult, task) -> None
             if result.review_type == "B" and assessment.get("verdict") == "insufficient_context" and citations == []:
                 continue
             validate_citations(citations)
+            if (assessment.get("verdict") == "concern" if result.review_type == "A" else
+                    assessment.get("verdict") in ("concern", "conditional_risk")) and not any(
+                    citation["path"] and citation["version"] == "head" for citation in citations):
+                raise PartitionError("agent_concern_head_citation_missing")
     if (list(result.findings) != final.get("findings") or list(result.perspectives) != final.get("perspectives")
             or list(result.questions) != final.get("questions") or result.summary != final.get("summary")):
         raise PartitionError("agent_final_result_mismatch")
