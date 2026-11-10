@@ -845,6 +845,7 @@ def test_ondemand_service_enqueues_and_processes_one_worker_run(
     from review_bot.runtime import service
 
     service_config.raw["execution"]["available_modes"] = ["architecture"]
+    service_config.raw["execution"]["task_timeout_seconds"] = 3000
     service_config.raw["publish"]["mode"] = "artifact_only"
     write_config(service_config)
     github = MockGitHubClient()
@@ -873,7 +874,7 @@ def test_ondemand_service_enqueues_and_processes_one_worker_run(
         time.time(), time.time(), vm_id="i-1234abcd")
 
     mode_results, trace = service.execute_ondemand_review(
-        str(service_config.path), job, lambda: True,
+        str(service_config.path), job, lambda: True, vm_lifetime_seconds=3600,
     )
 
     assert mode_results == {"architecture": "completed", "intent": "not_selected"}
@@ -897,3 +898,33 @@ def test_ondemand_service_enqueues_and_processes_one_worker_run(
     assert mismatch_results == {"architecture": "failed", "intent": "failed"}
     assert mismatch_trace["worker_completed"] is False
     assert worker_pipeline_ports["analyzer"].run_analysis.call_count == analyzer_calls
+
+
+def test_ondemand_vm_lifetime_guard_and_optional_lifetime(
+    service_config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from review_bot.application.ondemand import ReviewJob
+    from review_bot.runtime import service
+    from review_bot.runtime.service import ServiceConfigurationError
+
+    service_config.raw["execution"]["task_timeout_seconds"] = 3000
+    write_config(service_config)
+    job = ReviewJob("a" * 64, 44, 99, 7, "a" * 40, "b" * 40, "running",
+        time.time(), time.time(), vm_id="i-1234abcd")
+
+    class ReachedServiceState(Exception):
+        pass
+
+    def stop_at_service_state(_config):
+        raise ReachedServiceState
+
+    monkeypatch.setattr(service, "open_service_state", stop_at_service_state)
+    with pytest.raises(ServiceConfigurationError, match="task_timeout_exceeds_vm_lifetime"):
+        service.execute_ondemand_review(str(service_config.path), job, lambda: True,
+            vm_lifetime_seconds=3200)
+    with pytest.raises(ReachedServiceState):
+        service.execute_ondemand_review(str(service_config.path), job, lambda: True,
+            vm_lifetime_seconds=3600)
+    with pytest.raises(ReachedServiceState):
+        service.execute_ondemand_review(str(service_config.path), job, lambda: True,
+            vm_lifetime_seconds=None)

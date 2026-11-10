@@ -26,6 +26,7 @@ class Ec2VmLauncher:
         minutes = max(1, max_lifetime_seconds // 60)
         user_data = ("#!/bin/bash\nset -eu\n"
             f"shutdown -h +{minutes}\n"
+            f"# review-bot-max-lifetime-seconds {max_lifetime_seconds}\n"
             f"# review-bot-ondemand --job-id {job_id}\n")
         tags = {
             **self.instance_tags,

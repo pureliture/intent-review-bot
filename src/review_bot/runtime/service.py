@@ -31,6 +31,9 @@ class ServiceConfigurationError(ValueError):
     """Operator-facing errors containing field names, never raw values or paths."""
 
 
+_VM_LIFETIME_MARGIN_SECONDS = 300
+
+
 def enqueue_service_review(job_store: SQLiteJobStore, request: PrRequestRecord, delivery=None) -> None:
     if delivery is None:
         job_store.enqueue_request(request)
@@ -291,7 +294,8 @@ def run_worker(config_path: str | None, *, once: bool = False) -> int:
     return 0
 
 
-def execute_ondemand_review(config_path: str | None, job, is_current) -> tuple[dict[str, str], dict]:
+def execute_ondemand_review(config_path: str | None, job, is_current, *,
+    vm_lifetime_seconds: int | None = None) -> tuple[dict[str, str], dict]:
     if not re.fullmatch(r"[0-9a-f]{64}", job.job_id):
         raise ServiceConfigurationError("Invalid on-demand job id")
     try:
@@ -304,6 +308,9 @@ def execute_ondemand_review(config_path: str | None, job, is_current) -> tuple[d
     os.environ[state_env] = os.fspath(base / "ondemand" / job.job_id)
     try:
         config = load_service_config(config_path)
+        if (vm_lifetime_seconds is not None
+                and config.execution.task_timeout_seconds + _VM_LIFETIME_MARGIN_SECONDS > vm_lifetime_seconds):
+            raise ServiceConfigurationError("task_timeout_exceeds_vm_lifetime")
         with open_service_state(config) as (root, job_store):
             analyzer_factory = (lambda: _architecture_analyzer(config, root)) if (
                 "architecture" in config.execution.available_modes) else None

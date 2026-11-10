@@ -234,6 +234,7 @@ def test_ec2_launcher_adds_bootstrap_tags_without_overriding_job_tags(aws):
         ec2.describe_instance_attribute(InstanceId=vm_id, Attribute="userData")["UserData"]["Value"]
     ).decode()
     assert f"# review-bot-ondemand --job-id {job_id}" in user_data
+    assert "# review-bot-max-lifetime-seconds 600" in user_data
     assert "exec /opt/review-bot/bin/review-bot-ondemand" not in user_data
 
 

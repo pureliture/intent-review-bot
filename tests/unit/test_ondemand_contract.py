@@ -258,6 +258,89 @@ def test_vm_entrypoint_uses_imds_identity_and_fake_execute(env, monkeypatch):
     assert launcher.terminated == [vm_id]
 
 
+def test_vm_entrypoint_passes_imds_lifetime_to_service(env, monkeypatch):
+    from review_bot.runtime import ondemand_entrypoint, service
+
+    _, _, _, coordinator = env
+    job_id = coordinator.accept(event()).job_id
+    vm_id = coordinator.launch(job_id).vm_id
+    monkeypatch.setattr(ondemand_entrypoint, "read_instance_id", lambda: vm_id)
+    monkeypatch.setattr(ondemand_entrypoint, "read_vm_lifetime_seconds", lambda: 3600)
+    calls = []
+
+    def execute(config_path, job, is_current, *, vm_lifetime_seconds=None):
+        calls.append((config_path, job.job_id, vm_lifetime_seconds, is_current()))
+        return {"architecture": "completed", "intent": "not_selected"}, {"worker": "fake"}
+
+    monkeypatch.setattr(service, "execute_ondemand_review", execute)
+    assert ondemand_entrypoint.run_ondemand(job_id, config_path="/operator.yaml",
+        coordinator=coordinator) == 0
+    assert calls == [("/operator.yaml", job_id, 3600, True)]
+
+
+def test_imds_vm_lifetime_marker_present_absent_and_malformed():
+    from review_bot.runtime.ondemand_entrypoint import read_vm_lifetime_seconds
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def read(self, _limit):
+            return self.body
+
+    for user_data, expected in (
+        (b"# review-bot-max-lifetime-seconds 3600\n", 3600),
+        (b"# no lifetime marker\n", None),
+        (b"# review-bot-max-lifetime-seconds invalid\n", None),
+        (b"# review-bot-max-lifetime-seconds 0\n", None),
+    ):
+        calls = []
+
+        def urlopen(request, *, timeout):
+            calls.append((request, timeout))
+            return Response(b"token" if request.method == "PUT" else user_data)
+
+        assert read_vm_lifetime_seconds(urlopen=urlopen) == expected
+        assert [request.method for request, _ in calls] == ["PUT", "GET"]
+        assert calls[1][0].full_url.endswith("/latest/user-data")
+        assert calls[1][0].get_header("X-aws-ec2-metadata-token") == "token"
+        assert all(timeout <= 2 for _, timeout in calls)
+
+
+def test_imds_vm_lifetime_failure_returns_none():
+    from review_bot.runtime.ondemand_entrypoint import read_vm_lifetime_seconds
+
+    def urlopen(_request, *, timeout):
+        raise OSError("metadata unavailable")
+
+    assert read_vm_lifetime_seconds(urlopen=urlopen) is None
+
+
+def test_vm_configuration_failure_completes_job_without_requeue(env):
+    from review_bot.runtime.ondemand_vm import run_job
+    from review_bot.runtime.service import ServiceConfigurationError
+
+    _, store, _, coordinator = env
+    job_id = coordinator.accept(event()).job_id
+    vm_id = coordinator.launch(job_id).vm_id
+
+    def execute(_job, _is_current):
+        raise ServiceConfigurationError("task_timeout_exceeds_vm_lifetime")
+
+    finished = run_job(coordinator, job_id, vm_id, execute, heartbeat_seconds=0.01,
+        self_vm_id=vm_id)
+
+    assert finished is not None and finished.state == "failed"
+    assert store.get(job_id).trace == {"error": "ServiceConfigurationError"}
+    assert coordinator.recover() == []
+
+
 def test_imds_identity_uses_token_then_instance_id_with_short_timeouts():
     from review_bot.runtime.ondemand_entrypoint import read_instance_id
 
