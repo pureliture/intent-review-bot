@@ -61,7 +61,10 @@ class FakeAgentRunner:
         self.repair_oversize_output = None
         self.request = None
         self.run_modes = []
+        self.run_requests = []
+        self.run_callback = None
         self.repair_calls = 0
+        self.repair_timeouts = []
         self.repair_message = None
         self.repair_messages = []
         self.verify_claim_ids = []
@@ -75,6 +78,7 @@ class FakeAgentRunner:
 
     def run(self, request):
         self.run_modes.append(request.mode)
+        self.run_requests.append(request)
         self.request = request
         self.workspace = {
             path.relative_to(request.workspace_dir).as_posix()
@@ -116,10 +120,13 @@ class FakeAgentRunner:
                 body = body(request, claims)
         else:
             body = self.output(request) if callable(self.output) else self.output
-        return self._response(body, self.omit_output, self.oversize_output, "fake-session", {
+        response = self._response(body, self.omit_output, self.oversize_output, "fake-session", {
             "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
             "model_calls": 1, "cost": {"total": 0.01},
         })
+        if self.run_callback:
+            self.run_callback(request)
+        return response
 
     def _response(self, body, omit_output, oversize_output, session_id, usage):
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,8 +144,9 @@ class FakeAgentRunner:
         return AgentRunResponse("DONE", self.session, usage, "0.73.1", 0,
             session_id, self.output_path)
 
-    def repair(self, request, session_id, message):
+    def repair(self, request, session_id, message, *, timeout_seconds=None):
         self.repair_calls += 1
+        self.repair_timeouts.append(timeout_seconds)
         self.repair_message = message
         self.repair_messages.append(message)
         if self.repair_error:
@@ -208,6 +216,14 @@ def _run(task, mode, tmp_path, body, *, session=None, runner=None):
     return run_agent_review(task, mode, runner, language="en", instructions="Use the code evidence.")
 
 
+class ControlledClock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def monotonic(self):
+        return self.now
+
+
 @pytest.mark.parametrize(("mode", "skill"), [
     ("architecture", "review-architecture"),
     ("intent", "review-intent"),
@@ -250,7 +266,7 @@ def test_agent_architecture_result_validates_formats_with_exact_citations_and_tr
     assert "void run()" in markdown
     assert "Engine: `pi-agent`" in markdown
     assert "0.73.1" in markdown and result.partition["agent"]["skill_sha256"] in markdown
-    assert "timeout 30s" in markdown and "max proxy calls 12" in markdown and "max output tokens 2048" in markdown
+    assert "timeout 3000s" in markdown and "max proxy calls 12" in markdown and "max output tokens 2048" in markdown
     assert "| agent_review | 0 | 2 | 2 | 0 |" in markdown
     assert "Agent cost:" in markdown and "0.025" in markdown
     assert result.partition["engine"] == "pi-agent"
@@ -265,6 +281,104 @@ def test_agent_architecture_result_validates_formats_with_exact_citations_and_tr
     assert runner.generation_contract_json["allowed_target_ids"] == prepare_originals(task, "architecture")[1]["targets"]
     assert runner.generation_contract_json["required_keys"]["finding"][-1] == "citations"
     assert runner.generation_contract_json["citation_rules"]["empty_target_ids_basis"] == "observed_structure"
+
+
+def test_verifier_gets_remaining_deadline_at_its_own_start(tmp_path, monkeypatch):
+    task = _pmd_partition_task()
+    clock = ControlledClock()
+    monkeypatch.setattr(agent_review.time, "monotonic", clock.monotonic)
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+    runner.run_callback = lambda request: setattr(clock, "now", 40) if request.mode == "architecture" else None
+
+    result = run_agent_review(task, "architecture", runner, language="en", instructions="", deadline=100)
+
+    assert [request.timeout_seconds for request in runner.run_requests] == [100, 60]
+    assert result.partition["agent"]["limits"]["timeout_seconds"] == 100
+    assert result.partition["identity"]["models"]["verifier"]["timeout_seconds"] == 100
+
+
+def test_revision_gets_fresh_remaining_deadline_after_generation_timeout_elapsed(tmp_path, monkeypatch):
+    task = _pmd_partition_task()
+    body = _architecture_body(task)
+    clock = ControlledClock()
+    monkeypatch.setattr(agent_review.time, "monotonic", clock.monotonic)
+    runner = FakeAgentRunner(tmp_path, body)
+    runner.verify_outputs = [lambda _request, claims: {"items": {claim["id"]: {
+        field: {"state": "contradicted" if claim["id"] == "findings:0" else "supported",
+            "reason": "Recheck this finding." if claim["id"] == "findings:0"
+            else "The frozen source supports this field.", "citations": claim["cited"]}
+        for field in claim["fields"]} for claim in claims}}]
+    runner.revision_output = {"items": {"findings:0": {
+        "action": "revise", "item": body["findings"][0]}}}
+
+    def advance_after_verification(request):
+        if request.mode == "verify" and clock.now == 0:
+            clock.now = 3100
+
+    runner.run_callback = advance_after_verification
+    result = run_agent_review(task, "architecture", runner, language="en", instructions="",
+        timeout_seconds=3000, deadline=4000)
+
+    assert runner.run_requests[0].timeout_seconds == 3000
+    assert runner.repair_timeouts == [900]
+    assert runner.run_requests[-1].timeout_seconds == 900
+    assert result.status == "completed"
+
+
+def test_timeout_cap_limits_each_agent_stage(tmp_path, monkeypatch):
+    task = _pmd_partition_task()
+    body = _architecture_body(task)
+    clock = ControlledClock()
+    monkeypatch.setattr(agent_review.time, "monotonic", clock.monotonic)
+    runner = FakeAgentRunner(tmp_path, {"invalid": True}, repair_output=body)
+    runner.verify_outputs = [lambda _request, claims: {"items": {claim["id"]: {
+        field: {"state": "contradicted" if claim["id"] == "findings:0" else "supported",
+            "reason": "Recheck this finding." if claim["id"] == "findings:0"
+            else "The frozen source supports this field.", "citations": claim["cited"]}
+        for field in claim["fields"]} for claim in claims}}]
+    runner.revision_output = {"items": {"findings:0": {
+        "action": "revise", "item": body["findings"][0]}}}
+
+    run_agent_review(task, "architecture", runner, language="en", instructions="",
+        timeout_seconds=12, deadline=1000)
+
+    assert [request.timeout_seconds for request in runner.run_requests] == [12, 12, 12]
+    assert runner.repair_timeouts == [12, 12]
+
+
+def test_expired_deadline_before_verification_is_recorded_as_timeout(tmp_path, monkeypatch):
+    task = _pmd_partition_task()
+    clock = ControlledClock()
+    monkeypatch.setattr(agent_review.time, "monotonic", clock.monotonic)
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+    runner.run_callback = lambda request: setattr(clock, "now", 101) if request.mode == "architecture" else None
+
+    result = run_agent_review(task, "architecture", runner, language="en", instructions="",
+        max_revisions=0, deadline=100)
+
+    assert runner.run_modes == ["architecture"]
+    assert any(issue["reason"] == "verifier_run_failed:timeout"
+        for item in result.partition["fact_verification"]["items"] for issue in item["host_issues"])
+
+
+def test_expired_deadline_before_revision_is_recorded_as_timeout(tmp_path, monkeypatch):
+    task = _pmd_partition_task()
+    clock = ControlledClock()
+    monkeypatch.setattr(agent_review.time, "monotonic", clock.monotonic)
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+    runner.verify_outputs = [lambda _request, claims: {"items": {claim["id"]: {
+        field: {"state": "contradicted" if claim["id"] == "findings:0" else "supported",
+            "reason": "Recheck this finding." if claim["id"] == "findings:0"
+            else "The frozen source supports this field.", "citations": claim["cited"]}
+        for field in claim["fields"]} for claim in claims}}]
+    runner.run_callback = lambda request: setattr(clock, "now", 101) if request.mode == "verify" else None
+
+    result = run_agent_review(task, "architecture", runner, language="en", instructions="", deadline=100)
+
+    finding = next(item for item in result.partition["fact_verification"]["items"]
+        if item["item_id"] == "findings:0")
+    assert any(issue["reason"] == "revision_run_failed:timeout" for issue in finding["host_issues"])
+    assert runner.repair_timeouts == []
 
 
 def test_agent_result_with_unset_output_cap_records_null_and_hides_it_in_trace(tmp_path):
