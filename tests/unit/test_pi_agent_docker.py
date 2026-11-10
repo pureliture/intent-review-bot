@@ -130,10 +130,10 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
             assert (skills_dir / "check_output.mjs").is_file()
             mount = next(item for item in argv if ":/sessions:rw" in item)
             session_dir = Path(mount.split(":/sessions:rw")[0])
-            (session_dir / "session.jsonl").write_text(
-                ('{"type":"session","id":"session-verify"}\n'
-                    if any("verify-claims" in item for item in argv) else
-                    '{"type":"session","id":"session-123"}\n'), encoding="utf-8")
+            is_verifier = any("verify-claims" in item for item in argv)
+            session_jsonl = ('{"type":"session","id":"session-verify"}\n' if is_verifier else
+                '{"type":"session","id":"session-123"}\n{"type":"compaction","tokensBefore":42}\n')
+            (session_dir / "session.jsonl").write_text(session_jsonl, encoding="utf-8")
             return subprocess.CompletedProcess(argv, 0, '{"summary":"ok"}', "")
         return subprocess.CompletedProcess(argv, 0, "ok", "")
 
@@ -145,10 +145,11 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
     first = runner.run(request)
     repaired = runner.repair(request, first.session_id, "item_index=0 reason=agent_output_invalid")
     result = runner.finish(first.session_id)
+    verifier_finalization = None
     verifier_request = AgentRunRequest("verify", workspace, "verify-claims",
         "stealth/crouton-alpha", 20)
     verifier = runner.run(verifier_request)
-    runner.finish(verifier.session_id)
+    verifier_finalization = runner.finish(verifier.session_id)
 
     agents = [argv for argv in calls if "review-bot-pi-agent:0.73.1" in argv]
     proxies = [argv for argv in calls if "review-bot-agent-proxy:1" in argv]
@@ -167,6 +168,11 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
     assert proxy_sessions[0] != proxy_sessions[1]
     assert result.usage["input_tokens"] == 23 and result.usage["output_tokens"] == 7
     assert result.usage["cost"]["total"] == 0.0025
+    assert first.usage["max_prompt_tokens"] == repaired.usage["max_prompt_tokens"] == 23
+    assert first.usage["compactions"] == repaired.usage["compactions"] == result.usage["compactions"] == 1
+    assert result.usage["max_prompt_tokens"] == 23
+    assert verifier_finalization.usage["max_prompt_tokens"] == 23
+    assert verifier_finalization.usage["compactions"] == 0
     assert result.proxy_ledger_path.endswith("usage.jsonl")
     out_mounts = [next(arg for arg in argv if ":/out:rw" in arg) for argv in agents]
     assert out_mounts[0] == out_mounts[1]
@@ -174,6 +180,27 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
     assert skills_mounts[0] == skills_mounts[1]
     assert agents[0][agents[0].index("--skill") + 1] == "/skills/review-architecture/SKILL.md"
     assert any(argv[1:3] == ["network", "rm"] for argv in calls)
+
+
+def test_proxy_usage_tracks_max_prompt_tokens_and_none_when_unreported(tmp_path):
+    ledger = tmp_path / "usage.jsonl"
+    ledger.write_text(
+        '{"prompt_tokens":42,"completion_tokens":3}\n{"completion_tokens":8}\n',
+        encoding="utf-8",
+    )
+    assert DockerPiAgentRunner._proxy_usage(ledger)["max_prompt_tokens"] == 42
+
+    ledger.write_text('{"completion_tokens":8}\n', encoding="utf-8")
+    assert DockerPiAgentRunner._proxy_usage(ledger)["max_prompt_tokens"] is None
+
+
+def test_session_compaction_count_uses_persisted_compaction_entry_type():
+    session = (
+        b'{"type":"session","id":"session-123"}\n'
+        b'{"type":"compaction","summary":"summary","tokensBefore":42}\n'
+        b'{"type":"message","message":{"role":"user","content":"hello"}}\n'
+    )
+    assert DockerPiAgentRunner._session_compactions(session) == 1
 
 
 @pytest.mark.parametrize(("provider", "key_file_variable", "key_variable", "credential_source"), [

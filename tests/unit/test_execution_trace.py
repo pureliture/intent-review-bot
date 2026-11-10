@@ -37,3 +37,39 @@ def test_trace_reports_stages_models_and_unknown_usage_without_zeroing():
 def test_trace_contains_no_prompt_or_response_material():
     text = execution_trace(_result(summary="SECRET_SUMMARY", findings=({"text": "SECRET_FINDING"},)))
     assert "SECRET" not in text
+
+
+def test_agent_trace_aggregates_context_pressure_and_renders_verification_usage():
+    generation_usage = {
+        "input_tokens": 40, "output_tokens": 10, "total_tokens": 50, "model_calls": 3,
+        "max_prompt_tokens": 100, "compactions": 2,
+    }
+    verification_runs = [
+        {"role": "verify", "usage": {
+            "input_tokens": 20, "output_tokens": 10, "total_tokens": 30,
+            "max_prompt_tokens": 80, "compactions": 2,
+        }},
+        {"role": "revise", "usage": {
+            "input_tokens": 999, "output_tokens": 999, "total_tokens": 1998,
+            "max_prompt_tokens": 1000, "compactions": 100,
+        }},
+        {"role": "verify", "usage": {
+            "input_tokens": 15, "output_tokens": 5, "total_tokens": 20,
+            "max_prompt_tokens": 120, "compactions": 1,
+        }},
+    ]
+    partition = {
+        "engine": "pi-agent",
+        "agent": {
+            "pi_version": "0.73.1", "skill_sha256": "a" * 64, "model": "beam-free",
+            "usage": generation_usage, "repair_attempted": False, "rejected": [],
+        },
+        "fact_verification": {"runs": verification_runs},
+    }
+
+    text = execution_trace(_result(partition=partition))
+
+    assert ("- Agent usage: input 40 · output 10 · total 50 tokens · "
+        "max request input 100 · compactions 2") in text
+    assert ("- Agent verification usage: input 35 · output 15 · total 50 tokens · "
+        "max request input 120 · compactions 3") in text
