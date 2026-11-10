@@ -32,6 +32,11 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
             assert (skills_dir / "review-architecture" / "SKILL.md").is_file()
             assert (skills_dir / "review-intent" / "SKILL.md").is_file()
             assert (skills_dir / "check_output.mjs").is_file()
+            config_mount = next(item for item in argv if item.endswith(":/agent:ro"))
+            models = json.loads((Path(config_mount.split(":/agent:ro")[0]) / "models.json").read_text())
+            model = models["providers"]["llmproxy"]["models"][0]
+            assert model["id"] == "stealth/crouton-alpha"
+            assert "contextWindow" not in model
             return subprocess.CompletedProcess(argv, 1, "", "agent failed")
         return subprocess.CompletedProcess(argv, 0, "ok", "")
 

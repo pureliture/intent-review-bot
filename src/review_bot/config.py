@@ -319,6 +319,7 @@ class AgentEngineConfig(BaseModel):
     timeout_seconds: int = Field(ge=1, le=3600, default=900)
     max_proxy_calls: int = Field(ge=1, le=512, default=40)
     max_output_tokens: int = Field(ge=1, le=32768, default=4096)
+    max_revisions: int = Field(ge=0, le=3, default=1)
     session_store_dir: str = Field(min_length=1, max_length=1024,
         default="~/.local/share/review-bot/agent-sessions")
 

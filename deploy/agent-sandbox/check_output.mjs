@@ -267,6 +267,114 @@ function checkIntent(result, contract) {
   });
 }
 
+function checkVerify(result, contract) {
+  let claims;
+  try {
+    claims = JSON.parse(fs.readFileSync(path.join(workspace, "claims.json"), "utf8"));
+  } catch {
+    error(["workspace", "claims.json"], "agent_verify_claims_invalid");
+    return;
+  }
+  if (!object(claims) || !Array.isArray(claims.claims)) {
+    error(["workspace", "claims.json"], "agent_verify_claims_invalid");
+    return;
+  }
+  if (!exactKeys(result, contract.required_keys.envelope, [])) return;
+  if (!object(result.items)) {
+    error(["items"], "agent_verify_items_invalid");
+    return;
+  }
+  const expectedRows = new Map();
+  for (const claim of claims.claims) {
+    if (!object(claim) || typeof claim.id !== "string" || !object(claim.fields)
+        || expectedRows.has(claim.id)) {
+      error(["workspace", "claims.json"], "agent_verify_claims_invalid");
+      return;
+    }
+    expectedRows.set(claim.id, Object.keys(claim.fields));
+  }
+  const actualRows = Object.keys(result.items).sort();
+  const expectedIds = [...expectedRows.keys()].sort();
+  if (JSON.stringify(actualRows) !== JSON.stringify(expectedIds)) {
+    error(["items"], "agent_verify_row_coverage_invalid");
+  }
+  const states = ["supported", "contradicted", "unverifiable", "non_factual"];
+  for (const [id, fields] of expectedRows) {
+    const row = result.items[id];
+    if (!object(row)) {
+      error(["items", id], "agent_verify_row_invalid");
+      continue;
+    }
+    const actualFields = Object.keys(row).sort();
+    const expectedFields = [...fields].sort();
+    if (JSON.stringify(actualFields) !== JSON.stringify(expectedFields)) {
+      error(["items", id], "agent_verify_field_coverage_invalid");
+    }
+    for (const field of fields) {
+      const at = ["items", id, field];
+      const verdict = row[field];
+      if (!exactKeys(verdict, contract.required_keys.field, at)) continue;
+      if (!states.includes(verdict.state)) error([...at, "state"], "agent_verify_state_invalid");
+      if (typeof verdict.reason !== "string" || verdict.reason.length < 1 || verdict.reason.length > 4000) {
+        error([...at, "reason"], "agent_verify_reason_invalid");
+      }
+      if (!Array.isArray(verdict.citations) || verdict.citations.length > contract.max_items.citations_per_field) {
+        error([...at, "citations"], "agent_verify_citations_invalid");
+        continue;
+      }
+      if (verdict.state === "supported" && typeof claimFieldText(expectedRows, claims, id, field) === "string"
+          && claimFieldText(expectedRows, claims, id, field).trim().length > 0
+          && verdict.citations.length === 0) {
+        error([...at, "citations"], "agent_verify_supported_citations_missing");
+      }
+      if (verdict.state === "supported" && typeof claimFieldText(expectedRows, claims, id, field) === "string"
+          && claimFieldText(expectedRows, claims, id, field).trim().length > 0
+          && !verdict.citations.some((citation) => citation?.version === "head" || citation?.version === "base")) {
+        error([...at, "citations"], "verifier_code_citation_missing");
+      }
+      verdict.citations.forEach((citation, index) => {
+        const citeAt = [...at, "citations", index];
+        if (!exactKeys(citation, ["path", "version", "quote"], citeAt)) return;
+        if (typeof citation.path !== "string" || typeof citation.quote !== "string" || !citation.quote
+            || !["head", "base", "pr"].includes(citation.version)) {
+          error(citeAt, "agent_verify_citation_shape_invalid");
+          return;
+        }
+        let file;
+        if (citation.version === "pr") {
+          if (citation.path !== "PR.md") {
+            error([...citeAt, "path"], "agent_verify_citation_source_invalid");
+            return;
+          }
+          file = path.join(workspace, "PR.md");
+        } else {
+          file = safeSourcePath(citation.version, citation.path);
+        }
+        if (!file) {
+          error([...citeAt, "path"], "agent_verify_citation_source_invalid");
+          return;
+        }
+        let source;
+        try {
+          source = fs.readFileSync(file);
+        } catch {
+          error([...citeAt, "path"], "agent_verify_citation_source_missing");
+          return;
+        }
+        const quote = Buffer.from(citation.quote, "utf8");
+        const first = source.indexOf(quote);
+        if (first < 0) error([...citeAt, "quote"], "agent_output_quote_absent");
+        else if (source.lastIndexOf(quote) !== first) error([...citeAt, "quote"], "agent_output_quote_ambiguous");
+      });
+    }
+  }
+}
+
+function claimFieldText(expectedRows, claims, id, field) {
+  const claim = claims.claims.find((candidate) => candidate.id === id);
+  return claim?.fields?.[field];
+}
+
 function main() {
   let contract;
   try {
@@ -275,7 +383,7 @@ function main() {
     error(["workspace", "contract.json"], "agent_contract_invalid");
     return;
   }
-  if (!object(contract) || !["architecture", "intent"].includes(contract.mode)
+  if (!object(contract) || !["architecture", "intent", "verify"].includes(contract.mode)
       || !object(contract.required_keys) || !object(contract.enums)
       || !object(contract.citation_rules) || !object(contract.max_items)) {
     error(["workspace", "contract.json"], "agent_contract_invalid");
@@ -285,7 +393,8 @@ function main() {
     "agent_output_missing", "agent_output_unreadable", contract.max_output_bytes);
   if (result !== null) {
     if (contract.mode === "architecture") checkArchitecture(result, contract);
-    else checkIntent(result, contract);
+    else if (contract.mode === "intent") checkIntent(result, contract);
+    else checkVerify(result, contract);
   }
   if (errors.length === 0) {
     process.stdout.write("OK\n");

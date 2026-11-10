@@ -16,14 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from review_bot.application.context import hash_json
-from review_bot.application import partition_choices as choices
 from review_bot.application import review_fact_check as fact_check
-from review_bot.application.fact_verification import execute_fact_verification
-from review_bot.application.model_execution import (
-    ModelExecutionBudget,
-    OUTPUT_RECOVERY_FINAL_RESERVE,
-    model_profile,
-)
 from review_bot.application.partition_review import (
     FINAL_FINDING_BASES,
     FINAL_FINDING_VERDICTS,
@@ -34,23 +27,20 @@ from review_bot.application.partition_review import (
 )
 from review_bot.application.source_partition import PartitionError, SourceOriginal, make_span
 from review_bot.application.source_quote_citations import resolve_quote_citations
-from review_bot.application.review_output_contract import render_output_contract
-from review_bot.domain.intent_models import IntentReviewLimits, IntentStageRecord
-from review_bot.domain.models_v1 import ModelRequest
-from review_bot.domain.partition_review import PartitionReviewLimits, PartitionReviewResult
+from review_bot.domain.intent_models import IntentStageRecord
+from review_bot.domain.partition_review import PartitionReviewResult
 from review_bot.ports import (
     AgentRunError,
     AgentRunFinalization,
     AgentRunRequest,
     AgentRunResponse,
     AgentRunner,
-    ModelClient,
 )
 
 _MAX_OUTPUT_BYTES = 1_048_576
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_SKILLS = {"architecture": "review-architecture", "intent": "review-intent"}
+_SKILLS = {"architecture": "review-architecture", "intent": "review-intent", "verify": "verify-claims"}
 
 
 def agent_skill_path(mode: str) -> Path:
@@ -153,6 +143,15 @@ def _workspace(task, mode: str, originals: list[SourceOriginal], meta: dict, ski
 
 
 def _contract_json(mode: str, meta: dict) -> dict[str, Any]:
+    if mode == "verify":
+        return {
+            "mode": "verify",
+            "required_keys": {"envelope": ["items"], "field": ["state", "reason", "citations"]},
+            "enums": {"state": ["contradicted", "non_factual", "supported", "unverifiable"]},
+            "citation_rules": {"versions": ["head", "base", "pr"], "quote_occurrences": 1},
+            "max_output_bytes": _MAX_OUTPUT_BYTES,
+            "max_items": {"citations_per_field": 32},
+        }
     architecture = mode == "architecture"
     required_keys = {
         "envelope": (["summary", "summary_citations", "findings"] if architecture else
@@ -200,6 +199,15 @@ def _contract_json(mode: str, meta: dict) -> dict[str, Any]:
 
 
 def _contract(mode: str, meta: dict, skill: str, instructions: str) -> str:
+    if mode == "verify":
+        return (
+            f"Mode: verify; skill: {skill}\n"
+            "Read /workspace/CONTRACT.md, /workspace/contract.json, and /workspace/claims.json.\n"
+            "Return exactly one state, reason, and citations array for every claim field.\n"
+            "Use supported, contradicted, unverifiable, or non_factual. A non-empty supported field needs citations.\n"
+            "Citations use exact path/version/quote from head/base code, or path PR.md and version pr.\n"
+            "Write the JSON object to /out/result.json and run node /skills/check_output.mjs until it prints OK.\n"
+        )
     targets = json.dumps(meta.get("targets", []), ensure_ascii=False)
     perspectives = json.dumps(list(PERSPECTIVE_IDS), ensure_ascii=False)
     if mode == "architecture":
@@ -273,6 +281,10 @@ def _decode_output(path: Path | None, mode: str) -> dict:
         raise AgentOutputError("agent_output_json_invalid", detail) from None
     if not isinstance(value, dict):
         raise AgentOutputError("agent_output_schema_invalid", "JSON root must be an object")
+    if mode == "verify":
+        if set(value) != {"items"} or not isinstance(value["items"], dict):
+            raise AgentOutputError("verifier_output_invalid")
+        return value
     expected = ({"summary", "summary_citations", "findings"} if mode == "architecture" else
         {"summary", "summary_citations", "perspectives", "questions"})
     if "summary_citations" not in value:
@@ -559,7 +571,7 @@ def _result(task, mode, language, originals, meta, final, rejected, skill_id, sk
         "source_hashes": {item.evidence_id: item.digest for item in originals},
         "repository_wide": False, "review_complete": status == "completed"}
     model_record = {"provider": "pi-agent", "model": model, "is_mock": False,
-        "profile": {"max_input_tokens": None, "max_output_tokens": limits["max_output_tokens"],
+        "profile": {"max_output_tokens": limits["max_output_tokens"],
             "timeout_seconds": limits["timeout_seconds"]}}
     top_usage = _agent_usage(usage)
     result = PartitionReviewResult(
@@ -612,162 +624,446 @@ def _configured_limits(runner, timeout: int) -> dict[str, int]:
     }
 
 
-class _AgentFactCheckStop(Exception):
-    pass
+def _stored_verifier_citation(span, *, path=None, version=None) -> dict[str, Any]:
+    return {
+        "evidence_id": span.evidence_id, "start_byte": span.start_byte, "end_byte": span.end_byte,
+        "sha": span.sha, "path": span.path if path is None else path,
+        "version": span.version if version is None else version,
+        "begin_line": span.begin_line, "end_line": span.end_line, "quote": span.text,
+    }
 
 
-def _agent_fact_check_execution(mode, language, review_client, decision_client, profile, limits, budget, first_record):
-    decisions = []
-    decision_profile = model_profile(decision_client, limits) if decision_client is not None else None
-    choice_client = decision_client if decision_profile is not None else review_client
-    decision_profile = decision_profile or profile
+def _verifier_claims(final: dict, row_ids: dict | None = None) -> list[dict[str, Any]]:
+    claims = []
+    for row in fact_check.items(final):
+        row_id = _current_row_id(row["id"], row_ids) if row_ids is not None else row["id"]
+        cited = final.get("summary_citations", []) if row["id"] == "summary" else (
+            row["item"].get("citations", []) if isinstance(row["item"], dict) else [])
+        claims.append({
+            "id": row_id, "kind": row["kind"], "fields": fact_check.fields(row),
+            "cited": [{"path": item.get("path", ""), "version": item.get("version", ""),
+                "quote": item.get("quote", "")} for item in cited],
+        })
+    return claims
 
-    def request(stage, payload, schema, current):
-        output = current.max_output_tokens
-        model_payload = {"stage": stage, "mode": mode, "language": language, **payload}
-        prompt = fact_check.prompt_for(stage) + render_output_contract(schema)
-        prompt += "\nWrite every prose value in Korean." if language == "ko" else "\nWrite every prose value in English."
-        return ModelRequest(1, current.model, prompt,
-            json.dumps(model_payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
-            current.timeout_seconds, output, schema,
-            reasoning_budget_tokens=(output - OUTPUT_RECOVERY_FINAL_RESERVE
-                if stage in ("fact_check", "fact_rewrite") and output > OUTPUT_RECOVERY_FINAL_RESERVE
-                and getattr(review_client, "supports_bounded_reasoning", False) is True else None))
 
-    def measure(req, client, current, label, *, for_generation=False):
-        admitted, index = budget.measure(req, client, current, label=label,
-            reserve_calls=0, reserve_tokens=0, generate=for_generation,
-            allow_native_tokenizer=label.split(":", 1)[0] in ("fact_check", "fact_rewrite"))
-        if not admitted:
-            if budget.records[index].reason == "input_limit_exceeded":
-                return False
-            raise _AgentFactCheckStop(budget.records[index].reason)
-        return True
+def _write_verifier_workspace(workspace: Path, claims: list[dict], meta: dict, instructions: str) -> None:
+    _write_workspace_file(workspace, "claims.json",
+        json.dumps({"claims": claims}, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"))
+    _write_workspace_file(workspace, "contract.json",
+        json.dumps(_contract_json("verify", meta), ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"))
+    _write_workspace_file(workspace, "CONTRACT.md",
+        _contract("verify", meta, _SKILLS["verify"], instructions).encode("utf-8"))
 
-    def execute(req, client, current, label):
-        if not measure(req, client, current, label + ":admission", for_generation=True):
-            raise _AgentFactCheckStop("native_request_exceeds_model_limits")
-        raw, index = budget.execute_bounded_output(req, client, current, label=label,
-            reserve_calls=0, reserve_tokens=0,
-            allow_native_tokenizer=label.split(":", 1)[0] in ("fact_check", "fact_rewrite"))
-        if raw is None:
-            raise _AgentFactCheckStop(budget.records[index].reason)
-        return raw, index
 
-    def choose(stage, state, options, question, *, covered=(), observed=()):
-        req = ModelRequest(1, decision_profile.model, choices.SYSTEM,
-            json.dumps({"stage": stage, "mode": mode, "language": language, "state": state,
-                "question": question,
-                "options": [{key: row[key] for key in ("label", "key", "description")} for row in options]},
-                ensure_ascii=False, separators=(",", ":"), allow_nan=False),
-            decision_profile.timeout_seconds, min(decision_profile.max_output_tokens, choices.CHOICE_OUTPUT_TOKENS),
-            choices.choice_schema(options))
-        if len(options) == 1:
-            selected, index, raw = options[0], None, None
-        else:
-            for retry in range(2):
-                raw, index = execute(req, choice_client, decision_profile, stage + ":" + state.get("field", "choice"))
+def _verifier_citation(raw: Any, originals: list[SourceOriginal], delivered_spans: list) -> dict[str, Any]:
+    if not isinstance(raw, dict) or set(raw) != {"path", "version", "quote"}:
+        raise PartitionError("verifier_citation_unbound")
+    path, version, quote = raw["path"], raw["version"], raw["quote"]
+    if not isinstance(path, str) or not isinstance(version, str) or not isinstance(quote, str):
+        raise PartitionError("verifier_citation_unbound")
+    if version in ("head", "base"):
+        candidates = [item for item in originals if item.path == path and item.version == version]
+    elif version == "pr" and path == "PR.md":
+        encoded = quote.encode("utf-8")
+        pr_sources = [item for item in originals if item.kind == "pr_text"]
+        combined = "\n\n".join(item.text for item in pr_sources).encode("utf-8")
+        candidates = [item for item in pr_sources if item.raw.count(encoded) == 1]
+        if combined.count(encoded) != 1:
+            candidates = []
+    else:
+        candidates = []
+    if len(candidates) != 1:
+        raise PartitionError("verifier_citation_unbound")
+    original = candidates[0]
+    try:
+        spans = resolve_quote_citations(
+            [{"source_id": original.evidence_id, "quote": quote}],
+            {item.evidence_id: item for item in originals}, delivered_spans)
+    except (PartitionError, TypeError, ValueError):
+        raise PartitionError("verifier_citation_unbound") from None
+    return _stored_verifier_citation(spans[0],
+        path="PR.md" if version == "pr" else original.path,
+        version="pr" if version == "pr" else original.version)
+
+
+def _validate_verifier_output(body: dict, claims: list[dict], originals: list[SourceOriginal],
+    delivered_spans: list) -> tuple[dict[str, dict[str, dict]], list[dict]]:
+    if not isinstance(body, dict) or set(body) != {"items"} or not isinstance(body["items"], dict):
+        raise AgentOutputError("verifier_output_invalid")
+    expected = {claim["id"]: set(claim["fields"]) for claim in claims}
+    if set(body["items"]) != set(expected):
+        raise AgentOutputError("verifier_output_invalid")
+    states = {"supported", "contradicted", "unverifiable", "non_factual"}
+    verdicts, host_issues = {}, []
+    by_claim = {claim["id"]: claim for claim in claims}
+    for row_id, fields in expected.items():
+        row = body["items"].get(row_id)
+        if not isinstance(row, dict) or set(row) != fields:
+            raise AgentOutputError("verifier_output_invalid")
+        verdicts[row_id] = {}
+        for field in fields:
+            raw = row[field]
+            if (not isinstance(raw, dict) or set(raw) != {"state", "reason", "citations"}
+                    or raw.get("state") not in states or not isinstance(raw.get("reason"), str)
+                    or not 1 <= len(raw["reason"]) <= 4000 or not isinstance(raw.get("citations"), list)
+                    or len(raw["citations"]) > 32):
+                raise AgentOutputError("verifier_output_invalid")
+            text = by_claim[row_id]["fields"][field]
+            if raw["state"] == "supported" and isinstance(text, str) and text.strip() and not raw["citations"]:
+                raise AgentOutputError("verifier_output_invalid")
+            citations, failed = [], []
+            for citation in raw["citations"]:
                 try:
-                    selected = choices.accept_choice(raw, options)
+                    citations.append(_verifier_citation(citation, originals, delivered_spans))
                 except PartitionError:
-                    budget.records[index] = replace(budget.records[index], status="failed", reason="invalid_closed_choice")
-                    if retry:
-                        raise
-                else:
-                    budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
-                    break
-        record = {"stage": stage, "field": state.get("field"), "input_hash": hash_json(state),
-            "state": deepcopy(state), "options": deepcopy(options), "choice": selected["label"],
-            "selected_key": selected["key"], "response": raw,
-            "method": "model" if index is not None else "single_valid_candidate",
-            "stage_index": index - first_record if index is not None else None,
-            "covered_unit_ids": sorted(covered), "input_observation_ids": list(observed)}
-        record["decision_id"] = "D" + hash_json(record)[:24]
-        decisions.append(record)
-        return selected, record["decision_id"]
-
-    return request, measure, execute, choose, decisions, decision_profile, _AgentFactCheckStop
+                    failed.append(deepcopy(citation))
+            state, reason = raw["state"], raw["reason"]
+            if failed:
+                state, reason = "unverifiable", "verifier_citation_unbound"
+                host_issues.append({"item_id": row_id, "field": field,
+                    "reason": reason, "citations": failed})
+            elif (state == "supported" and isinstance(text, str) and text.strip()
+                    and not any(citation["version"] in ("head", "base") for citation in citations)):
+                state, reason = "unverifiable", "verifier_code_citation_missing"
+                host_issues.append({"item_id": row_id, "field": field,
+                    "reason": reason, "citations": deepcopy(citations)})
+            verdicts[row_id][field] = {"state": state, "reason": reason, "citations": citations}
+    return verdicts, host_issues
 
 
-def _apply_agent_fact_verification(result, mode, originals, meta, review_client, limits, budget, decision_client):
+def _row_status(verdicts: dict[str, dict]) -> str:
+    return "model_supported" if all(item["state"] in ("supported", "non_factual")
+        for item in verdicts.values()) else "unverified"
+
+
+def _all_unverified(claims: list[dict], reason: str) -> dict[str, dict[str, dict]]:
+    return {claim["id"]: {field: {"state": "unverifiable", "reason": reason, "citations": []}
+        for field in claim["fields"]} for claim in claims}
+
+
+def _revision_body(final: dict, mode: str) -> dict:
+    body = {"summary": final["summary"], "summary_citations": [
+        {"path": item["path"], "version": item["version"], "quote": item["quote"]}
+        for item in final.get("summary_citations", [])]}
+    if mode == "architecture":
+        body["findings"] = deepcopy(final["findings"])
+        for item in body["findings"]:
+            item["citations"] = [{"path": cite["path"], "version": cite["version"], "quote": cite["quote"]}
+                for cite in item["citations"]]
+    else:
+        body["perspectives"] = deepcopy(final["perspectives"])
+        for perspective in body["perspectives"]:
+            for item in perspective["assessments"]:
+                item["citations"] = [{"path": cite["path"], "version": cite["version"], "quote": cite["quote"]}
+                    for cite in item["citations"]]
+        body["questions"] = list(final["questions"])
+    return body
+
+
+def _stable_row_ids(final: dict) -> dict:
+    return {
+        "findings": [f"findings:{index}" for index in range(len(final["findings"]))],
+        "questions": [f"questions:{index}" for index in range(len(final["questions"]))],
+        "assessments": {
+            index: [f"perspectives:{index}:{assessment_index}"
+                for assessment_index in range(len(perspective["assessments"]))]
+            for index, perspective in enumerate(final["perspectives"])
+        },
+    }
+
+
+def _current_row_id(row_id: str, row_ids: dict) -> str:
+    parts = row_id.split(":")
+    if parts[0] == "findings" and len(parts) == 2:
+        return row_ids["findings"][int(parts[1])]
+    if parts[0] == "questions" and len(parts) == 2:
+        return row_ids["questions"][int(parts[1])]
+    if parts[0] == "perspectives" and len(parts) == 3:
+        return row_ids["assessments"][int(parts[1])][int(parts[2])]
+    return row_id
+
+
+def _current_row_index(row_id: str, row_ids: dict) -> int:
+    parts = row_id.split(":")
+    if parts[0] == "findings" and len(parts) == 2:
+        return row_ids["findings"].index(row_id)
+    if parts[0] == "questions" and len(parts) == 2:
+        return row_ids["questions"].index(row_id)
+    if parts[0] == "perspectives" and len(parts) == 3:
+        return row_ids["assessments"][int(parts[1])].index(row_id)
+    raise PartitionError("revision_item_invalid")
+
+
+def _row_item(final: dict, row_id: str, mode: str, row_ids: dict) -> Any:
+    if row_id == "summary":
+        return final["summary"]
+    parts = row_id.split(":")
+    index = _current_row_index(row_id, row_ids)
+    if parts[0] == "findings" and mode == "architecture":
+        return final["findings"][index]
+    if parts[0] == "questions" and mode == "intent":
+        return final["questions"][index]
+    if parts[0] == "perspectives" and mode == "intent" and len(parts) == 3:
+        return final["perspectives"][int(parts[1])]["assessments"][index]
+    raise PartitionError("revision_item_invalid")
+
+
+def _revision_item(body: dict, row_id: str, item: Any, mode: str, row_ids: dict) -> None:
+    parts = row_id.split(":")
+    if row_id == "summary":
+        if not isinstance(item, dict) or set(item) != {"summary", "summary_citations"}:
+            raise PartitionError("revision_item_invalid")
+        body["summary"], body["summary_citations"] = item["summary"], item["summary_citations"]
+    elif parts[0] == "findings" and mode == "architecture" and len(parts) == 2:
+        body["findings"][_current_row_index(row_id, row_ids)] = item
+    elif parts[0] == "questions" and mode == "intent" and len(parts) == 2:
+        body["questions"][_current_row_index(row_id, row_ids)] = item
+    elif parts[0] == "perspectives" and mode == "intent" and len(parts) == 3:
+        body["perspectives"][int(parts[1])]["assessments"][
+            _current_row_index(row_id, row_ids)] = item
+    else:
+        raise PartitionError("revision_item_invalid")
+
+
+def _withdraw_items(final: dict, row_ids: dict, row_ids_to_withdraw: list[str], mode: str) -> None:
+    groups = {}
+    for row_id in row_ids_to_withdraw:
+        parts = row_id.split(":")
+        if row_id == "summary":
+            raise PartitionError("summary_withdrawal_rejected")
+        index = _current_row_index(row_id, row_ids)
+        if parts[0] == "findings" and mode == "architecture" and len(parts) == 2:
+            key, values, ids = ("findings",), final["findings"], row_ids["findings"]
+        elif parts[0] == "questions" and mode == "intent" and len(parts) == 2:
+            key, values, ids = ("questions",), final["questions"], row_ids["questions"]
+        elif parts[0] == "perspectives" and mode == "intent" and len(parts) == 3:
+            perspective_index = int(parts[1])
+            key = ("assessments", perspective_index)
+            values = final["perspectives"][perspective_index]["assessments"]
+            ids = row_ids["assessments"][perspective_index]
+        else:
+            raise PartitionError("revision_item_invalid")
+        groups.setdefault(key, (values, ids, []))[2].append(index)
+    for values, ids, indexes in groups.values():
+        for index in sorted(indexes, reverse=True):
+            values.pop(index)
+            ids.pop(index)
+
+
+def _validate_revision(body: dict, row_id: str, item: Any, mode: str, meta: dict,
+    originals: list[SourceOriginal], delivered_spans: list, row_ids: dict) -> dict:
+    candidate = deepcopy(body)
+    _revision_item(candidate, row_id, item, mode, row_ids)
+    final, rejected = _validate_output(candidate, mode, meta, originals, delivered_spans)
+    if rejected:
+        raise PartitionError("revision_output_invalid")
+    return final
+
+
+def _decode_json_file(path: Path | None) -> dict:
+    if path is None:
+        raise AgentOutputError("agent_output_missing")
+    try:
+        if path.stat().st_size > _MAX_OUTPUT_BYTES:
+            raise AgentOutputError("agent_output_too_large")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise AgentOutputError("agent_output_missing") from None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise AgentOutputError("agent_output_invalid") from None
+    if not isinstance(value, dict):
+        raise AgentOutputError("agent_output_invalid")
+    return value
+
+
+def _run_verifier(runner, workspace: Path, claims: list[dict], meta: dict, instructions: str,
+    originals: list[SourceOriginal], model: str, timeout: int, language: str) -> tuple[dict, list, dict]:
+    _write_verifier_workspace(workspace, claims, meta, instructions)
+    request = AgentRunRequest("verify", workspace, _SKILLS["verify"], model, timeout)
+    response = runner.run(request)
+    if not isinstance(response, AgentRunResponse) or response.exit_status != 0 or not response.session_id:
+        raise AgentRunError("verifier_run_failed")
+    session_id = response.session_id
+    verify_spans = [make_span(item, 0, len(item.raw), "agent_verify") for item in originals]
+    try:
+        try:
+            body = _decode_output(response.output_path, "verify")
+            verdicts, issues = _validate_verifier_output(body, claims, originals, verify_spans)
+        except (AgentOutputError, ValueError, TypeError, json.JSONDecodeError):
+            repaired = runner.repair(request, session_id,
+                "Verifier output was invalid. Rewrite /out/result.json with exact row and field coverage, "
+                "run node /skills/check_output.mjs until it prints OK, and reply DONE.")
+            if (not isinstance(repaired, AgentRunResponse) or repaired.exit_status != 0
+                    or repaired.session_id not in (None, session_id)):
+                raise AgentRunError("verifier_repair_failed")
+            try:
+                body = _decode_output(repaired.output_path, "verify")
+                verdicts, issues = _validate_verifier_output(body, claims, originals, verify_spans)
+            except (AgentOutputError, ValueError, TypeError, json.JSONDecodeError):
+                verdicts, issues = _all_unverified(claims, "verifier_output_invalid"), []
+    finally:
+        finalization = runner.finish(session_id)
+    session = _store_session(finalization.session_jsonl,
+        getattr(runner, "session_store_dir", Path.home() / ".local/share/review-bot/agent-sessions"))
+    return verdicts, issues, {"role": "verify", "session": session, "usage": finalization.usage,
+        "duration_ms": 0}
+
+
+def _apply_agent_fact_verification(result, mode, runner, request, session_id, workspace,
+    originals, meta, instructions, model, timeout, max_revisions):
+    final = deepcopy(result.partition["final"])
+    pre_verification_final = deepcopy(final)
+    row_ids = _stable_row_ids(final)
+    claims = _verifier_claims(final, row_ids)
+    rows = {row["id"]: row for row in fact_check.items(final)}
+    ledger = {"version": "agent-verify-v1", "status": "unverified",
+        "original_final_hash": hash_json(pre_verification_final), "accepted_final_hash": hash_json(final),
+        "items": [], "runs": [], "model_assisted_is_not_proof": True}
+    for claim in claims:
+        item = deepcopy(rows[claim["id"]]["item"])
+        ledger["items"].append({"item_id": claim["id"], "original": item, "status": "unverified",
+            "accepted": deepcopy(item), "attempts": [], "host_issues": [], "revision": None})
+    initial_run_failure = None
+    try:
+        verdicts, issues, run_record = _run_verifier(runner, workspace, claims, meta, instructions,
+            originals, model, timeout, result.language)
+        ledger["runs"].append(run_record)
+    except AgentRunError as error:
+        verdicts, issues = _all_unverified(claims, "verifier_run_failed"), []
+        initial_run_failure = f"verifier_run_failed:{error.code}"
+    for entry in ledger["items"]:
+        row_verdicts = verdicts.get(entry["item_id"], {})
+        row_issues = [issue for issue in issues if issue.get("item_id") == entry["item_id"]]
+        entry["attempts"].append({"item_hash": hash_json(entry["original"]), "verdicts": row_verdicts,
+            "host_issues": deepcopy(row_issues)})
+        entry["status"] = _row_status(row_verdicts)
+        entry["host_issues"].extend(deepcopy(row_issues))
+        if initial_run_failure:
+            entry["host_issues"].append({"reason": initial_run_failure})
+    revisions = 0
+    while revisions < max_revisions:
+        issue_entries = ([entry for entry in ledger["items"] if entry["status"] == "unverified"]
+            if session_id is not None else [])
+        if not issue_entries:
+            break
+        message = "Verifier findings for rows requiring revision:\n" + json.dumps({
+            entry["item_id"]: entry["attempts"][-1]["verdicts"] for entry in issue_entries},
+            ensure_ascii=False, sort_keys=True) + (
+            "\nWrite /out/revision.json with one action per listed row: revise with the corrected "
+            "generation-contract item, or withdraw. The summary may only be revised. Reply DONE.")
+        try:
+            revised_response = runner.repair(request, session_id, message)
+        except AgentRunError as error:
+            for entry in issue_entries:
+                entry["host_issues"].append({"reason": f"revision_run_failed:{error.code}"})
+            break
+        if not isinstance(revised_response, AgentRunResponse) or revised_response.exit_status != 0:
+            for entry in issue_entries:
+                entry["host_issues"].append({"reason": "revision_run_failed"})
+            break
+        ledger["runs"].append({"role": "revise", "session": _store_session(revised_response.session_jsonl,
+            getattr(runner, "session_store_dir", Path.home() / ".local/share/review-bot/agent-sessions")),
+            "usage": _usage(revised_response), "duration_ms": 0})
+        revisions += 1
+        try:
+            raw_revision = _decode_json_file((revised_response.output_path or workspace / "revision.json").with_name("revision.json"))
+            if set(raw_revision) != {"items"} or not isinstance(raw_revision["items"], dict):
+                raise PartitionError("revision_output_invalid")
+            if set(raw_revision["items"]) != {entry["item_id"] for entry in issue_entries}:
+                raise PartitionError("revision_output_invalid")
+        except (AgentOutputError, PartitionError, ValueError, TypeError, json.JSONDecodeError):
+            for entry in issue_entries:
+                entry["host_issues"].append({"reason": "revision_output_invalid"})
+            break
+        revised_ids = []
+        withdrawn_ids = []
+        for entry in issue_entries:
+            action = raw_revision["items"][entry["item_id"]]
+            if not isinstance(action, dict) or action.get("action") not in ("revise", "withdraw"):
+                entry["host_issues"].append({"reason": "revision_output_invalid"})
+                continue
+            if action["action"] == "withdraw":
+                if entry["item_id"] == "summary":
+                    entry["host_issues"].append({"reason": "summary_withdrawal_rejected"})
+                    continue
+                withdrawn_ids.append(entry["item_id"])
+                history = entry["revision"] or []
+                history.append({"action": "withdraw", "round": revisions})
+                entry["status"], entry["accepted"], entry["revision"] = "withdrawn", None, history
+                continue
+            try:
+                revised_final = _validate_revision(_revision_body(final, mode), entry["item_id"],
+                    action.get("item"), mode, meta, originals, _delivered(originals)[1], row_ids)
+            except (PartitionError, AgentOutputError, ValueError, TypeError):
+                entry["host_issues"].append({"reason": "revision_output_invalid"})
+                continue
+            final = revised_final
+            revised_ids.append(entry["item_id"])
+            history = entry["revision"] or []
+            history.append({"action": "revise", "item": deepcopy(action["item"]), "round": revisions})
+            entry["revision"] = history
+            entry["accepted"] = deepcopy(_row_item(final, entry["item_id"], mode, row_ids))
+        if withdrawn_ids:
+            _withdraw_items(final, row_ids, withdrawn_ids, mode)
+        if revised_ids:
+            revised_claims = [claim for claim in _verifier_claims(final, row_ids)
+                if claim["id"] in revised_ids]
+            reverification_failure = None
+            try:
+                verdicts, issues, run_record = _run_verifier(runner, workspace, revised_claims, meta,
+                    instructions, originals, model, timeout, result.language)
+                ledger["runs"].append(run_record)
+            except AgentRunError as error:
+                verdicts, issues = _all_unverified(revised_claims, "verifier_run_failed"), []
+                reverification_failure = f"verifier_run_failed:{error.code}"
+            for entry in ledger["items"]:
+                if entry["item_id"] not in revised_ids:
+                    continue
+                row_verdicts = verdicts.get(entry["item_id"], {})
+                row_issues = [issue for issue in issues if issue.get("item_id") == entry["item_id"]]
+                entry["attempts"].append({"item_hash": hash_json(entry["accepted"]), "verdicts": row_verdicts,
+                    "host_issues": deepcopy(row_issues)})
+                entry["status"] = _row_status(row_verdicts)
+                entry["host_issues"].extend(deepcopy(row_issues))
+                if reverification_failure:
+                    entry["host_issues"].append({"reason": reverification_failure})
+    ledger["accepted_final_hash"] = hash_json(final)
+    ledger["status"] = ("model_supported" if all(entry["status"] in ("model_supported", "withdrawn")
+        for entry in ledger["items"]) else "unverified")
     partition = deepcopy(result.partition)
-    if review_client is None:
-        result.partition["fact_verification"] = "not_configured"
-        return result
-    if result.status == "failed":
-        result.partition["fact_verification"] = "not_run"
-        return result
-    if limits is None:
-        raise ValueError("agent_fact_verification_limits_required")
-    fact_limits = limits
-    fallback_input = IntentReviewLimits().max_input_tokens
-    probe_limits = (replace(fact_limits, max_input_tokens=fallback_input)
-        if fact_limits.max_input_tokens is None else fact_limits)
-    profile = model_profile(review_client, probe_limits)
-    if profile is None:
-        raise ValueError("agent_fact_review_profile_unset")
-    if fact_limits.max_input_tokens is None:
-        fact_limits = replace(fact_limits,
-            max_input_tokens=profile.max_input_tokens or fallback_input)
-    if budget is None:
-        budget = ModelExecutionBudget(fact_limits,
-            time.monotonic() + fact_limits.task_timeout_seconds, None)
-    elif budget.limits.max_input_tokens is None:
-        budget.limits = fact_limits
-    first_record = len(budget.records)
-    request, measure, execute, choose, decisions, decision_profile, stop_error = _agent_fact_check_execution(
-        mode, result.language, review_client, decision_client, profile, fact_limits, budget, first_record)
-    final, original_final, ledger = execute_fact_verification(
-        partition["final"], originals, meta,
-        mode=mode, review_client=review_client, profile=profile, budget=budget,
-        request=request, measure=measure, execute=execute, choose=choose,
-        max_rewrites=fact_limits.max_rechecks, stop_error=stop_error,
-        first_record=first_record, language=result.language,
-        final_citation_source_ids={item.evidence_id for item in originals
-            if item.path and item.version in ("head", "base")})
-    partition.update(pre_verification_final=original_final, operator_selected_mode=mode,
-        decisions=decisions, fact_verification=ledger, final=final)
-    partition["rejected_model_outputs"] = [
-        {"stage_index": index - first_record, **deepcopy(item)}
-        for index, items in budget.rejected_outputs.items()
-        if index >= first_record for item in items]
-    partition["output_recoveries"] = [
-        {**deepcopy(item), "failed_stage_index": item["failed_stage_index"] - first_record,
-            "recovery_stage_index": item["recovery_stage_index"] - first_record}
-        for item in budget.output_recoveries if item["failed_stage_index"] >= first_record]
-    identity = deepcopy(partition["identity"])
+    partition.update(pre_verification_final=pre_verification_final, operator_selected_mode=mode,
+        decisions=[], fact_verification=ledger, final=final)
     agent = partition["agent"]
+    identity = deepcopy(partition["identity"])
     identity.update(models={
         "agent": {"provider": "pi-agent", "model": agent["model"],
             "timeout_seconds": agent["limits"]["timeout_seconds"],
             "max_proxy_calls": agent["limits"]["max_proxy_calls"],
             "max_output_tokens": agent["limits"]["max_output_tokens"]},
-        "review": asdict(profile),
-        **({"decision": asdict(decision_profile)} if decision_client is not None else {}),
-    }, limits=asdict(fact_limits))
+        "verifier": {"provider": "pi-agent", "model": model, "timeout_seconds": timeout,
+            "max_proxy_calls": agent["limits"]["max_proxy_calls"],
+            "max_output_tokens": agent["limits"]["max_output_tokens"]},
+    }, limits={**agent["limits"], "max_revisions": max_revisions})
     partition["identity"] = identity
     status, reason = result.status, result.reason
-    if ledger["status"] != "model_supported":
+    if ledger["status"] != "model_supported" and result.status != "failed":
         status, reason = "partial_review", "factual_verification_incomplete"
-    elif mode == "intent" and "agent_perspectives_incomplete" in final["missing_context"]:
+    elif mode == "intent" and "agent_perspectives_incomplete" in final["missing_context"] and result.status != "failed":
         status, reason = "partial_review", "agent_perspectives_incomplete"
-    scope = {**result.scope, "review_complete": status == "completed"}
     return replace(result, status=status, reason=reason, run_key=hash_json(identity),
-        stages=tuple(budget.records[first_record:]), summary=final["summary"],
-        findings=tuple(final["findings"]), perspectives=tuple(final["perspectives"]),
-        questions=tuple(final["questions"]), scope=scope, partition=partition)
+        summary=final["summary"], findings=tuple(final["findings"]), perspectives=tuple(final["perspectives"]),
+        questions=tuple(final["questions"]), scope={**result.scope, "review_complete": status == "completed"},
+        partition=partition)
 
 
 def run_agent_review(task, mode: str, runner: AgentRunner, *, language: str, instructions: str,
-    timeout_seconds: int | None = None, review_client: ModelClient | None = None,
-    fact_limits: PartitionReviewLimits | None = None, budget: ModelExecutionBudget | None = None,
-    decision_client: ModelClient | None = None) -> PartitionReviewResult:
+    timeout_seconds: int | None = None, max_revisions: int | None = None) -> PartitionReviewResult:
     if mode not in ("architecture", "intent") or language not in ("ko", "en"):
         raise ValueError("invalid_agent_review_options")
     originals, meta = prepare_originals(task, mode)
     skill_id = _SKILLS[mode]
-    skill_path = agent_skill_path(mode)
-    skill_bytes = skill_path.read_bytes()
+    skill_bytes = agent_skill_path(mode).read_bytes()
     skill_sha = hashlib.sha256(skill_bytes).hexdigest()
     model = getattr(runner, "model_id", "stealth/crouton-alpha")
     timeout = timeout_seconds or getattr(runner, "timeout_seconds", 900)
@@ -777,108 +1073,289 @@ def run_agent_review(task, mode: str, runner: AgentRunner, *, language: str, ins
     request = AgentRunRequest(mode, workspace, skill_id, model, timeout)
     response = None
     session_id = None
-    finalization: AgentRunFinalization | None = None
+    finalization = None
     final = _empty_final(delivered_spans)
     rejected_before: list[dict] = []
     rejected: list[dict] = []
-    first_diagnostics: list[str] = []
-    repair_attempted = False
     status, reason = "failed", "agent_output_invalid"
-    run_error: AgentRunError | None = None
-    output_invalid = True
+    repair_attempted = False
+    valid_final = False
+    first_diagnostics: list[str] = []
     try:
         response = runner.run(request)
-        if not isinstance(response, AgentRunResponse) or response.exit_status != 0:
-            raise AgentRunError("agent_exit_nonzero")
-        session_id = response.session_id
-        if not session_id:
+        if not isinstance(response, AgentRunResponse) or response.exit_status != 0 or not response.session_id:
             raise AgentRunError("agent_session_unavailable")
+        session_id = response.session_id
         try:
             first_final, first_rejected = _parse_agent_output(
                 response.output_path, mode, meta, originals, delivered_spans)
         except AgentOutputError as error:
-            first_final = None
-            first_rejected = [{"kind": "envelope", "index": 0, "reason": error.code}]
+            first_final, first_rejected = None, [{"kind": "envelope", "index": 0, "reason": error.code}]
             first_diagnostics = [error.detail] if error.detail else []
         except (ValueError, TypeError, json.JSONDecodeError):
-            first_final = None
-            first_rejected = [{"kind": "envelope", "index": 0, "reason": "agent_output_schema_invalid"}]
+            first_final, first_rejected = None, [{"kind": "envelope", "index": 0,
+                "reason": "agent_output_schema_invalid"}]
         rejected_before = list(first_rejected)
         repair_attempted = bool(first_rejected)
         if first_final is not None and mode == "intent" and "agent_perspectives_incomplete" in first_final["missing_context"]:
             repair_attempted = True
-            accepted_ids = {row["perspective_id"] for row in first_final["perspectives"]}
             if not rejected_before:
+                accepted_ids = {row["perspective_id"] for row in first_final["perspectives"]}
                 rejected_before = [{"kind": "perspective", "index": index,
                     "reason": "agent_perspective_missing"}
-                    for index, perspective_id in enumerate(PERSPECTIVE_IDS) if perspective_id not in accepted_ids]
+                    for index, identifier in enumerate(PERSPECTIVE_IDS) if identifier not in accepted_ids]
         if repair_attempted:
             response = runner.repair(request, session_id, _repair_message(rejected_before, first_diagnostics))
             if not isinstance(response, AgentRunResponse) or response.exit_status != 0:
                 raise AgentRunError("agent_repair_failed")
-            if response.session_id not in (None, session_id):
-                raise AgentRunError("agent_session_changed")
             try:
-                final, rejected = _parse_agent_output(
-                    response.output_path, mode, meta, originals, delivered_spans)
-                output_invalid = False
-            except AgentOutputError as error:
-                rejected = [{"kind": "envelope", "index": 0, "reason": error.code}]
-                final = _empty_final(delivered_spans)
-                status, reason = "failed", error.code
-            except (ValueError, TypeError, json.JSONDecodeError):
-                rejected = [{"kind": "envelope", "index": 0, "reason": "agent_output_schema_invalid"}]
-                final = _empty_final(delivered_spans)
-                status, reason = "failed", "agent_output_schema_invalid"
-        elif first_final is None:
-            final = _empty_final(delivered_spans)
-            rejected = first_rejected
-            status, reason = "failed", first_rejected[0]["reason"]
-        else:
+                final, rejected = _parse_agent_output(response.output_path, mode, meta, originals, delivered_spans)
+                valid_final = True
+            except (AgentOutputError, ValueError, TypeError, json.JSONDecodeError) as error:
+                code = error.code if isinstance(error, AgentOutputError) else "agent_output_schema_invalid"
+                final, rejected, status, reason = _empty_final(delivered_spans), [
+                    {"kind": "envelope", "index": 0, "reason": code}], "failed", code
+        elif first_final is not None:
             final, rejected = first_final, first_rejected
-            output_invalid = False
-        if not output_invalid:
-            if mode == "architecture":
-                status = "completed"
-            elif "agent_perspectives_incomplete" in final["missing_context"]:
-                status = "partial_review"
-            else:
-                status = "completed"
+            valid_final = True
+        else:
+            rejected, status, reason = first_rejected, "failed", first_rejected[0]["reason"]
+        if valid_final:
+            status = "partial_review" if mode == "intent" and "agent_perspectives_incomplete" in final["missing_context"] else "completed"
             reason = ("agent_perspectives_incomplete" if status == "partial_review"
                 else "agent_items_rejected" if rejected else "completed")
     except AgentRunError as error:
-        run_error = error
-        final, rejected = _empty_final(delivered_spans), []
-        status, reason = "failed", f"agent_run_failed:{error.code}"
-    finally:
-        if session_id:
-            try:
-                finalization = runner.finish(session_id)
-            except AgentRunError as error:
-                if run_error is None:
-                    run_error = error
-                    final, rejected = _empty_final(delivered_spans), []
-                    status, reason = "failed", f"agent_run_failed:{error.code}"
-        temporary.cleanup()
+        final, rejected, status, reason = _empty_final(delivered_spans), [], "failed", f"agent_run_failed:{error.code}"
     if response is None:
         response = AgentRunResponse("", b"", {}, "unavailable", 1)
-    session_jsonl = finalization.session_jsonl if finalization is not None else response.session_jsonl
-    usage = finalization.usage if finalization is not None else _usage(response)
-    agent_reported_usage = (finalization.agent_reported_usage if finalization is not None
-        else _usage(response))
-    session = _store_session(session_jsonl,
-        getattr(runner, "session_store_dir", Path.home() / ".local/share/review-bot/agent-sessions"))
-    duration_ms = finalization.duration_ms if finalization is not None else 0
-    proxy_ledger_path = finalization.proxy_ledger_path if finalization is not None else ""
-    pi_version = response.pi_version if response.pi_version else "unavailable"
-    result = _result(task, mode, language, originals, meta, final, rejected, skill_id, skill_sha, model,
-        session, usage, agent_reported_usage, pi_version, status, reason, prompt_hash, limits=limits,
-        repair_attempted=repair_attempted, rejected_before=rejected_before, duration_ms=duration_ms,
-        proxy_ledger_path=proxy_ledger_path)
-    validate_agent_partition_result(result, task)
-    result = _apply_agent_fact_verification(result, mode, originals, meta, review_client, fact_limits, budget, decision_client)
+    max_revisions = (getattr(getattr(runner, "config", None), "max_revisions", 1)
+        if max_revisions is None else max_revisions)
+    try:
+        if session_id:
+            # Keep the generation session open while verifier and revision invocations use it.
+            initial = _result(task, mode, language, originals, meta, final, rejected, skill_id, skill_sha, model,
+                {}, {}, {}, response.pi_version or "unavailable", status, reason, prompt_hash, limits=limits,
+                repair_attempted=repair_attempted, rejected_before=rejected_before, duration_ms=0,
+                proxy_ledger_path="")
+            initial = _apply_agent_fact_verification(initial, mode, runner, request, session_id, workspace,
+                originals, meta, instructions, model, timeout, max_revisions)
+            finalization = runner.finish(session_id)
+            session = _store_session(finalization.session_jsonl,
+                getattr(runner, "session_store_dir", Path.home() / ".local/share/review-bot/agent-sessions"))
+            agent = deepcopy(initial.partition["agent"])
+            agent.update(session=session, usage=finalization.usage,
+                agent_reported_usage=finalization.agent_reported_usage,
+                duration_ms=finalization.duration_ms, proxy_ledger_path=finalization.proxy_ledger_path)
+            partition = deepcopy(initial.partition)
+            partition["agent"] = agent
+            identity = deepcopy(partition["identity"])
+            partition["identity"] = identity
+            result = replace(initial, partition=partition, run_key=hash_json(identity),
+                usage=_agent_usage(finalization.usage))
+        else:
+            initial = _result(task, mode, language, originals, meta, final, rejected, skill_id, skill_sha, model,
+                {}, {}, {}, response.pi_version or "unavailable", status, reason, prompt_hash, limits=limits,
+                repair_attempted=repair_attempted, rejected_before=rejected_before, duration_ms=0,
+                proxy_ledger_path="")
+            result = _apply_agent_fact_verification(initial, mode, runner, request, None, workspace,
+                originals, meta, instructions, model, timeout, max_revisions)
+            result = replace(result, partition={**result.partition, "agent": {
+                **result.partition["agent"],
+                "session": _store_session(response.session_jsonl, getattr(runner, "session_store_dir",
+                    Path.home() / ".local/share/review-bot/agent-sessions")),
+            }})
+    finally:
+        temporary.cleanup()
     validate_agent_partition_result(result, task)
     return result
+
+
+def _validate_stored_verifier_citation(citation: dict, originals: list[SourceOriginal]) -> None:
+    if not isinstance(citation, dict) or set(citation) != {
+            "evidence_id", "start_byte", "end_byte", "sha", "path", "version",
+            "begin_line", "end_line", "quote"}:
+        raise PartitionError("stored_agent_verification_citation")
+    try:
+        rebound = _verifier_citation(
+            {"path": citation["path"], "version": citation["version"], "quote": citation["quote"]},
+            originals, _delivered(originals)[1])
+    except (PartitionError, TypeError, ValueError, UnicodeError):
+        raise PartitionError("stored_agent_verification_citation") from None
+    if citation != rebound:
+        raise PartitionError("stored_agent_verification_citation")
+
+
+def _validate_agent_verification_replay(result: PartitionReviewResult, originals: list[SourceOriginal],
+    meta: dict) -> None:
+    ledger = result.partition.get("fact_verification")
+    if not isinstance(ledger, dict) or set(ledger) != {
+            "version", "status", "original_final_hash", "accepted_final_hash", "items", "runs",
+            "model_assisted_is_not_proof"} or ledger["version"] != "agent-verify-v1":
+        raise PartitionError("stored_agent_verification_ledger")
+    if ledger["model_assisted_is_not_proof"] is not True or not isinstance(ledger["items"], list):
+        raise PartitionError("stored_agent_verification_ledger")
+    pre = result.partition.get("pre_verification_final")
+    final = result.partition.get("final")
+    if not isinstance(pre, dict) or hash_json(pre) != ledger["original_final_hash"]:
+        raise PartitionError("stored_agent_verification_final")
+    mode = "intent" if result.review_type == "B" else "architecture"
+    _, delivered_spans = _delivered(originals)
+    if result.status == "failed":
+        if pre != _empty_final(delivered_spans):
+            raise PartitionError("stored_agent_verification_final")
+    else:
+        try:
+            checked_pre, rejected = _validate_output(_revision_body(pre, mode), mode, meta,
+                originals, delivered_spans)
+        except (AgentOutputError, PartitionError, ValueError, TypeError):
+            raise PartitionError("stored_agent_verification_final") from None
+        if (any(item not in result.partition["agent"]["rejected"] for item in rejected)
+                or checked_pre != pre):
+            raise PartitionError("stored_agent_verification_final")
+    if hash_json(final) != ledger["accepted_final_hash"]:
+        raise PartitionError("stored_agent_verification_final")
+    expected_rows = fact_check.items(pre)
+    expected_ids = [row["id"] for row in expected_rows]
+    if [entry.get("item_id") for entry in ledger["items"]] != expected_ids:
+        raise PartitionError("stored_agent_verification_ledger")
+    revision_limit = result.partition.get("identity", {}).get("limits", {}).get("max_revisions", 0)
+    for entry, row in zip(ledger["items"], expected_rows):
+        if not isinstance(entry, dict) or set(entry) != {
+                "item_id", "original", "status", "accepted", "attempts", "host_issues", "revision"}:
+            raise PartitionError("stored_agent_verification_ledger")
+        if entry["original"] != row["item"] or entry["status"] not in ("model_supported", "unverified", "withdrawn"):
+            raise PartitionError("stored_agent_verification_ledger")
+        if (not isinstance(entry["attempts"], list) or not entry["attempts"]
+                or not isinstance(entry["host_issues"], list)
+                or any(not isinstance(issue, dict) or not isinstance(issue.get("reason"), str)
+                    for issue in entry["host_issues"])):
+            raise PartitionError("stored_agent_verification_ledger")
+        for attempt in entry["attempts"]:
+            if not isinstance(attempt, dict) or set(attempt) != {"item_hash", "verdicts", "host_issues"}:
+                raise PartitionError("stored_agent_verification_ledger")
+            if not isinstance(attempt["verdicts"], dict):
+                raise PartitionError("stored_agent_verification_verdict")
+            fields = fact_check.fields({"id": entry["item_id"],
+                "item": entry["accepted"] if entry["accepted"] is not None else entry["original"]})
+            if set(attempt["verdicts"]) != set(fields):
+                raise PartitionError("stored_agent_verification_verdict")
+            for verdict in attempt["verdicts"].values():
+                if (not isinstance(verdict, dict) or set(verdict) != {"state", "reason", "citations"}
+                        or verdict["state"] not in ("supported", "contradicted", "unverifiable", "non_factual")
+                        or not isinstance(verdict["reason"], str) or not 1 <= len(verdict["reason"]) <= 4000
+                        or not isinstance(verdict["citations"], list)):
+                    raise PartitionError("stored_agent_verification_verdict")
+                for citation in verdict["citations"]:
+                    _validate_stored_verifier_citation(citation, originals)
+            if not isinstance(attempt["host_issues"], list):
+                raise PartitionError("stored_agent_verification_verdict")
+            for issue in attempt["host_issues"]:
+                if (not isinstance(issue, dict) or set(issue) != {"item_id", "field", "reason", "citations"}
+                        or issue["item_id"] != entry["item_id"]
+                        or issue["reason"] not in (
+                            "verifier_citation_unbound", "verifier_code_citation_missing")
+                        or issue["field"] not in attempt["verdicts"]
+                        or not isinstance(issue["citations"], list)):
+                    raise PartitionError("stored_agent_verification_verdict")
+                verdict = attempt["verdicts"][issue["field"]]
+                if (verdict["state"] != "unverifiable" or verdict["reason"] != issue["reason"]
+                        or (issue["reason"] == "verifier_citation_unbound" and not issue["citations"])
+                        or (issue["reason"] == "verifier_code_citation_missing"
+                            and verdict["citations"] != issue["citations"])
+                        or (issue["reason"] == "verifier_code_citation_missing"
+                            and any(citation["version"] in ("head", "base")
+                                for citation in issue["citations"]))):
+                    raise PartitionError("stored_agent_verification_verdict")
+        history = entry["revision"]
+        if history is not None:
+            if (not isinstance(history, list) or not history or len(history) > revision_limit
+                    or any(not isinstance(event, dict) for event in history)):
+                raise PartitionError("stored_agent_verification_ledger")
+            saw_withdrawal = False
+            last_round = 0
+            for index, event in enumerate(history):
+                revision_round = event.get("round")
+                if (type(revision_round) is not int or revision_round <= last_round
+                        or revision_round > revision_limit):
+                    raise PartitionError("stored_agent_verification_ledger")
+                last_round = revision_round
+                if event.get("action") == "revise":
+                    if (saw_withdrawal or set(event) != {"action", "item", "round"}
+                            or not isinstance(event["item"], dict)):
+                        raise PartitionError("stored_agent_verification_ledger")
+                elif event.get("action") == "withdraw":
+                    if (saw_withdrawal or index != len(history) - 1
+                            or set(event) != {"action", "round"}
+                            or entry["item_id"] == "summary"):
+                        raise PartitionError("stored_agent_verification_ledger")
+                    saw_withdrawal = True
+                else:
+                    raise PartitionError("stored_agent_verification_ledger")
+        revision_count = sum(event["action"] == "revise" for event in history or [])
+        if len(entry["attempts"]) != revision_count + 1:
+            raise PartitionError("stored_agent_verification_ledger")
+        last_attempt = entry["attempts"][-1]
+        derived = ("unverified" if last_attempt["host_issues"]
+            else _row_status(last_attempt["verdicts"]))
+        if history and history[-1]["action"] == "withdraw":
+            if entry["status"] != "withdrawn" or entry["accepted"] is not None:
+                raise PartitionError("stored_agent_verification_status")
+        elif entry["status"] != derived:
+            raise PartitionError("stored_agent_verification_status")
+    if ledger["status"] != ("model_supported" if all(entry["status"] in ("model_supported", "withdrawn")
+        for entry in ledger["items"]) else "unverified"):
+        raise PartitionError("stored_agent_verification_status")
+    derived = deepcopy(pre)
+    row_ids = _stable_row_ids(derived)
+    generation_spans = delivered_spans
+    current_items = {
+        entry["item_id"]: deepcopy(_row_item(derived, entry["item_id"], mode, row_ids))
+        for entry in ledger["items"]
+    }
+    expected_attempt_hashes = {
+        item_id: [hash_json(item)] for item_id, item in current_items.items()
+    }
+    events_by_round = {}
+    for entry in ledger["items"]:
+        for event in entry["revision"] or []:
+            events_by_round.setdefault(event["round"], []).append((entry, event))
+    withdrawn_ids = set()
+    for revision_round in sorted(events_by_round):
+        withdrawals = []
+        for entry, event in events_by_round[revision_round]:
+            if event["action"] == "withdraw":
+                withdrawals.append(entry["item_id"])
+                continue
+            try:
+                candidate = _validate_revision(_revision_body(derived, mode), entry["item_id"],
+                    event["item"], mode, meta, originals, generation_spans, row_ids)
+                current_items[entry["item_id"]] = deepcopy(
+                    _row_item(candidate, entry["item_id"], mode, row_ids))
+            except (PartitionError, AgentOutputError, IndexError, ValueError, TypeError):
+                raise PartitionError("stored_agent_verification_revision") from None
+            expected_attempt_hashes[entry["item_id"]].append(hash_json(current_items[entry["item_id"]]))
+            derived = candidate
+        try:
+            _withdraw_items(derived, row_ids, withdrawals, mode)
+        except PartitionError:
+            raise PartitionError("stored_agent_verification_revision") from None
+        withdrawn_ids.update(withdrawals)
+    for entry in ledger["items"]:
+        expected_accepted = None if entry["item_id"] in withdrawn_ids else current_items[entry["item_id"]]
+        if (entry["accepted"] != expected_accepted
+                or [attempt["item_hash"] for attempt in entry["attempts"]]
+                    != expected_attempt_hashes[entry["item_id"]]):
+            raise PartitionError("stored_agent_verification_revision")
+    if derived != final:
+        raise PartitionError("stored_agent_verification_final")
+    if result.status != "failed":
+        expected_status = "partial_review" if ledger["status"] != "model_supported" else result.status
+        if ledger["status"] != "model_supported" and result.reason != "factual_verification_incomplete":
+            raise PartitionError("stored_agent_verification_status")
+        if ledger["status"] == "model_supported" and result.status == "partial_review" and result.reason != "agent_perspectives_incomplete":
+            raise PartitionError("stored_agent_verification_status")
+    if not isinstance(ledger["runs"], list):
+        raise PartitionError("stored_agent_verification_ledger")
 
 
 def validate_agent_partition_result(result: PartitionReviewResult, task) -> None:
@@ -908,9 +1385,8 @@ def validate_agent_partition_result(result: PartitionReviewResult, task) -> None
             {"source_scope_policy": meta["source_scope"]["policy"]} if "source_scope" in meta else {})}
     fact_configured = isinstance(partition.get("fact_verification"), dict)
     identity_base = {key: value for key, value in identity.items() if key not in ("models", "limits")}
-    identity_shape_valid = (identity_base == expected_identity
-        and (set(identity) == set(expected_identity) | {"models", "limits"} if fact_configured
-            else identity == expected_identity))
+    identity_shape_valid = (identity_base == expected_identity and fact_configured
+        and set(identity) == set(expected_identity) | {"models", "limits"})
     if (agent["skill_id"] != expected_skill or not isinstance(agent["skill_sha256"], str)
             or not _SHA256.fullmatch(agent["skill_sha256"]) or not isinstance(agent["model"], str)
             or not agent["model"] or not identity_shape_valid or result.run_key != hash_json(identity)):
@@ -963,9 +1439,6 @@ def validate_agent_partition_result(result: PartitionReviewResult, task) -> None
             or (result.review_type == "A" and final["perspectives"])
             or (result.review_type == "B" and final["findings"])):
         raise PartitionError("invalid_agent_final_schema")
-    if (list(result.findings) != final.get("findings") or list(result.perspectives) != final.get("perspectives")
-            or list(result.questions) != final.get("questions") or result.summary != final.get("summary")):
-        raise PartitionError("agent_final_result_mismatch")
     if result.status not in ("completed", "partial_review", "failed"):
         raise PartitionError("invalid_agent_result_status")
     if (not isinstance(agent["pi_version"], str) or not agent["pi_version"]
@@ -995,7 +1468,7 @@ def validate_agent_partition_result(result: PartitionReviewResult, task) -> None
             or (agent["before_rejected_count"] > 0 and not agent["repair_attempted"])):
         raise PartitionError("agent_usage_or_repair_metadata_mismatch")
     if (result.status == "failed" and not re.fullmatch(
-            r"(?:agent_output_[a-z][a-z0-9_]{0,63}|agent_run_failed:[a-z][a-z0-9_]{0,63})",
+            r"(?:agent_[a-z][a-z0-9_]{0,127}|agent_run_failed:[a-z][a-z0-9_]{0,63})",
             result.reason)):
         raise PartitionError("invalid_agent_failure_reason")
     if not isinstance(agent["rejected"], list) or any(
@@ -1078,7 +1551,7 @@ def validate_agent_partition_result(result: PartitionReviewResult, task) -> None
     validate_citations(final["summary_citations"],
         allow_empty=result.status == "failed" or not code_originals,
         missing_reason="agent_summary_citations_missing")
-    for row in (*result.findings, *result.perspectives):
+    for row in (*final["findings"], *final["perspectives"]):
         if not isinstance(row, dict):
             raise PartitionError("invalid_agent_final_item")
         assessments = row.get("assessments", [row])
@@ -1110,6 +1583,9 @@ def validate_agent_partition_result(result: PartitionReviewResult, task) -> None
             if result.review_type == "B" and assessment.get("verdict") == "insufficient_context" and citations == []:
                 continue
             validate_citations(citations)
+    if (list(result.findings) != final.get("findings") or list(result.perspectives) != final.get("perspectives")
+            or list(result.questions) != final.get("questions") or result.summary != final.get("summary")):
+        raise PartitionError("agent_final_result_mismatch")
     if result.review_type == "A":
         if any(set(row) != {"statement", "reasoning", "failure_condition", "verdict", "basis", "target_ids", "citations"}
                 or not all(isinstance(row.get(key), str) for key in ("statement", "reasoning", "failure_condition"))
@@ -1141,27 +1617,26 @@ def validate_agent_partition_result(result: PartitionReviewResult, task) -> None
             raise PartitionError("agent_target_reviews_invalid")
         validate_citations(reviews["citations"]) if reviews.get("citations") else None
     fact_verification = partition.get("fact_verification")
-    if fact_verification in ("not_configured", "not_run"):
-        if any(key in partition for key in ("pre_verification_final", "operator_selected_mode", "decisions")):
-            raise PartitionError("agent_fact_verification_envelope_invalid")
-    elif fact_verification is not None:
-        identity = partition.get("identity", {})
-        models = identity.get("models")
-        limits = identity.get("limits")
-        expected_agent_model = {"provider": "pi-agent", "model": agent["model"],
-            "timeout_seconds": agent["limits"]["timeout_seconds"],
-            "max_proxy_calls": agent["limits"]["max_proxy_calls"],
-            "max_output_tokens": agent["limits"]["max_output_tokens"]}
-        if (not isinstance(fact_verification, dict)
-                or partition.get("operator_selected_mode") != ("intent" if result.review_type == "B" else "architecture")
-                or not isinstance(partition.get("pre_verification_final"), dict)
-                or not isinstance(partition.get("decisions"), list)
-                or not isinstance(models, dict) or models.get("agent") != expected_agent_model
-                or set(models) not in ({"agent", "review"}, {"agent", "review", "decision"})
-                or not isinstance(models.get("review"), dict)
-                or not isinstance(models["review"].get("provider"), str)
-                or not isinstance(models["review"].get("model"), str)
-                or not isinstance(limits, dict) or type(limits.get("max_rechecks")) is not int
-                or not 0 <= limits["max_rechecks"] <= 1 or result.run_key != hash_json(identity)):
-            raise PartitionError("agent_fact_verification_envelope_invalid")
-        fact_check.validate(result, originals, meta)
+    identity = partition.get("identity", {})
+    models = identity.get("models") if isinstance(identity, dict) else None
+    verification_limits = identity.get("limits") if isinstance(identity, dict) else None
+    expected_agent_model = {"provider": "pi-agent", "model": agent["model"],
+        "timeout_seconds": agent["limits"]["timeout_seconds"],
+        "max_proxy_calls": agent["limits"]["max_proxy_calls"],
+        "max_output_tokens": agent["limits"]["max_output_tokens"]}
+    if (not isinstance(fact_verification, dict)
+            or partition.get("operator_selected_mode") != ("intent" if result.review_type == "B" else "architecture")
+            or not isinstance(partition.get("pre_verification_final"), dict)
+            or not isinstance(partition.get("decisions"), list)
+            or not isinstance(models, dict) or models.get("agent") != expected_agent_model
+            or set(models) != {"agent", "verifier"}
+            or not isinstance(models.get("verifier"), dict)
+            or not isinstance(models["verifier"].get("provider"), str)
+            or not isinstance(models["verifier"].get("model"), str)
+            or not isinstance(verification_limits, dict)
+            or set(verification_limits) != {"timeout_seconds", "max_proxy_calls", "max_output_tokens", "max_revisions"}
+            or type(verification_limits.get("max_revisions")) is not int
+            or not 0 <= verification_limits["max_revisions"] <= 3
+            or result.run_key != hash_json(identity)):
+        raise PartitionError("agent_fact_verification_envelope_invalid")
+    _validate_agent_verification_replay(result, originals, meta)

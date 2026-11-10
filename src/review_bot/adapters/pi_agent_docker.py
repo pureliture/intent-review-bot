@@ -200,8 +200,12 @@ class DockerPiAgentRunner:
         return result
 
     def _start(self, request: AgentRunRequest) -> tuple[str, _ActiveRun]:
-        if request.mode not in ("architecture", "intent") or request.skill_id != (
-                "review-architecture" if request.mode == "architecture" else "review-intent"):
+        allowed_skills = {
+            "architecture": "review-architecture",
+            "intent": "review-intent",
+            "verify": "verify-claims",
+        }
+        if request.mode not in allowed_skills or request.skill_id != allowed_skills[request.mode]:
             raise AgentRunError("invalid_request")
         if not os.environ.get("OPENROUTER_API_KEY"):
             raise AgentRunError("openrouter_api_key_missing")
@@ -241,7 +245,7 @@ class DockerPiAgentRunner:
                 "baseUrl": "http://llm-proxy:8080/v1", "apiKey": "DUMMY_NOT_A_KEY",
                 "api": "openai-completions", "models": [{
                     "id": request.model, "name": request.model, "reasoning": True,
-                    "contextWindow": 1048576, "maxTokens": self.config.max_output_tokens,
+                    "maxTokens": self.config.max_output_tokens,
                 }],
             }}}
             (config_dir / "models.json").write_text(json.dumps(models), encoding="utf-8")
