@@ -79,6 +79,7 @@ def test_docker_runner_tracks_concurrent_sessions_safely(tmp_path, monkeypatch):
         run = SimpleNamespace(
             request=request,
             network=f"network-{request.mode}",
+            egress_network=f"egress-{request.mode}",
             proxy_name=f"proxy-{request.mode}",
             agent_name=f"agent-{request.mode}",
             config_temporary=temporary,
@@ -187,6 +188,9 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
     assert "OPENROUTER_API_KEY" not in agent and "test-only-secret" not in json.dumps(agent)
     assert not any("docker.sock" in argument for argument in agent)
     proxy = next(argv for argv in calls if argv[1] == "run" and proxy_image_tag() in argv)
+    proxy_network = proxy[proxy.index("--network") + 1]
+    assert proxy_network.startswith("review-agent-egress-")
+    assert proxy_network != "bridge"
     assert "UPSTREAM_API_KEY" in proxy
     assert not any(arg.startswith("MAX_OUTPUT_TOKENS=") for arg in proxy)
     assert not any(arg.startswith("UPSTREAM_API_KEY=") for arg in proxy)
@@ -196,6 +200,7 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
     assert any(argv[1:4] == ["rm", "-f", next(arg for arg in argv if arg.startswith("review-agent-"))]
         for argv in calls if len(argv) > 3 and argv[1] == "rm")
     assert any(argv[1:3] == ["network", "rm"] for argv in calls)
+    assert ["docker", "network", "rm", proxy_network] in calls
 
 
 @pytest.mark.parametrize(("mode", "skill_id"), [
@@ -240,6 +245,33 @@ def test_docker_runner_maps_timeout_to_agent_error_and_cleans_up(tmp_path, monke
     with pytest.raises(AgentRunError, match="timeout"):
         runner.run(AgentRunRequest("intent", workspace, "review-intent", "stealth/crouton-alpha", 1))
     assert any(argv[1:3] == ["network", "rm"] for argv in calls)
+    created_egress_networks = {argv[-1] for argv in calls
+        if argv[1:3] == ["network", "create"] and argv[-1].startswith("review-agent-egress-")}
+    removed_egress_networks = {argv[-1] for argv in calls
+        if argv[1:3] == ["network", "rm"] and argv[-1].startswith("review-agent-egress-")}
+    assert created_egress_networks == removed_egress_networks
+
+
+def test_docker_runner_fails_closed_when_egress_network_creation_fails(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[1:3] == ["network", "create"] and argv[-1].startswith("review-agent-egress-"):
+            return subprocess.CompletedProcess(argv, 1, "", "network create failed")
+        if argv[1:3] == ["network", "rm"] and argv[-1].startswith("review-agent-egress-"):
+            return subprocess.CompletedProcess(argv, 1, "", "no such network")
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = DockerPiAgentRunner(AgentEngineConfig())
+    with pytest.raises(AgentRunError, match="docker_network_failed"):
+        runner.run(AgentRunRequest("architecture", workspace, "review-architecture", "model", 10))
+
+    assert not any(argv[1] == "run" for argv in calls)
 
 
 def test_docker_runner_rejects_skill_mode_mismatch(tmp_path):
@@ -296,6 +328,14 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
 
     agents = [argv for argv in calls if "review-bot-pi-agent:0.73.1" in argv]
     proxies = [argv for argv in calls if argv[1] == "run" and proxy_image_tag() in argv]
+    proxy_networks = [argv[argv.index("--network") + 1] for argv in proxies]
+    assert all(network.startswith("review-agent-egress-") and network != "bridge"
+        for network in proxy_networks)
+    created_egress_networks = {argv[-1] for argv in calls
+        if argv[1:3] == ["network", "create"] and argv[-1].startswith("review-agent-egress-")}
+    removed_egress_networks = {argv[-1] for argv in calls
+        if argv[1:3] == ["network", "rm"] and argv[-1].startswith("review-agent-egress-")}
+    assert created_egress_networks == removed_egress_networks
     assert first.session_id == repaired.session_id == "session-123"
     assert verifier.session_id == "session-verify"
     assert len(agents) == 3 and len(proxies) == 2

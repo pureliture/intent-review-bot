@@ -903,6 +903,74 @@ def _configure_agent_mode_worker(worker, tmp_path, monkeypatch, runner, *,
         receipt("intent", run, review_snap, mode_sel, deadline))
 
 
+def test_worker_records_incomplete_agent_review_as_failed_without_publication(
+    claimed_worker, monkeypatch,
+) -> None:
+    _store, worker, run = claimed_worker
+    worker.config = worker.config.model_copy(update={"review_engine": "agent"})
+    task = SimpleNamespace(limitations=())
+    result = SimpleNamespace(
+        status="failed", reason="incomplete_code_input", run_key="f" * 64,
+        scope={"review_complete": False}, usage={}, limitations=(),
+        model_delivery={"status": "not_attempted"},
+    )
+    review_snap = SimpleNamespace(
+        snapshot_id="a" * 64, head_sha="b" * 40, target_base_sha="c" * 40,
+    )
+    pr_snap = SimpleNamespace(head_sha="b" * 40)
+    mode_sel = SimpleNamespace(selection_id="d" * 64, selected_modes=("architecture",))
+    monkeypatch.setattr(worker, "_cached_review", lambda *_args, **_kwargs: (task, result))
+    monkeypatch.setattr(worker, "_reuse_publication", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, "_publication_input_key", lambda _mode, key: key)
+    monkeypatch.setattr(worker, "_stage", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, "_require_active", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, "_presentation_options", lambda _mode: {})
+    monkeypatch.setattr(worker, "_trace_options", lambda *_args: {})
+    monkeypatch.setattr(worker, "_settings_notice", lambda text: text)
+    monkeypatch.setattr(
+        "review_bot.adapters.markdown.partition_formatter.format_partition_review_markdown",
+        lambda *_args, **_kwargs: "incomplete review",
+    )
+    monkeypatch.setattr("review_bot.runtime.worker.publish_review_comment",
+        lambda *_args, **_kwargs: pytest.fail("incomplete input must not be published"))
+
+    receipt = worker._execute_architecture(
+        run, review_snap, pr_snap, SimpleNamespace(review_mode="normal"), mode_sel,
+        None, "", "", False, time.monotonic() + 60,
+    )
+
+    assert receipt.execution_status == "failed"
+    assert receipt.error_code == "incomplete_code_input"
+    assert receipt.publication is None
+    assert worker.github_client.posted_comments == []
+
+
+def test_worker_marks_incomplete_agent_mode_failed_and_does_not_publish_it(
+    claimed_worker, tmp_path, monkeypatch,
+) -> None:
+    store, worker, run = claimed_worker
+    runner = _BarrierAgentRunner(parallel=False)
+    _configure_agent_mode_worker(worker, tmp_path, monkeypatch, runner, parallel_modes=False)
+
+    def failed_architecture(run, review_snap, _pr_snap, _classification, mode_sel,
+            _artifacts, _title, _body, _draft, _deadline):
+        return ExecutionReceipt(2, "architecture", mode_sel.selection_id, review_snap.snapshot_id,
+            run.generation, run.fingerprint, "failed", error_code="incomplete_code_input")
+
+    monkeypatch.setattr(worker, "_execute_architecture", failed_architecture)
+
+    assert worker.process_run(run) is False
+
+    status, error = store._get_connection().execute(
+        "SELECT status, error FROM runs WHERE run_id = ?;", (run.run_id,),
+    ).fetchone()
+    assert (status, error) == ("failed", "incomplete_code_input")
+    assert {comment["body"] for comment in worker.github_client.posted_comments} == {"intent review"}
+    assert store._get_connection().execute(
+        "SELECT marker, status FROM publication_receipts WHERE run_id = ?;", (run.run_id,),
+    ).fetchall() == [(worker.config.publish.b_marker, "succeeded")]
+
+
 @pytest.mark.parametrize(("parallel_modes", "expected_max_active"), [
     (None, 2),
     (False, 1),

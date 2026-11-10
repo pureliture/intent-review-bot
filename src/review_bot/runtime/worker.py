@@ -1123,6 +1123,9 @@ class WorkerLoop:
             error_code = _exception_error_code(f"{prefix}_pipeline_error", exc)
             return replace(core_receipt, execution_status="failed", error_code=error_code,
                 publication=self._publish_failure_notice(run, "architecture", review_snap, error_code, deadline, draft=draft))
+        if (_agent_engine_enabled(self.config) and result.status == "failed"
+                and result.reason in ("incomplete_code_input", "incomparable_input")):
+            return core_receipt
         self._require_active(run, deadline)
         if not writes_comment:
             publication = PublicationReceipt(None, "not_attempted",
@@ -1312,6 +1315,9 @@ class WorkerLoop:
             error_code = _exception_error_code("intent_artifact_error", exc)
             return replace(core_receipt, execution_status="failed", error_code=error_code,
                 publication=self._publish_failure_notice(run, "intent", review_snap, error_code, deadline, draft=draft))
+        if (agent_engine and result.status == "failed"
+                and result.reason in ("incomplete_code_input", "incomparable_input")):
+            return core_receipt
         self._stage(run, RunStage.PUBLISH, deadline)
         if reason is not None:
             publication = PublicationReceipt(None, "not_attempted",

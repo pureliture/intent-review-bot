@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +22,12 @@ from review_bot.application.agent_review import (
     run_agent_review,
 )
 from review_bot.application.context import hash_json
-from review_bot.application.partition_review import PERSPECTIVE_IDS, prepare_originals, validate_partition_result
+from review_bot.application.partition_review import (
+    PERSPECTIVE_IDS,
+    build_task_input,
+    prepare_originals,
+    validate_partition_result,
+)
 from review_bot.application.source_partition import PartitionError, SourceOriginal, make_span
 from review_bot.config import load_review_config_from_str
 from review_bot.ports import AgentRunError, AgentRunFinalization, AgentRunResponse
@@ -440,6 +446,40 @@ def test_agent_intent_result_validates_and_formats_all_perspectives(tmp_path):
     assert _SEARCH_SCOPE_RULE in runner.generation_contract
 
 
+def test_agent_review_incomplete_code_input_fails_without_running_agent(tmp_path):
+    task = _pmd_partition_task()
+    snapshot = replace(task.snapshot, head=replace(task.snapshot.head, complete=False))
+    task = build_task_input(snapshot, task.delta, task.classification)
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+
+    result = run_agent_review(task, "architecture", runner, language="en", instructions="")
+
+    assert runner.run_modes == []
+    assert result.status == "failed"
+    assert result.reason == "incomplete_code_input"
+    assert result.scope["review_complete"] is False
+    validate_partition_result(result, task)
+
+
+def test_agent_review_incomparable_input_fails_without_running_agent(tmp_path):
+    from review_bot.application.intent_context import build_intent_task_input
+
+    original = make_intent_task()
+    snapshot = replace(original.snapshot, comparison_status="incomparable", comparison_base_sha=None)
+    task = build_intent_task_input(snapshot, original.base, original.head,
+        related_paths=original.reviewed_paths, context_paths=original.context_paths,
+        dependency_notes=original.dependency_notes)
+    runner = FakeAgentRunner(tmp_path, _intent_body(task))
+
+    result = run_agent_review(task, "intent", runner, language="en", instructions="")
+
+    assert runner.run_modes == []
+    assert result.status == "failed"
+    assert result.reason == "incomparable_input"
+    assert result.scope["review_complete"] is False
+    validate_partition_result(result, task)
+
+
 def test_intent_empty_assessment_perspective_is_completed_and_omitted_from_comment(tmp_path):
     task = make_intent_task()
     body = _intent_body(task)
@@ -683,6 +723,36 @@ def test_agent_revision_withdraws_and_revises_intent_assessments_by_original_id(
     assert entries["perspectives:0:1"]["accepted"]["statement"] == (
         "The revised original second assessment.")
     assert runner.verify_claim_ids[-1] == ["perspectives:0:1"]
+    validate_partition_result(result, task)
+
+
+def test_agent_revision_withdrawing_last_intent_assessment_marks_result_partial(tmp_path):
+    task = make_intent_task()
+    body = _intent_body(task)
+    for perspective in body["perspectives"][1:]:
+        perspective["assessments"] = []
+    runner = FakeAgentRunner(tmp_path, body)
+    runner.verify_outputs = [lambda _request, claims: {"items": {
+        claim["id"]: {
+                field: {
+                "state": "contradicted" if claim["id"] != "summary" else "supported",
+                "reason": "Recheck this assessment.",
+                "citations": claim["cited"] if str(text).strip() else [],
+            }
+            for field, text in claim["fields"].items()
+        }
+        for claim in claims
+    }}]
+    runner.revision_output = {"items": {"perspectives:0:0": {"action": "withdraw"}}}
+
+    result = run_agent_review(task, "intent", runner, language="en", instructions="")
+
+    assert runner.revision_rows_seen == ["perspectives:0:0"]
+    assert runner.finished
+    assert result.status == "partial_review"
+    assert result.reason == "agent_perspectives_incomplete"
+    assert result.partition["final"]["missing_context"].count("agent_perspectives_incomplete") == 1
+    assert not any(perspective["assessments"] for perspective in result.perspectives)
     validate_partition_result(result, task)
 
 
@@ -1069,7 +1139,7 @@ def test_json_parse_diagnostic_is_sent_in_repair_message(tmp_path):
     ("unknown_path", "agent_citation_unknown_path"),
     ("unknown_target", "agent_finding_unknown_target"),
     ("bad_enum", "agent_finding_invalid_verdict"),
-    ("no_citations", "agent_item_citations_missing"),
+    ("no_citations", "agent_concern_head_citation_missing"),
 ])
 def test_invalid_agent_finding_is_rejected_with_reason(tmp_path, mutation, reason):
     task = _pmd_partition_task()
@@ -1093,6 +1163,67 @@ def test_invalid_agent_finding_is_rejected_with_reason(tmp_path, mutation, reaso
     assert result.partition["agent"]["rejected"][0]["reason"] == reason
     markdown = format_partition_review_markdown(result, task, publication_mode="comment")
     assert "Rejected items: 1" in markdown and reason in markdown
+    validate_partition_result(result, task)
+
+
+def test_architecture_concern_requires_head_code_citation(tmp_path):
+    task = _pmd_partition_task()
+    originals, _meta = prepare_originals(task, "architecture")
+    base = next(item for item in originals if item.path == "src/A.java" and item.version == "base")
+    quote = next(line for line in base.text.splitlines() if line.strip())
+    body = _architecture_body(task)
+    body["findings"][0]["failure_condition"] = ""
+    body["findings"][0]["citations"] = [{
+        "path": base.path, "version": "base", "quote": quote,
+    }]
+
+    result = _run(task, "architecture", tmp_path, body)
+
+    assert result.partition["agent"]["rejected"][0]["reason"] == "agent_concern_head_citation_missing"
+    validate_partition_result(result, task)
+
+
+def test_architecture_concern_accepts_head_citation_without_failure_condition(tmp_path):
+    task = _pmd_partition_task()
+    body = _architecture_body(task)
+    body["findings"][0]["failure_condition"] = ""
+
+    result = _run(task, "architecture", tmp_path, body)
+
+    assert result.findings[0]["verdict"] == "concern"
+    assert result.findings[0]["failure_condition"] == ""
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("verdict", ["concern", "conditional_risk"])
+def test_intent_concern_requires_and_accepts_head_code_citation(tmp_path, verdict):
+    task = make_intent_task()
+    body = _intent_body(task)
+    assessment = body["perspectives"][0]["assessments"][0]
+    assessment["verdict"] = verdict
+    assessment["failure_condition"] = ""
+
+    result = _run(task, "intent", tmp_path, body)
+
+    assert result.perspectives[0]["assessments"][0]["verdict"] == verdict
+    assert result.perspectives[0]["assessments"][0]["failure_condition"] == ""
+    validate_partition_result(result, task)
+
+
+def test_intent_concern_with_base_only_citation_is_rejected(tmp_path):
+    task = make_intent_task()
+    originals, _meta = prepare_originals(task, "intent")
+    base = next(item for item in originals if item.path == "src/value.py" and item.version == "base")
+    quote = next(line for line in base.text.splitlines() if line.strip())
+    body = _intent_body(task)
+    assessment = body["perspectives"][0]["assessments"][0]
+    assessment["verdict"] = "concern"
+    assessment["failure_condition"] = ""
+    assessment["citations"] = [{"path": base.path, "version": "base", "quote": quote}]
+
+    result = _run(task, "intent", tmp_path, body)
+
+    assert result.partition["agent"]["rejected"][0]["reason"] == "agent_concern_head_citation_missing"
     validate_partition_result(result, task)
 
 
@@ -1190,7 +1321,7 @@ def test_intent_concern_without_citation_is_rejected_and_cannot_complete_missing
     result = _run(task, "intent", tmp_path, body)
 
     assert result.status == "partial_review"
-    assert result.partition["agent"]["rejected"][0]["reason"] == "agent_item_citations_missing"
+    assert result.partition["agent"]["rejected"][0]["reason"] == "agent_concern_head_citation_missing"
     validate_partition_result(result, task)
 
 
@@ -1204,7 +1335,7 @@ def test_intent_rejected_assessment_does_not_downgrade_complete_perspectives(tmp
 
     assert result.status == "completed"
     assert result.reason == "agent_items_rejected"
-    assert result.partition["agent"]["rejected"][0]["reason"] == "agent_item_citations_missing"
+    assert result.partition["agent"]["rejected"][0]["reason"] == "agent_concern_head_citation_missing"
     validate_partition_result(result, task)
 
 
