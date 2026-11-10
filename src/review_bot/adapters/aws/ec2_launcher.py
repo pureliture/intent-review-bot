@@ -57,6 +57,10 @@ class Ec2VmLauncher:
             {"Name": f"tag:{self.tag_prefix}:job-id", "Values": ["*"]},
             {"Name": "instance-state-name", "Values": ["pending", "running"]},
         ]
+        filters.extend(
+            {"Name": f"tag:{key}", "Values": [self.instance_tags[key]]}
+            for key in sorted(self.instance_tags)
+        )
         token = None
         while True:
             request = {"Filters": filters}

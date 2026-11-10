@@ -207,6 +207,27 @@ def test_ec2_managed_instance_listing_paginates():
     }
 
 
+def test_ec2_managed_instance_listing_filters_deployment_tags():
+    class Client:
+        def __init__(self):
+            self.filters = None
+
+        def describe_instances(self, **kwargs):
+            self.filters = kwargs["Filters"]
+            return {"Reservations": []}
+
+    client = Client()
+    launcher = Ec2VmLauncher(client, "lt-id", instance_tags={
+        "team": "review-bot", "review-bot:job-table": "review-bot-prod",
+    })
+
+    assert launcher.list_managed_instances() == []
+    assert client.filters[-2:] == [
+        {"Name": "tag:review-bot:job-table", "Values": ["review-bot-prod"]},
+        {"Name": "tag:team", "Values": ["review-bot"]},
+    ]
+
+
 def test_ec2_launcher_adds_bootstrap_tags_without_overriding_job_tags(aws):
     coordinator, ec2, _ = aws
     launcher = Ec2VmLauncher(
