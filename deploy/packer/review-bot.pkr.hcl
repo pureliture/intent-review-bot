@@ -85,6 +85,7 @@ source "amazon-ebs" "review_bot" {
 }
 
 source "lxd" "review_bot" {
+  container_name  = "packer-review-bot"
   image           = var.lxd_source_image
   output_image    = var.lxd_output_image
   profile         = var.lxd_profile
