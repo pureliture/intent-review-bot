@@ -51,6 +51,12 @@ variable "lxd_output_image" {
   default = "review-bot-worker"
 }
 
+# Seconds to wait after the build VM starts: file/exec provisioners fail until lxd-agent runs (~20s).
+variable "lxd_init_sleep_seconds" {
+  type    = string
+  default = "90"
+}
+
 variable "lxd_profile" {
   type    = string
   default = "review-bot-worker"
@@ -86,6 +92,7 @@ source "amazon-ebs" "review_bot" {
 
 source "lxd" "review_bot" {
   container_name  = "packer-review-bot"
+  init_sleep      = var.lxd_init_sleep_seconds
   image           = var.lxd_source_image
   output_image    = var.lxd_output_image
   profile         = var.lxd_profile
