@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import tempfile
 import time
@@ -656,6 +657,33 @@ def _write_verifier_workspace(workspace: Path, claims: list[dict], meta: dict, i
         _contract("verify", meta, _SKILLS["verify"], instructions).encode("utf-8"))
 
 
+def _verifier_workspace(workspace: Path) -> tuple[Path, tempfile.TemporaryDirectory]:
+    temporary = tempfile.TemporaryDirectory(
+        prefix=f"{workspace.name}-verifier-", dir=workspace.parent)
+    root = Path(temporary.name)
+    try:
+        os.chmod(root, 0o755)
+        for name in ("head", "base"):
+            source, destination = workspace / name, root / name
+            if source.is_dir():
+                try:
+                    shutil.copytree(source, destination, copy_function=os.link)
+                except OSError:
+                    shutil.rmtree(destination, ignore_errors=True)
+                    shutil.copytree(source, destination, copy_function=shutil.copy2)
+            else:
+                destination.mkdir()
+        source, destination = workspace / "PR.md", root / "PR.md"
+        try:
+            os.link(source, destination)
+        except OSError:
+            shutil.copy2(source, destination)
+    except BaseException:
+        temporary.cleanup()
+        raise
+    return root, temporary
+
+
 def _verifier_citation(raw: Any, originals: list[SourceOriginal], delivered_spans: list) -> dict[str, Any]:
     if not isinstance(raw, dict) or set(raw) != {"path", "version", "quote"}:
         raise PartitionError("verifier_citation_unbound")
@@ -879,35 +907,39 @@ def _decode_json_file(path: Path | None) -> dict:
 
 def _run_verifier(runner, workspace: Path, claims: list[dict], meta: dict, instructions: str,
     originals: list[SourceOriginal], model: str, timeout: int, language: str) -> tuple[dict, list, dict]:
-    _write_verifier_workspace(workspace, claims, meta, instructions)
-    request = AgentRunRequest("verify", workspace, _SKILLS["verify"], model, timeout)
-    response = runner.run(request)
-    if not isinstance(response, AgentRunResponse) or response.exit_status != 0 or not response.session_id:
-        raise AgentRunError("verifier_run_failed")
-    session_id = response.session_id
-    verify_spans = [make_span(item, 0, len(item.raw), "agent_verify") for item in originals]
+    verifier_workspace, temporary = _verifier_workspace(workspace)
     try:
+        _write_verifier_workspace(verifier_workspace, claims, meta, instructions)
+        request = AgentRunRequest("verify", verifier_workspace, _SKILLS["verify"], model, timeout)
+        response = runner.run(request)
+        if not isinstance(response, AgentRunResponse) or response.exit_status != 0 or not response.session_id:
+            raise AgentRunError("verifier_run_failed")
+        session_id = response.session_id
+        verify_spans = [make_span(item, 0, len(item.raw), "agent_verify") for item in originals]
         try:
-            body = _decode_output(response.output_path, "verify")
-            verdicts, issues = _validate_verifier_output(body, claims, originals, verify_spans)
-        except (AgentOutputError, ValueError, TypeError, json.JSONDecodeError):
-            repaired = runner.repair(request, session_id,
-                "Verifier output was invalid. Rewrite /out/result.json with exact row and field coverage, "
-                "run node /skills/check_output.mjs until it prints OK, and reply DONE.")
-            if (not isinstance(repaired, AgentRunResponse) or repaired.exit_status != 0
-                    or repaired.session_id not in (None, session_id)):
-                raise AgentRunError("verifier_repair_failed")
             try:
-                body = _decode_output(repaired.output_path, "verify")
+                body = _decode_output(response.output_path, "verify")
                 verdicts, issues = _validate_verifier_output(body, claims, originals, verify_spans)
             except (AgentOutputError, ValueError, TypeError, json.JSONDecodeError):
-                verdicts, issues = _all_unverified(claims, "verifier_output_invalid"), []
+                repaired = runner.repair(request, session_id,
+                    "Verifier output was invalid. Rewrite /out/result.json with exact row and field coverage, "
+                    "run node /skills/check_output.mjs until it prints OK, and reply DONE.")
+                if (not isinstance(repaired, AgentRunResponse) or repaired.exit_status != 0
+                        or repaired.session_id not in (None, session_id)):
+                    raise AgentRunError("verifier_repair_failed")
+                try:
+                    body = _decode_output(repaired.output_path, "verify")
+                    verdicts, issues = _validate_verifier_output(body, claims, originals, verify_spans)
+                except (AgentOutputError, ValueError, TypeError, json.JSONDecodeError):
+                    verdicts, issues = _all_unverified(claims, "verifier_output_invalid"), []
+        finally:
+            finalization = runner.finish(session_id)
+        session = _store_session(finalization.session_jsonl,
+            getattr(runner, "session_store_dir", Path.home() / ".local/share/review-bot/agent-sessions"))
+        return verdicts, issues, {"role": "verify", "session": session, "usage": finalization.usage,
+            "duration_ms": 0}
     finally:
-        finalization = runner.finish(session_id)
-    session = _store_session(finalization.session_jsonl,
-        getattr(runner, "session_store_dir", Path.home() / ".local/share/review-bot/agent-sessions"))
-    return verdicts, issues, {"role": "verify", "session": session, "usage": finalization.usage,
-        "duration_ms": 0}
+        temporary.cleanup()
 
 
 def _apply_agent_fact_verification(result, mode, runner, request, session_id, workspace,
@@ -953,11 +985,33 @@ def _apply_agent_fact_verification(result, mode, runner, request, session_id, wo
             if session_id is not None and not generation_failed else [])
         if not issue_entries:
             break
+        expected_row_ids = [entry["item_id"] for entry in issue_entries]
+        _write_workspace_file(workspace, "revision_rows.json",
+            json.dumps(expected_row_ids, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+        generation_contract = _contract_json(mode, meta)
+        if mode == "architecture":
+            item_shapes = {"findings": generation_contract["required_keys"]["finding"]}
+        else:
+            item_shapes = {
+                "questions": "a non-empty string",
+                "perspectives": generation_contract["required_keys"]["assessment"],
+            }
+        item_shapes["summary"] = {"summary": "...", "summary_citations": [
+            {"path": "...", "version": "head or base", "quote": "..."}]}
         message = "Verifier findings for rows requiring revision:\n" + json.dumps({
             entry["item_id"]: entry["attempts"][-1]["verdicts"] for entry in issue_entries},
             ensure_ascii=False, sort_keys=True) + (
-            "\nWrite /out/revision.json with one action per listed row: revise with the corrected "
-            "generation-contract item, or withdraw. The summary may only be revised. Reply DONE.")
+            "\nWrite /out/revision.json with exactly this shape: "
+            "{\"items\":{\"<row_id>\":{\"action\":\"revise\",\"item\":<full replacement item>}"
+            " | {\"action\":\"withdraw\"}}}. The items keys must exactly match these row IDs: "
+            + json.dumps(expected_row_ids, ensure_ascii=False) +
+            ". A revise action has exactly the keys action and item; a withdraw action has exactly "
+            "the key action. Replacement item shapes are " +
+            json.dumps(item_shapes, ensure_ascii=False, sort_keys=True) +
+            ". Summary revisions must contain exactly summary and summary_citations and summary "
+            "cannot be withdrawn. The host has written the expected row IDs to "
+            "/workspace/revision_rows.json. Run node /skills/check_output.mjs --revision until it "
+            "prints OK, then reply DONE.")
         try:
             revised_response = runner.repair(request, session_id, message)
         except AgentRunError as error:

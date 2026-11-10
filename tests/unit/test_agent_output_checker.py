@@ -15,7 +15,8 @@ CHECKER = Path(__file__).resolve().parents[2] / "deploy" / "agent-sandbox" / "ch
 pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
 
 
-def _run_checker(tmp_path, mode, result, source=b"void run() {}", *, claims=None, pr_text=None):
+def _run_checker(tmp_path, mode, result, source=b"void run() {}", *, claims=None, pr_text=None,
+    revision_rows=None):
     workspace = tmp_path / "workspace"
     output = tmp_path / "out"
     (workspace / "head" / "src").mkdir(parents=True, exist_ok=True)
@@ -29,18 +30,24 @@ def _run_checker(tmp_path, mode, result, source=b"void run() {}", *, claims=None
         (workspace / "claims.json").write_text(json.dumps({"claims": claims or [{
             "id": "summary", "kind": "summary", "fields": {"text": "Review."}, "cited": [],
         }]}), encoding="utf-8")
+    if revision_rows is not None:
+        (workspace / "revision_rows.json").write_text(json.dumps(revision_rows), encoding="utf-8")
     contract = _contract_json(mode, {"targets": ["target-1"]})
     (workspace / "contract.json").write_text(json.dumps(contract), encoding="utf-8")
     if isinstance(result, bytes):
-        (output / "result.json").write_bytes(result)
+        (output / ("revision.json" if revision_rows is not None else "result.json")).write_bytes(result)
     else:
-        (output / "result.json").write_text(json.dumps(result), encoding="utf-8")
+        filename = "revision.json" if revision_rows is not None else "result.json"
+        (output / filename).write_text(json.dumps(result), encoding="utf-8")
     env = {
         **os.environ,
         "REVIEW_BOT_WORKSPACE_DIR": str(workspace),
         "REVIEW_BOT_OUTPUT_DIR": str(output),
     }
-    return subprocess.run(["node", str(CHECKER)], capture_output=True, text=True,
+    command = ["node", str(CHECKER)]
+    if revision_rows is not None:
+        command.append("--revision")
+    return subprocess.run(command, capture_output=True, text=True,
         env=env, timeout=10, check=False)
 
 
@@ -264,3 +271,79 @@ def test_checker_verify_allows_pr_text_context_and_rejects_wrong_path(tmp_path):
     }, pr_text="Changed behavior.")
     assert invalid.returncode == 1
     assert "/items/summary/text/citations/0/path: agent_verify_citation_source_invalid" in invalid.stdout
+
+
+def test_checker_revision_accepts_generation_contract_item(tmp_path):
+    result = _run_checker(tmp_path, "architecture", {
+        "items": {"findings:0": {"action": "revise", "item": _finding(target_ids=["target-1"])}},
+    }, revision_rows=["findings:0"])
+
+    assert result.returncode == 0
+    assert result.stdout == "OK\n"
+
+
+def test_checker_revision_accepts_intent_rows_and_summary_shape(tmp_path):
+    result = _run_checker(tmp_path, "intent", {
+        "items": {
+            "summary": {"action": "revise", "item": {
+                "summary": "Reviewed intent.", "summary_citations": _summary_citations()}},
+            "questions:0": {"action": "revise", "item": "Clarify the required behavior."},
+            "perspectives:2:0": {"action": "revise", "item": {
+                "verdict": "aligned", "statement": "The change matches the purpose.",
+                "reasoning": "The implementation supports the stated requirement.",
+                "failure_condition": "", "citations": _summary_citations()}},
+        },
+    }, revision_rows=["summary", "questions:0", "perspectives:2:0"])
+
+    assert result.returncode == 0
+    assert result.stdout == "OK\n"
+
+
+def test_checker_revision_rejects_wrong_envelope(tmp_path):
+    result = _run_checker(tmp_path, "architecture", {"actions": []}, revision_rows=["findings:0"])
+
+    assert result.returncode == 1
+    assert "agent_output_keys_invalid" in result.stdout
+
+
+@pytest.mark.parametrize("items", [
+    {},
+    {
+        "findings:0": {"action": "withdraw"},
+        "findings:1": {"action": "withdraw"},
+    },
+])
+def test_checker_revision_requires_exact_row_ids(tmp_path, items):
+    result = _run_checker(tmp_path, "architecture", {"items": items},
+        revision_rows=["findings:0"])
+
+    assert result.returncode == 1
+    assert "/items: agent_revision_row_coverage_invalid" in result.stdout
+
+
+def test_checker_revision_rejects_bad_action(tmp_path):
+    result = _run_checker(tmp_path, "architecture", {
+        "items": {"findings:0": {"action": "dismiss"}},
+    }, revision_rows=["findings:0"])
+
+    assert result.returncode == 1
+    assert "/items/findings:0/action: agent_revision_action_invalid" in result.stdout
+
+
+def test_checker_revision_validates_replacement_citations(tmp_path):
+    finding = _finding(target_ids=["target-1"], quote="not in source")
+    result = _run_checker(tmp_path, "architecture", {
+        "items": {"findings:0": {"action": "revise", "item": finding}},
+    }, revision_rows=["findings:0"])
+
+    assert result.returncode == 1
+    assert "/items/findings:0/item/citations/0/quote: agent_output_quote_absent" in result.stdout
+
+
+def test_checker_revision_rejects_summary_withdrawal(tmp_path):
+    result = _run_checker(tmp_path, "architecture", {
+        "items": {"summary": {"action": "withdraw"}},
+    }, revision_rows=["summary"])
+
+    assert result.returncode == 1
+    assert "/items/summary: agent_revision_summary_withdrawal_invalid" in result.stdout

@@ -175,6 +175,45 @@ function checkSummaryCitations(result, contract) {
   return true;
 }
 
+function checkFinding(finding, at, contract, seen) {
+  if (!exactKeys(finding, contract.required_keys.finding, at)) return;
+  for (const key of ["statement", "reasoning"]) nonemptyString(finding[key], [...at, key]);
+  nonemptyString(finding.failure_condition, [...at, "failure_condition"], true);
+  if (!contract.enums.verdict.includes(finding.verdict)) {
+    error([...at, "verdict"], "agent_output_enum_invalid");
+  }
+  if (!contract.enums.basis.includes(finding.basis)) {
+    error([...at, "basis"], "agent_output_enum_invalid");
+  }
+  if (!Array.isArray(finding.target_ids)) {
+    error([...at, "target_ids"], "agent_output_targets_invalid");
+  } else if (finding.target_ids.length > contract.max_items.target_ids_per_finding
+      || finding.target_ids.some((target) => !contract.allowed_target_ids.includes(target))
+      || new Set(finding.target_ids).size !== finding.target_ids.length
+      || (finding.target_ids.length === 0
+        && finding.basis !== contract.citation_rules.empty_target_ids_basis)) {
+    error([...at, "target_ids"], "agent_output_targets_invalid");
+  }
+  checkCitations(finding.citations, [...at, "citations"], contract, false);
+  const identity = stable({ statement: finding.statement, citations: finding.citations });
+  if (seen.has(identity)) error(at, "agent_output_duplicate");
+  seen.add(identity);
+}
+
+function checkAssessment(assessment, at, contract, seen) {
+  if (!exactKeys(assessment, contract.required_keys.assessment, at)) return;
+  if (!contract.enums.verdict.includes(assessment.verdict)) {
+    error([...at, "verdict"], "agent_output_enum_invalid");
+  }
+  for (const key of ["statement", "reasoning"]) nonemptyString(assessment[key], [...at, key]);
+  nonemptyString(assessment.failure_condition, [...at, "failure_condition"], true);
+  const allowEmpty = assessment.verdict === contract.citation_rules.empty_citations_verdict;
+  checkCitations(assessment.citations, [...at, "citations"], contract, allowEmpty);
+  const identity = stable({ statement: assessment.statement, citations: assessment.citations });
+  if (seen.has(identity)) error(at, "agent_output_duplicate");
+  seen.add(identity);
+}
+
 function checkArchitecture(result, contract) {
   if (!checkSummaryCitations(result, contract)) return;
   if (!exactKeys(result, contract.required_keys.envelope, [])) return;
@@ -187,33 +226,8 @@ function checkArchitecture(result, contract) {
     error(["findings"], "agent_output_too_many_items");
   }
   const seen = new Set();
-  result.findings.forEach((finding, index) => {
-    const at = ["findings", index];
-    if (!exactKeys(finding, contract.required_keys.finding, at)) return;
-    for (const key of ["statement", "reasoning"]) nonemptyString(finding[key], [...at, key]);
-    nonemptyString(finding.failure_condition, [...at, "failure_condition"], true);
-    if (!contract.enums.verdict.includes(finding.verdict)) {
-      error([...at, "verdict"], "agent_output_enum_invalid");
-    }
-    if (!contract.enums.basis.includes(finding.basis)) {
-      error([...at, "basis"], "agent_output_enum_invalid");
-    }
-    if (!Array.isArray(finding.target_ids)) {
-      error([...at, "target_ids"], "agent_output_targets_invalid");
-    } else {
-      if (finding.target_ids.length > contract.max_items.target_ids_per_finding
-          || finding.target_ids.some((target) => !contract.allowed_target_ids.includes(target))
-          || new Set(finding.target_ids).size !== finding.target_ids.length
-          || (finding.target_ids.length === 0
-            && finding.basis !== contract.citation_rules.empty_target_ids_basis)) {
-        error([...at, "target_ids"], "agent_output_targets_invalid");
-      }
-    }
-    checkCitations(finding.citations, [...at, "citations"], contract, false);
-    const identity = stable({ statement: finding.statement, citations: finding.citations });
-    if (seen.has(identity)) error(at, "agent_output_duplicate");
-    seen.add(identity);
-  });
+  result.findings.forEach((finding, index) =>
+    checkFinding(finding, ["findings", index], contract, seen));
 }
 
 function checkIntent(result, contract) {
@@ -251,18 +265,7 @@ function checkIntent(result, contract) {
       return;
     }
     perspective.assessments.forEach((assessment, assessmentIndex) => {
-      const itemAt = [...at, "assessments", assessmentIndex];
-      if (!exactKeys(assessment, contract.required_keys.assessment, itemAt)) return;
-      if (!contract.enums.verdict.includes(assessment.verdict)) {
-        error([...itemAt, "verdict"], "agent_output_enum_invalid");
-      }
-      for (const key of ["statement", "reasoning"]) nonemptyString(assessment[key], [...itemAt, key]);
-      nonemptyString(assessment.failure_condition, [...itemAt, "failure_condition"], true);
-      const allowEmpty = assessment.verdict === contract.citation_rules.empty_citations_verdict;
-      checkCitations(assessment.citations, [...itemAt, "citations"], contract, allowEmpty);
-      const identity = stable({ statement: assessment.statement, citations: assessment.citations });
-      if (seenItems.has(identity)) error(itemAt, "agent_output_duplicate");
-      seenItems.add(identity);
+      checkAssessment(assessment, [...at, "assessments", assessmentIndex], contract, seenItems);
     });
   });
 }
@@ -370,12 +373,75 @@ function checkVerify(result, contract) {
   }
 }
 
+function checkRevisionItem(rowId, item, contract) {
+  const at = ["items", rowId, "item"];
+  if (rowId === "summary") {
+    if (!exactKeys(item, ["summary", "summary_citations"], at)) return;
+    nonemptyString(item.summary, [...at, "summary"]);
+    checkSummaryCitations({ summary_citations: item.summary_citations }, contract);
+  } else if (contract.mode === "architecture" && /^findings:\d+$/.test(rowId)) {
+    checkFinding(item, at, contract, new Set());
+  } else if (contract.mode === "intent" && /^questions:\d+$/.test(rowId)) {
+    nonemptyString(item, at);
+  } else if (contract.mode === "intent" && /^perspectives:\d+:\d+$/.test(rowId)) {
+    checkAssessment(item, at, contract, new Set());
+  } else {
+    error(["items", rowId], "agent_revision_row_id_invalid");
+  }
+}
+
+function checkRevision(result, contract) {
+  if (!["architecture", "intent"].includes(contract.mode)) {
+    error(["workspace", "contract.json", "mode"], "agent_revision_contract_invalid");
+    return;
+  }
+  let expectedRows;
+  try {
+    expectedRows = JSON.parse(fs.readFileSync(path.join(workspace, "revision_rows.json"), "utf8"));
+  } catch {
+    error(["workspace", "revision_rows.json"], "agent_revision_rows_invalid");
+    return;
+  }
+  if (!Array.isArray(expectedRows) || expectedRows.some((row) => typeof row !== "string")
+      || new Set(expectedRows).size !== expectedRows.length) {
+    error(["workspace", "revision_rows.json"], "agent_revision_rows_invalid");
+    return;
+  }
+  if (!exactKeys(result, ["items"], [])) return;
+  if (!object(result.items)) {
+    error(["items"], "agent_revision_items_invalid");
+    return;
+  }
+  const actualRows = Object.keys(result.items).sort();
+  if (JSON.stringify(actualRows) !== JSON.stringify([...expectedRows].sort())) {
+    error(["items"], "agent_revision_row_coverage_invalid");
+  }
+  for (const rowId of expectedRows) {
+    const at = ["items", rowId];
+    const action = result.items[rowId];
+    if (!object(action) || typeof action.action !== "string") {
+      error(at, "agent_revision_action_invalid");
+      continue;
+    }
+    if (action.action === "withdraw") {
+      if (!exactKeys(action, ["action"], at)) continue;
+      if (rowId === "summary") error(at, "agent_revision_summary_withdrawal_invalid");
+    } else if (action.action === "revise") {
+      if (!exactKeys(action, ["action", "item"], at)) continue;
+      checkRevisionItem(rowId, action.item, contract);
+    } else {
+      error([...at, "action"], "agent_revision_action_invalid");
+    }
+  }
+}
+
 function claimFieldText(expectedRows, claims, id, field) {
   const claim = claims.claims.find((candidate) => candidate.id === id);
   return claim?.fields?.[field];
 }
 
 function main() {
+  const revisionMode = process.argv.includes("--revision");
   let contract;
   try {
     contract = JSON.parse(fs.readFileSync(path.join(workspace, "contract.json"), "utf8"));
@@ -389,10 +455,11 @@ function main() {
     error(["workspace", "contract.json"], "agent_contract_invalid");
     return;
   }
-  const result = readJson(path.join(output, "result.json"), [],
+  const result = readJson(path.join(output, revisionMode ? "revision.json" : "result.json"), [],
     "agent_output_missing", "agent_output_unreadable", contract.max_output_bytes);
   if (result !== null) {
-    if (contract.mode === "architecture") checkArchitecture(result, contract);
+    if (revisionMode) checkRevision(result, contract);
+    else if (contract.mode === "architecture") checkArchitecture(result, contract);
     else if (contract.mode === "intent") checkIntent(result, contract);
     else checkVerify(result, contract);
   }
