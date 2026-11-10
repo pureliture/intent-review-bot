@@ -317,6 +317,7 @@ class AgentEngineConfig(BaseModel):
     provider: Literal["openrouter", "opencode-go"] = "openrouter"
     model_id: str = Field(default="stealth/crouton-alpha", min_length=1, max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/-]*$")
+    parallel_modes: bool = True
     timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
     max_proxy_calls: int = Field(ge=1, le=512, default=40)
     max_output_tokens: int | None = Field(default=None, ge=1, le=32768)
@@ -454,6 +455,11 @@ class TargetRepositoryConfig(BaseModel):
 def compute_config_hash(data: dict[str, Any] | BaseModel) -> str:
     """Computes a deterministic SHA-256 digest over normalized canonical JSON."""
     raw_dict = data.model_dump(mode="json") if isinstance(data, BaseModel) else data
+    agent_engine = raw_dict.get("agent_engine")
+    if isinstance(agent_engine, dict) and "parallel_modes" in agent_engine:
+        raw_dict = {**raw_dict, "agent_engine": {
+            key: value for key, value in agent_engine.items() if key != "parallel_modes"
+        }}
     if isinstance(raw_dict.get("partition_evaluation"), dict) and not raw_dict["partition_evaluation"].get("enabled"):
         raw_dict = {key: value for key, value in raw_dict.items() if key != "partition_evaluation"}
     if isinstance(raw_dict.get("intent"), dict) and raw_dict["intent"].get("pipeline") == "declared-v1":

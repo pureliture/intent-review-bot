@@ -44,6 +44,7 @@ def test_agent_engine_config_is_opt_in_and_strict(valid_config_yaml: str) -> Non
     assert config.agent_engine.context_window_tokens is None
     assert config.agent_engine.max_output_tokens is None
     assert config.agent_engine.timeout_seconds is None
+    assert config.agent_engine.parallel_modes is True
 
     enabled = valid_config_yaml.replace("schema_version: 2", "schema_version: 2\nreview_engine: agent", 1)
     config, _ = load_review_config_from_str(enabled)
@@ -243,6 +244,16 @@ def test_config_hash_invariance(valid_config_yaml: str) -> None:
     _cfg2, hash2 = load_review_config_from_str(reversed_yaml)
 
     assert hash1 == hash2 == EXPECTED_EXAMPLE_HASH
+
+
+def test_agent_parallel_modes_does_not_change_config_hash(valid_config_yaml: str) -> None:
+    agent_yaml = valid_config_yaml.replace("schema_version: 2", "schema_version: 2\nreview_engine: agent", 1)
+    config, _ = load_review_config_from_str(agent_yaml)
+    serial_config = config.model_copy(update={
+        "agent_engine": config.agent_engine.model_copy(update={"parallel_modes": False}),
+    })
+
+    assert config.config_hash == serial_config.config_hash
 
 
 def test_active_environment_validation(valid_config_yaml: str) -> None:

@@ -17,11 +17,13 @@ from review_bot.application.agent_review import (
     _initial_agent_prompt,
     _verifier_claims,
     _validate_verifier_output,
+    agent_review_generation_key,
     run_agent_review,
 )
 from review_bot.application.context import hash_json
 from review_bot.application.partition_review import PERSPECTIVE_IDS, prepare_originals, validate_partition_result
 from review_bot.application.source_partition import PartitionError, SourceOriginal, make_span
+from review_bot.config import load_review_config_from_str
 from review_bot.ports import AgentRunError, AgentRunFinalization, AgentRunResponse
 from tests.fixtures.intent_perspectives import make_task as make_intent_task
 from tests.unit.test_partition_review import _pmd_partition_task
@@ -253,6 +255,18 @@ def test_agent_verifier_claims_exclude_failure_conditions(mode):
     assert summary["fields"] == {"text": final["summary"]}
     assert rows
     assert all(set(claim["fields"]) == {"statement", "reasoning"} for claim in rows)
+
+
+def test_agent_generation_key_ignores_parallel_mode_scheduling(valid_config_yaml):
+    config, _ = load_review_config_from_str(
+        valid_config_yaml.replace("schema_version: 2", "schema_version: 2\nreview_engine: agent", 1))
+    task = SimpleNamespace(input_hash="1" * 64)
+
+    parallel_key = agent_review_generation_key(task, "architecture", config, language="en", instructions="")
+    config.agent_engine.parallel_modes = False
+    serial_key = agent_review_generation_key(task, "architecture", config, language="en", instructions="")
+
+    assert parallel_key == serial_key
 
 
 def test_agent_architecture_result_validates_formats_with_exact_citations_and_trace(tmp_path):
