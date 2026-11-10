@@ -6,10 +6,12 @@ import hmac
 import json
 import sqlite3
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -24,15 +26,58 @@ from review_bot.adapters.sqlite.store import SQLiteJobStore
 from review_bot.application.delta import build_delta
 from review_bot.application.snapshot import assemble_snapshot_bundle
 from review_bot.config import load_review_config_from_str
-from review_bot.domain.envelope_v2 import ChangedFile, PrRequestRecord, PublicationReceipt, RunRecord
+from review_bot.domain.envelope_v2 import (
+    ChangedFile,
+    ExecutionReceipt,
+    PrRequestRecord,
+    PublicationReceipt,
+    RunRecord,
+)
 from review_bot.domain.models_v1 import ModelResponse, ReviewResult, TaskInput
 from review_bot.domain.status import RunStage, RunStatus
-from review_bot.ports import GitHubClient, MergeBaseResult, ModelClient, RepositoryReader, StaticAnalyzer
+from review_bot.ports import (
+    GitHubAuthorizationError,
+    GitHubClient,
+    MergeBaseResult,
+    ModelClient,
+    RepositoryReader,
+    StaticAnalyzer,
+)
 from review_bot.runtime.webhook import create_webhook_app
-from review_bot.runtime.worker import WorkerLoop
+from review_bot.runtime.worker import WorkerLoop, _CommonFailure
 from tests.conftest import MockGitHubClient, SyntheticGitRepo
 
 SECRET = "test_webhook_secret_xyz"
+
+
+@dataclass(frozen=True)
+class _AgentModeTask:
+    input_hash: str
+
+
+class _BarrierAgentRunner:
+    def __init__(self, *, parallel: bool, fail_mode: str | None = None) -> None:
+        self.barrier = threading.Barrier(2, timeout=5) if parallel else None
+        self.fail_mode = fail_mode
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+        self.finished: list[str] = []
+
+    def run(self, mode: str) -> SimpleNamespace:
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            if self.barrier is not None:
+                self.barrier.wait()
+            if mode == self.fail_mode:
+                raise GitHubAuthorizationError("test authorization failure")
+            return SimpleNamespace(mode=mode, status="completed")
+        finally:
+            with self.lock:
+                self.active -= 1
+                self.finished.append(mode)
 
 
 @pytest.fixture(name="valid_config_yaml")
@@ -54,6 +99,37 @@ def webhook_client(tmp_path: Path, valid_config_yaml: str) -> tuple[TestClient, 
     app = create_webhook_app(config, store, secret=SECRET)
     client = TestClient(app)
     return client, store
+
+
+def test_worker_passes_run_deadline_and_optional_agent_cap(monkeypatch) -> None:
+    from review_bot.application import agent_review, partition_review
+
+    worker = WorkerLoop.__new__(WorkerLoop)
+    worker.config = SimpleNamespace(review_engine="agent", agent_engine=SimpleNamespace(
+        timeout_seconds=None, max_revisions=1))
+    worker.agent_runner = object()
+    worker._repository_settings = SimpleNamespace(bundle=SimpleNamespace(
+        instructions_for=lambda _mode: "instructions"))
+    deadlines = []
+    worker._require_active = lambda _run, deadline: deadlines.append(deadline)
+    captured = {}
+    expected_result = object()
+
+    def fake_run_agent_review(*args, **kwargs):
+        captured.update(kwargs)
+        return expected_result
+
+    monkeypatch.setattr(agent_review, "run_agent_review", fake_run_agent_review)
+    monkeypatch.setattr(partition_review, "validate_partition_result", lambda _result, _task: None)
+
+    deadline = 123.5
+    result = worker._review_partitioned(object(), "architecture", object(), deadline, "en")
+
+    assert result is expected_result
+    assert captured["deadline"] == deadline
+    assert captured["timeout_seconds"] is None
+    assert captured["max_revisions"] == 1
+    assert deadlines == [deadline, deadline]
 
 
 class TestWebhookEndpoints:
@@ -310,6 +386,21 @@ class TestWorkerLoopRuntime:
         worker = WorkerLoop(config, store, worker_id="test-worker", lease_duration=5.0)
 
         assert worker.claim_and_execute_once() is False
+        store.close()
+
+    def test_agent_worker_skips_openrouter_review_client_construction(
+        self, tmp_path: Path, valid_config_yaml: str, monkeypatch,
+    ) -> None:
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        config, _ = load_review_config_from_str(valid_config_yaml)
+        config.review_engine = "agent"
+        config.model.profile = "openrouter-review"
+        store = SQLiteJobStore(tmp_path / "agent_worker.db")
+
+        worker = WorkerLoop(config, store)
+        assert worker.model_client is None
+        worker.prepare_models()
+        assert worker.model_client is None
         store.close()
 
     def test_worker_generation_fencing_aborts_stale_run(self, tmp_path: Path, valid_config_yaml: str) -> None:
@@ -745,6 +836,188 @@ def claimed_worker(
         yield store, worker, run
     finally:
         store.close()
+
+
+def _configure_agent_mode_worker(worker, tmp_path, monkeypatch, runner, *,
+        parallel_modes: bool | None = None, publish_comments: bool = True,
+        fail_after_agent_mode: str | None = None,
+        architecture_published: threading.Event | None = None) -> None:
+    config_updates = {
+        "review_engine": "agent",
+        "execution": worker.config.execution.model_copy(update={
+            "available_modes": ["architecture", "intent"],
+        }),
+        "publish": worker.config.publish.model_copy(update={
+            "mode": "comment", "b_comments_enabled": True,
+        }),
+    }
+    if parallel_modes is not None:
+        config_updates["agent_engine"] = worker.config.agent_engine.model_copy(update={
+            "parallel_modes": parallel_modes,
+        })
+    worker.config = worker.config.model_copy(update=config_updates)
+    worker.artifact_root = tmp_path / "agent-artifacts"
+    worker.agent_runner = runner
+    monkeypatch.setattr("review_bot.runtime.worker.collect_intent_sources", lambda *_args, **_kwargs:
+        SimpleNamespace(evidence=(), unavailable_sources=(),
+            captured_at="2026-10-06T12:00:00Z", as_of="2026-10-06T12:00:00Z"))
+    monkeypatch.setattr("review_bot.runtime.worker.build_intent_task_input", lambda *_args, **_kwargs:
+        _AgentModeTask("1" * 64))
+
+    from review_bot.application import agent_review, partition_review
+
+    def fake_run_agent_review(_task_input, mode, agent_runner, **_kwargs):
+        result = agent_runner.run(mode)
+        if mode == "intent" and architecture_published is not None:
+            assert architecture_published.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(agent_review, "run_agent_review", fake_run_agent_review)
+    monkeypatch.setattr(partition_review, "validate_partition_result", lambda _result, _task: None)
+
+    def receipt(mode, run, review_snap, mode_sel, deadline):
+        worker._review_partitioned(_AgentModeTask("2" * 64), mode, run, deadline,
+            worker.config.output.language)
+        if mode == fail_after_agent_mode:
+            raise _CommonFailure("intent_failure")
+        body = f"{mode} review"
+        comment = worker.github_client.post_comment(run.pr_number, body) if publish_comments else None
+        if mode == "architecture" and comment is not None and architecture_published is not None:
+            architecture_published.set()
+        marker = worker.config.publish.a_marker if mode == "architecture" else worker.config.publish.b_marker
+        publication = PublicationReceipt(
+            comment["id"] if comment is not None else None,
+            "succeeded" if comment is not None else "not_attempted",
+            hashlib.sha256(body.encode()).hexdigest(),
+            marker=marker,
+            reason="" if comment is not None else "not_attempted",
+        )
+        return ExecutionReceipt(2, mode, mode_sel.selection_id, review_snap.snapshot_id,
+            run.generation, run.fingerprint, "completed", publication=publication)
+
+    monkeypatch.setattr(worker, "_execute_architecture", lambda run, review_snap, _pr_snap,
+        _classification, mode_sel, _artifacts, _title, _body, _draft, deadline:
+        receipt("architecture", run, review_snap, mode_sel, deadline))
+    monkeypatch.setattr(worker, "_execute_intent", lambda run, review_snap, mode_sel,
+        _material, _artifacts, deadline, draft=False:
+        receipt("intent", run, review_snap, mode_sel, deadline))
+
+
+def test_worker_records_incomplete_agent_review_as_failed_without_publication(
+    claimed_worker, monkeypatch,
+) -> None:
+    _store, worker, run = claimed_worker
+    worker.config = worker.config.model_copy(update={"review_engine": "agent"})
+    task = SimpleNamespace(limitations=())
+    result = SimpleNamespace(
+        status="failed", reason="incomplete_code_input", run_key="f" * 64,
+        scope={"review_complete": False}, usage={}, limitations=(),
+        model_delivery={"status": "not_attempted"},
+    )
+    review_snap = SimpleNamespace(
+        snapshot_id="a" * 64, head_sha="b" * 40, target_base_sha="c" * 40,
+    )
+    pr_snap = SimpleNamespace(head_sha="b" * 40)
+    mode_sel = SimpleNamespace(selection_id="d" * 64, selected_modes=("architecture",))
+    monkeypatch.setattr(worker, "_cached_review", lambda *_args, **_kwargs: (task, result))
+    monkeypatch.setattr(worker, "_reuse_publication", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, "_publication_input_key", lambda _mode, key: key)
+    monkeypatch.setattr(worker, "_stage", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, "_require_active", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, "_presentation_options", lambda _mode: {})
+    monkeypatch.setattr(worker, "_trace_options", lambda *_args: {})
+    monkeypatch.setattr(worker, "_settings_notice", lambda text: text)
+    monkeypatch.setattr(
+        "review_bot.adapters.markdown.partition_formatter.format_partition_review_markdown",
+        lambda *_args, **_kwargs: "incomplete review",
+    )
+    monkeypatch.setattr("review_bot.runtime.worker.publish_review_comment",
+        lambda *_args, **_kwargs: pytest.fail("incomplete input must not be published"))
+
+    receipt = worker._execute_architecture(
+        run, review_snap, pr_snap, SimpleNamespace(review_mode="normal"), mode_sel,
+        None, "", "", False, time.monotonic() + 60,
+    )
+
+    assert receipt.execution_status == "failed"
+    assert receipt.error_code == "incomplete_code_input"
+    assert receipt.publication is None
+    assert worker.github_client.posted_comments == []
+
+
+def test_worker_marks_incomplete_agent_mode_failed_and_does_not_publish_it(
+    claimed_worker, tmp_path, monkeypatch,
+) -> None:
+    store, worker, run = claimed_worker
+    runner = _BarrierAgentRunner(parallel=False)
+    _configure_agent_mode_worker(worker, tmp_path, monkeypatch, runner, parallel_modes=False)
+
+    def failed_architecture(run, review_snap, _pr_snap, _classification, mode_sel,
+            _artifacts, _title, _body, _draft, _deadline):
+        return ExecutionReceipt(2, "architecture", mode_sel.selection_id, review_snap.snapshot_id,
+            run.generation, run.fingerprint, "failed", error_code="incomplete_code_input")
+
+    monkeypatch.setattr(worker, "_execute_architecture", failed_architecture)
+
+    assert worker.process_run(run) is False
+
+    status, error = store._get_connection().execute(
+        "SELECT status, error FROM runs WHERE run_id = ?;", (run.run_id,),
+    ).fetchone()
+    assert (status, error) == ("failed", "incomplete_code_input")
+    assert {comment["body"] for comment in worker.github_client.posted_comments} == {"intent review"}
+    assert store._get_connection().execute(
+        "SELECT marker, status FROM publication_receipts WHERE run_id = ?;", (run.run_id,),
+    ).fetchall() == [(worker.config.publish.b_marker, "succeeded")]
+
+
+@pytest.mark.parametrize(("parallel_modes", "expected_max_active"), [
+    (None, 2),
+    (False, 1),
+])
+def test_agent_worker_runs_architecture_and_intent_concurrently_by_default(
+    claimed_worker, tmp_path, monkeypatch, parallel_modes, expected_max_active,
+) -> None:
+    store, worker, run = claimed_worker
+    runner = _BarrierAgentRunner(parallel=parallel_modes is not False)
+    _configure_agent_mode_worker(worker, tmp_path, monkeypatch, runner, parallel_modes=parallel_modes)
+
+    assert worker.process_run(run) is True
+
+    status, error = store._get_connection().execute(
+        "SELECT status, error FROM runs WHERE run_id = ?;", (run.run_id,),
+    ).fetchone()
+    assert (status, error) == ("succeeded", None)
+    assert runner.max_active == expected_max_active
+    assert {comment["body"] for comment in worker.github_client.posted_comments} == {
+        "architecture review", "intent review",
+    }
+
+
+@pytest.mark.parametrize("parallel_modes", [False, True])
+def test_agent_worker_parallel_mode_failure_matches_sequential_and_joins_threads(
+    claimed_worker, tmp_path, monkeypatch, parallel_modes,
+) -> None:
+    store, worker, run = claimed_worker
+    runner = _BarrierAgentRunner(parallel=parallel_modes)
+    architecture_published = threading.Event()
+    _configure_agent_mode_worker(worker, tmp_path, monkeypatch, runner,
+        parallel_modes=parallel_modes, fail_after_agent_mode="intent",
+        architecture_published=architecture_published)
+
+    assert worker.process_run(run) is False
+
+    status, error = store._get_connection().execute(
+        "SELECT status, error FROM runs WHERE run_id = ?;", (run.run_id,),
+    ).fetchone()
+    assert (status, error) == ("failed", "intent_failure")
+    assert set(runner.finished) == {"architecture", "intent"}
+    publications = store._get_connection().execute(
+        "SELECT marker, status FROM publication_receipts WHERE run_id = ?;", (run.run_id,),
+    ).fetchall()
+    assert publications == [(worker.config.publish.a_marker, "succeeded")]
+    if parallel_modes:
+        assert not any(thread.name.startswith("agent-mode") for thread in threading.enumerate())
 
 
 @pytest.fixture
@@ -1455,3 +1728,16 @@ def test_worker_terminal_write_cannot_clobber_successor(
     assert before is not None
     assert conn.execute("SELECT * FROM runs WHERE run_id = ?;", (run.run_id,)).fetchone() == before
     assert conn.execute("SELECT * FROM publication_receipts;").fetchall() == receipts_before
+
+
+def test_external_current_guard_blocks_github_publication(
+    claimed_worker: tuple[SQLiteJobStore, WorkerLoop, RunRecord],
+) -> None:
+    store, worker, run = claimed_worker
+    github = worker.github_client
+    worker.external_write_guard = lambda: False
+
+    assert worker.process_run(run) is False
+    assert github.comments == {}
+    assert github.posted_comments == []
+    assert github.updated_comments == []

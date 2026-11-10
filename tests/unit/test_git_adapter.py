@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import pytest
 
+import review_bot.adapters.git as git_adapter
 from review_bot.adapters.git import (
     CommitNotFoundError,
+    GitError,
     GitRepositoryReader,
     _fixed_sha,
     _safe_path,
@@ -88,6 +91,37 @@ def test_git_repository_reader_commit_and_blobs(synthetic_repo: SyntheticGitRepo
     assert file_by_path["test/MainTest.java"].kind == "test"
     assert file_by_path["build.gradle"].kind == "build"
     assert len(snapshot.inventory_hash) == 64
+
+
+def test_read_tree_blobs_fails_closed_when_a_listed_blob_is_missing(monkeypatch):
+    first_oid, missing_oid = "b" * 40, "c" * 40
+    entries = (
+        f"100644 blob {first_oid}\tsrc/first.java\0"
+        f"100644 blob {missing_oid}\tsrc/missing.java\0"
+    ).encode()
+    batch = f"{first_oid} blob 5\nhello\n{missing_oid} missing\n".encode()
+
+    def fake_run_git(repo_path, args, input_bytes=None, check=True, timeout=30):
+        output = entries if args[0] == "ls-tree" else batch
+        return subprocess.CompletedProcess(args, 0, output, b"")
+
+    monkeypatch.setattr(git_adapter, "_run_git", fake_run_git)
+    with pytest.raises(GitError, match="Missing Git blob for src/missing.java"):
+        read_tree_blobs("/unused", "a" * 40)
+
+
+@pytest.mark.parametrize("response", [b"malformed\n", b"b" * 40 + b" blob nope\n"])
+def test_read_tree_blobs_fails_closed_on_malformed_batch_header(monkeypatch, response):
+    oid = "b" * 40
+    listing = f"100644 blob {oid}\tsrc/file.java\0".encode()
+
+    def fake_run_git(repo_path, args, input_bytes=None, check=True, timeout=30):
+        output = listing if args[0] == "ls-tree" else response
+        return subprocess.CompletedProcess(args, 0, output, b"")
+
+    monkeypatch.setattr(git_adapter, "_run_git", fake_run_git)
+    with pytest.raises(GitError, match="Malformed cat-file response"):
+        read_tree_blobs("/unused", "a" * 40)
 
 
 def test_git_diff_and_rename_map(synthetic_repo: SyntheticGitRepo) -> None:

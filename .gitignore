@@ -50,3 +50,12 @@ secrets/
 
 # Downloaded analysis tool binaries (checksums live in tooling/tools.lock.json)
 tooling/lib/
+
+# Local Terraform plans, state, variables and build outputs
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+deploy/terraform/dist/
+packer_cache/

@@ -1,0 +1,16 @@
+[Unit]
+Description=Run one on-demand review and terminate the worker
+After=network-online.target cloud-final.service docker.service user@1001.service
+Wants=network-online.target
+Requires=docker.service user@1001.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/review-bot/bin/bootstrap
+TimeoutStartSec=infinity
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

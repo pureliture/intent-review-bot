@@ -1,0 +1,8 @@
+lambda_zip_path      = "/absolute/path/to/deploy/terraform/dist/lambda.zip"
+worker_ami_id        = "ami-REPLACE"
+worker_instance_type = "t3.large"
+vpc_id               = "vpc-REPLACE"
+subnet_id            = "subnet-REPLACE"
+
+allowed_installations = [12345678]
+allowed_repositories  = ["organization/repository"]

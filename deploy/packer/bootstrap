@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+shutdown_on_exit() {
+  status=$?
+  trap - EXIT
+  /sbin/shutdown -h now || true
+  exit "${status}"
+}
+trap shutdown_on_exit EXIT
+
+imds_token="$(curl --connect-timeout 2 --max-time 3 --fail --silent --show-error \
+  -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+  http://169.254.169.254/latest/api/token)"
+imds_get() {
+  curl --connect-timeout 2 --max-time 3 --fail --silent --show-error \
+    -H "X-aws-ec2-metadata-token: ${imds_token}" \
+    "http://169.254.169.254/latest/${1}"
+}
+
+user_data="$(imds_get user-data)"
+job_id="$(printf '%s\n' "${user_data}" | python3 -c '
+import re
+import sys
+text = sys.stdin.read()
+match = re.search(r"review-bot-ondemand --job-id ([0-9a-f]{64})", text)
+if match is None:
+    raise SystemExit("on-demand job id missing from EC2 user data")
+print(match.group(1))
+')"
+github_secret_arn="$(imds_get meta-data/tags/instance/review-bot:github-app-secret-arn)"
+openrouter_secret_arn="$(imds_get meta-data/tags/instance/review-bot:openrouter-secret-arn)"
+job_table="$(imds_get meta-data/tags/instance/review-bot:job-table)"
+region="$(imds_get meta-data/placement/region)"
+
+install -d -o root -g root -m 0700 /run/review-bot
+install -d -o root -g reviewbot -m 0750 /etc/review-bot
+install -d -o reviewbot -g reviewbot -m 0700 /var/lib/review-bot
+/opt/review-bot/venv/bin/python /opt/review-bot/bootstrap_runtime.py \
+  "${github_secret_arn}" "${openrouter_secret_arn}" "${region}"
+
+export AWS_REGION="${region}"
+export AWS_DEFAULT_REGION="${region}"
+export REVIEW_BOT_JOB_TABLE="${job_table}"
+export REVIEW_BOT_CONFIG=/etc/review-bot/operator.yaml
+export REVIEW_BOT_STATE_DIR=/var/lib/review-bot
+REVIEW_BOT_APP_ID="$(< /run/review-bot/github-app-id)"
+export REVIEW_BOT_APP_ID
+export REVIEW_BOT_APP_PRIVATE_KEY_FILE=/run/review-bot/github-app-private-key.pem
+export OPENROUTER_API_KEY_FILE=/run/review-bot/openrouter-api-key
+export DOCKER_HOST=unix:///run/user/1001/docker.sock
+export REVIEW_BOT_AGENT_DOCKER_HOST=unix:///var/run/docker.sock
+export XDG_RUNTIME_DIR=/run/user/1001
+export HOME=/home/reviewbot
+export USER=reviewbot
+export LOGNAME=reviewbot
+
+for attempt in $(seq 1 30); do
+  if docker info >/dev/null 2>&1; then
+    break
+  fi
+  if [[ "${attempt}" == 30 ]]; then
+    exit 1
+  fi
+  sleep 1
+done
+
+runuser --preserve-environment --user reviewbot -- \
+  /opt/review-bot/bin/review-bot-ondemand --job-id "${job_id}"

@@ -125,7 +125,7 @@ class ExecutionConfig(BaseModel):
     selector_policy: Literal["all_available"] = "all_available"
     selector_uses_model: bool = False
     worker_concurrency: int = Field(ge=1, le=2, default=1)
-    task_timeout_seconds: int = Field(ge=1, default=900)
+    task_timeout_seconds: int = Field(ge=1, default=3000)
     max_model_calls: int = Field(ge=1, le=512, default=256)
     max_total_tokens: int = Field(ge=1, default=8388608)
     pr_actions: list[str] = Field(
@@ -310,6 +310,37 @@ class PartitionEvaluationConfig(BaseModel):
         return self
 
 
+class AgentEngineConfig(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    image_tag: str = Field(default="review-bot-pi-agent:0.73.1", min_length=1, max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+    provider: Literal["openrouter", "opencode-go"] = "openrouter"
+    model_id: str = Field(default="stealth/crouton-alpha", min_length=1, max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/-]*$")
+    parallel_modes: bool = True
+    timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
+    max_proxy_calls: int = Field(ge=1, le=512, default=40)
+    max_output_tokens: int | None = Field(default=None, ge=1, le=32768)
+    context_window_tokens: int | None = Field(default=None, ge=1024, le=10_000_000)
+    max_revisions: int = Field(ge=0, le=3, default=1)
+    session_store_dir: str = Field(min_length=1, max_length=1024,
+        default="~/.local/share/review-bot/agent-sessions")
+
+    @field_validator("session_store_dir")
+    @classmethod
+    def validate_session_store_dir(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("session_store_dir cannot contain NUL")
+        return value
+
+    @field_validator("image_tag")
+    @classmethod
+    def validate_image_tag(cls, value: str) -> str:
+        if ":" not in value.rsplit("/", 1)[-1]:
+            raise ValueError("image_tag must include a tag")
+        return value
+
+
 class CodeInputConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
     versions: list[str] = Field(default_factory=lambda: ["comparison_base", "head"])
@@ -354,6 +385,8 @@ class ReviewBotConfig(BaseModel):
     service: ServiceConfig
     publish: PublishConfig = Field(default_factory=PublishConfig)
     model: ModelConfig
+    review_engine: Literal["partition", "agent"] = "partition"
+    agent_engine: AgentEngineConfig = Field(default_factory=AgentEngineConfig)
     architecture: ArchitectureConfig = Field(default_factory=ArchitectureConfig)
     intent: IntentConfig = Field(default_factory=IntentConfig)
     partition_evaluation: PartitionEvaluationConfig = Field(default_factory=PartitionEvaluationConfig)
@@ -372,11 +405,12 @@ class ReviewBotConfig(BaseModel):
             raise ValueError("architecture configuration is required for architecture-only execution")
         if self.execution.mode == "github_app" and "mode" not in self.publish.model_fields_set:
             self.publish.mode = "comment"
-        if self.partition_evaluation.enabled and self.publish.mode != "artifact_only" and self.execution.mode != "github_app":
+        if self.review_engine == "partition" and self.partition_evaluation.enabled and self.publish.mode != "artifact_only" and self.execution.mode != "github_app":
             raise ValueError("partition evaluation requires artifact_only publication")
-        if self.partition_evaluation.enabled and "intent" in self.execution.available_modes and self.intent.pipeline != "perspectives-v1":
+        if (self.review_engine == "partition" and self.partition_evaluation.enabled
+                and "intent" in self.execution.available_modes and self.intent.pipeline != "perspectives-v1"):
             raise ValueError("partition intent evaluation requires perspectives-v1")
-        if self.intent.pipeline == "perspectives-v1":
+        if self.review_engine == "partition" and self.intent.pipeline == "perspectives-v1":
             private_output = self.publish.mode == "artifact_only" and not self.publish.b_comments_enabled
             app_comments = (
                 self.execution.mode == "github_app" and self.execution.backend == "github_app"
@@ -421,10 +455,17 @@ class TargetRepositoryConfig(BaseModel):
 def compute_config_hash(data: dict[str, Any] | BaseModel) -> str:
     """Computes a deterministic SHA-256 digest over normalized canonical JSON."""
     raw_dict = data.model_dump(mode="json") if isinstance(data, BaseModel) else data
+    agent_engine = raw_dict.get("agent_engine")
+    if isinstance(agent_engine, dict) and "parallel_modes" in agent_engine:
+        raw_dict = {**raw_dict, "agent_engine": {
+            key: value for key, value in agent_engine.items() if key != "parallel_modes"
+        }}
     if isinstance(raw_dict.get("partition_evaluation"), dict) and not raw_dict["partition_evaluation"].get("enabled"):
         raw_dict = {key: value for key, value in raw_dict.items() if key != "partition_evaluation"}
     if isinstance(raw_dict.get("intent"), dict) and raw_dict["intent"].get("pipeline") == "declared-v1":
         raw_dict = {**raw_dict, "intent": {key: value for key, value in raw_dict["intent"].items() if key != "pipeline"}}
+    if raw_dict.get("review_engine", "partition") == "partition":
+        raw_dict = {key: value for key, value in raw_dict.items() if key not in ("review_engine", "agent_engine")}
     execution = raw_dict.get("execution")
     if (
         raw_dict.get("schema_version") == 2 and isinstance(execution, dict)
