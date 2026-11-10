@@ -4,6 +4,10 @@ packer {
       source  = "github.com/hashicorp/amazon"
       version = "= 1.3.9"
     }
+    lxd = {
+      source  = "github.com/hashicorp/lxd"
+      version = "= 1.0.3"
+    }
   }
 }
 
@@ -13,7 +17,8 @@ variable "region" {
 }
 
 variable "subnet_id" {
-  type = string
+  type    = string
+  default = null
 }
 
 variable "ssh_source_cidr" {
@@ -34,6 +39,21 @@ variable "repo_source_path" {
 variable "review_bot_wheel_dir" {
   type    = string
   default = "deploy/terraform/dist/wheel/"
+}
+
+variable "lxd_source_image" {
+  type    = string
+  default = "ubuntu:24.04"
+}
+
+variable "lxd_output_image" {
+  type    = string
+  default = "review-bot-worker"
+}
+
+variable "lxd_profile" {
+  type    = string
+  default = "review-bot-worker"
 }
 
 source "amazon-ebs" "review_bot" {
@@ -64,8 +84,20 @@ source "amazon-ebs" "review_bot" {
   }
 }
 
+source "lxd" "review_bot" {
+  image           = var.lxd_source_image
+  output_image    = var.lxd_output_image
+  profile         = var.lxd_profile
+  virtual_machine = true
+
+  launch_config = {
+    "limits.cpu"    = "4"
+    "limits.memory" = "8GiB"
+  }
+}
+
 build {
-  sources = ["source.amazon-ebs.review_bot"]
+  sources = ["source.amazon-ebs.review_bot", "source.lxd.review_bot"]
 
   provisioner "file" {
     source      = var.repo_source_path

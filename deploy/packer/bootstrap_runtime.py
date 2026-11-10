@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import json
 import os
 import pwd
+import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import boto3
+
+_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]*$")
+_DEFAULT_PROVIDER = "openrouter"
+_DEFAULT_MODEL_ID = "stealth/crouton-alpha"
 
 
 def write_private(path: Path, value: str) -> None:
@@ -26,28 +34,41 @@ def secret(client, secret_arn: str) -> str:
     return value
 
 
-def main() -> None:
-    github_arn, openrouter_arn, region = sys.argv[1:4]
-    client = boto3.client("secretsmanager", region_name=region)
-    github_credentials = json.loads(secret(client, github_arn))
-    app_id = str(github_credentials["app_id"])
-    private_key = github_credentials["private_key"]
-    if not app_id or not isinstance(private_key, str) or not private_key:
-        raise ValueError("GitHub App secret must contain app_id and private_key")
-    openrouter_key = secret(client, openrouter_arn)
+def agent_settings_from_environment(
+    environ: Mapping[str, str],
+) -> tuple[str, str, int | None]:
+    provider = environ.get("REVIEW_BOT_AGENT_PROVIDER") or _DEFAULT_PROVIDER
+    model_id = environ.get("REVIEW_BOT_AGENT_MODEL_ID") or _DEFAULT_MODEL_ID
+    if provider not in {"openrouter", "opencode-go"}:
+        raise ValueError("invalid_agent_provider")
+    if len(model_id) > 128 or _MODEL_ID.fullmatch(model_id) is None:
+        raise ValueError("invalid_agent_model_id")
+    context_value = environ.get("REVIEW_BOT_AGENT_CONTEXT_WINDOW_TOKENS", "")
+    if not context_value:
+        context_window_tokens = None
+    else:
+        try:
+            context_window_tokens = int(context_value)
+        except ValueError as exc:
+            raise ValueError("invalid_agent_context_window_tokens") from exc
+        if not 1024 <= context_window_tokens <= 10_000_000:
+            raise ValueError("invalid_agent_context_window_tokens")
+    return provider, model_id, context_window_tokens
 
-    directory = Path("/run/review-bot")
-    reviewbot = pwd.getpwnam("reviewbot")
-    os.chown(directory, reviewbot.pw_uid, reviewbot.pw_gid)
-    os.chmod(directory, 0o700)
-    write_private(directory / "github-app-id", app_id)
-    write_private(directory / "github-app-private-key.pem", private_key)
-    write_private(directory / "openrouter-api-key", openrouter_key)
 
-    pin = Path("/etc/review-bot/pmd-image-pin").read_text(encoding="utf-8").strip()
-    if not pin.startswith("sha256:") or len(pin) != 71:
-        raise ValueError("PMD image is not pinned by a SHA-256 image ID")
-    config = f"""schema_version: 2
+def render_operator_config(
+    pin: str,
+    *,
+    provider: str = _DEFAULT_PROVIDER,
+    model_id: str = _DEFAULT_MODEL_ID,
+    context_window_tokens: int | None = None,
+) -> str:
+    context_window = (
+        f"  context_window_tokens: {context_window_tokens}\n"
+        if context_window_tokens is not None
+        else ""
+    )
+    return f"""schema_version: 2
 codebase:
   product: github-review-bot
   python_package: review_bot
@@ -62,7 +83,7 @@ execution:
   selector_policy: all_available
   selector_uses_model: false
   worker_concurrency: 1
-  task_timeout_seconds: 900
+  task_timeout_seconds: 3000
   pr_actions: [opened, synchronize, reopened, edited, labeled, unlabeled, ready_for_review, closed]
 service:
   receiver: fastapi_uvicorn
@@ -95,10 +116,9 @@ model:
 review_engine: agent
 agent_engine:
   image_tag: review-bot-pi-agent:0.73.1
-  model_id: stealth/crouton-alpha
-  timeout_seconds: 900
-  max_proxy_calls: 40
-  max_output_tokens: 4096
+  provider: {provider}
+  model_id: {model_id}
+{context_window}  max_proxy_calls: 40
   session_store_dir: /var/lib/review-bot/agent-sessions
 architecture:
   review_type: A
@@ -151,10 +171,40 @@ output:
   distinguish_prepared_sent_and_opinion_scope: true
   evidence_ids_required: true
 """
-    path = Path("/etc/review-bot/operator.yaml")
-    path.write_text(config, encoding="utf-8")
-    os.chown(path, reviewbot.pw_uid, reviewbot.pw_gid)
-    os.chmod(path, 0o640)
+
+
+def main() -> None:
+    github_arn, openrouter_arn, region = sys.argv[1:4]
+    provider, model_id, context_window_tokens = agent_settings_from_environment(os.environ)
+    client = boto3.client("secretsmanager", region_name=region)
+    github_credentials = json.loads(secret(client, github_arn))
+    app_id = str(github_credentials["app_id"])
+    private_key = github_credentials["private_key"]
+    if not app_id or not isinstance(private_key, str) or not private_key:
+        raise ValueError("GitHub App secret must contain app_id and private_key")
+    model_key = secret(client, openrouter_arn)
+
+    directory = Path("/run/review-bot")
+    reviewbot = pwd.getpwnam("reviewbot")
+    os.chown(directory, reviewbot.pw_uid, reviewbot.pw_gid)
+    os.chmod(directory, 0o700)
+    write_private(directory / "github-app-id", app_id)
+    write_private(directory / "github-app-private-key.pem", private_key)
+    write_private(directory / "model-api-key", model_key)
+
+    pin = Path("/etc/review-bot/pmd-image-pin").read_text(encoding="utf-8").strip()
+    if not pin.startswith("sha256:") or len(pin) != 71:
+        raise ValueError("PMD image is not pinned by a SHA-256 image ID")
+    config = render_operator_config(
+        pin,
+        provider=provider,
+        model_id=model_id,
+        context_window_tokens=context_window_tokens,
+    )
+    config_path = Path("/etc/review-bot/operator.yaml")
+    config_path.write_text(config, encoding="utf-8")
+    os.chown(config_path, reviewbot.pw_uid, reviewbot.pw_gid)
+    os.chmod(config_path, 0o640)
     state_dir = Path("/var/lib/review-bot")
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chown(state_dir, reviewbot.pw_uid, reviewbot.pw_gid)

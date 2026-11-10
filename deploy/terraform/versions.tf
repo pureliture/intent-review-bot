@@ -24,4 +24,13 @@ locals {
     "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.lambda_recovery_name}:*",
   ]
   worker_log_group_arn = "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:${local.worker_log_group}:*"
+  agent_instance_tags = merge(
+    {
+      "review-bot:agent-provider" = var.agent_provider
+      "review-bot:agent-model-id" = var.agent_model_id
+    },
+    var.agent_context_window_tokens == null ? {} : {
+      "review-bot:agent-context-window-tokens" = tostring(var.agent_context_window_tokens)
+    },
+  )
 }
