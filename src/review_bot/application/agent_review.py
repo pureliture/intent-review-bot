@@ -925,13 +925,17 @@ def _apply_agent_fact_verification(result, mode, runner, request, session_id, wo
         ledger["items"].append({"item_id": claim["id"], "original": item, "status": "unverified",
             "accepted": deepcopy(item), "attempts": [], "host_issues": [], "revision": None})
     initial_run_failure = None
-    try:
-        verdicts, issues, run_record = _run_verifier(runner, workspace, claims, meta, instructions,
-            originals, model, timeout, result.language)
-        ledger["runs"].append(run_record)
-    except AgentRunError as error:
-        verdicts, issues = _all_unverified(claims, "verifier_run_failed"), []
-        initial_run_failure = f"verifier_run_failed:{error.code}"
+    generation_failed = result.status == "failed"
+    if generation_failed:
+        verdicts, issues = _all_unverified(claims, "generation_failed"), []
+    else:
+        try:
+            verdicts, issues, run_record = _run_verifier(runner, workspace, claims, meta, instructions,
+                originals, model, timeout, result.language)
+            ledger["runs"].append(run_record)
+        except AgentRunError as error:
+            verdicts, issues = _all_unverified(claims, "verifier_run_failed"), []
+            initial_run_failure = f"verifier_run_failed:{error.code}"
     for entry in ledger["items"]:
         row_verdicts = verdicts.get(entry["item_id"], {})
         row_issues = [issue for issue in issues if issue.get("item_id") == entry["item_id"]]
@@ -939,12 +943,14 @@ def _apply_agent_fact_verification(result, mode, runner, request, session_id, wo
             "host_issues": deepcopy(row_issues)})
         entry["status"] = _row_status(row_verdicts)
         entry["host_issues"].extend(deepcopy(row_issues))
-        if initial_run_failure:
+        if generation_failed:
+            entry["host_issues"].append({"reason": "generation_failed"})
+        elif initial_run_failure:
             entry["host_issues"].append({"reason": initial_run_failure})
     revisions = 0
     while revisions < max_revisions:
         issue_entries = ([entry for entry in ledger["items"] if entry["status"] == "unverified"]
-            if session_id is not None else [])
+            if session_id is not None and not generation_failed else [])
         if not issue_entries:
             break
         message = "Verifier findings for rows requiring revision:\n" + json.dumps({

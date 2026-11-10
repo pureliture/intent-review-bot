@@ -132,7 +132,8 @@ class WorkerLoop:
         model_settings = getattr(config, "model", None)
         profile = getattr(model_settings, "profile", None)
         agent_enabled = _agent_engine_enabled(config)
-        self.model_client = model_client if model_client is not None else build_review_client(profile, model_settings)
+        self.model_client = model_client if model_client is not None else (
+            None if agent_enabled else build_review_client(profile, model_settings))
         self.agent_runner = agent_runner
         if agent_enabled and self.agent_runner is None:
             from review_bot.adapters.pi_agent_docker import DockerPiAgentRunner

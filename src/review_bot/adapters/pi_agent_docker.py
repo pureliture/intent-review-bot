@@ -58,8 +58,12 @@ class DockerPiAgentRunner:
         self.repo_root = repo_root or Path(__file__).resolve().parents[3]
         self._active_runs: dict[str, _ActiveRun] = {}
 
-    def _docker(self, args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess:
-        return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout, check=False)
+    def _docker(self, args: list[str], *, timeout: int = 30,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        options: dict[str, Any] = {"capture_output": True, "text": True, "timeout": timeout, "check": False}
+        if env is not None:
+            options["env"] = env
+        return subprocess.run(["docker", *args], **options)
 
     @staticmethod
     def _runtime_uid_gid() -> tuple[int, int]:
@@ -103,7 +107,8 @@ class DockerPiAgentRunner:
         argv.extend(["--print", prompt])
         return argv
 
-    def _proxy_argv(self, network: str, name: str, model: str, ledger_dir: Path) -> list[str]:
+    def _proxy_argv(self, network: str, name: str, model: str, ledger_dir: Path,
+        upstream_session_id: str) -> list[str]:
         uid, gid = self._runtime_uid_gid()
         return [
             "run", "-d", "--name", name, "--network", "bridge", "--read-only",
@@ -111,13 +116,31 @@ class DockerPiAgentRunner:
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--pids-limit", "64", "--memory", "256m", "--user", f"{uid}:{gid}",
             "--volume", f"{ledger_dir}:/ledger:rw",
-            "--env", "OPENROUTER_API_KEY",
+            "--env", "UPSTREAM_API_KEY",
+            "--env", f"PROVIDER={self.config.provider}",
+            "--env", f"UPSTREAM_SESSION_ID={upstream_session_id}",
             "--env", f"MODEL_ID={model}",
             "--env", f"MAX_PROXY_CALLS={self.config.max_proxy_calls}",
             "--env", f"MAX_OUTPUT_TOKENS={self.config.max_output_tokens}",
             "--env", "USAGE_LEDGER_PATH=/ledger/usage.jsonl",
             PROXY_IMAGE,
         ]
+
+    def _upstream_api_key(self) -> str:
+        variables = {
+            "openrouter": ("OPENROUTER_API_KEY_FILE", "OPENROUTER_API_KEY"),
+            "opencode-go": ("OPENCODE_API_KEY_FILE", "OPENCODE_API_KEY"),
+        }
+        file_variable, key_variable = variables[self.config.provider]
+        key_file = os.environ.get(file_variable, "").strip()
+        if key_file:
+            try:
+                value = Path(key_file).expanduser().read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError):
+                value = ""
+            if value:
+                return value
+        return os.environ.get(key_variable, "").strip()
 
     @staticmethod
     def _session_id(session: bytes) -> str | None:
@@ -207,8 +230,11 @@ class DockerPiAgentRunner:
         }
         if request.mode not in allowed_skills or request.skill_id != allowed_skills[request.mode]:
             raise AgentRunError("invalid_request")
-        if not os.environ.get("OPENROUTER_API_KEY"):
-            raise AgentRunError("openrouter_api_key_missing")
+        upstream_api_key = self._upstream_api_key()
+        if not upstream_api_key:
+            missing_key_code = ("openrouter_api_key_missing" if self.config.provider == "openrouter"
+                else "opencode_api_key_missing")
+            raise AgentRunError(missing_key_code)
         skill = agent_skill_path(request.mode)
         source_skills_dir = agent_skills_dir()
         checker_path = agent_checker_path()
@@ -218,6 +244,7 @@ class DockerPiAgentRunner:
         network = f"review-agent-net-{suffix}"
         proxy_name = f"review-agent-proxy-{suffix}"
         agent_name = f"review-agent-{suffix}"
+        upstream_session_id = f"ses_{uuid.uuid4().hex}"
         self.session_store_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         ledger_root = self.session_store_dir / "proxy-ledgers"
         ledger_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -241,12 +268,15 @@ class DockerPiAgentRunner:
                 os.chmod(directory, 0o755)
                 for filename in files:
                     os.chmod(Path(directory) / filename, 0o644)
+            model_config = {
+                "id": request.model, "name": request.model, "reasoning": True,
+                "maxTokens": self.config.max_output_tokens,
+            }
+            if self.config.context_window_tokens is not None:
+                model_config["contextWindow"] = self.config.context_window_tokens
             models = {"providers": {"llmproxy": {
                 "baseUrl": "http://llm-proxy:8080/v1", "apiKey": "DUMMY_NOT_A_KEY",
-                "api": "openai-completions", "models": [{
-                    "id": request.model, "name": request.model, "reasoning": True,
-                    "maxTokens": self.config.max_output_tokens,
-                }],
+                "api": "openai-completions", "models": [model_config],
             }}}
             (config_dir / "models.json").write_text(json.dumps(models), encoding="utf-8")
             os.chmod(config_dir / "models.json", 0o444)
@@ -259,7 +289,10 @@ class DockerPiAgentRunner:
             created = self._docker(["network", "create", "--internal", "--driver", "bridge", network])
             if created.returncode != 0:
                 raise AgentRunError("docker_network_failed")
-            proxy = self._docker(self._proxy_argv(network, proxy_name, request.model, ledger_dir))
+            proxy_env = os.environ.copy()
+            proxy_env["UPSTREAM_API_KEY"] = upstream_api_key
+            proxy = self._docker(self._proxy_argv(network, proxy_name, request.model, ledger_dir,
+                upstream_session_id), env=proxy_env)
             if proxy.returncode != 0:
                 raise AgentRunError("proxy_start_failed")
             connected = self._docker(["network", "connect", "--alias", "llm-proxy", network, proxy_name])

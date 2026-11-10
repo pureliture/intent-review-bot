@@ -38,15 +38,33 @@ def test_agent_engine_config_is_opt_in_and_strict(valid_config_yaml: str) -> Non
     config, _ = load_review_config_from_str(valid_config_yaml)
     assert config.review_engine == "partition"
     assert config.agent_engine.model_id == "stealth/crouton-alpha"
+    assert config.agent_engine.provider == "openrouter"
+    assert config.agent_engine.context_window_tokens is None
     assert config.agent_engine.timeout_seconds > 0
 
     enabled = valid_config_yaml.replace("schema_version: 2", "schema_version: 2\nreview_engine: agent", 1)
     config, _ = load_review_config_from_str(enabled)
     assert config.review_engine == "agent"
 
+    opencode = enabled.replace("review_engine: agent",
+        "review_engine: agent\nagent_engine:\n  provider: opencode-go\n  context_window_tokens: 1048576")
+    config, _ = load_review_config_from_str(opencode)
+    assert config.agent_engine.provider == "opencode-go"
+    assert config.agent_engine.context_window_tokens == 1048576
+
     invalid_engine = enabled.replace("review_engine: agent", "review_engine: autonomous")
     with pytest.raises(ConfigValidationError):
         load_review_config_from_str(invalid_engine)
+
+    invalid_provider = enabled.replace("review_engine: agent",
+        "review_engine: agent\nagent_engine:\n  provider: other")
+    with pytest.raises(ConfigValidationError):
+        load_review_config_from_str(invalid_provider)
+
+    invalid_context_window = enabled.replace("review_engine: agent",
+        "review_engine: agent\nagent_engine:\n  context_window_tokens: 1023")
+    with pytest.raises(ConfigValidationError):
+        load_review_config_from_str(invalid_context_window)
 
     invalid_limits = enabled.replace("review_engine: agent", "review_engine: agent\nagent_engine:\n  max_proxy_calls: 0")
     with pytest.raises(ConfigValidationError):

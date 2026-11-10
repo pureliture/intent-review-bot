@@ -5,6 +5,8 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
+import pytest
+
 
 def _proxy_module():
     path = Path(__file__).resolve().parents[2] / "deploy" / "agent-sandbox" / "llm_proxy.py"
@@ -41,6 +43,40 @@ def test_proxy_adds_a_ceiling_when_request_omits_max_tokens():
     assert payload["usage"] == {"include": True}
 
 
+def test_proxy_uses_fixed_provider_upstreams_and_opencode_headers():
+    proxy = _proxy_module()
+    openrouter = proxy.ProxyState("model-a", 1, 1024)
+    openrouter_request = proxy.build_upstream_request(openrouter, {"model": "model-a"}, "test-key")
+    assert openrouter_request.full_url == "https://openrouter.ai/api/v1/chat/completions"
+
+    session_id = "ses_0123456789abcdef0123456789abcdef"
+    opencode = proxy.ProxyState("model-b", 1, 1024, provider="opencode-go",
+        upstream_session_id=session_id)
+    request = proxy.build_upstream_request(opencode, {"model": "model-b"}, "test-key")
+    headers = {key.lower(): value for key, value in request.header_items()}
+    assert request.full_url == "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    assert headers["authorization"] == "Bearer test-key"
+    assert headers["user-agent"] == "review-bot-agent/0.1.0"
+    assert headers["x-opencode-session"] == session_id
+
+
+def test_opencode_request_omits_usage_include_and_unknown_provider_is_rejected():
+    proxy = _proxy_module()
+    state = proxy.ProxyState("model-b", 2, 1024, provider="opencode-go",
+        upstream_session_id="ses_0123456789abcdef0123456789abcdef")
+    allowed, payload = proxy.authorize_request("/v1/chat/completions",
+        {"model": "model-b", "usage": {"include": True, "other": "value"}}, state)
+    assert allowed == 200
+    assert payload["usage"] == {"other": "value"}
+
+    allowed, payload = proxy.authorize_request("/v1/chat/completions",
+        {"model": "model-b"}, state)
+    assert allowed == 200 and "usage" not in payload
+
+    with pytest.raises(ValueError, match="unsupported_provider"):
+        proxy.ProxyState("model", 1, 1024, provider="arbitrary")
+
+
 def test_proxy_extracts_openrouter_usage_cost_and_writes_a_call_ledger(tmp_path):
     proxy = _proxy_module()
     payload = {"usage": {"prompt_tokens": 23, "completion_tokens": 7,
@@ -59,3 +95,16 @@ def test_proxy_extracts_openrouter_usage_cost_and_writes_a_call_ledger(tmp_path)
     state = proxy.ProxyState("stealth/crouton-alpha", 1, 128, str(ledger))
     state.record({"call": 1, "status": 200, **proxy.usage_record(payload)})
     assert json.loads(ledger.read_text(encoding="utf-8"))["cost"]["total"] == 0.0025
+
+
+def test_proxy_extracts_opencode_go_usage():
+    proxy = _proxy_module()
+    payload = {"usage": {"prompt_tokens": 23, "completion_tokens": 7,
+        "total_tokens": 30, "cost": 0, "completion_tokens_details": {"reasoning_tokens": 4},
+        "opencode": {"billing_source": "go", "list_cost": 0, "allowance": 0,
+            "tokens": {"input": 23, "output": 7}}}}
+    assert proxy.usage_record(payload) == {
+        "prompt_tokens": 23, "completion_tokens": 7, "total_tokens": 30,
+        "cost": {"total": 0, "list_cost": 0, "allowance": 0},
+        "billing_source": "go",
+    }

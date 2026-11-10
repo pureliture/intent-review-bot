@@ -46,6 +46,7 @@ class FakeAgentRunner:
         self.oversize_output = False
         self.repair_oversize_output = None
         self.request = None
+        self.run_modes = []
         self.repair_calls = 0
         self.repair_message = None
         self.repair_messages = []
@@ -59,6 +60,7 @@ class FakeAgentRunner:
             ]}
 
     def run(self, request):
+        self.run_modes.append(request.mode)
         self.request = request
         self.workspace = {
             path.relative_to(request.workspace_dir).as_posix()
@@ -694,7 +696,8 @@ def test_malformed_agent_json_fails_closed(tmp_path):
     runner = FakeAgentRunner(tmp_path, "not json")
     result = _run(task, "architecture", tmp_path, "not json", runner=runner)
     assert result.status == "failed" and result.reason == "agent_output_json_invalid"
-    assert runner.repair_calls == 1 and len(runner.finished) == 2
+    assert runner.repair_calls == 1 and len(runner.finished) == 1
+    assert runner.run_modes == ["architecture"]
     validate_partition_result(result, task)
 
 
@@ -949,6 +952,16 @@ def test_timeout_agent_error_becomes_failed_result(tmp_path):
     runner = FakeAgentRunner(tmp_path, error=AgentRunError("timeout"))
     result = _run(task, "architecture", tmp_path, None, runner=runner)
     assert result.status == "failed" and result.reason == "agent_run_failed:timeout"
+    assert runner.run_modes == ["architecture"]
+    ledger = result.partition["fact_verification"]
+    assert ledger["status"] == "unverified" and ledger["runs"] == []
+    assert ledger["items"]
+    for entry in ledger["items"]:
+        assert entry["status"] == "unverified"
+        assert entry["host_issues"] == [{"reason": "generation_failed"}]
+        assert all(verdict["state"] == "unverifiable"
+            and verdict["reason"] == "generation_failed"
+            for verdict in entry["attempts"][0]["verdicts"].values())
     validate_partition_result(result, task)
 
 
