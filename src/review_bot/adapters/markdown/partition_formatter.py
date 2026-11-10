@@ -49,6 +49,9 @@ def _format_private_partition_markdown(result: PartitionReviewResult, task, **_o
         elif isinstance(verification, dict):
             lines.append("- 코드 판단은 모델이 원문과 대조한 결과이며, 정확성을 증명하지는 않습니다." if ko else
                 "- Code claims were checked by a model against originals; this is not a proof of accuracy.")
+            if verification.get("version") == "agent-verify-v2":
+                lines.append("- 성립 조건은 가정을 설명하는 필드라 사실 검토 대상에서 제외했습니다." if ko else
+                    "- Failure conditions describe hypothetical scenarios and are excluded from factual review.")
             for entry in verification["items"]:
                 corrected = len(entry["attempts"]) > 1
                 citation_only = (corrected and any("citation_repair" in attempt for attempt in entry["attempts"])

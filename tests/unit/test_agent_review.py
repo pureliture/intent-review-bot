@@ -9,10 +9,13 @@ from types import SimpleNamespace
 import pytest
 
 from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
+from review_bot.application import agent_review
 from review_bot.application.agent_review import (
+    AgentOutputError,
     _SEARCH_SCOPE_RULE,
     _contract,
     _initial_agent_prompt,
+    _verifier_claims,
     _validate_verifier_output,
     run_agent_review,
 )
@@ -219,6 +222,23 @@ def test_search_scope_rule_is_in_initial_prompts(mode):
     assert _SEARCH_SCOPE_RULE in _initial_agent_prompt(mode)
 
 
+@pytest.mark.parametrize("mode", ["architecture", "intent"])
+def test_agent_verifier_claims_exclude_failure_conditions(mode):
+    task = _pmd_partition_task() if mode == "architecture" else make_intent_task()
+    final = _architecture_body(task) if mode == "architecture" else _intent_body(task)
+    final.setdefault("findings", [])
+    final.setdefault("perspectives", [])
+    final.setdefault("questions", [])
+
+    claims = _verifier_claims(final)
+    summary = next(claim for claim in claims if claim["id"] == "summary")
+    rows = [claim for claim in claims if claim["id"] != "summary"]
+
+    assert summary["fields"] == {"text": final["summary"]}
+    assert rows
+    assert all(set(claim["fields"]) == {"statement", "reasoning"} for claim in rows)
+
+
 def test_agent_architecture_result_validates_formats_with_exact_citations_and_trace(tmp_path):
     task = _pmd_partition_task()
     runner = FakeAgentRunner(tmp_path, _architecture_body(task))
@@ -302,6 +322,50 @@ def test_agent_fact_verification_supported_items_are_retained(tmp_path):
     assert all(row["status"] == "model_supported" for row in result.partition["fact_verification"]["items"])
     assert all(run["duration_ms"] == 0 for run in result.partition["fact_verification"]["runs"]
         if run["role"] == "verify")
+
+
+@pytest.mark.parametrize(("language", "disclosure"), [
+    ("ko", "- 성립 조건은 가정을 설명하는 필드라 사실 검토 대상에서 제외했습니다."),
+    ("en", "- Failure conditions describe hypothetical scenarios and are excluded from factual review."),
+])
+def test_agent_v2_verifies_findings_without_failure_condition_and_discloses_it(
+        tmp_path, language, disclosure):
+    task = _pmd_partition_task()
+    body = _architecture_body(task)
+    result = run_agent_review(task, "architecture", FakeAgentRunner(tmp_path, body),
+        language=language, instructions="")
+
+    ledger = result.partition["fact_verification"]
+    entry = next(row for row in ledger["items"] if row["item_id"] == "findings:0")
+    verdicts = entry["attempts"][0]["verdicts"]
+    markdown = format_partition_review_markdown(result, task, publication_mode="artifact_only")
+
+    assert result.status == "completed"
+    assert ledger["version"] == "agent-verify-v2"
+    assert entry["status"] == "model_supported"
+    assert set(verdicts) == {"statement", "reasoning"}
+    assert all(verdict["state"] == "supported" for verdict in verdicts.values())
+    assert "When the method is called" in markdown
+    assert disclosure in markdown
+    validate_partition_result(result, task)
+
+
+def test_agent_v2_rejects_failure_condition_verdict(tmp_path):
+    task = _pmd_partition_task()
+    originals, _meta = prepare_originals(task, "architecture")
+    spans = [make_span(original, 0, len(original.raw), "agent_verify") for original in originals]
+    final = _architecture_body(task)
+    final.update(perspectives=[], questions=[])
+    claims = _verifier_claims(final)
+    body = {"items": {claim["id"]: {
+        field: {"state": "supported", "reason": "The frozen source supports this field.",
+            "citations": claim["cited"]}
+        for field in claim["fields"]} for claim in claims}}
+    body["items"]["findings:0"]["failure_condition"] = {
+        "state": "supported", "reason": "It is supported.", "citations": []}
+
+    with pytest.raises(AgentOutputError, match="verifier_output_invalid"):
+        _validate_verifier_output(body, claims, originals, spans)
 
 
 def test_agent_fact_verification_rewrites_contradicted_assessment(tmp_path):
@@ -645,11 +709,44 @@ def test_agent_verification_replay_rejects_tampering(tmp_path, mutation):
         validate_partition_result(altered, task)
 
 
+def test_agent_verification_replay_accepts_legacy_v1_after_global_version_changes(tmp_path, monkeypatch):
+    task = _pmd_partition_task()
+    monkeypatch.setattr(agent_review, "_AGENT_VERIFY_VERSION", "agent-verify-v1")
+
+    result = _run(task, "architecture", tmp_path, _architecture_body(task))
+
+    assert result.partition["fact_verification"]["version"] == "agent-verify-v1"
+    finding = next(entry for entry in result.partition["fact_verification"]["items"]
+        if entry["item_id"] == "findings:0")
+    assert set(finding["attempts"][0]["verdicts"]) == {
+        "statement", "reasoning", "failure_condition"}
+    monkeypatch.undo()
+    validate_partition_result(result, task)
+
+
+def test_agent_verification_replay_rejects_v2_failure_condition_verdict_and_unknown_version(tmp_path):
+    task = _pmd_partition_task()
+    result = _run(task, "architecture", tmp_path, _architecture_body(task))
+
+    altered = deepcopy(result)
+    finding = next(entry for entry in altered.partition["fact_verification"]["items"]
+        if entry["item_id"] == "findings:0")
+    finding["attempts"][0]["verdicts"]["failure_condition"] = {
+        "state": "unverifiable", "reason": "Not a verified field.", "citations": []}
+    with pytest.raises(PartitionError, match="stored_agent_verification_verdict"):
+        validate_partition_result(altered, task)
+
+    altered = deepcopy(result)
+    altered.partition["fact_verification"]["version"] = "agent-verify-v3"
+    with pytest.raises(PartitionError, match="stored_agent_verification_ledger"):
+        validate_partition_result(altered, task)
+
+
 def test_agent_fact_verification_without_review_client_is_not_configured(tmp_path):
     task = make_intent_task()
     result = _run(task, "intent", tmp_path, _intent_body(task))
 
-    assert result.partition["fact_verification"]["version"] == "agent-verify-v1"
+    assert result.partition["fact_verification"]["version"] == "agent-verify-v2"
     assert result.partition["fact_verification"]["status"] == "model_supported"
     markdown = format_partition_review_markdown(result, task, publication_mode="artifact_only")
     assert "Code claims were checked by a model" in markdown

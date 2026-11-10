@@ -41,6 +41,8 @@ from review_bot.ports import (
 _MAX_OUTPUT_BYTES = 1_048_576
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_AGENT_VERIFY_VERSION = "agent-verify-v2"
+_UNVERIFIED_CONDITION_FIELDS = frozenset({"failure_condition"})
 _SKILLS = {"architecture": "review-architecture", "intent": "review-intent", "verify": "verify-claims"}
 _SEARCH_SCOPE_RULE = (
     "All inputs are under /workspace and the checker is /skills/check_output.mjs. "
@@ -670,6 +672,16 @@ def _stored_verifier_citation(span, *, path=None, version=None) -> dict[str, Any
     }
 
 
+def _verified_fields(row, version: str | None = None) -> dict[str, str]:
+    fields = fact_check.fields(row)
+    if version is None:
+        version = _AGENT_VERIFY_VERSION
+    if version == "agent-verify-v1":
+        return fields
+    return {key: value for key, value in fields.items()
+        if key not in _UNVERIFIED_CONDITION_FIELDS}
+
+
 def _verifier_claims(final: dict, row_ids: dict | None = None) -> list[dict[str, Any]]:
     claims = []
     for row in fact_check.items(final):
@@ -677,7 +689,7 @@ def _verifier_claims(final: dict, row_ids: dict | None = None) -> list[dict[str,
         cited = final.get("summary_citations", []) if row["id"] == "summary" else (
             row["item"].get("citations", []) if isinstance(row["item"], dict) else [])
         claims.append({
-            "id": row_id, "kind": row["kind"], "fields": fact_check.fields(row),
+            "id": row_id, "kind": row["kind"], "fields": _verified_fields(row),
             "cited": [{"path": item.get("path", ""), "version": item.get("version", ""),
                 "quote": item.get("quote", "")} for item in cited],
         })
@@ -985,7 +997,7 @@ def _apply_agent_fact_verification(result, mode, runner, request, session_id, wo
     row_ids = _stable_row_ids(final)
     claims = _verifier_claims(final, row_ids)
     rows = {row["id"]: row for row in fact_check.items(final)}
-    ledger = {"version": "agent-verify-v1", "status": "unverified",
+    ledger = {"version": _AGENT_VERIFY_VERSION, "status": "unverified",
         "original_final_hash": hash_json(pre_verification_final), "accepted_final_hash": hash_json(final),
         "items": [], "runs": [], "model_assisted_is_not_proof": True}
     for claim in claims:
@@ -1286,7 +1298,8 @@ def _validate_agent_verification_replay(result: PartitionReviewResult, originals
     ledger = result.partition.get("fact_verification")
     if not isinstance(ledger, dict) or set(ledger) != {
             "version", "status", "original_final_hash", "accepted_final_hash", "items", "runs",
-            "model_assisted_is_not_proof"} or ledger["version"] != "agent-verify-v1":
+            "model_assisted_is_not_proof"} or ledger["version"] not in (
+                "agent-verify-v1", "agent-verify-v2"):
         raise PartitionError("stored_agent_verification_ledger")
     if ledger["model_assisted_is_not_proof"] is not True or not isinstance(ledger["items"], list):
         raise PartitionError("stored_agent_verification_ledger")
@@ -1331,8 +1344,9 @@ def _validate_agent_verification_replay(result: PartitionReviewResult, originals
                 raise PartitionError("stored_agent_verification_ledger")
             if not isinstance(attempt["verdicts"], dict):
                 raise PartitionError("stored_agent_verification_verdict")
-            fields = fact_check.fields({"id": entry["item_id"],
-                "item": entry["accepted"] if entry["accepted"] is not None else entry["original"]})
+            fields = _verified_fields({"id": entry["item_id"],
+                "item": entry["accepted"] if entry["accepted"] is not None else entry["original"]},
+                ledger["version"])
             if set(attempt["verdicts"]) != set(fields):
                 raise PartitionError("stored_agent_verification_verdict")
             for verdict in attempt["verdicts"].values():
