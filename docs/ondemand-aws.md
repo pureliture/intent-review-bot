@@ -82,7 +82,8 @@ uses that opt-out because the reused LocalStack instance has Logs disabled.
    deploy/scripts/build_lambda_zip.sh
    ```
 
-   This produces `deploy/terraform/dist/lambda.zip` and `review_bot.whl` for the Packer build.
+   This produces `deploy/terraform/dist/lambda.zip` and the original-named application wheel under
+   `deploy/terraform/dist/wheel/` for the Packer build.
 
 2. Initialize Packer and build the AMI in the target AWS environment. Limit the temporary SSH rule to the operator's
    source IP. The Packer source filter is restricted to Canonical owner `099720109477`.
@@ -93,7 +94,7 @@ uses that opt-out because the reused LocalStack instance has Logs disabled.
      -var 'subnet_id=subnet-REPLACE' \
      -var 'ssh_source_cidr=YOUR_PUBLIC_IP/32' \
      -var 'repo_source_path=.' \
-     -var 'review_bot_wheel_path=deploy/terraform/dist/review_bot.whl' \
+     -var 'review_bot_wheel_dir=deploy/terraform/dist/wheel/' \
      deploy/packer/review-bot.pkr.hcl
    ```
 

@@ -31,9 +31,9 @@ variable "repo_source_path" {
   default = "."
 }
 
-variable "review_bot_wheel_path" {
+variable "review_bot_wheel_dir" {
   type    = string
-  default = "deploy/terraform/dist/review_bot.whl"
+  default = "deploy/terraform/dist/wheel/"
 }
 
 source "amazon-ebs" "review_bot" {
@@ -72,9 +72,13 @@ build {
     destination = "/tmp/review-bot-source/"
   }
 
+  provisioner "shell" {
+    inline = ["mkdir -p /tmp/review-bot-wheel"]
+  }
+
   provisioner "file" {
-    source      = var.review_bot_wheel_path
-    destination = "/tmp/review_bot.whl"
+    source      = "${trimsuffix(var.review_bot_wheel_dir, "/")}/"
+    destination = "/tmp/review-bot-wheel/"
   }
 
   provisioner "file" {
@@ -117,14 +121,15 @@ build {
       "systemctl enable --now docker.service",
       "install -d -o root -g root -m 0755 /opt/review-bot/bin /etc/review-bot /var/lib/review-bot",
       "python3 -m venv /opt/review-bot/venv",
-      "/opt/review-bot/venv/bin/pip install --no-cache-dir /tmp/review_bot.whl boto3",
+      "/opt/review-bot/venv/bin/pip install --no-cache-dir /tmp/review-bot-wheel/*.whl boto3",
       "install -m 0755 /tmp/review-bot-bootstrap /opt/review-bot/bin/bootstrap",
       "install -m 0644 /tmp/review-bot-bootstrap-runtime.py /opt/review-bot/bootstrap_runtime.py",
       "ln -s /opt/review-bot/venv/bin/review-bot-ondemand /opt/review-bot/bin/review-bot-ondemand",
       "install -m 0644 /tmp/review-bot-bootstrap.service /etc/systemd/system/review-bot-bootstrap.service",
       "cd /tmp/review-bot-source",
+      "rm -rf dist",
       "mkdir -p dist",
-      "cp /tmp/review_bot.whl dist/review_bot.whl",
+      "cp /tmp/review-bot-wheel/*.whl dist/",
       "runuser -u reviewbot -- env HOME=/home/reviewbot USER=reviewbot LOGNAME=reviewbot docker build --tag review-bot-application:local .",
       "runuser -u reviewbot -- env HOME=/home/reviewbot USER=reviewbot LOGNAME=reviewbot docker pull amazoncorretto:21",
       "runuser -u reviewbot -- env HOME=/home/reviewbot USER=reviewbot LOGNAME=reviewbot docker build --build-arg REVIEW_BOT_IMAGE=review-bot-application:local --build-arg JDK_IMAGE=amazoncorretto:21 --file Dockerfile.pmd --tag review-bot-pmd:7.3.0 .",
@@ -137,7 +142,7 @@ build {
       "systemctl enable review-bot-bootstrap.service",
       "java -version",
       "python3 --version",
-      "rm -rf /tmp/review-bot-source /tmp/review_bot.whl /tmp/review-bot-pmd.tar /tmp/review-bot-bootstrap /tmp/review-bot-bootstrap-runtime.py /tmp/review-bot-bootstrap.service"
+      "rm -rf /tmp/review-bot-source /tmp/review-bot-wheel /tmp/review-bot-pmd.tar /tmp/review-bot-bootstrap /tmp/review-bot-bootstrap-runtime.py /tmp/review-bot-bootstrap.service"
     ]
   }
 }

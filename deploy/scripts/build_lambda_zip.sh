@@ -12,12 +12,11 @@ docker run --rm --platform linux/amd64 \
   --entrypoint /bin/bash \
   public.ecr.aws/lambda/python:3.11 \
   -euo pipefail -c '
-    rm -rf /out/package /out/wheels /out/lambda.zip /out/review_bot.whl
-    mkdir -p /out/package /out/wheels
-    python -m pip wheel --no-deps --wheel-dir /out/wheels /src
-    wheel="$(find /out/wheels -maxdepth 1 -type f -name "*.whl" -print -quit)"
+    rm -rf /out/package /out/wheels /out/wheel /out/lambda.zip /out/review_bot.whl
+    mkdir -p /out/package /out/wheel
+    python -m pip wheel --no-deps --wheel-dir /out/wheel /src
+    wheel="$(find /out/wheel -maxdepth 1 -type f -name "*.whl" -print -quit)"
     test -n "${wheel}"
-    cp "${wheel}" /out/review_bot.whl
     python -m pip install --no-cache-dir --no-deps --target /out/package "${wheel}"
     python -m pip install --no-cache-dir --target /out/package \
       "boto3>=1.34,<2" "pydantic>=2.13,<3"
@@ -27,4 +26,4 @@ docker run --rm --platform linux/amd64 \
   '
 
 printf 'Lambda ZIP: %s\n' "${output_dir}/lambda.zip"
-printf 'Application wheel: %s\n' "${output_dir}/review_bot.whl"
+printf 'Application wheel directory: %s\n' "${output_dir}/wheel/"
