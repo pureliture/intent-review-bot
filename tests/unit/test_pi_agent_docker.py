@@ -339,6 +339,9 @@ def test_docker_runner_reads_key_file_and_exposes_key_only_to_proxy_process(tmp_
 
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
+        if argv[1:3] == ["image", "inspect"]:
+            assert proxy_image_tag() in argv
+            return subprocess.CompletedProcess(argv, 0, "image exists", "")
         if "review-bot-pi-agent:0.73.1" in argv:
             return subprocess.CompletedProcess(argv, 1, "", "agent failed")
         return subprocess.CompletedProcess(argv, 0, "ok", "")
@@ -350,7 +353,9 @@ def test_docker_runner_reads_key_file_and_exposes_key_only_to_proxy_process(tmp_
             "architecture", workspace, "review-architecture", "stealth/crouton-alpha", 10
         ))
 
-    proxy = next((argv, kwargs) for argv, kwargs in calls if "review-bot-agent-proxy:1" in argv)
+    proxy = next((argv, kwargs) for argv, kwargs in calls
+        if argv[1] == "run" and proxy_image_tag() in argv)
+    assert any(argv[1:3] == ["image", "inspect"] for argv, _ in calls)
     assert proxy[1]["env"]["UPSTREAM_API_KEY"] == "file-only-secret"
     agent = next((argv, kwargs) for argv, kwargs in calls if "review-bot-pi-agent:0.73.1" in argv)
     assert "UPSTREAM_API_KEY" not in agent[1].get("env", {})
