@@ -9,7 +9,13 @@ from types import SimpleNamespace
 import pytest
 
 from review_bot.adapters.markdown.partition_formatter import format_partition_review_markdown
-from review_bot.application.agent_review import _validate_verifier_output, run_agent_review
+from review_bot.application.agent_review import (
+    _SEARCH_SCOPE_RULE,
+    _contract,
+    _initial_agent_prompt,
+    _validate_verifier_output,
+    run_agent_review,
+)
 from review_bot.application.context import hash_json
 from review_bot.application.partition_review import PERSPECTIVE_IDS, prepare_originals, validate_partition_result
 from review_bot.application.source_partition import PartitionError, SourceOriginal, make_span
@@ -199,6 +205,20 @@ def _run(task, mode, tmp_path, body, *, session=None, runner=None):
     return run_agent_review(task, mode, runner, language="en", instructions="Use the code evidence.")
 
 
+@pytest.mark.parametrize(("mode", "skill"), [
+    ("architecture", "review-architecture"),
+    ("intent", "review-intent"),
+    ("verify", "verify-claims"),
+])
+def test_search_scope_rule_is_in_every_contract(mode, skill):
+    assert _SEARCH_SCOPE_RULE in _contract(mode, {"targets": []}, skill, "")
+
+
+@pytest.mark.parametrize("mode", ["architecture", "intent", "verify"])
+def test_search_scope_rule_is_in_initial_prompts(mode):
+    assert _SEARCH_SCOPE_RULE in _initial_agent_prompt(mode)
+
+
 def test_agent_architecture_result_validates_formats_with_exact_citations_and_trace(tmp_path):
     task = _pmd_partition_task()
     runner = FakeAgentRunner(tmp_path, _architecture_body(task))
@@ -218,6 +238,7 @@ def test_agent_architecture_result_validates_formats_with_exact_citations_and_tr
     assert {"PR.md", "signals.json", "CONTRACT.md"} <= runner.generation_workspace
     assert "contract.json" in runner.generation_workspace
     assert "target_ids may be empty only when basis is observed_structure" in runner.generation_contract
+    assert _SEARCH_SCOPE_RULE in runner.generation_contract
     assert "Every finding and assessment needs at least one citation" in runner.generation_contract
     assert "empty intent assessments list means no distinct finding" in runner.generation_contract
     assert runner.generation_contract_json["mode"] == "architecture"
@@ -228,7 +249,8 @@ def test_agent_architecture_result_validates_formats_with_exact_citations_and_tr
 
 def test_agent_intent_result_validates_and_formats_all_perspectives(tmp_path):
     task = make_intent_task()
-    result = _run(task, "intent", tmp_path, _intent_body(task))
+    runner = FakeAgentRunner(tmp_path, _intent_body(task))
+    result = run_agent_review(task, "intent", runner, language="en", instructions="")
 
     validate_partition_result(result, task)
     markdown = format_partition_review_markdown(result, task, publication_mode="comment")
@@ -237,6 +259,7 @@ def test_agent_intent_result_validates_and_formats_all_perspectives(tmp_path):
     assert "Assessment for problem\\_success\\." in markdown
     assert "src/value.py" in markdown and "/blob/" in markdown
     assert "Engine: `pi-agent`" in markdown
+    assert _SEARCH_SCOPE_RULE in runner.generation_contract
 
 
 def test_intent_empty_assessment_perspective_is_completed_and_omitted_from_comment(tmp_path):
@@ -321,6 +344,7 @@ def test_agent_verifier_uses_isolated_workspace_without_changing_generation_cont
     assert runner.verifier_workspace_dir != runner.generation_workspace_dir
     assert runner.verifier_workspace_dir.parent == runner.generation_workspace_dir.parent
     assert runner.generation_contract_hashes_during_verify == runner.generation_contract_hashes_before_verify
+    assert _SEARCH_SCOPE_RULE in runner.contract
     assert runner.contract_json["mode"] == "verify"
     assert not runner.verifier_workspace_dir.exists()
     assert {"head/src/A.java", "base/src/A.java", "PR.md"} <= runner.workspace

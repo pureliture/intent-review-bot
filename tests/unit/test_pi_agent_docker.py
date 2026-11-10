@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from review_bot.adapters.pi_agent_docker import DockerPiAgentRunner
+from review_bot.application.agent_review import _SEARCH_SCOPE_RULE, _initial_agent_prompt
 from review_bot.config import AgentEngineConfig
 from review_bot.ports import AgentRunError, AgentRunRequest
 
@@ -32,11 +33,21 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
             assert (skills_dir / "review-architecture" / "SKILL.md").is_file()
             assert (skills_dir / "review-intent" / "SKILL.md").is_file()
             assert (skills_dir / "check_output.mjs").is_file()
-            config_mount = next(item for item in argv if item.endswith(":/agent:ro"))
-            models = json.loads((Path(config_mount.split(":/agent:ro")[0]) / "models.json").read_text())
+            settings_mount = next(item for item in argv
+                if item.endswith(":/agent/settings.json:ro"))
+            config_dir = Path(settings_mount.split(":/agent/settings.json:ro")[0]).parent
+            models = json.loads((config_dir / "models.json").read_text())
             model = models["providers"]["llmproxy"]["models"][0]
             assert model["id"] == "stealth/crouton-alpha"
             assert "contextWindow" not in model
+            assert any(item.endswith(":/agent/models.json:ro") for item in argv)
+            assert any(item.startswith("/agent:rw,") for index, item in enumerate(argv)
+                if index > 0 and argv[index - 1] == "--tmpfs")
+            settings_path = config_dir / "settings.json"
+            assert json.loads(settings_path.read_text()) == {"shellCommandPrefix": "ulimit -t 120"}
+            assert settings_path.stat().st_mode & 0o777 == 0o444
+            prompt = argv[argv.index("--print") + 1]
+            assert _SEARCH_SCOPE_RULE in prompt
             return subprocess.CompletedProcess(argv, 1, "", "agent failed")
         return subprocess.CompletedProcess(argv, 0, "ok", "")
 
@@ -61,7 +72,8 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
     assert any(":/skills:ro" in arg for arg in agent)
     assert not any(":/skills/check_output.mjs:ro" in arg for arg in agent)
     assert any(":/out:rw" in arg for arg in agent)
-    assert any(":/agent:ro" in arg for arg in agent)
+    assert any(arg.endswith(":/agent/models.json:ro") for arg in agent)
+    assert any(arg.endswith(":/agent/settings.json:ro") for arg in agent)
     assert any(":/sessions:rw" in arg for arg in agent)
     assert agent[agent.index("--skill") + 1] == "/skills/review-architecture/SKILL.md"
     assert "bash" in agent[agent.index("--tools") + 1].split(",")
@@ -81,6 +93,31 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
     assert any(argv[1:4] == ["rm", "-f", next(arg for arg in argv if arg.startswith("review-agent-"))]
         for argv in calls if len(argv) > 3 and argv[1] == "rm")
     assert any(argv[1:3] == ["network", "rm"] for argv in calls)
+
+
+@pytest.mark.parametrize(("mode", "skill_id"), [
+    ("architecture", "review-architecture"),
+    ("verify", "verify-claims"),
+])
+def test_initial_agent_prompt_scopes_searches(tmp_path, monkeypatch, mode, skill_id):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
+    prompts = []
+
+    def fake_run(argv, **kwargs):
+        if "review-bot-pi-agent:0.73.1" in argv:
+            prompts.append(argv[argv.index("--print") + 1])
+            return subprocess.CompletedProcess(argv, 1, "", "agent failed")
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = DockerPiAgentRunner(AgentEngineConfig())
+    with pytest.raises(AgentRunError, match="agent_crashed"):
+        runner.run(AgentRunRequest(mode, workspace, skill_id, "model-id", 10))
+
+    assert prompts == [_initial_agent_prompt(mode)]
+    assert _SEARCH_SCOPE_RULE in prompts[0]
 
 
 def test_docker_runner_maps_timeout_to_agent_error_and_cleans_up(tmp_path, monkeypatch):
@@ -265,8 +302,8 @@ def test_pi_models_json_uses_configured_context_window(tmp_path, monkeypatch):
 
     def fake_run(argv, **kwargs):
         if "review-bot-pi-agent:0.73.1" in argv:
-            config_mount = next(item for item in argv if item.endswith(":/agent:ro"))
-            models = json.loads((Path(config_mount.split(":/agent:ro")[0]) / "models.json").read_text())
+            config_mount = next(item for item in argv if item.endswith(":/agent/models.json:ro"))
+            models = json.loads(Path(config_mount.split(":/agent/models.json:ro")[0]).read_text())
             assert models["providers"]["llmproxy"]["models"][0]["contextWindow"] == 262144
             return subprocess.CompletedProcess(argv, 1, "", "agent failed")
         return subprocess.CompletedProcess(argv, 0, "ok", "")
