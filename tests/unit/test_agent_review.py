@@ -40,6 +40,11 @@ class FakeAgentRunner:
         self.generation_contract_json = {}
         self.contract = ""
         self.contract_json = {}
+        self.generation_workspace_dir = None
+        self.verifier_workspace_dir = None
+        self.generation_contract_hashes_before_verify = None
+        self.generation_contract_hashes_during_verify = None
+        self.revision_rows_seen = None
         self.output_path = tmp_path / "fake-out" / "result.json"
         self.omit_output = False
         self.repair_omit_output = None
@@ -72,6 +77,17 @@ class FakeAgentRunner:
             self.generation_workspace = set(self.workspace)
             self.generation_contract = self.contract
             self.generation_contract_json = deepcopy(self.contract_json)
+            self.generation_workspace_dir = request.workspace_dir
+            self.generation_contract_hashes_before_verify = {
+                name: hashlib.sha256((request.workspace_dir / name).read_bytes()).hexdigest()
+                for name in ("contract.json", "CONTRACT.md")
+            }
+        else:
+            self.verifier_workspace_dir = request.workspace_dir
+            self.generation_contract_hashes_during_verify = {
+                name: hashlib.sha256((self.generation_workspace_dir / name).read_bytes()).hexdigest()
+                for name in ("contract.json", "CONTRACT.md")
+            }
         if self.error:
             raise self.error
         if request.mode == "verify":
@@ -134,6 +150,8 @@ class FakeAgentRunner:
                 self.repair_output if self.repair_output is not None else self.output)
             body = body(request) if callable(body) else body
             if "/out/revision.json" in message:
+                self.revision_rows_seen = json.loads(
+                    (request.workspace_dir / "revision_rows.json").read_text(encoding="utf-8"))
                 self.output_path = request.workspace_dir / "revision.json"
         return self._response(body,
             self.omit_output if self.repair_omit_output is None else self.repair_omit_output,
@@ -280,6 +298,28 @@ def test_agent_fact_verification_rewrites_contradicted_assessment(tmp_path):
     assert len(entry["attempts"]) == 2
     assert result.status == "completed"
     assert runner.verify_claim_ids[-1] == ["findings:0"]
+    assert runner.revision_rows_seen == ["findings:0"]
+    assert '"findings:0"' in runner.repair_message
+    assert '"<row_id>"' in runner.repair_message
+    assert '"findings": [' in runner.repair_message
+    assert '"summary_citations"' in runner.repair_message
+    assert '"statement"' in runner.repair_message
+    assert "node /skills/check_output.mjs --revision" in runner.repair_message
+
+
+def test_agent_verifier_uses_isolated_workspace_without_changing_generation_contract(tmp_path):
+    task = _pmd_partition_task()
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+
+    result = run_agent_review(task, "architecture", runner, language="en", instructions="")
+
+    assert result.status == "completed"
+    assert runner.verifier_workspace_dir != runner.generation_workspace_dir
+    assert runner.verifier_workspace_dir.parent == runner.generation_workspace_dir.parent
+    assert runner.generation_contract_hashes_during_verify == runner.generation_contract_hashes_before_verify
+    assert runner.contract_json["mode"] == "verify"
+    assert not runner.verifier_workspace_dir.exists()
+    assert {"head/src/A.java", "base/src/A.java", "PR.md"} <= runner.workspace
 
 
 def test_agent_fact_verification_supports_multiple_revision_rounds(tmp_path):
