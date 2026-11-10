@@ -14,7 +14,7 @@ moto = pytest.importorskip("moto")
 
 from review_bot.adapters.aws.dynamodb_job_store import DynamoDbJobStore  # noqa: E402
 from review_bot.adapters.aws.ec2_launcher import Ec2VmLauncher  # noqa: E402
-from review_bot.application.ondemand import OnDemandCoordinator  # noqa: E402
+from review_bot.application.ondemand import ManagedInstance, OnDemandCoordinator  # noqa: E402
 from review_bot.runtime.aws_lambda import build_intake_handler, build_recovery_handler  # noqa: E402
 from review_bot.runtime.ondemand_vm import run_job  # noqa: E402
 
@@ -52,10 +52,10 @@ def aws(monkeypatch):
         yield coordinator, ec2, clock
 
 
-def webhook(action="synchronize", head="b" * 40, delivery="d-1", secret=SECRET):
+def webhook(action="synchronize", head="b" * 40, delivery="d-1", secret=SECRET, pr=5):
     body = json.dumps({"action": action, "installation": {"id": 11},
         "repository": {"id": 22, "full_name": "o/r"},
-        "pull_request": {"number": 5, "base": {"sha": "a" * 40}, "head": {"sha": head}}}).encode()
+        "pull_request": {"number": pr, "base": {"sha": "a" * 40}, "head": {"sha": head}}}).encode()
     signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return {"headers": {"X-Hub-Signature-256": signature, "X-GitHub-Delivery": delivery, "X-GitHub-Event": "pull_request"},
         "body": base64.b64encode(body).decode(), "isBase64Encoded": True}
@@ -124,7 +124,142 @@ def test_superseded_vm_cannot_write_and_lost_vm_is_relaunched_by_recovery(aws):
     result = build_recovery_handler(coordinator)()
     assert result == {"recovered": 1, "relaunched": 1}
     assert coordinator.store.get(new.job_id).attempts == 1 and coordinator.store.get(new.job_id).state == "launching"
-    assert states(ec2).count("running") == 2 and states(ec2).count("terminated") == 1
+    assert states(ec2).count("running") == 1 and states(ec2).count("terminated") == 2
+
+
+def test_failed_claim_terminates_self_without_releasing_another_jobs_vm(aws):
+    coordinator, ec2, _ = aws
+    handler = build_intake_handler(coordinator, lambda: SECRET)
+    handler(webhook(pr=5, delivery="d-first"))
+    handler(webhook(pr=6, head="c" * 40, delivery="d-second"))
+    jobs = sorted(coordinator.store.list_active(), key=lambda item: item.pr_number)
+    job_with_other_vm, self_job = jobs
+    other_vm, second_job_vm = job_with_other_vm.vm_id, self_job.vm_id
+    self_vm = ec2.run_instances(ImageId=ec2.describe_images()["Images"][0]["ImageId"],
+        InstanceType="t3.micro", MinCount=1, MaxCount=1)["Instances"][0]["InstanceId"]
+    assert coordinator.claim(job_with_other_vm.job_id, "already-running")
+    finished = run_job(coordinator, job_with_other_vm.job_id, "duplicate-worker",
+        lambda *_: pytest.fail("failed claim must not execute"), self_vm_id=self_vm)
+    assert finished is None
+    current = coordinator.store.get(job_with_other_vm.job_id)
+    assert current.vm_id == other_vm
+    instances = {item["InstanceId"]: item["State"]["Name"] for reservation in ec2.describe_instances()["Reservations"]
+        for item in reservation["Instances"]}
+    assert instances[other_vm] == "running"
+    assert instances[second_job_vm] == "running"
+    assert instances[self_vm] == "terminated"
+
+
+def test_failed_claim_with_own_vm_releases_it(aws):
+    coordinator, ec2, _ = aws
+    handler = build_intake_handler(coordinator, lambda: SECRET)
+    handler(webhook())
+    job = next(iter(coordinator.store.list_active()))
+    assert coordinator.claim(job.job_id, "owner")
+    assert run_job(coordinator, job.job_id, "duplicate",
+        lambda *_: pytest.fail("failed claim must not execute"), self_vm_id=job.vm_id) is None
+    assert states(ec2) == ["terminated"]
+
+
+def test_cancelled_job_retains_state_after_terminate_failure_and_retries(aws, monkeypatch):
+    coordinator, ec2, _ = aws
+    handler = build_intake_handler(coordinator, lambda: SECRET)
+    handler(webhook())
+    job = next(iter(coordinator.store.list_active()))
+    original_terminate = coordinator.launcher.terminate
+    monkeypatch.setattr(coordinator.launcher, "terminate",
+        lambda _vm: (_ for _ in ()).throw(RuntimeError("temporary")))
+
+    handler(webhook(action="closed", delivery="close-job"))
+    cancelled = coordinator.store.get(job.job_id)
+    assert cancelled.state == "cancelled"
+    assert cancelled.termination_error == "RuntimeError"
+    assert states(ec2) == ["running"]
+
+    monkeypatch.setattr(coordinator.launcher, "terminate", original_terminate)
+    coordinator.recover()
+    assert coordinator.store.get(job.job_id).state == "cancelled"
+    assert coordinator.store.get(job.job_id).termination_error is None
+    assert states(ec2) == ["terminated"]
+
+
+def test_ec2_managed_instance_listing_paginates():
+    class PagedClient:
+        def __init__(self):
+            self.calls = []
+
+        def describe_instances(self, **kwargs):
+            self.calls.append(kwargs)
+            if "NextToken" not in kwargs:
+                return {"Reservations": [{"Instances": [{"InstanceId": "i-one", "Tags": [
+                    {"Key": "review-bot:job-id", "Value": "a" * 64}]}]}], "NextToken": "page-2"}
+            return {"Reservations": [{"Instances": [{"InstanceId": "i-two", "Tags": [
+                {"Key": "review-bot:job-id", "Value": "b" * 64}]}]}]}
+
+    client = PagedClient()
+    launcher = Ec2VmLauncher(client, "lt-id")
+    assert launcher.list_managed_instances() == [
+        ManagedInstance("i-one", "a" * 64), ManagedInstance("i-two", "b" * 64),
+    ]
+    assert client.calls[1]["NextToken"] == "page-2"
+    assert {item["Name"] for item in client.calls[0]["Filters"]} == {
+        "tag:review-bot:managed", "tag:review-bot:job-id", "instance-state-name",
+    }
+
+
+def test_ec2_managed_instance_listing_filters_deployment_tags():
+    class Client:
+        def __init__(self):
+            self.filters = None
+
+        def describe_instances(self, **kwargs):
+            self.filters = kwargs["Filters"]
+            return {"Reservations": []}
+
+    client = Client()
+    launcher = Ec2VmLauncher(client, "lt-id", instance_tags={
+        "team": "review-bot", "review-bot:job-table": "review-bot-prod",
+        "review-bot:managed": "false", "review-bot:job-id": "0" * 64,
+    })
+
+    assert launcher.list_managed_instances() == []
+    assert client.filters[-2:] == [
+        {"Name": "tag:review-bot:job-table", "Values": ["review-bot-prod"]},
+        {"Name": "tag:team", "Values": ["review-bot"]},
+    ]
+    assert {"Name": "tag:review-bot:managed", "Values": ["true"]} in client.filters
+    assert not any(f["Values"] in (["false"], ["0" * 64]) for f in client.filters)
+
+
+def test_ec2_launcher_adds_bootstrap_tags_without_overriding_job_tags(aws):
+    coordinator, ec2, _ = aws
+    launcher = Ec2VmLauncher(
+        ec2,
+        coordinator.launcher.launch_template_id,
+        instance_tags={
+            "review-bot:job-table": "jobs",
+            "review-bot:managed": "false",
+            "review-bot:job-id": "0" * 64,
+        },
+    )
+    job_id = "a" * 64
+    vm_id = launcher.launch(job_id, max_lifetime_seconds=600, launch_token="launch-token")
+    instance = next(
+        instance
+        for reservation in ec2.describe_instances()["Reservations"]
+        for instance in reservation["Instances"]
+        if instance["InstanceId"] == vm_id
+    )
+    tags = {tag["Key"]: tag["Value"] for tag in instance["Tags"]}
+    assert tags["review-bot:managed"] == "true"
+    assert tags["review-bot:job-id"] == job_id
+    assert tags["review-bot:job-table"] == "jobs"
+    user_data = base64.b64decode(
+        ec2.describe_instance_attribute(InstanceId=vm_id, Attribute="userData")["UserData"]["Value"]
+    ).decode()
+    assert f"# review-bot-ondemand --job-id {job_id}" in user_data
+    assert "# review-bot-max-lifetime-seconds 600" in user_data
+    assert "exec /opt/review-bot/bin/review-bot-ondemand" not in user_data
 
 
 def test_concurrent_claims_on_dynamodb_yield_single_owner(aws):

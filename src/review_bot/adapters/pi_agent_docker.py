@@ -162,8 +162,13 @@ class DockerPiAgentRunner:
     def _docker(self, args: list[str], *, timeout: int = 30,
         env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         options: dict[str, Any] = {"capture_output": True, "text": True, "timeout": timeout, "check": False}
-        if env is not None:
-            options["env"] = env
+        agent_docker_host = os.environ.get("REVIEW_BOT_AGENT_DOCKER_HOST")
+        if env is not None or agent_docker_host:
+            docker_env = dict(env if env is not None else os.environ)
+            if agent_docker_host:
+                docker_env["DOCKER_HOST"] = agent_docker_host
+                docker_env.pop("DOCKER_CONTEXT", None)
+            options["env"] = docker_env
         return subprocess.run(["docker", *args], **options)
 
     @staticmethod

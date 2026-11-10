@@ -1,7 +1,9 @@
 """Fail-closed CLI composition of the signed receiver and installation-bound worker."""
 from __future__ import annotations
 
+import json
 import os
+import re
 import stat
 import threading
 from collections.abc import Iterator
@@ -17,7 +19,7 @@ from review_bot.adapters.github.auth import GitHubAppTokenProvider
 from review_bot.adapters.pmd.container import RootlessPmdAnalyzer, _IMAGE_PIN
 from review_bot.adapters.sqlite.store import SQLiteJobStore
 from review_bot.config import ConfigValidationError, ReviewBotConfig, load_review_config, validate_active_environment
-from review_bot.domain.envelope_v2 import RunRecord
+from review_bot.domain.envelope_v2 import PrRequestRecord, RunRecord
 from review_bot.ports import GitHubClient, RepositoryReader
 from review_bot.runtime.github_app import GitHubAppAdapters
 from review_bot.runtime.webhook import create_webhook_app
@@ -27,6 +29,16 @@ from review_bot.runtime.intent_api import API_TOKEN_ENV, attach_intent_api, crea
 
 class ServiceConfigurationError(ValueError):
     """Operator-facing errors containing field names, never raw values or paths."""
+
+
+_VM_LIFETIME_MARGIN_SECONDS = 300
+
+
+def enqueue_service_review(job_store: SQLiteJobStore, request: PrRequestRecord, delivery=None) -> None:
+    if delivery is None:
+        job_store.enqueue_request(request)
+    else:
+        job_store.accept_delivery(delivery, request)
 
 
 def load_service_config(path: str | None) -> ReviewBotConfig:
@@ -226,7 +238,8 @@ def run_webhook(config_path: str | None, *, host: str = "127.0.0.1", port: int =
         if config.execution.mode == "offline":
             app = create_intent_app(config, job_store, root / "artifacts")
         else:
-            app = create_webhook_app(config, job_store)
+            app = create_webhook_app(config, job_store,
+                enqueue_pr_request=lambda delivery, request: enqueue_service_review(job_store, request, delivery))
             if os.environ.get(API_TOKEN_ENV, "").strip():
                 attach_intent_api(app, config, job_store, root / "artifacts")
         uvicorn.run(app, host=host, port=port)
@@ -279,3 +292,100 @@ def run_worker(config_path: str | None, *, once: bool = False) -> int:
             finally:
                 second_store.close()
     return 0
+
+
+def execute_ondemand_review(config_path: str | None, job, is_current, *,
+    vm_lifetime_seconds: int | None = None) -> tuple[dict[str, str], dict]:
+    if not re.fullmatch(r"[0-9a-f]{64}", job.job_id):
+        raise ServiceConfigurationError("Invalid on-demand job id")
+    try:
+        initial_config, _ = load_review_config(config_path)
+    except Exception:
+        raise ServiceConfigurationError("Cannot load operator --config") from None
+    state_env = initial_config.service.state_root_env
+    previous = os.environ.get(state_env)
+    base = Path(previous or "/var/lib/review-bot")
+    os.environ[state_env] = os.fspath(base / "ondemand" / job.job_id)
+    try:
+        config = load_service_config(config_path)
+        if (vm_lifetime_seconds is not None
+                and config.execution.task_timeout_seconds + _VM_LIFETIME_MARGIN_SECONDS > vm_lifetime_seconds):
+            raise ServiceConfigurationError("task_timeout_exceeds_vm_lifetime")
+        with open_service_state(config) as (root, job_store):
+            analyzer_factory = (lambda: _architecture_analyzer(config, root)) if (
+                "architecture" in config.execution.available_modes) else None
+            adapters = _ClaimedAppAdapters(config, root / "repositories")
+            loop = WorkerLoop(
+                config, job_store, analyzer_factory=analyzer_factory,
+                github_client_factory=adapters.github_client,
+                repo_reader_factory=adapters.repository_reader,
+                artifact_root=root / "artifacts",
+                repository_settings_factory=adapters.review_settings,
+                external_write_guard=is_current,
+                expected_head_sha=job.head_sha,
+            )
+            loop.prepare_models()
+            enqueue_service_review(job_store, PrRequestRecord(
+                job.installation_id, job.repository_id, job.pr_number, 1,
+            ))
+            run = job_store.claim_next_run(loop.worker_id, loop.lease_duration)
+            if run is None or (run.installation_id, run.repository_id, run.pr_number) != (
+                job.installation_id, job.repository_id, job.pr_number,
+            ):
+                raise ServiceConfigurationError("Could not claim the on-demand review run")
+            completed = loop.process_run(run)
+            artifact_path = root / "artifacts" / "runs" / str(job.repository_id) / str(job.pr_number) / run.run_id
+            try:
+                manifest = json.loads((artifact_path / "manifest.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                manifest = {}
+            if not isinstance(manifest, dict) or not manifest:
+                return (
+                    {"architecture": "failed", "intent": "failed"},
+                    {"run_id": run.run_id, "worker_completed": completed, "status": "failed", "modes": {}},
+                )
+            modes: dict[str, str] = {}
+            trace_modes = {}
+            selected = set(manifest.get("selected_modes", ()))
+            for mode, directory in (("architecture", "A"), ("intent", "B")):
+                if mode not in selected:
+                    modes[mode] = "not_selected"
+                    continue
+                try:
+                    receipt = json.loads((artifact_path / directory / "receipt.json").read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    receipt = {}
+                record = manifest.get("modes", {}).get(mode, {})
+                publication = receipt.get("publication") or record.get("publication")
+                execution_status = receipt.get("execution_status")
+                result_status = record.get("status")
+                if execution_status == "failed":
+                    modes[mode] = "publication_failed" if (
+                        isinstance(publication, dict) and publication.get("status") == "failed"
+                    ) else "failed"
+                elif result_status == "partial_review":
+                    modes[mode] = "partial_review"
+                elif execution_status in ("completed", "not_run"):
+                    modes[mode] = "completed"
+                else:
+                    modes[mode] = "failed"
+                trace_modes[mode] = {
+                    "execution_status": execution_status,
+                    "error_code": receipt.get("error_code"),
+                    "usage": receipt.get("usage"),
+                    "model_delivery": receipt.get("model_delivery"),
+                    "publication": publication,
+                }
+            trace = {
+                "run_id": run.run_id,
+                "worker_completed": completed,
+                "status": manifest.get("status"),
+                "selected_modes": sorted(selected),
+                "modes": trace_modes,
+            }
+            return modes, trace
+    finally:
+        if previous is None:
+            os.environ.pop(state_env, None)
+        else:
+            os.environ[state_env] = previous

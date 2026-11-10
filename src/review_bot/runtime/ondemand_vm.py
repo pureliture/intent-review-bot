@@ -11,9 +11,15 @@ Execute = Callable[[ReviewJob, Callable[[], bool]], tuple[dict[str, str], dict]]
 
 
 def run_job(coordinator: OnDemandCoordinator, job_id: str, worker_id: str, execute: Execute, *,
-    heartbeat_seconds: float | None = None) -> ReviewJob | None:
+    heartbeat_seconds: float | None = None, self_vm_id: str | None = None) -> ReviewJob | None:
     job = coordinator.claim(job_id, worker_id)
     if job is None:
+        if self_vm_id:
+            current = coordinator.store.get(job_id)
+            if current is not None and current.vm_id == self_vm_id:
+                coordinator.release_vm(current)
+            else:
+                coordinator.launcher.terminate(self_vm_id)
         return None
     lost = threading.Event()
     stop = threading.Event()
@@ -37,7 +43,7 @@ def run_job(coordinator: OnDemandCoordinator, job_id: str, worker_id: str, execu
         try:
             mode_results, trace = execute(job, is_current)
         except Exception as exc:
-            mode_results, trace = {"review": "failed"}, {"error": type(exc).__name__}
+            mode_results, trace = {"architecture": "failed", "intent": "failed"}, {"error": type(exc).__name__}
         stop.set()
         thread.join(timeout=interval + 1)
         try:
@@ -49,5 +55,7 @@ def run_job(coordinator: OnDemandCoordinator, job_id: str, worker_id: str, execu
     finally:
         stop.set()
         current = coordinator.store.get(job_id)
-        if current is not None and current.vm_id:
+        if self_vm_id and (current is None or current.vm_id != self_vm_id):
+            coordinator.launcher.terminate(self_vm_id)
+        elif current is not None and current.vm_id:
             coordinator.release_vm(current)

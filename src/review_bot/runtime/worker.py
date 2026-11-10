@@ -118,6 +118,8 @@ class WorkerLoop:
         decision_client: ModelClient | None = None,
         repository_settings_factory: Callable[..., SettingsResolution] | None = None,
         agent_runner: Any | None = None,
+        external_write_guard: Callable[[], bool] | None = None,
+        expected_head_sha: str | None = None,
     ) -> None:
         self.config = config
         self.job_store = job_store
@@ -127,6 +129,8 @@ class WorkerLoop:
         self.github_client_factory = github_client_factory
         self.repo_reader_factory = repo_reader_factory
         self.repository_settings_factory = repository_settings_factory
+        self.external_write_guard = external_write_guard
+        self.expected_head_sha = expected_head_sha
         self._repository_settings = SettingsResolution(RepositoryReviewSettings())
         self.artifact_root = artifact_root
         self._review_cache = SharedReviewCache(artifact_root.parent) if artifact_root is not None else None
@@ -566,6 +570,8 @@ class WorkerLoop:
                 if pr_data.get("state", "open") != "open":
                     return self._update_run(run, RunStatus.CANCELLED, reason="pr_not_open")
                 head_sha = pr_data.get("head", {}).get("sha", "")
+                if self.expected_head_sha is not None and head_sha != self.expected_head_sha:
+                    raise _CommonFailure("on_demand_head_mismatch")
                 target_base_sha = pr_data.get("base", {}).get("sha", "")
                 branch = pr_data.get("head", {}).get("ref", "")
                 labels = tuple(
@@ -864,6 +870,12 @@ class WorkerLoop:
     def _active(self, run: RunRecord, deadline: float) -> bool:
         if not self._check_fencing_and_lease(run.run_id, run.generation):
             return False
+        if self.external_write_guard is not None:
+            try:
+                if self.external_write_guard() is not True:
+                    return False
+            except Exception:
+                return False
         if self._stop_event.is_set():
             self._update_run(run, RunStatus.CANCELLED, reason="worker_stopped")
             return False

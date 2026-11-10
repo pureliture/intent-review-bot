@@ -1728,3 +1728,16 @@ def test_worker_terminal_write_cannot_clobber_successor(
     assert before is not None
     assert conn.execute("SELECT * FROM runs WHERE run_id = ?;", (run.run_id,)).fetchone() == before
     assert conn.execute("SELECT * FROM publication_receipts;").fetchall() == receipts_before
+
+
+def test_external_current_guard_blocks_github_publication(
+    claimed_worker: tuple[SQLiteJobStore, WorkerLoop, RunRecord],
+) -> None:
+    store, worker, run = claimed_worker
+    github = worker.github_client
+    worker.external_write_guard = lambda: False
+
+    assert worker.process_run(run) is False
+    assert github.comments == {}
+    assert github.posted_comments == []
+    assert github.updated_comments == []

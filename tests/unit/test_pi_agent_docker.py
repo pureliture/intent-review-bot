@@ -366,6 +366,43 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
     assert any(argv[1:3] == ["network", "rm"] for argv in calls)
 
 
+def test_docker_runner_reads_key_file_and_exposes_key_only_to_proxy_process(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    key_file = tmp_path / "openrouter-key"
+    key_file.write_text("file-only-secret\n", encoding="utf-8")
+    key_file.chmod(0o600)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY_FILE", str(key_file))
+    monkeypatch.setenv("REVIEW_BOT_AGENT_DOCKER_HOST", "unix:///var/run/docker.sock")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[1:3] == ["image", "inspect"]:
+            assert proxy_image_tag() in argv
+            return subprocess.CompletedProcess(argv, 0, "image exists", "")
+        if "review-bot-pi-agent:0.73.1" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "agent failed")
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = DockerPiAgentRunner(AgentEngineConfig(session_store_dir=str(tmp_path / "sessions")))
+    with pytest.raises(AgentRunError, match="agent_crashed"):
+        runner.run(AgentRunRequest(
+            "architecture", workspace, "review-architecture", "stealth/crouton-alpha", 10
+        ))
+
+    proxy = next((argv, kwargs) for argv, kwargs in calls
+        if argv[1] == "run" and proxy_image_tag() in argv)
+    assert any(argv[1:3] == ["image", "inspect"] for argv, _ in calls)
+    assert proxy[1]["env"]["UPSTREAM_API_KEY"] == "file-only-secret"
+    agent = next((argv, kwargs) for argv, kwargs in calls if "review-bot-pi-agent:0.73.1" in argv)
+    assert "UPSTREAM_API_KEY" not in agent[1].get("env", {})
+    assert agent[1]["env"]["DOCKER_HOST"] == "unix:///var/run/docker.sock"
+    assert "file-only-secret" not in json.dumps(agent[0])
+
+
 def test_proxy_usage_tracks_max_prompt_tokens_and_none_when_unreported(tmp_path):
     ledger = tmp_path / "usage.jsonl"
     ledger.write_text(
