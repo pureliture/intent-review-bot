@@ -654,12 +654,12 @@ def _repair_message(rejected: list[dict], diagnostics: list[str] | None = None) 
     )
 
 
-def _configured_limits(runner, timeout: int) -> dict[str, int]:
+def _configured_limits(runner, timeout: int) -> dict[str, int | None]:
     config = getattr(runner, "config", None)
     return {
         "timeout_seconds": timeout,
         "max_proxy_calls": getattr(config, "max_proxy_calls", 40),
-        "max_output_tokens": getattr(config, "max_output_tokens", 4096),
+        "max_output_tokens": getattr(config, "max_output_tokens", None),
     }
 
 
@@ -1570,7 +1570,11 @@ def validate_agent_partition_result(result: PartitionReviewResult, task) -> None
             or type(agent["duration_ms"]) is not int or agent["duration_ms"] < 0
             or not isinstance(agent["limits"], dict) or set(agent["limits"]) != {
                 "timeout_seconds", "max_proxy_calls", "max_output_tokens"}
-            or any(type(value) is not int or value < 1 for value in agent["limits"].values())
+            or any(type(value) is not int or value < 1
+                for key, value in agent["limits"].items() if key != "max_output_tokens")
+            or (agent["limits"]["max_output_tokens"] is not None
+                and (type(agent["limits"]["max_output_tokens"]) is not int
+                    or agent["limits"]["max_output_tokens"] < 1))
             or type(agent["repair_attempted"]) is not bool
             or not isinstance(agent["rejected_before"], list)
             or not isinstance(agent["rejected"], list)

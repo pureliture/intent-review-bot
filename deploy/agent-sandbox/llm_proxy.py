@@ -14,11 +14,12 @@ UPSTREAMS = {
     "openrouter": "https://openrouter.ai/api/v1/chat/completions",
     "opencode-go": "https://opencode.ai/inference/go/openai/v1/chat/completions",
 }
+PI_MAX_OUTPUT_TOKENS = 32000  # pi's own per-request ceiling
 _MAX_USAGE_SCAN_BYTES = 16_777_216
 
 
 class ProxyState:
-    def __init__(self, model: str, call_budget: int, max_output_tokens: int,
+    def __init__(self, model: str, call_budget: int, max_output_tokens: int | None = None,
         ledger_path: str | None = None, provider: str = "openrouter",
         upstream_session_id: str | None = None) -> None:
         if provider not in UPSTREAMS:
@@ -58,13 +59,16 @@ def authorize_request(path: str, payload: dict, state: ProxyState) -> tuple[int,
         if state.remaining <= 0:
             return 429, None
         state.remaining -= 1
+    output_ceiling = (state.max_output_tokens if state.max_output_tokens is not None
+        else PI_MAX_OUTPUT_TOKENS)
     for key in ("max_tokens", "max_completion_tokens"):
-        value = payload.get(key)
-        if value is not None:
+        if key in payload:
+            value = payload[key]
             if type(value) is not int or value < 1:
                 return 400, None
-            payload[key] = min(value, state.max_output_tokens)
-    if "max_tokens" not in payload and "max_completion_tokens" not in payload:
+            payload[key] = min(value, output_ceiling)
+    if (state.max_output_tokens is not None and "max_tokens" not in payload
+            and "max_completion_tokens" not in payload):
         payload["max_tokens"] = state.max_output_tokens
     usage_options = payload.get("usage")
     if state.provider == "openrouter":
@@ -249,8 +253,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    max_output_tokens = os.environ.get("MAX_OUTPUT_TOKENS")
     state = ProxyState(os.environ["MODEL_ID"], int(os.environ["MAX_PROXY_CALLS"]),
-        int(os.environ["MAX_OUTPUT_TOKENS"]), os.environ.get("USAGE_LEDGER_PATH"),
+        int(max_output_tokens) if max_output_tokens else None,
+        os.environ.get("USAGE_LEDGER_PATH"),
         os.environ.get("PROVIDER", "openrouter"), os.environ.get("UPSTREAM_SESSION_ID"))
     handler = type("ConfiguredProxyHandler", (ProxyHandler,), {"state": state})
     ThreadingHTTPServer(("0.0.0.0", 8080), handler).serve_forever()

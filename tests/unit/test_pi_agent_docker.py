@@ -40,6 +40,7 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
             model = models["providers"]["llmproxy"]["models"][0]
             assert model["id"] == "stealth/crouton-alpha"
             assert "contextWindow" not in model
+            assert "maxTokens" not in model
             assert any(item.endswith(":/agent/models.json:ro") for item in argv)
             assert any(item.startswith("/agent:rw,") for index, item in enumerate(argv)
                 if index > 0 and argv[index - 1] == "--tmpfs")
@@ -86,6 +87,7 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
     assert not any("docker.sock" in argument for argument in agent)
     proxy = next(argv for argv in calls if "review-bot-agent-proxy:1" in argv)
     assert "UPSTREAM_API_KEY" in proxy
+    assert not any(arg.startswith("MAX_OUTPUT_TOKENS=") for arg in proxy)
     assert not any(arg.startswith("UPSTREAM_API_KEY=") for arg in proxy)
     assert "PROVIDER=openrouter" in proxy
     assert not any("OPENROUTER_API_KEY" in argument for argument in proxy)
@@ -313,6 +315,31 @@ def test_pi_models_json_uses_configured_context_window(tmp_path, monkeypatch):
         session_store_dir=str(tmp_path / "sessions")))
     with pytest.raises(AgentRunError, match="agent_crashed"):
         runner.run(AgentRunRequest("architecture", workspace, "review-architecture", "model-id", 10))
+
+
+def test_pi_and_proxy_receive_explicit_output_token_cap(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if "review-bot-pi-agent:0.73.1" in argv:
+            config_mount = next(item for item in argv if item.endswith(":/agent/models.json:ro"))
+            models = json.loads(Path(config_mount.split(":/agent/models.json:ro")[0]).read_text())
+            assert models["providers"]["llmproxy"]["models"][0]["maxTokens"] == 8192
+            return subprocess.CompletedProcess(argv, 1, "", "agent failed")
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = DockerPiAgentRunner(AgentEngineConfig(max_output_tokens=8192,
+        session_store_dir=str(tmp_path / "sessions")))
+    with pytest.raises(AgentRunError, match="agent_crashed"):
+        runner.run(AgentRunRequest("architecture", workspace, "review-architecture", "model-id", 10))
+
+    proxy = next(argv for argv in calls if "review-bot-agent-proxy:1" in argv)
+    assert "MAX_OUTPUT_TOKENS=8192" in proxy
 
 
 @pytest.mark.parametrize(("provider", "error_code"), [

@@ -150,9 +150,11 @@ def execution_trace(result, *, context: Mapping | None = None, ko: bool = True) 
             f"{_code(agent.get('skill_sha256', unknown))}")
         lines.append(f"- Agent model: {_code(agent.get('model', unknown))}")
         if isinstance(limits, Mapping):
-            lines.append(f"- Agent limits: timeout {_usage_text(limits.get('timeout_seconds'), ko)}s · "
-                f"max proxy calls {_usage_text(limits.get('max_proxy_calls'), ko)} · "
-                f"max output tokens {_usage_text(limits.get('max_output_tokens'), ko)}")
+            limits_line = (f"- Agent limits: timeout {_usage_text(limits.get('timeout_seconds'), ko)}s · "
+                f"max proxy calls {_usage_text(limits.get('max_proxy_calls'), ko)}")
+            if limits.get("max_output_tokens") is not None:
+                limits_line += f" · max output tokens {_usage_text(limits['max_output_tokens'], ko)}"
+            lines.append(limits_line)
         lines.append(f"- Agent usage: input {_usage_text(agent_usage.get('input_tokens', agent_usage.get('input')), ko)} · "
             f"output {_usage_text(agent_usage.get('output_tokens', agent_usage.get('output')), ko)} · "
             f"total {_usage_text(agent_usage.get('total_tokens', agent_usage.get('total')), ko)} tokens"

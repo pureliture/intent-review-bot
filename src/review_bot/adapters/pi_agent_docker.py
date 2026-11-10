@@ -118,7 +118,7 @@ class DockerPiAgentRunner:
     def _proxy_argv(self, network: str, name: str, model: str, ledger_dir: Path,
         upstream_session_id: str) -> list[str]:
         uid, gid = self._runtime_uid_gid()
-        return [
+        argv = [
             "run", "-d", "--name", name, "--network", "bridge", "--read-only",
             "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=32m",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -129,10 +129,11 @@ class DockerPiAgentRunner:
             "--env", f"UPSTREAM_SESSION_ID={upstream_session_id}",
             "--env", f"MODEL_ID={model}",
             "--env", f"MAX_PROXY_CALLS={self.config.max_proxy_calls}",
-            "--env", f"MAX_OUTPUT_TOKENS={self.config.max_output_tokens}",
-            "--env", "USAGE_LEDGER_PATH=/ledger/usage.jsonl",
-            PROXY_IMAGE,
         ]
+        if self.config.max_output_tokens is not None:
+            argv.extend(["--env", f"MAX_OUTPUT_TOKENS={self.config.max_output_tokens}"])
+        argv.extend(["--env", "USAGE_LEDGER_PATH=/ledger/usage.jsonl", PROXY_IMAGE])
+        return argv
 
     def _upstream_api_key(self) -> str:
         variables = {
@@ -295,8 +296,9 @@ class DockerPiAgentRunner:
                     os.chmod(Path(directory) / filename, 0o644)
             model_config = {
                 "id": request.model, "name": request.model, "reasoning": True,
-                "maxTokens": self.config.max_output_tokens,
             }
+            if self.config.max_output_tokens is not None:
+                model_config["maxTokens"] = self.config.max_output_tokens
             if self.config.context_window_tokens is not None:
                 model_config["contextWindow"] = self.config.context_window_tokens
             models = {"providers": {"llmproxy": {

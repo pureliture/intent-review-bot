@@ -267,6 +267,36 @@ def test_agent_architecture_result_validates_formats_with_exact_citations_and_tr
     assert runner.generation_contract_json["citation_rules"]["empty_target_ids_basis"] == "observed_structure"
 
 
+def test_agent_result_with_unset_output_cap_records_null_and_hides_it_in_trace(tmp_path):
+    task = _pmd_partition_task()
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+    runner.config.max_output_tokens = None
+    result = run_agent_review(task, "architecture", runner, language="en", instructions="")
+
+    agent = result.partition["agent"]
+    markdown = format_partition_review_markdown(result, task, publication_mode="comment")
+
+    assert agent["limits"]["max_output_tokens"] is None
+    assert result.model["profile"]["max_output_tokens"] is None
+    assert result.partition["identity"]["models"]["agent"]["max_output_tokens"] is None
+    assert result.partition["identity"]["models"]["verifier"]["max_output_tokens"] is None
+    assert "Agent limits:" in markdown
+    assert "max output tokens" not in markdown
+    validate_partition_result(result, task)
+
+
+def test_agent_legacy_output_cap_4096_replays(tmp_path):
+    task = _pmd_partition_task()
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+    runner.config.max_output_tokens = 4096
+    result = run_agent_review(task, "architecture", runner, language="en", instructions="")
+
+    assert result.partition["agent"]["limits"]["max_output_tokens"] == 4096
+    assert result.partition["identity"]["models"]["agent"]["max_output_tokens"] == 4096
+    assert result.model["profile"]["max_output_tokens"] == 4096
+    validate_partition_result(result, task)
+
+
 def test_agent_intent_result_validates_and_formats_all_perspectives(tmp_path):
     task = make_intent_task()
     runner = FakeAgentRunner(tmp_path, _intent_body(task))

@@ -43,6 +43,78 @@ def test_proxy_adds_a_ceiling_when_request_omits_max_tokens():
     assert payload["usage"] == {"include": True}
 
 
+def test_proxy_without_configured_cap_uses_pi_ceiling_without_injecting_tokens():
+    proxy = _proxy_module()
+    state = proxy.ProxyState("model", 3, None)
+
+    allowed, bounded = proxy.authorize_request("/v1/chat/completions",
+        {"model": "model", "max_tokens": 50000}, state)
+    assert allowed == 200 and bounded["max_tokens"] == 32000
+
+    allowed, bounded = proxy.authorize_request("/v1/chat/completions",
+        {"model": "model", "max_tokens": 1000}, state)
+    assert allowed == 200 and bounded["max_tokens"] == 1000
+
+    allowed, bounded = proxy.authorize_request("/v1/chat/completions", {"model": "model"}, state)
+    assert allowed == 200
+    assert "max_tokens" not in bounded and "max_completion_tokens" not in bounded
+
+
+def test_proxy_configured_output_cap_keeps_clamping_and_default_injection():
+    proxy = _proxy_module()
+    state = proxy.ProxyState("model", 2, 4096)
+
+    allowed, bounded = proxy.authorize_request("/v1/chat/completions",
+        {"model": "model", "max_tokens": 50000}, state)
+    assert allowed == 200 and bounded["max_tokens"] == 4096
+
+    allowed, bounded = proxy.authorize_request("/v1/chat/completions", {"model": "model"}, state)
+    assert allowed == 200 and bounded["max_tokens"] == 4096
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("max_tokens", 0),
+    ("max_tokens", None),
+    ("max_tokens", True),
+    ("max_completion_tokens", -1),
+    ("max_completion_tokens", "100"),
+])
+def test_proxy_rejects_non_positive_integer_output_limits(field, value):
+    proxy = _proxy_module()
+    state = proxy.ProxyState("model", 1, None)
+
+    status, payload = proxy.authorize_request("/v1/chat/completions",
+        {"model": "model", field: value}, state)
+
+    assert status == 400 and payload is None
+
+
+@pytest.mark.parametrize("configured_value", [None, ""])
+def test_proxy_main_treats_missing_or_empty_output_cap_as_unset(monkeypatch, configured_value):
+    proxy = _proxy_module()
+    captured = {}
+
+    class Server:
+        def __init__(self, _address, handler):
+            captured["state"] = handler.state
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr(proxy, "ThreadingHTTPServer", Server)
+    monkeypatch.setenv("MODEL_ID", "model")
+    monkeypatch.setenv("MAX_PROXY_CALLS", "1")
+    monkeypatch.setenv("PROVIDER", "openrouter")
+    if configured_value is None:
+        monkeypatch.delenv("MAX_OUTPUT_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("MAX_OUTPUT_TOKENS", configured_value)
+
+    proxy.main()
+
+    assert captured["state"].max_output_tokens is None
+
+
 def test_proxy_uses_fixed_provider_upstreams_and_opencode_headers():
     proxy = _proxy_module()
     openrouter = proxy.ProxyState("model-a", 1, 1024)

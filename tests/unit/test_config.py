@@ -40,6 +40,7 @@ def test_agent_engine_config_is_opt_in_and_strict(valid_config_yaml: str) -> Non
     assert config.agent_engine.model_id == "stealth/crouton-alpha"
     assert config.agent_engine.provider == "openrouter"
     assert config.agent_engine.context_window_tokens is None
+    assert config.agent_engine.max_output_tokens is None
     assert config.agent_engine.timeout_seconds > 0
 
     enabled = valid_config_yaml.replace("schema_version: 2", "schema_version: 2\nreview_engine: agent", 1)
@@ -47,10 +48,12 @@ def test_agent_engine_config_is_opt_in_and_strict(valid_config_yaml: str) -> Non
     assert config.review_engine == "agent"
 
     opencode = enabled.replace("review_engine: agent",
-        "review_engine: agent\nagent_engine:\n  provider: opencode-go\n  context_window_tokens: 1048576")
+        "review_engine: agent\nagent_engine:\n  provider: opencode-go\n"
+        "  context_window_tokens: 1048576\n  max_output_tokens: 8192")
     config, _ = load_review_config_from_str(opencode)
     assert config.agent_engine.provider == "opencode-go"
     assert config.agent_engine.context_window_tokens == 1048576
+    assert config.agent_engine.max_output_tokens == 8192
 
     invalid_engine = enabled.replace("review_engine: agent", "review_engine: autonomous")
     with pytest.raises(ConfigValidationError):
