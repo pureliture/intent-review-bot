@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import suppress
@@ -63,6 +64,7 @@ class DockerPiAgentRunner:
         self.session_store_dir = Path(config.session_store_dir).expanduser().resolve()
         self.repo_root = repo_root or Path(__file__).resolve().parents[3]
         self._active_runs: dict[str, _ActiveRun] = {}
+        self._active_runs_lock = threading.Lock()
 
     def _docker(self, args: list[str], *, timeout: int = 30,
         env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
@@ -391,7 +393,8 @@ class DockerPiAgentRunner:
         try:
             _, run = self._start(request)
             response = self._invoke(run, _initial_agent_prompt(request.mode), None)
-            self._active_runs[response.session_id] = run
+            with self._active_runs_lock:
+                self._active_runs[response.session_id] = run
             return response
         except AgentRunError:
             if "run" in locals():
@@ -416,7 +419,8 @@ class DockerPiAgentRunner:
 
     def repair(self, request: AgentRunRequest, session_id: str, message: str, *,
         timeout_seconds: int | None = None) -> AgentRunResponse:
-        run = self._active_runs.get(session_id)
+        with self._active_runs_lock:
+            run = self._active_runs.get(session_id)
         if run is None or run.request != request:
             raise AgentRunError("agent_session_unknown")
         if timeout_seconds is not None:
@@ -424,7 +428,8 @@ class DockerPiAgentRunner:
         return self._invoke(run, message, session_id)
 
     def finish(self, session_id: str) -> AgentRunFinalization:
-        run = self._active_runs.pop(session_id, None)
+        with self._active_runs_lock:
+            run = self._active_runs.pop(session_id, None)
         if run is None:
             raise AgentRunError("agent_session_unknown")
         duration_ms = int((time.monotonic() - run.started) * 1000)

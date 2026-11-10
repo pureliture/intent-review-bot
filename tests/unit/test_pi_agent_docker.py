@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from review_bot.adapters.pi_agent_docker import DockerPiAgentRunner
 from review_bot.application.agent_review import _SEARCH_SCOPE_RULE, _initial_agent_prompt
 from review_bot.config import AgentEngineConfig
-from review_bot.ports import AgentRunError, AgentRunRequest
+from review_bot.ports import AgentRunError, AgentRunRequest, AgentRunResponse
 
 
 def test_docker_runner_resolves_relative_session_store_dir(tmp_path, monkeypatch):
@@ -17,6 +21,60 @@ def test_docker_runner_resolves_relative_session_store_dir(tmp_path, monkeypatch
     runner = DockerPiAgentRunner(AgentEngineConfig(session_store_dir="relative-ledger"))
     assert runner.session_store_dir == (tmp_path / "relative-ledger").resolve()
     assert runner.session_store_dir.is_absolute()
+
+
+def test_docker_runner_tracks_concurrent_sessions_safely(tmp_path, monkeypatch):
+    runner = DockerPiAgentRunner(AgentEngineConfig())
+    barrier = threading.Barrier(2, timeout=5)
+
+    class Temporary:
+        def cleanup(self):
+            pass
+
+    def start(request):
+        temporary = Temporary()
+        run = SimpleNamespace(
+            request=request,
+            network=f"network-{request.mode}",
+            proxy_name=f"proxy-{request.mode}",
+            agent_name=f"agent-{request.mode}",
+            config_temporary=temporary,
+            session_temporary=temporary,
+            skills_temporary=temporary,
+            output_temporary=temporary,
+            started=time.monotonic(),
+            session_jsonl=b"session",
+            ledger_path=tmp_path / f"{request.mode}.jsonl",
+        )
+        return None, run
+
+    def invoke(run, _prompt, _session_id):
+        barrier.wait()
+        return AgentRunResponse("ok", b"session", {}, "0.73.1", 0, f"session-{run.request.mode}")
+
+    monkeypatch.setattr(runner, "_start", start)
+    monkeypatch.setattr(runner, "_invoke", invoke)
+    monkeypatch.setattr(runner, "_cleanup_names", lambda *_args: None)
+    monkeypatch.setattr(runner, "_proxy_usage", lambda _path, _session: {"calls": 0})
+    monkeypatch.setattr(runner, "_agent_reported_usage", lambda _session: {})
+
+    requests = [
+        AgentRunRequest(mode, tmp_path, "skill", "model", 10)
+        for mode in ("architecture", "intent")
+    ]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(runner.run, requests))
+
+    assert {response.session_id for response in responses} == {
+        "session-architecture", "session-intent",
+    }
+    assert set(runner._active_runs) == {"session-architecture", "session-intent"}
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        finalizations = list(executor.map(runner.finish, sorted(runner._active_runs)))
+
+    assert all(finalization.session_jsonl == b"session" for finalization in finalizations)
+    assert runner._active_runs == {}
 
 
 def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monkeypatch):

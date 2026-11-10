@@ -1,6 +1,7 @@
 """Background Worker execution loop, lease heartbeat management, and generation fencing."""
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -12,6 +13,7 @@ import socket
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from types import SimpleNamespace
@@ -172,6 +174,7 @@ class WorkerLoop:
             self.planning_client.set_cancellation_callback(self._stop_event.is_set)
         self._lease_lost = False
         self._current_run_id: str | None = None
+        self._mode_lock_context = threading.local()
         self._partition_budget_key = None
         self._partition_budget = None
         self._partition_plan = self._partition_task = self._partition_planning_result = None
@@ -234,10 +237,21 @@ class WorkerLoop:
         if _agent_engine_enabled(self.config):
             from review_bot.application.agent_review import run_agent_review
             self._require_active(run, deadline)
-            result = run_agent_review(task_input, mode, self.agent_runner, language=language,
-                instructions=self._repository_settings.bundle.instructions_for(mode),
-                timeout_seconds=self.config.agent_engine.timeout_seconds,
-                max_revisions=self.config.agent_engine.max_revisions, deadline=deadline)
+            mode_context = getattr(self, "_mode_lock_context", None)
+            mode_lock = getattr(mode_context, "lock", None)
+            release_lock = mode_lock is not None and getattr(mode_context, "lock_held", False)
+            if release_lock:
+                mode_context.lock_held = False
+                mode_lock.release()
+            try:
+                result = run_agent_review(task_input, mode, self.agent_runner, language=language,
+                    instructions=self._repository_settings.bundle.instructions_for(mode),
+                    timeout_seconds=self.config.agent_engine.timeout_seconds,
+                    max_revisions=self.config.agent_engine.max_revisions, deadline=deadline)
+            finally:
+                if release_lock:
+                    mode_lock.acquire()
+                    mode_context.lock_held = True
             self._require_active(run, deadline)
             from review_bot.application.partition_review import validate_partition_result
             validate_partition_result(result, task_input)
@@ -262,6 +276,48 @@ class WorkerLoop:
             prepared_plan=getattr(self, "_partition_plan", None) if mode != "planning" else None,
             review_instructions=self._repository_settings.bundle.instructions_for(mode) if mode != "planning" else "",
             decision_client=self.decision_client)
+
+    def _execute_mode(
+        self, run, mode, review_snap, pr_snap, classification, mode_sel, material, artifacts,
+        title, body, draft, deadline, mode_lock=None,
+    ) -> ExecutionReceipt:
+        mode_context = self._mode_lock_context
+        if mode_lock is not None:
+            mode_context.lock = mode_lock
+            mode_lock.acquire()
+            mode_context.lock_held = True
+        try:
+            if mode_lock is not None:
+                self._require_active(run, deadline)
+            try:
+                deferred = self._partition_plan.partition.get("deferred_modes", {}) if self._partition_plan is not None else {}
+                if mode in deferred:
+                    error_code = "partition_mode_planning_deferred:" + deferred[mode]
+                    receipt = ExecutionReceipt(2, mode, mode_sel.selection_id, review_snap.snapshot_id,
+                        run.generation, run.fingerprint, "failed", error_code=error_code,
+                        publication=self._publish_failure_notice(run, mode, review_snap, error_code, deadline, draft=draft))
+                elif mode == "architecture":
+                    receipt = self._execute_architecture(run, review_snap, pr_snap, classification, mode_sel,
+                        artifacts, title, body, draft, deadline)
+                else:
+                    receipt = self._execute_intent(run, review_snap, mode_sel, material, artifacts, deadline, draft=draft)
+            except (_RunAborted, _CommonFailure, GitHubAuthorizationError):
+                raise
+            except Exception as exc:
+                self._require_active(run, deadline)
+                prefix = "worker" if mode_sel.selected_modes == ("architecture",) else mode
+                error_code = str(exc) if isinstance(exc, (_ModeFailure, IntentInputError)) else _exception_error_code(
+                    f"{prefix}_pipeline_error", exc)
+                receipt = ExecutionReceipt(2, mode, mode_sel.selection_id, review_snap.snapshot_id,
+                    run.generation, run.fingerprint, "failed", error_code=error_code,
+                    publication=self._publish_failure_notice(run, mode, review_snap, error_code, deadline, draft=draft))
+            return receipt
+        finally:
+            if mode_lock is not None:
+                if mode_context.lock_held:
+                    mode_lock.release()
+                del mode_context.lock
+                del mode_context.lock_held
 
     def _plan_partitioned(self, task_input, available_modes, run, deadline):
         from review_bot.application.partition_review import validate_partition_result
@@ -691,30 +747,35 @@ class WorkerLoop:
             if self.artifact_root is not None:
                 artifacts = artifacts or RunArtifacts(self.artifact_root, run)
                 artifacts.save_common(snapshot=review_snap, selection=mode_sel, config_hash=self.config.config_hash)
+            parallel_receipts = None
+            mode_errors = {}
+            if (_agent_engine_enabled(self.config)
+                    and getattr(self.config.agent_engine, "parallel_modes", True)
+                    and len(mode_sel.selected_modes) > 1):
+                mode_lock = threading.Lock()
+                with ThreadPoolExecutor(max_workers=len(mode_sel.selected_modes),
+                        thread_name_prefix="agent-mode") as executor:
+                    futures = {
+                        mode: executor.submit(contextvars.copy_context().run, self._execute_mode,
+                            run, mode, review_snap, pr_snap, classification, mode_sel, material, artifacts,
+                            title, body, draft, deadline, mode_lock)
+                        for mode in mode_sel.selected_modes
+                    }
+                    wait(futures.values())
+                    parallel_receipts = {}
+                    mode_errors = {}
+                    for mode in mode_sel.selected_modes:
+                        try:
+                            parallel_receipts[mode] = futures[mode].result()
+                        except BaseException as exc:
+                            mode_errors[mode] = exc
             for mode in mode_sel.selected_modes:
                 self._require_active(run, deadline)
-                try:
-                    deferred = self._partition_plan.partition.get("deferred_modes", {}) if self._partition_plan is not None else {}
-                    if mode in deferred:
-                        error_code = "partition_mode_planning_deferred:" + deferred[mode]
-                        receipt = ExecutionReceipt(2, mode, mode_sel.selection_id, review_snap.snapshot_id,
-                            run.generation, run.fingerprint, "failed", error_code=error_code,
-                            publication=self._publish_failure_notice(run, mode, review_snap, error_code, deadline, draft=draft))
-                    elif mode == "architecture":
-                        receipt = self._execute_architecture(run, review_snap, pr_snap, classification, mode_sel,
-                            artifacts, title, body, draft, deadline)
-                    else:
-                        receipt = self._execute_intent(run, review_snap, mode_sel, material, artifacts, deadline, draft=draft)
-                except (_RunAborted, _CommonFailure, GitHubAuthorizationError):
-                    raise
-                except Exception as exc:
-                    self._require_active(run, deadline)
-                    prefix = "worker" if mode_sel.selected_modes == ("architecture",) else mode
-                    error_code = str(exc) if isinstance(exc, (_ModeFailure, IntentInputError)) else _exception_error_code(
-                        f"{prefix}_pipeline_error", exc)
-                    receipt = ExecutionReceipt(2, mode, mode_sel.selection_id, review_snap.snapshot_id,
-                        run.generation, run.fingerprint, "failed", error_code=error_code,
-                        publication=self._publish_failure_notice(run, mode, review_snap, error_code, deadline, draft=draft))
+                if parallel_receipts is not None and mode in mode_errors:
+                    continue
+                receipt = (parallel_receipts[mode] if parallel_receipts is not None else self._execute_mode(
+                    run, mode, review_snap, pr_snap, classification, mode_sel, material, artifacts,
+                    title, body, draft, deadline))
                 self._require_active(run, deadline)
                 if receipt.publication is not None:
                     eligible = (receipt.execution_status in ("completed", "not_run") and receipt.publication.status == "succeeded"
@@ -739,6 +800,9 @@ class WorkerLoop:
                 receipts[mode] = receipt
                 if publication is not None and publication.reason == "publication_authorization_lost":
                     raise _CommonFailure("publication_authorization_lost")
+            for mode in mode_sel.selected_modes:
+                if mode in mode_errors:
+                    raise mode_errors[mode]
             failed = [receipt for receipt in receipts.values() if receipt.execution_status == "failed"
                 or receipt.publication is not None and receipt.publication.status not in ("succeeded", "not_attempted")]
             all_reused = bool(receipts) and all(receipt.reused for receipt in receipts.values())

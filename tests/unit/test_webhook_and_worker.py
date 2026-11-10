@@ -6,9 +6,10 @@ import hmac
 import json
 import sqlite3
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,15 +26,58 @@ from review_bot.adapters.sqlite.store import SQLiteJobStore
 from review_bot.application.delta import build_delta
 from review_bot.application.snapshot import assemble_snapshot_bundle
 from review_bot.config import load_review_config_from_str
-from review_bot.domain.envelope_v2 import ChangedFile, PrRequestRecord, PublicationReceipt, RunRecord
+from review_bot.domain.envelope_v2 import (
+    ChangedFile,
+    ExecutionReceipt,
+    PrRequestRecord,
+    PublicationReceipt,
+    RunRecord,
+)
 from review_bot.domain.models_v1 import ModelResponse, ReviewResult, TaskInput
 from review_bot.domain.status import RunStage, RunStatus
-from review_bot.ports import GitHubClient, MergeBaseResult, ModelClient, RepositoryReader, StaticAnalyzer
+from review_bot.ports import (
+    GitHubAuthorizationError,
+    GitHubClient,
+    MergeBaseResult,
+    ModelClient,
+    RepositoryReader,
+    StaticAnalyzer,
+)
 from review_bot.runtime.webhook import create_webhook_app
-from review_bot.runtime.worker import WorkerLoop
+from review_bot.runtime.worker import WorkerLoop, _CommonFailure
 from tests.conftest import MockGitHubClient, SyntheticGitRepo
 
 SECRET = "test_webhook_secret_xyz"
+
+
+@dataclass(frozen=True)
+class _AgentModeTask:
+    input_hash: str
+
+
+class _BarrierAgentRunner:
+    def __init__(self, *, parallel: bool, fail_mode: str | None = None) -> None:
+        self.barrier = threading.Barrier(2, timeout=5) if parallel else None
+        self.fail_mode = fail_mode
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+        self.finished: list[str] = []
+
+    def run(self, mode: str) -> SimpleNamespace:
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            if self.barrier is not None:
+                self.barrier.wait()
+            if mode == self.fail_mode:
+                raise GitHubAuthorizationError("test authorization failure")
+            return SimpleNamespace(mode=mode, status="completed")
+        finally:
+            with self.lock:
+                self.active -= 1
+                self.finished.append(mode)
 
 
 @pytest.fixture(name="valid_config_yaml")
@@ -792,6 +836,120 @@ def claimed_worker(
         yield store, worker, run
     finally:
         store.close()
+
+
+def _configure_agent_mode_worker(worker, tmp_path, monkeypatch, runner, *,
+        parallel_modes: bool | None = None, publish_comments: bool = True,
+        fail_after_agent_mode: str | None = None,
+        architecture_published: threading.Event | None = None) -> None:
+    config_updates = {
+        "review_engine": "agent",
+        "execution": worker.config.execution.model_copy(update={
+            "available_modes": ["architecture", "intent"],
+        }),
+        "publish": worker.config.publish.model_copy(update={
+            "mode": "comment", "b_comments_enabled": True,
+        }),
+    }
+    if parallel_modes is not None:
+        config_updates["agent_engine"] = worker.config.agent_engine.model_copy(update={
+            "parallel_modes": parallel_modes,
+        })
+    worker.config = worker.config.model_copy(update=config_updates)
+    worker.artifact_root = tmp_path / "agent-artifacts"
+    worker.agent_runner = runner
+    monkeypatch.setattr("review_bot.runtime.worker.collect_intent_sources", lambda *_args, **_kwargs:
+        SimpleNamespace(evidence=(), unavailable_sources=(),
+            captured_at="2026-10-06T12:00:00Z", as_of="2026-10-06T12:00:00Z"))
+    monkeypatch.setattr("review_bot.runtime.worker.build_intent_task_input", lambda *_args, **_kwargs:
+        _AgentModeTask("1" * 64))
+
+    from review_bot.application import agent_review, partition_review
+
+    def fake_run_agent_review(_task_input, mode, agent_runner, **_kwargs):
+        result = agent_runner.run(mode)
+        if mode == "intent" and architecture_published is not None:
+            assert architecture_published.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(agent_review, "run_agent_review", fake_run_agent_review)
+    monkeypatch.setattr(partition_review, "validate_partition_result", lambda _result, _task: None)
+
+    def receipt(mode, run, review_snap, mode_sel, deadline):
+        worker._review_partitioned(_AgentModeTask("2" * 64), mode, run, deadline,
+            worker.config.output.language)
+        if mode == fail_after_agent_mode:
+            raise _CommonFailure("intent_failure")
+        body = f"{mode} review"
+        comment = worker.github_client.post_comment(run.pr_number, body) if publish_comments else None
+        if mode == "architecture" and comment is not None and architecture_published is not None:
+            architecture_published.set()
+        marker = worker.config.publish.a_marker if mode == "architecture" else worker.config.publish.b_marker
+        publication = PublicationReceipt(
+            comment["id"] if comment is not None else None,
+            "succeeded" if comment is not None else "not_attempted",
+            hashlib.sha256(body.encode()).hexdigest(),
+            marker=marker,
+            reason="" if comment is not None else "not_attempted",
+        )
+        return ExecutionReceipt(2, mode, mode_sel.selection_id, review_snap.snapshot_id,
+            run.generation, run.fingerprint, "completed", publication=publication)
+
+    monkeypatch.setattr(worker, "_execute_architecture", lambda run, review_snap, _pr_snap,
+        _classification, mode_sel, _artifacts, _title, _body, _draft, deadline:
+        receipt("architecture", run, review_snap, mode_sel, deadline))
+    monkeypatch.setattr(worker, "_execute_intent", lambda run, review_snap, mode_sel,
+        _material, _artifacts, deadline, draft=False:
+        receipt("intent", run, review_snap, mode_sel, deadline))
+
+
+@pytest.mark.parametrize(("parallel_modes", "expected_max_active"), [
+    (None, 2),
+    (False, 1),
+])
+def test_agent_worker_runs_architecture_and_intent_concurrently_by_default(
+    claimed_worker, tmp_path, monkeypatch, parallel_modes, expected_max_active,
+) -> None:
+    store, worker, run = claimed_worker
+    runner = _BarrierAgentRunner(parallel=parallel_modes is not False)
+    _configure_agent_mode_worker(worker, tmp_path, monkeypatch, runner, parallel_modes=parallel_modes)
+
+    assert worker.process_run(run) is True
+
+    status, error = store._get_connection().execute(
+        "SELECT status, error FROM runs WHERE run_id = ?;", (run.run_id,),
+    ).fetchone()
+    assert (status, error) == ("succeeded", None)
+    assert runner.max_active == expected_max_active
+    assert {comment["body"] for comment in worker.github_client.posted_comments} == {
+        "architecture review", "intent review",
+    }
+
+
+@pytest.mark.parametrize("parallel_modes", [False, True])
+def test_agent_worker_parallel_mode_failure_matches_sequential_and_joins_threads(
+    claimed_worker, tmp_path, monkeypatch, parallel_modes,
+) -> None:
+    store, worker, run = claimed_worker
+    runner = _BarrierAgentRunner(parallel=parallel_modes)
+    architecture_published = threading.Event()
+    _configure_agent_mode_worker(worker, tmp_path, monkeypatch, runner,
+        parallel_modes=parallel_modes, fail_after_agent_mode="intent",
+        architecture_published=architecture_published)
+
+    assert worker.process_run(run) is False
+
+    status, error = store._get_connection().execute(
+        "SELECT status, error FROM runs WHERE run_id = ?;", (run.run_id,),
+    ).fetchone()
+    assert (status, error) == ("failed", "intent_failure")
+    assert set(runner.finished) == {"architecture", "intent"}
+    publications = store._get_connection().execute(
+        "SELECT marker, status FROM publication_receipts WHERE run_id = ?;", (run.run_id,),
+    ).fetchall()
+    assert publications == [(worker.config.publish.a_marker, "succeeded")]
+    if parallel_modes:
+        assert not any(thread.name.startswith("agent-mode") for thread in threading.enumerate())
 
 
 @pytest.fixture

@@ -100,6 +100,8 @@ def agent_review_generation_key(task, mode: str, config, *, language: str, instr
                 "image_tag", "model_id", "timeout_seconds", "max_proxy_calls", "max_output_tokens",
             )
         }
+    if isinstance(agent_config, dict):
+        agent_config = {key: value for key, value in agent_config.items() if key != "parallel_modes"}
     architecture = getattr(config, "architecture", None)
     if hasattr(architecture, "model_dump"):
         architecture = architecture.model_dump(mode="json")
