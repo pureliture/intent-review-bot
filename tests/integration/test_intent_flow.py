@@ -197,7 +197,7 @@ def test_signed_python_pr_creates_private_validated_b_without_java(intent_flow):
     assert (result["status"], result["reason"]) == ("completed", "validated")
     assert len(flow.model.requests) == result["usage"]["calls"] == 3
     assert {item["kind"] for item in task["snapshot"]["evidence"]} == {"pr_text", "issue_text"}
-    assert task["reviewed_paths"] == ["app.py", "tests/test_app.py"]
+    assert task["reviewed_paths"] == ["app.py"] and task["context_paths"] == ["tests/test_app.py"]
     assert "outside.py" not in json.dumps(task)
     assert result["scope"]["tests_executed_by_bot"] is False
     assert receipt["b_result"] == result and receipt["a_result"] is None
@@ -373,9 +373,10 @@ def test_b_not_run_is_explicit_and_does_not_shrink_scope(intent_flow, case, monk
     task = json.loads((root / "planning-input.json").read_text())
     assert status == "failed" and (plan["status"], plan["reason"]) == ("not_run", expected)
     assert not (root / "B/result.json").exists()
-    assert "app.py" in task["reviewed_paths"] and "tests/test_app.py" in task["reviewed_paths"]
+    assert "app.py" in task["reviewed_paths"] and "tests/test_app.py" not in task["reviewed_paths"]
+    assert "tests/test_app.py" in task["context_paths"]
     if case == "missing_path":
-        assert "tests/missing.py" in task["reviewed_paths"]
+        assert "tests/missing.py" in task["context_paths"]
     assert plan["usage"]["calls"] == 0 and flow.model.requests == []
     assert not flow.planning_model.requests
 

@@ -7,9 +7,11 @@ import json
 import os
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -58,6 +60,52 @@ def test_offline_fixed_service_rejects_absent_api_auth(service_config, monkeypat
     monkeypatch.delenv("REVIEW_BOT_API_TOKEN", raising=False)
     assert main(["webhook", "--config", str(service_config.path)]) == 1
     assert "REVIEW_BOT_API_TOKEN" in capsys.readouterr().err
+
+
+def test_model_admission_status_absent_db_is_read_only(tmp_path, monkeypatch, capsys):
+    from review_bot.runtime.cli import main
+
+    state_dir = tmp_path / "missing-state"
+    monkeypatch.setenv("REVIEW_BOT_MODEL_STATE_DIR", str(state_dir))
+    assert main(["model-admission", "status"]) == 0
+    assert capsys.readouterr().out.strip() == "no admission state"
+    assert not state_dir.exists()
+
+
+def test_model_admission_resolve_requires_confirmation_without_db_change(tmp_path, monkeypatch):
+    from review_bot.adapters.model_http import default_model_admission
+    from review_bot.runtime.cli import main
+
+    state_dir = tmp_path / "admission-state"
+    monkeypatch.setenv("REVIEW_BOT_MODEL_STATE_DIR", str(state_dir))
+    admission = default_model_admission()
+    with admission.request(deadline=time.monotonic() + 2, generates=True) as ticket:
+        ticket.mark_sent()
+    before = admission.snapshot()
+    assert main(["model-admission", "resolve", "--token", ticket.token]) == 2
+    assert admission.snapshot() == before
+
+
+def test_model_admission_resolve_preserves_other_slots_and_reports_unknown_tokens(tmp_path, monkeypatch):
+    from review_bot.adapters.model_http import default_model_admission
+    from review_bot.runtime.cli import main
+
+    state_dir = tmp_path / "admission-state"
+    monkeypatch.setenv("REVIEW_BOT_MODEL_STATE_DIR", str(state_dir))
+    admission = default_model_admission()
+    tokens = []
+    for _ in range(2):
+        with admission.request(deadline=time.monotonic() + 2, generates=True) as ticket:
+            ticket.mark_sent()
+        tokens.append(ticket.token)
+    assert len(admission.snapshot()) == 2
+    assert main(["model-admission", "resolve", "--token", tokens[0], "--confirmed-idle"]) == 0
+    assert [row[0] for row in admission.snapshot()] == [tokens[1]]
+    assert main(["model-admission", "resolve", "--token", tokens[0], "--confirmed-idle"]) == 1
+    assert main(["model-admission", "resolve", "--token", uuid4().hex, "--confirmed-idle"]) == 1
+    assert [row[0] for row in admission.snapshot()] == [tokens[1]]
+    assert main(["model-admission", "resolve", "--token", "invalid", "--confirmed-idle"]) == 2
+    assert [row[0] for row in admission.snapshot()] == [tokens[1]]
 
 
 def test_mixed_mode_service_requires_a_pinned_analyzer_image(service_config):
@@ -786,3 +834,97 @@ def test_signed_cli_intake_to_real_worker_with_mock_github(
         assert len(github.updated_comments) == (1 if operation == "update" else 0)
     for job_store in dependencies.opened:
         job_store.close.assert_called_once_with()
+
+
+def test_ondemand_service_enqueues_and_processes_one_worker_run(
+    service_config, worker_pipeline_ports, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from review_bot.adapters.github.client import MockGitHubClient
+    from review_bot.application.ondemand import ReviewJob
+    from review_bot.application.repository_review_settings import RepositoryReviewSettings, SettingsResolution
+    from review_bot.runtime import service
+
+    service_config.raw["execution"]["available_modes"] = ["architecture"]
+    service_config.raw["execution"]["task_timeout_seconds"] = 3000
+    service_config.raw["publish"]["mode"] = "artifact_only"
+    write_config(service_config)
+    github = MockGitHubClient()
+    github.set_pull_request(7, repository="org/repo")
+    github.pull_requests[7]["base"]["repo"] = {"id": 99, "full_name": "org/repo"}
+    github.pull_requests[7].update(title="Synthetic architecture change", body="Synthetic PR", draft=False)
+
+    class Adapters:
+        def __init__(self, _config, _cache_root):
+            pass
+
+        def github_client(self, _run):
+            return github
+
+        def repository_reader(self, _run, _pr_data, _client):
+            return worker_pipeline_ports["repo_reader"]
+
+        def review_settings(self, *_args, **_kwargs):
+            return SettingsResolution(RepositoryReviewSettings())
+
+    monkeypatch.setattr(service, "_ClaimedAppAdapters", Adapters)
+    monkeypatch.setattr(service, "_architecture_analyzer",
+        lambda _config, _root: worker_pipeline_ports["analyzer"])
+    monkeypatch.setattr(service, "WorkerLoop", shared_fixture_worker)
+    job = ReviewJob("a" * 64, 44, 99, 7, "a" * 40, "b" * 40, "running",
+        time.time(), time.time(), vm_id="i-1234abcd")
+
+    mode_results, trace = service.execute_ondemand_review(
+        str(service_config.path), job, lambda: True, vm_lifetime_seconds=3600,
+    )
+
+    assert mode_results == {"architecture": "completed", "intent": "not_selected"}
+    assert trace["worker_completed"] is True and trace["selected_modes"] == ["architecture"]
+    state = service_config.state / "ondemand" / job.job_id
+    connection = sqlite3.connect(state / "jobs.sqlite")
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+        assert connection.execute("SELECT status FROM runs").fetchone()[0] == "succeeded"
+    finally:
+        connection.close()
+
+    github.set_pull_request(8, repository="org/repo", head_sha="c" * 40)
+    github.pull_requests[8]["base"]["repo"] = {"id": 99, "full_name": "org/repo"}
+    mismatched = ReviewJob("b" * 64, 44, 99, 8, "a" * 40, "b" * 40, "running",
+        time.time(), time.time(), vm_id="i-abcd1234")
+    analyzer_calls = worker_pipeline_ports["analyzer"].run_analysis.call_count
+    mismatch_results, mismatch_trace = service.execute_ondemand_review(
+        str(service_config.path), mismatched, lambda: True,
+    )
+    assert mismatch_results == {"architecture": "failed", "intent": "failed"}
+    assert mismatch_trace["worker_completed"] is False
+    assert worker_pipeline_ports["analyzer"].run_analysis.call_count == analyzer_calls
+
+
+def test_ondemand_vm_lifetime_guard_and_optional_lifetime(
+    service_config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from review_bot.application.ondemand import ReviewJob
+    from review_bot.runtime import service
+    from review_bot.runtime.service import ServiceConfigurationError
+
+    service_config.raw["execution"]["task_timeout_seconds"] = 3000
+    write_config(service_config)
+    job = ReviewJob("a" * 64, 44, 99, 7, "a" * 40, "b" * 40, "running",
+        time.time(), time.time(), vm_id="i-1234abcd")
+
+    class ReachedServiceState(Exception):
+        pass
+
+    def stop_at_service_state(_config):
+        raise ReachedServiceState
+
+    monkeypatch.setattr(service, "open_service_state", stop_at_service_state)
+    with pytest.raises(ServiceConfigurationError, match="task_timeout_exceeds_vm_lifetime"):
+        service.execute_ondemand_review(str(service_config.path), job, lambda: True,
+            vm_lifetime_seconds=3200)
+    with pytest.raises(ReachedServiceState):
+        service.execute_ondemand_review(str(service_config.path), job, lambda: True,
+            vm_lifetime_seconds=3600)
+    with pytest.raises(ReachedServiceState):
+        service.execute_ondemand_review(str(service_config.path), job, lambda: True,
+            vm_lifetime_seconds=None)

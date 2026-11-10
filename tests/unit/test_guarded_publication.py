@@ -429,3 +429,56 @@ def test_publication_invalid_comment_id_cannot_succeed(
     assert receipt.reason == "invalid_comment_id"
     assert receipt.comment_id is None
     update_comment.assert_not_called()
+
+
+def test_publication_readback_mismatch_is_not_success() -> None:
+    client = MockGitHubClient()
+    client.set_pull_request(pr_number=1, state="open", head_sha="b" * 40, base_sha="a" * 40)
+    original_create = client.create_comment
+
+    def tampered_post(pr_number: int, body: str):
+        created = original_create(pr_number, body)
+        client.comments[created["id"]] = {**created, "body": body + "\nforeign edit"}
+        return created
+
+    client.create_comment = tampered_post  # type: ignore[method-assign]
+    receipt = publish_review_comment(github_client=client, repository_id=123, pr_number=1,
+        expected_head_sha="b" * 40, expected_base_sha="a" * 40, body="Review body")
+    assert receipt.status == "unknown"
+    assert receipt.reason == "readback_mismatch"
+    assert receipt.comment_id is not None
+
+
+def test_publication_readback_failure_is_not_success() -> None:
+    client = MockGitHubClient()
+    client.set_pull_request(pr_number=1, state="open", head_sha="b" * 40, base_sha="a" * 40)
+    calls = {"n": 0}
+    original_find = client.find_marker_comment
+
+    def flaky_find(*args: Any, **kwargs: Any):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise httpx.ReadTimeout("readback")
+        return original_find(*args, **kwargs)
+
+    client.find_marker_comment = flaky_find  # type: ignore[method-assign]
+    receipt = publish_review_comment(github_client=client, repository_id=123, pr_number=1,
+        expected_head_sha="b" * 40, expected_base_sha="a" * 40, body="Review body")
+    assert receipt.status == "unknown"
+    assert receipt.reason.startswith("readback_failed")
+
+
+def test_publication_readback_tolerates_line_ending_normalization() -> None:
+    client = MockGitHubClient()
+    client.set_pull_request(pr_number=1, state="open", head_sha="b" * 40, base_sha="a" * 40)
+    original_create = client.create_comment
+
+    def crlf_post(pr_number: int, body: str):
+        created = original_create(pr_number, body)
+        client.comments[created["id"]] = {**created, "body": body.replace("\n", "\r\n")}
+        return created
+
+    client.create_comment = crlf_post  # type: ignore[method-assign]
+    receipt = publish_review_comment(github_client=client, repository_id=123, pr_number=1,
+        expected_head_sha="b" * 40, expected_base_sha="a" * 40, body="Review body\nline two")
+    assert receipt.status == "succeeded"

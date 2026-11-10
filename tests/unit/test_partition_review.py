@@ -2212,7 +2212,9 @@ def test_selected_consumer_native400_keeps_unknown_reservation_and_fresh_childre
             if payload["stage"] == "review_partition":
                 # Prove the OpenRouter wire builder is the exact-wire source.
                 wire, maximum = review_wire_payload(request)
-                assert wire["model"] == request.model and maximum == request.max_output_tokens
+                from review_bot.adapters.byte_budget import effective_output_reservation
+                assert wire["model"] == request.model and maximum == effective_output_reservation(
+                    request.max_output_tokens, "openrouter")
                 assert isinstance(wire["messages"], list) and wire["stream"] is False
                 size = sum(len(block["text"].encode()) for source in payload.get("originals", []) for block in source["blocks"])
                 if size > 400:
@@ -2337,4 +2339,74 @@ def test_selected_consumer_refinement_keeps_cpd_partner_details_and_both_head_so
                 assert target["head_findings"] == json.loads(json.dumps([asdict(finding)]))
     assert set(paths) <= delivered
     assert result.partition["consumer_delivery"]["decision_id"]
+    validate_partition_result(result, task)
+
+
+def test_split_source_recheck_completes_when_multiple_requested_originals_exceed_single_request_limit():
+    import hashlib
+    from review_bot.application.intent_context import build_intent_task_input
+
+    text_a = "def call_value(x):\n" + "    x += 1\n" * 60 + "    return x\n"
+    text_b = "def value(y):\n" + "    y += 2\n" * 60 + "    return y\n"
+    task = make_task()
+    def extend_head(code):
+        files = []
+        for f in code.files:
+            if f.path == "src/caller.py":
+                f = replace(f, content=text_a, content_hash=hashlib.sha256(text_a.encode()).hexdigest())
+            elif f.path == "src/value.py":
+                f = replace(f, content=text_b, content_hash=hashlib.sha256(text_b.encode()).hexdigest())
+            files.append(f)
+        inv = hashlib.sha256(":".join(f"{f.path}:{f.content_hash}" for f in sorted(files, key=lambda x: x.path)).encode()).hexdigest()
+        return replace(code, files=tuple(files), inventory_hash=inv)
+    task = build_intent_task_input(task.snapshot, task.base, extend_head(task.head), related_paths=task.reviewed_paths)
+
+    recheck_calls = 0
+    def request_two_then_one(payload, body):
+        nonlocal recheck_calls
+        if payload["stage"] == "final_review":
+            test_ref = next(
+                s["ranges"][0]["reference_id"]
+                for s in payload["citation_catalog"]
+                if s["path"] == "tests/test_label.py"
+            )
+            for item in body["perspectives"]:
+                item["citations"] = [{"reference_id": test_ref}]
+            for key, review_item in body["target_reviews"].items():
+                base_cat = next(
+                    (s for s in payload["citation_catalog"] if s["path"] == key and s["version"] == "base"),
+                    None,
+                )
+                if base_cat is not None:
+                    review_item["citations"] = [{"reference_id": base_cat["ranges"][0]["reference_id"]}]
+            head_rows = [row for row in payload["fixed_original_inventory"] if row["version"] == "head" and row["path"] in ("src/caller.py", "src/value.py")]
+            assert len(head_rows) == 2
+            if "source_recheck" not in payload:
+                body["source_requests"] = [{"evidence_id": row["evidence_id"], "reason": "Need full head."} for row in head_rows]
+            else:
+                recheck_calls += 1
+                assert "target_reference_context" not in payload["source_recheck"]
+                if recheck_calls == 1:
+                    body["source_requests"] = [{"evidence_id": head_rows[-1]["evidence_id"], "reason": "Need remaining head."}]
+                else:
+                    body["source_requests"] = []
+        return body
+
+    def measured(request):
+        payload = json.loads(request.user_content)
+        if payload["stage"] == "final_review" and "source_recheck" in payload:
+            head_quotes = [
+                q for q in payload["original_quotes"]
+                if q["version"] == "head" and q["path"] in ("src/caller.py", "src/value.py") and q["end_byte"] - q["start_byte"] > 500
+            ]
+            if len(head_quotes) > 1 or any(q["version"] == "base" and q["end_byte"] - q["start_byte"] > 500 for q in payload["original_quotes"]):
+                return 100000
+        return 100
+
+    review = PartitionModelClient(counter=measured, transform=request_two_then_one)
+    result = run_partition_review(task, "intent", review, PartitionModelClient(group_all=True), limits=limits())
+    assert result.status == "completed", result.reason
+    histories = result.partition["source_recheck_requests"]
+    assert len(histories) == 2 and all(h["admitted"] for h in histories)
+    assert histories[0]["delivery"] == "split_requested_originals_with_retained_citations"
     validate_partition_result(result, task)

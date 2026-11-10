@@ -57,6 +57,36 @@ def test_explicit_planning_role_does_not_widen_existing_selector(offline_profile
     assert type(plan) is not type(selector)
 
 
+def test_openrouter_clients_use_remote_admission_without_changing_local_profiles(offline_profiles, monkeypatch, tmp_path):
+    from review_bot.runtime import model_clients
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("REVIEW_BOT_MODEL_STATE_DIR", str(tmp_path / "shared"))
+    settings = ModelConfig(max_concurrency=1)
+    profile = "openrouter"
+    clients = (
+        model_clients.build_review_client(profile, settings),
+        model_clients.build_selector_client(profile, settings),
+        model_clients.build_intent_selection_client(profile, settings),
+        model_clients.build_planning_client(profile, settings),
+    )
+    for client in clients:
+        assert client.request_admission.db_path == tmp_path / "shared/remote-requests.sqlite"
+        assert client.request_admission.reclaim_expired_remote is True
+
+    monkeypatch.setenv("REVIEW_BOT_REVIEW_BASE_URL", "http://127.0.0.1:1234/v1")
+    monkeypatch.setenv("REVIEW_BOT_REVIEW_MODEL", "local-model")
+    monkeypatch.setenv("REVIEW_BOT_REVIEW_CONTEXT_TOKENS", "131072")
+    monkeypatch.setenv("ME707_BONSAI_BASE_URL", "http://127.0.0.1:1234/v1")
+    local_clients = (
+        model_clients.build_review_client("openai-compatible", settings),
+        model_clients.build_review_client("me707-llamacpp", settings),
+    )
+    for client in local_clients:
+        assert client.request_admission.db_path == tmp_path / "shared/requests.sqlite"
+        assert client.request_admission.reclaim_expired_remote is False
+
+
 @pytest.mark.parametrize("profile,variable", [
     ("macbook-llamacpp", "MACBOOK_TEV1_BASE_URL"), ("me707-llamacpp", "ME707_TEV1_BASE_URL"),
 ])

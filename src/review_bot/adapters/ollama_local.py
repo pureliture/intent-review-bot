@@ -52,7 +52,7 @@ class _LocalOllamaClient:
             or url.path not in ("", "/")
         ):
             raise ValueError("Ollama endpoint must be an uncredentialed loopback HTTP origin")
-        if not isinstance(model, str) or not model.strip() or ":cloud" in model:
+        if not isinstance(model, str) or not model.strip() or ":cloud" in model or model.endswith("-cloud"):
             raise ValueError("An explicit local Ollama model is required")
         if type(timeout_seconds) is not int or timeout_seconds <= 0:
             raise ValueError("Ollama timeout must be positive")

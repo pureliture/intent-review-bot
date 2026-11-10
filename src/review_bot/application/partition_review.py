@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Callable
 
+from review_bot.adapters.byte_budget import effective_output_reservation
 from review_bot.application.architecture_review import ModelProfile
 from review_bot.application import partition_choices as choices
 from review_bot.application import partition_global_review as global_review
@@ -27,6 +28,7 @@ from review_bot.application.citation_reference_aliases import (
     alias_model_references, restore_model_references, uses_citation_aliases,
 )
 from review_bot.application.review_output_contract import render_output_contract
+from review_bot.application.fact_verification import execute_fact_verification
 from review_bot.application.code_first_intent_review import _original_text, _originals
 from review_bot.application.model_execution import ModelExecutionBudget, model_profile, OUTPUT_RECOVERY_FINAL_RESERVE
 from review_bot.application.context import build_task_input, hash_json
@@ -70,6 +72,9 @@ MAX_QUOTE_BYTES = 2048
 MAX_OBSERVATIONS = 32
 MAX_MODEL_CITATIONS = 32
 CONSUMER_ADMISSION_CONTRACT = "selected-review-native/v1"
+FINAL_FINDING_VERDICTS = ("concern", "improvement", "insufficient_context")
+FINAL_FINDING_BASES = ("criterion", "observed_structure", "analysis_signal")
+FINAL_PERSPECTIVE_VERDICTS = ("aligned", "concern", "conditional_risk", "insufficient_context", "not_apply")
 REVIEW_GROUNDING_RULE = ("\nDraft concern and conditional_risk require BOTH a nonempty concrete failure_condition "
                 "and at least one citation to supplied HEAD code with a nonempty file path. PR prose, static reports "
                 "and base-only code cannot establish a HEAD failure. Keep every original and cite only supplied "
@@ -421,12 +426,12 @@ def _architecture_source_paths(changed, signals):
 def _final_schema(ids, mode, targets, contexts=(), target_references=None, original_ids=(), perspective_ids=PERSPECTIVE_IDS):
     cite = _citation_schema(ids)
     judgement = _obj({"perspective_id": {"type": "string", "enum": list(perspective_ids)},
-        "verdict": {"type": "string", "enum": ["aligned", "concern", "conditional_risk", "insufficient_context", "not_apply"]},
+        "verdict": {"type": "string", "enum": list(FINAL_PERSPECTIVE_VERDICTS)},
         "statement": _text(), "reasoning": _text(), "failure_condition": _text(True),
         "citations": {**_array(cite, MAX_MODEL_CITATIONS), "minItems": 1}})
     finding = _obj({"statement": _text(), "reasoning": _text(), "failure_condition": _text(True),
-        "verdict": {"type": "string", "enum": ["concern", "improvement", "insufficient_context"]},
-        "basis": {"type": "string", "enum": ["criterion", "observed_structure", "analysis_signal"]},
+        "verdict": {"type": "string", "enum": list(FINAL_FINDING_VERDICTS)},
+        "basis": {"type": "string", "enum": list(FINAL_FINDING_BASES)},
         "target_ids": {**_array({"type": "string", "enum": list(targets)}, 32), "minItems": 1 if mode == "architecture" else 0}, "citations": {**_array(cite, MAX_MODEL_CITATIONS), "minItems": 1}})
     updates = _obj({key: _obj({"state": {"type": "string", "enum": ["unresolved", "resolved", "not_required"]},
         "reason": _text(), "citations": _array(cite, MAX_MODEL_CITATIONS)}) for key in contexts})
@@ -477,6 +482,24 @@ def _target_reference_context(targets, target_paths, references, supplied, origi
         "fixed_head_candidates": [identity(original) for original in originals
             if original.path in target_paths[target] and original.version == "head"]}
         for target in targets}
+
+
+def _undelivered_ranges(ranges, delivered):
+    """Byte ranges of ``ranges`` not covered by already delivered ``(start, end)`` ranges."""
+    result = []
+    for start, end in ranges:
+        cursor = start
+        for low, high in sorted(delivered):
+            if high <= cursor or low >= end:
+                continue
+            if low > cursor:
+                result.append((cursor, low))
+            cursor = max(cursor, high)
+            if cursor >= end:
+                break
+        if cursor < end:
+            result.append((cursor, end))
+    return result
 
 
 def _source_requests(values, originals):
@@ -543,16 +566,36 @@ def prepare_partition_architecture_task(reader, pr, delta, classification, *, be
     return build_task_input(Snapshot(pr, base, head), scoped_delta, classification)
 
 
+_BUILD_MANIFEST_NAMES = frozenset({"build.gradle", "build.gradle.kts", "pom.xml", "settings.gradle", "settings.gradle.kts"})
+
+
 def prepare_originals(task, mode):
     """One immutable declared corpus, without model-selected repository expansion."""
     if mode in ("intent", "planning") and isinstance(task, IntentTaskInput):
         task = decode_intent_task_input(asdict(task))
-        originals = [SourceOriginal(item["id"], _original_text(item), item["kind"],
-            item["locator"].get("path", ""), item["locator"].get("version", ""),
-            item["locator"].get("sha", "")) for item in _originals(task).values()]
+        changed_paths = {p for c in task.snapshot.changed_files for p in (c.path, c.previous_path) if p}
+        context_set = set(task.context_paths) | {
+            p for p in task.reviewed_paths
+            if p not in changed_paths and p.rsplit("/", 1)[-1].lower() in _BUILD_MANIFEST_NAMES
+        }
+        review_targets = [p for p in task.reviewed_paths if p not in context_set]
+        head_paths = {f.path for f in task.head.files}
+        originals = []
+        for item in _originals(task).values():
+            path = item["locator"].get("path", "")
+            version = item["locator"].get("version", "")
+            kind = item["kind"]
+            if path and path in context_set:
+                if path not in changed_paths and path.rsplit("/", 1)[-1].lower() in _BUILD_MANIFEST_NAMES:
+                    continue
+                if path not in changed_paths and version == "base" and path in head_paths:
+                    continue
+                kind = "context_source"
+            originals.append(SourceOriginal(item["id"], _original_text(item), kind, path, version, item["locator"].get("sha", "")))
         meta = {"input_hash": task.input_hash, "snapshot_id": task.snapshot.snapshot_id,
             "base_sha": task.base.sha, "head_sha": task.head.sha,
-            "targets": list(task.reviewed_paths), "target_paths": {p: [p] for p in task.reviewed_paths},
+            "targets": review_targets, "target_paths": {p: [p] for p in review_targets},
+            "context_paths": sorted(context_set),
             "limitations": [f"{u.source}:{u.reason}" for u in task.snapshot.unavailable_sources],
             "complete": intent_scope(task)["complete"], "comparison_status": task.snapshot.comparison_status}
         meta["target_details"] = [{"target_id": path, "paths": [path], "tool": "source_review",
@@ -632,7 +675,7 @@ def prepare_originals(task, mode):
     if len({o.evidence_id for o in originals}) != len(originals):
         raise PartitionError("duplicate_original_id")
     if isinstance(task, IntentTaskInput):
-        meta["source_scope"] = build_source_scope(originals, task.snapshot.changed_files)
+        meta["source_scope"] = build_source_scope(originals, task.snapshot.changed_files, task.dependency_notes)
         meta["limitations"].extend(meta["source_scope"]["boundaries"])
     return originals, meta
 
@@ -1044,8 +1087,9 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             **scope_notice(meta, {s.evidence_id for s in supplied}),
             "source_coverage": source_coverage,
             "target_reference_context": target_context, "target_reference_policy": TARGET_REFERENCE_POLICY,
-            **({"source_recheck": {**deepcopy(previous), "target_reference_context": deepcopy(target_context),
-                    "target_reference_policy": TARGET_REFERENCE_POLICY},
+            **({"source_recheck": {**deepcopy(previous), **(
+                    {"target_reference_context": deepcopy(target_context), "target_reference_policy": TARGET_REFERENCE_POLICY}
+                    if "rejected_response" in previous else {})},
                 "recheck_instruction": "Recheck the earlier interpretation and any requested originals against the SAME frozen base/head sources and diff. A defect fixed in head is not a current concern. Preserve genuine remaining concerns with actual head code and failure conditions. Correct the interpretation or its evidence; never fabricate evidence to retain the old verdict. Explain every correction in correction_reason. Clear source_requests only when the necessary recheck is satisfied."} if previous is not None else {}),
             "delivery_scope": "An unchanged original group result is attached; this request may contain only part of its original source. Other parts are reviewed on other integration pages. Do not claim missing PR input solely because it is on another page.",
             "review_targets": targets, "review_target_details": meta.get("target_details", []), "input_limitations": meta["limitations"],
@@ -1476,9 +1520,16 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             pieces = partition_original(local, lambda part: fits([absolute(part)]), before_step=guard)
             return [absolute(part) for part in pieces]
         integration_start = len(budget.records)
-        batches = native_integration_pages(review_notes, final_spans,
-            lambda rows, spans: measure(final_request(rows, spans), review_client, profile, "final_review:admission"),
-            refine_integration_source)
+        effective_integration_limit = min(profile.max_input_tokens or limits.max_input_tokens, limits.max_input_tokens)
+        def integration_fits(rows, spans):
+            current_profile = profile
+            if effective_integration_limit >= 4096:
+                if len(rows) > 1:
+                    current_profile = replace(profile, max_input_tokens=int(effective_integration_limit * 0.70))
+                elif len(spans) > 1 or any(s.end_byte - s.start_byte > 1024 for s in spans):
+                    current_profile = replace(profile, max_input_tokens=int(effective_integration_limit * 0.85))
+            return measure(final_request(rows, spans), review_client, current_profile, "final_review:admission")
+        batches = native_integration_pages(review_notes, final_spans, integration_fits, refine_integration_source)
         if len(batches) > 1:
             delivery = [{"observation_ids": [row["observation_id"] for row in batch["inputs"]],
                 "sources": span_payload(final_spans(batch["inputs"], batch["sources"]))} for batch in batches]
@@ -1546,8 +1597,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             for value in bounded_array(body["perspectives"], maximum=8):
                 row = bounded_object(value, {"perspective_id", "verdict", "statement", "reasoning", "failure_condition", "citations"})
                 identifier = row["perspective_id"]
-                if identifier not in _intent_ids(partitions) or identifier in seen or row["verdict"] not in (
-                    "aligned", "concern", "conditional_risk", "insufficient_context", "not_apply"):
+                if identifier not in _intent_ids(partitions) or identifier in seen or row["verdict"] not in FINAL_PERSPECTIVE_VERDICTS:
                     raise PartitionError("invalid_partition_perspective")
                 seen.add(identifier)
                 clean = {**row, "citations": final_citations(row["citations"], supplied)}
@@ -1562,9 +1612,9 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             findings = []
             for value in bounded_array(body["findings"], maximum=20):
                 row = bounded_object(value, {"statement", "reasoning", "failure_condition", "verdict", "basis", "target_ids", "citations"})
-                if row["verdict"] not in ("concern", "improvement", "insufficient_context"):
+                if row["verdict"] not in FINAL_FINDING_VERDICTS:
                     raise PartitionError("invalid_finding_verdict")
-                if row["basis"] not in ("criterion", "observed_structure", "analysis_signal"):
+                if row["basis"] not in FINAL_FINDING_BASES:
                     raise PartitionError("invalid_finding_basis")
                 targets = bounded_array(row["target_ids"], maximum=32)
                 if any(t not in page_targets for t in targets):
@@ -1607,7 +1657,9 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
             previous, retained, accepted_retained = None, [], []
             accepted_request_context = {}
             available_rechecks = limits.max_rechecks
-            for recheck in range(available_rechecks + 1):
+            recheck = 0
+            recheck_delivered = {}
+            while recheck <= available_rechecks:
                 request_value = final_request(working, source_spans, previous, retained)
                 context = restore_model_references(json.loads(request_value.user_content)["target_reference_context"],
                     model_reference_aliases.get(id(request_value), {}))
@@ -1632,7 +1684,20 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     if page_final["source_requests"] and recheck < available_rechecks:
                         requested_sources = [make_span(o, start, end, "requested_original")
                             for o in originals if o.evidence_id in {row["evidence_id"] for row in page_final["source_requests"]}
-                            for start, end in scoped_ranges(o, meta.get("source_scope"))]
+                            for start, end in _undelivered_ranges(scoped_ranges(o, meta.get("source_scope")),
+                                recheck_delivered.get(o.evidence_id, ()))]
+                        if not requested_sources:
+                            # Every requested byte was already sent by an earlier recheck of
+                            # this page. Re-sending it cannot make progress (issue #18); the
+                            # open request stays visible as unresolved context.
+                            partitions.setdefault("source_recheck_requests", []).append({"response": deepcopy(raw),
+                                **deepcopy(request_context), "final": deepcopy(page_final), "response_hash": hash_json(raw),
+                                "page_index": len(final_pages), "retained_citations": span_payload(retained),
+                                "delivery": "no_undelivered_requested_originals", "candidate_measurement_stages": [],
+                                "parent_integration_plan_id": partitions.get("integration_plan_id"),
+                                "stage_index": index - first_record, "requests": deepcopy(page_final["source_requests"]),
+                                "admitted": False, "reason": "requested_originals_already_delivered"})
+                            break
                         supplied = final_spans(working, [*source_spans, *retained])
                         roots = [c for row in review_notes for c in row["citations"]]
                         prior_sources = referenced_source_spans(raw, supplied, {o.evidence_id: o for o in originals},
@@ -1656,6 +1721,45 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                                 measurements.append(len(budget.records) - first_record)
                                 fits = measure(final_request(working, expanded, requested, next_retained), review_client, profile,
                                     "source_recheck:focused_admission", for_generation=True)
+                            if not fits and (len(requested_sources) > 1 or any(s.end_byte - s.start_byte > 1024 for s in requested_sources)):
+                                split_chunks, current_chunk = [], []
+                                for req_span in requested_sources:
+                                    measurements.append(len(budget.records) - first_record)
+                                    single_fits = measure(final_request(working, [req_span], requested, next_retained),
+                                        review_client, profile, "source_recheck:split_admission", for_generation=True)
+                                    if single_fits:
+                                        parts = [req_span]
+                                    elif req_span.end_byte - req_span.start_byte > 1024:
+                                        def part_fits(pieces):
+                                            measurements.append(len(budget.records) - first_record)
+                                            return measure(final_request(working, pieces, requested, next_retained),
+                                                review_client, profile, "source_recheck:split_admission", for_generation=True)
+                                        try:
+                                            parts = refine_integration_source(req_span, part_fits)
+                                        except PartitionError:
+                                            parts = []
+                                    else:
+                                        parts = []
+                                    if not parts:
+                                        split_chunks, current_chunk = [], []
+                                        break
+                                    for part in parts:
+                                        if current_chunk:
+                                            measurements.append(len(budget.records) - first_record)
+                                            if measure(final_request(working, [*current_chunk, part], requested, next_retained),
+                                                    review_client, profile, "source_recheck:split_admission", for_generation=True):
+                                                current_chunk.append(part)
+                                                continue
+                                            split_chunks.append(current_chunk)
+                                        current_chunk = [part]
+                                if current_chunk:
+                                    split_chunks.append(current_chunk)
+                                if split_chunks:
+                                    expanded = split_chunks[0]
+                                    delivery = "split_requested_originals_with_retained_citations"
+                                    fits = True
+                                    if len(split_chunks) > 1:
+                                        available_rechecks = max(available_rechecks, recheck + len(split_chunks))
                         except Stop as error:
                             unavailable = str(error)
                             if unavailable not in ("call_limit_exceeded", "task_token_limit_exceeded", "task_deadline_exceeded"):
@@ -1672,7 +1776,12 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                             "admitted": fits, **({"reason": unavailable} if not fits else {})})
                         if fits:
                             budget.records[index] = replace(budget.records[index], status="completed", reason="source_recheck_requested")
+                            requested_ids = {span.evidence_id for span in requested_sources}
+                            for span in expanded:
+                                if span.evidence_id in requested_ids:
+                                    recheck_delivered.setdefault(span.evidence_id, []).append((span.start_byte, span.end_byte))
                             previous, source_spans, retained = requested, expanded, next_retained
+                            recheck += 1
                             continue
                     break
                 except (PartitionError, ValueError) as error:
@@ -1686,6 +1795,7 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
                     if recheck == available_rechecks:
                         raise
                     previous = {"rejected_response": deepcopy(raw), "validation_error": reason}
+                    recheck += 1
             budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
             final_pages.append(page_final)
             partitions["integration_pages"].append({"inputs": deepcopy(working),
@@ -1774,186 +1884,12 @@ def run_partition_review(task, mode, review_client, planning_client, *, limits: 
         # A validated synthesis is still provisional with respect to factual
         # accuracy. Keep it unchanged, then check/correct only its factual items.
         partitions["pre_verification_final"] = deepcopy(final)
-        verification = {}
+
+        final, _, verification = execute_fact_verification(final, originals, meta, mode=mode,
+            review_client=review_client, profile=profile, budget=budget, request=request,
+            measure=measure, execute=execute, choose=choose, max_rewrites=limits.max_rechecks,
+            stop_error=Stop, first_record=first_record, language=language)
         partitions["fact_verification"] = verification
-
-        def fact_call(stage, rows, candidate, record, extra=None):
-            call = {"measurements": [], "extra": deepcopy(extra), "rows": deepcopy(rows)}
-            record["check" if stage == "fact_check" else "rewrite"] = call
-            # Frozen final roots keep batch replay independent of when another
-            # item was corrected. Current row citations are also always carried.
-            context = verification["original_final"]
-
-            def execute_split(packet, packet_rows, ranges, active_stage, parts):
-                packet["children"] = []
-                child_results = []
-                for child_rows, child_ranges in parts:
-                    child = {}
-                    packet["children"].append(child)
-                    child_stage = active_stage
-                    if active_stage == "fact_rewrite" and packet["split"] == "sources" and child_results:
-                        first_raw, first_refs, _, _ = child_results[0]
-                        replacement = fact_check.accept_rewrite(first_raw, packet_rows[0], first_refs, mode, meta)
-                        child_rows = [{**packet_rows[0], "item": replacement}]
-                        child_stage = "fact_check"
-                    child_results.append(execute_packet(child, child_rows, child_ranges, child_stage))
-                combined_refs = fact_check.merge_reference_contexts(
-                    child_refs for _, child_refs, _, _ in child_results)
-                combined_spans = list({(span.evidence_id, span.start_byte, span.end_byte): span
-                    for _, _, child_spans, _ in child_results for span in child_spans}.values())
-                if active_stage == "fact_check":
-                    raw = fact_check.assemble_checks(packet_rows, packet["children"])
-                elif packet["split"] == "items":
-                    raw = fact_check.assemble_rewrites(packet_rows, packet["children"])
-                else:
-                    # Generate one complete candidate, then check that fixed
-                    # candidate against each remaining exact source page.
-                    # The final whole-item recheck still owns acceptance.
-                    raw = deepcopy(packet["children"][0]["response"])
-                    packet["candidate_page_checks"] = [deepcopy(child["response"])
-                        for child in packet["children"][1:]]
-                packet["cited_evidence"] = [evidence for child in packet["children"] for evidence in child["cited_evidence"]]
-                final_index = child_results[-1][3]
-                if active_stage == "fact_check" and packet["split"] == "sources" and ranges is None:
-                    packet["discovery_response"] = deepcopy(raw)
-                    focused_ranges, history = fact_check.whole_claim_packet(packet, packet_rows, originals, packet["extra"])
-                    packet["discovery"] = deepcopy(history)
-                    if focused_ranges:
-                        packet["whole_claim"] = {}
-                        focused, focused_refs, focused_spans, focused_index = execute_packet(
-                            packet["whole_claim"], packet_rows, focused_ranges, "fact_check", history)
-                        if focused is not None:
-                            raw = focused
-                            combined_refs = fact_check.merge_reference_contexts((combined_refs, focused_refs))
-                            combined_spans = list({(span.evidence_id, span.start_byte, span.end_byte): span
-                                for span in [*combined_spans, *focused_spans]}.values())
-                            packet["cited_evidence"].extend(packet["whole_claim"]["cited_evidence"])
-                            final_index = focused_index
-                packet.update(response=deepcopy(raw), response_hash=hash_json(raw))
-                packet["delivered_ranges"] = [{"evidence_id": span.evidence_id,
-                    "start_byte": span.start_byte, "end_byte": span.end_byte} for span in combined_spans]
-                return raw, combined_refs, combined_spans, final_index
-
-            def execute_packet(packet, packet_rows, ranges=None, packet_stage=None, whole_claim=None):
-                active_stage = packet_stage or stage
-                packet_extra = fact_check.project_rewrite_context(extra, packet_rows)
-                packet.update(rows=deepcopy(packet_rows), extra=deepcopy(packet_extra), measurements=[], call_stage=active_stage)
-                if ranges is not None:
-                    packet["source_ranges"] = deepcopy(ranges)
-                if whole_claim is not None:
-                    packet["whole_claim_discovery"] = deepcopy(whole_claim)
-                for kind in (("cited_ranges",) if ranges is not None else
-                        ("complete_originals", "cited_originals", "cited_ranges")):
-                    payload, schema, refs, spans = fact_check.request_spec(active_stage, packet_rows, context,
-                        originals, meta, kind=kind, extra=packet_extra, ranges=ranges, whole_claim=whole_claim)
-                    req = request(active_stage, payload, schema, profile)
-                    packet["measurements"].append({"stage_index": len(budget.records) - first_record, "delivery": kind})
-                    if measure(req, review_client, profile, active_stage + ":" + kind + ":admission", for_generation=True):
-                        break
-                else:
-                    if whole_claim is not None:
-                        packet.update(admission_rejected=True, delivery=kind,
-                            payload_hash=hash_json(payload), schema_hash=hash_json(schema),
-                            delivered_ranges=[{"evidence_id": span.evidence_id, "start_byte": span.start_byte,
-                                "end_byte": span.end_byte} for span in spans])
-                        return None, refs, spans, None
-                    if len(packet_rows) > 1:
-                        middle = len(packet_rows) // 2
-                        parts = [(packet_rows[:middle], None), (packet_rows[middle:], None)]
-                        packet["split"] = "items"
-                    else:
-                        if ranges is None:
-                            # Discovery covers the full initially attempted
-                            # originals, including every requested fixed source.
-                            _, _, _, spans = fact_check.request_spec(active_stage, packet_rows, context,
-                                originals, meta, kind="complete_originals", extra=packet_extra)
-                        cover = ranges if ranges is not None else [{"evidence_id": span.evidence_id,
-                            "start_byte": span.start_byte, "end_byte": span.end_byte} for span in spans]
-                        if not cover:
-                            raise Stop("fact_fixed_request_exceeds_context")
-                        left, right = fact_check.split_ranges(cover, originals)
-                        parts = [(packet_rows, left), (packet_rows, right)]
-                        packet["split"] = "sources"
-                    packet["split_cause"] = "input_limit"
-                    return execute_split(packet, packet_rows, ranges, active_stage, parts)
-                packet.update(delivery=kind, payload_hash=hash_json(payload), schema_hash=hash_json(schema))
-                packet["delivered_ranges"] = [{"evidence_id": span.evidence_id,
-                    "start_byte": span.start_byte, "end_byte": span.end_byte} for span in spans]
-                try:
-                    raw, index = execute(req, review_client, profile, active_stage)
-                except Stop as error:
-                    failed = len(budget.records) - 1
-                    event = budget.records[failed]
-                    rejected = budget.rejected_outputs.get(failed, [])
-                    known = (str(error) == "model_output_limit" and event.reason == "model_output_limit" and
-                        bool(event.attempts) and bool(rejected) and not budget.operational_totals()[2] and
-                        all(attempt.delivery == "sent" and attempt.usage is not None and
-                            attempt.usage["output_tokens"] == req.max_output_tokens for attempt in event.attempts))
-                    if len(packet_rows) < 2 or not known:
-                        raise
-                    packet["split"] = "items"
-                    packet["split_cause"] = "known_output_limit"
-                    packet["output_failure"] = {"stage_index": failed - first_record,
-                        "rejected_output_hashes": [item["output_hash"] for item in rejected],
-                        "attempt_request_hashes": [attempt.request_hash for attempt in event.attempts]}
-                    middle = len(packet_rows) // 2
-                    parts = [(packet_rows[:middle], ranges), (packet_rows[middle:], ranges)]
-                    return execute_split(packet, packet_rows, ranges, active_stage, parts)
-                unique, citation_changes = fact_check.deduplicate_exact_citation_arrays(raw)
-                if citation_changes:
-                    packet.update(raw_response=deepcopy(raw), raw_response_hash=hash_json(raw),
-                        citation_deduplication=citation_changes)
-                    raw = unique
-                packet.update(response=deepcopy(raw), response_hash=hash_json(raw), stage_index=index - first_record)
-                try:
-                    packet["cited_evidence"] = fact_check.response_citations(raw, refs)
-                    if active_stage == "fact_check":
-                        fact_check.accept_check(raw, packet_rows, refs,
-                            [o["evidence_id"] for o in fact_check.unread_inventory(originals, spans)])
-                    else:
-                        fact_check.accept_rewrites(raw, packet_rows, refs, mode, meta)
-                except PartitionError as error:
-                    packet["validation_error"] = str(error)
-                    budget.records[index] = replace(budget.records[index], status="failed", reason=str(error))
-                    raise
-                budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
-                return raw, refs, spans, index
-
-            return execute_packet(call, rows)
-
-        def factual_check(rows, candidate, record):
-            raw, refs, spans, index = fact_call("fact_check", rows, candidate, record, fact_check.check_extra(record))
-            return deepcopy(raw["items"])
-
-        def factual_sources(row, candidate, record):
-            raw = record["check"]["response"]
-            parent = fact_check.source_parent(meta["input_hash"], verification["original_final_hash"], row, record)
-            plan = {"version": 1, "parent_plan_id": parent,
-                "reason": "required_context_from_existing_frozen_originals",
-                "prior_response_hash": hash_json(raw), "gaps": fact_check.source_gaps(record),
-                "complete": True, "requests": fact_check.planned_source_requests(record)}
-            plan["plan_id"] = hash_json(plan)
-            record["source_plan"] = plan
-
-        def factual_rewrite(rows, candidate, record):
-            extra = fact_check.rewrite_batch_extra(rows, record["batch_records"])
-            raw, refs, spans, index = fact_call("fact_rewrite", rows, candidate, record, extra)
-            replacements = fact_check.accept_rewrites(raw, rows, refs, mode, meta)
-            record["rewrite"]["accepted"] = deepcopy(replacements if len(rows) > 1 else replacements[rows[0]["id"]])
-            # New citations are drawn only from the frozen, actually delivered
-            # corpus. The original final and its entire source record remain.
-            fact_check.retain_sources(candidate, spans)
-            budget.records[index] = replace(budget.records[index], status="completed", reason="validated")
-            return replacements
-
-        try:
-            final = fact_check.run(final, originals, meta, mode=mode, check=factual_check,
-                rewrite=factual_rewrite, choose=choose, resolve_sources=factual_sources,
-                max_rewrites=limits.max_rechecks, ledger=verification, language=language)
-        except (Stop, PartitionError) as error:
-            verification.update(status="unverified", interruption_reason=str(error))
-            final = deepcopy(verification.get("accepted_final", final))
-            verification["accepted_final_hash"] = hash_json(final)
         partitions["final"] = final
         partitions["final_covered_unit_ids"] = sorted({u for row in review_notes for u in row["covered_unit_ids"]})
         status = "partial_review" if verification["status"] != "model_supported" or final["missing_context"] or has_insufficient_judgement(
@@ -3019,6 +2955,10 @@ def _validate_consumer_delivery(result, originals, meta, known_units):
 
 def validate_partition_result(result: PartitionReviewResult, task) -> None:
     """Recheck immutable originals, coverage and extracted quotes before output."""
+    if (isinstance(result, PartitionReviewResult) and isinstance(result.partition, dict)
+            and result.partition.get("engine") == "pi-agent"):
+        from review_bot.application.agent_review import validate_agent_partition_result
+        return validate_agent_partition_result(result, task)
     if type(result) is not PartitionReviewResult or result.schema_version != 13 or result.review_type not in ("A", "B", "PLAN"):
         raise PartitionError("invalid_partition_result")
     if result.status not in ("planned", "measured", "completed", "partial_review", "failed", "not_run"):

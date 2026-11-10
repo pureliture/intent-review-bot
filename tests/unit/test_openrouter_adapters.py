@@ -64,7 +64,7 @@ def ledger(monkeypatch, tmp_path):
             return httpx.Response(200, json={
                 "model": REVIEW_MODEL,
                 "choices": [{"index": 0, "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": '{"ok":true}'}}],
+                    "message": {"role": "assistant", "content": behavior.get("content", '{"ok":true}')}}],
                 "usage": {"prompt_tokens": 64, "completion_tokens": 4, "total_tokens": 68}})
         if req.url.path == "/api/alpha/decisions":
             return httpx.Response(200, json={
@@ -273,6 +273,53 @@ def test_review_payload_rejects_invalid_reasoning_cap():
     from review_bot.adapters.openrouter_chat import review_wire_payload
     with pytest.raises(PermanentModelError):
         review_wire_payload(review_request(model=REVIEW_MODEL), reasoning_max_tokens=0)
+
+
+def test_review_payload_strips_unique_items_only_from_wire_schema():
+    import json
+    from review_bot.adapters.openrouter_chat import review_wire_payload
+
+    schema = {"type": "object", "properties": {"items": {"type": "array",
+        "items": {"type": "object", "properties": {"id": {"type": "string"}},
+            "required": ["id"], "additionalProperties": False},
+        "uniqueItems": True}}, "required": ["items"], "additionalProperties": False}
+    payload, _ = review_wire_payload(review_request(model=REVIEW_MODEL, response_schema=schema))
+    wire_schema = payload["response_format"]["json_schema"]["schema"]
+
+    def contains_unique_items(value):
+        if isinstance(value, dict):
+            return "uniqueItems" in value or any(contains_unique_items(child) for child in value.values())
+        if isinstance(value, list):
+            return any(contains_unique_items(child) for child in value)
+        return False
+
+    assert not contains_unique_items(wire_schema)
+    assert '"uniqueItems":true' in payload["messages"][0]["content"]
+    contract = payload["messages"][0]["content"].split("Do not add prose or fields.\n", 1)[1]
+    assert json.loads(contract)["properties"]["items"]["uniqueItems"] is True
+
+
+def test_review_rejects_duplicate_items_from_unique_items_array(ledger):
+    calls, behavior = ledger
+    behavior["content"] = '{"ids":["same","same"]}'
+    schema = {"type": "object", "properties": {"ids": {"type": "array",
+        "items": {"type": "string"}, "uniqueItems": True}},
+        "required": ["ids"], "additionalProperties": False}
+    client = OpenRouterReviewClient(api_key="test-key")
+    with pytest.raises(PermanentModelError, match="OpenRouter review output repeats unique items"):
+        client.complete(review_request(response_schema=schema))
+    assert calls.count(("POST", "/api/v1/chat/completions")) == 1
+
+
+def test_review_wire_output_floor_and_choice_floor():
+    from review_bot.adapters.byte_budget import CHOICE_WIRE_FLOOR_TOKENS
+    from review_bot.adapters.openrouter_chat import review_wire_payload
+
+    payload, maximum = review_wire_payload(review_request(max_output_tokens=256))
+    assert maximum == payload["max_tokens"] == 2048
+    for request_tokens in (64, 32, 1):
+        payload, maximum = review_wire_payload(review_request(max_output_tokens=request_tokens))
+        assert maximum == payload["max_tokens"] == CHOICE_WIRE_FLOOR_TOKENS
 
 
 def test_catalog_retry_recovers_from_hung_get(ledger):

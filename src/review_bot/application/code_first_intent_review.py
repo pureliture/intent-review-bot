@@ -10,6 +10,7 @@ from dataclasses import asdict, fields, replace
 from difflib import unified_diff
 from typing import Any
 
+from review_bot.adapters.byte_budget import effective_output_reservation
 from review_bot.application.context import hash_json
 from review_bot.application.intent_context import (
     MAX_PATHS, TEXT_KINDS, IntentInputError,
@@ -641,7 +642,7 @@ def run_code_first_review(
         return finish("not_run", "model_profile_unset" if unset else "invalid_model_profile")
     if not task.reviewed_paths:
         return finish("not_run", "no_review_targets")
-    output = profile.max_output_tokens
+    output = effective_output_reservation(profile.max_output_tokens, profile.provider)
     call_reservation = 2
     joint = _joint_plan(task)
     request, _ = _request(task, "observe_group", profile, limits, group=joint["groups"][0],
@@ -652,9 +653,10 @@ def run_code_first_review(
     if not full_fits and budget.records[index].reason != "input_limit_exceeded":
         return stopped(index)
     if planning_client is not None and planner_profile is not None:
+        planner_output = effective_output_reservation(planner_profile.max_output_tokens, planner_profile.provider)
         request, _ = _request(task, "plan_code_review", planner_profile, limits, full_input_fits=full_fits)
         raw, index = budget.execute(request, planning_client, replace(planner_profile, max_attempts=1),
-            label="plan_code_review", reserve_calls=3 * call_reservation, reserve_tokens=3 * output)
+            label="plan_code_review", reserve_calls=3 * call_reservation, reserve_tokens=3 * planner_output)
         if raw is not None:
             try:
                 plan, relations = _validate_plan(raw, task, limits)

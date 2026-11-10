@@ -176,6 +176,7 @@ def read_tree_blobs(
     entries = proc.stdout.split(b"\0")
 
     path_to_oid: dict[str, str] = {}
+    oid_to_paths: dict[str, list[str]] = {}
     for entry in entries:
         if not entry:
             continue
@@ -194,6 +195,7 @@ def read_tree_blobs(
             continue
 
         path_to_oid[path] = oid
+        oid_to_paths.setdefault(oid, []).append(path)
 
     if not path_to_oid:
         return {}
@@ -209,16 +211,27 @@ def read_tree_blobs(
     for oid in unique_oids:
         nl = raw_output.find(b"\n", offset)
         if nl < 0:
-            break
+            raise GitError(f"Malformed cat-file response for {oid_to_paths[oid][0]}")
         header = raw_output[offset:nl].split()
-        if len(header) != 3 or header[1] != b"blob":
-            break
+        path = oid_to_paths[oid][0]
+        if len(header) == 2 and header[0].decode("ascii", errors="replace") == oid and header[1] == b"missing":
+            raise GitError(f"Missing Git blob for {path}")
+        if (len(header) != 3 or header[0].decode("ascii", errors="replace") != oid
+                or header[1] != b"blob" or not header[2].isdigit()):
+            raise GitError(f"Malformed cat-file response for {path}")
         size = int(header[2])
         content_start = nl + 1
         content_end = content_start + size
+        if content_end >= len(raw_output) or raw_output[content_end:content_end + 1] != b"\n":
+            raise GitError(f"Truncated cat-file content for {path}")
         content = raw_output[content_start:content_end]
+        if len(content) != size:
+            raise GitError(f"Truncated cat-file content for {path}")
         oid_to_content[oid] = content
         offset = content_end + 1  # trailing newline
+
+    if offset != len(raw_output):
+        raise GitError("Malformed trailing cat-file response")
 
     return {path: oid_to_content[oid] for path, oid in path_to_oid.items() if oid in oid_to_content}
 

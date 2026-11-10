@@ -9,6 +9,7 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 from typing import Any
 
+from review_bot.adapters.byte_budget import effective_output_reservation
 from review_bot.application.context import hash_json
 from review_bot.application.intent_context import (
     TEXT_KINDS, IntentInputError, bounded_array, bounded_object, bounded_text,
@@ -408,10 +409,11 @@ def run_intent_perspective_review(task_input: IntentTaskInput, model_client: Mod
         return finish("not_run", "no_review_targets")
     if profile is None or selector is None:
         return finish("not_run", "model_profile_unset" if profile is None else "selection_profile_unset")
-    output = profile.max_output_tokens
+    output = effective_output_reservation(profile.max_output_tokens, profile.provider)
+    selection_output = effective_output_reservation(SELECTION_OUTPUT_TOKENS, selector.provider)
     request = _request(task, profile, state, language, "draft_review")
     admitted, index = budget.measure(request, model_client, profile, label="full_input_admission",
-        reserve_calls=10, reserve_tokens=2 * output + 8 * SELECTION_OUTPUT_TOKENS, generate=False)
+        reserve_calls=10, reserve_tokens=2 * output + 8 * selection_output, generate=False)
     if not admitted:
         return stopped(index)
     for position, perspective in enumerate(PERSPECTIVES):
@@ -419,7 +421,7 @@ def run_intent_perspective_review(task_input: IntentTaskInput, model_client: Mod
         remaining = len(PERSPECTIVES) - position - 1
         body, index = budget.execute(request, selection_client, replace(selector, max_attempts=1),
             label=f"select_perspective:{perspective.id}", reserve_calls=remaining + 2,
-            reserve_tokens=remaining * SELECTION_OUTPUT_TOKENS + 2 * output)
+            reserve_tokens=remaining * selection_output + 2 * output)
         if body is None:
             return stopped(index)
         try:

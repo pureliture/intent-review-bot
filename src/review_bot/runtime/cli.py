@@ -8,8 +8,10 @@ import logging
 import sys
 import tempfile
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from review_bot import __version__
 from review_bot.adapters.git import CommitNotFoundError, GitError, GitRepositoryReader
@@ -156,6 +158,10 @@ def create_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
     subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
+    subparsers.add_parser(
+        "agent-proxy-image",
+        help="Print the content-addressed agent proxy image tag",
+    )
 
     # 1. review
     review_parser = subparsers.add_parser(
@@ -345,6 +351,29 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Process a single claimed run and exit",
     )
+
+    ondemand_parser = subparsers.add_parser(
+        "ondemand-run", help="Claim and execute one on-demand review job",
+    )
+    ondemand_parser.add_argument("--job-id", required=True)
+    ondemand_parser.add_argument("--vm-id", default=None, help="Override the IMDSv2 instance identity")
+    ondemand_parser.add_argument("--config",
+        default=os.environ.get("REVIEW_BOT_CONFIG", "/etc/review-bot/operator.yaml"),
+        help="Path to operator review-config.yaml")
+
+    admission_parser = subparsers.add_parser(
+        "model-admission", help="Inspect or resolve model HTTP admission slots",
+    )
+    admission_actions = admission_parser.add_subparsers(dest="model_admission_action", required=True)
+    admission_status = admission_actions.add_parser("status", help="Show existing admission slots")
+    admission_status.add_argument("--remote", action="store_true",
+        help="Inspect remote API admission state instead of local/default state")
+    admission_resolve = admission_actions.add_parser("resolve", help="Resolve a slot after confirming server idleness")
+    admission_resolve.add_argument("--token", default=None, help="Admission ticket token")
+    admission_resolve.add_argument("--confirmed-idle", action="store_true",
+        help="Confirm the server is idle and this uncertain slot may be released")
+    admission_resolve.add_argument("--remote", action="store_true",
+        help="Resolve remote API admission state instead of local/default state")
 
     intent_parser = subparsers.add_parser(
         "intent", help="Evaluate fixed B intent input privately, without posting or target execution",
@@ -787,11 +816,54 @@ def _cmd_worker(args: argparse.Namespace) -> int:
     return 1
 
 
+def run_model_admission(args: argparse.Namespace) -> int:
+    from review_bot.adapters.model_http import default_model_admission, remote_model_admission
+
+    if args.model_admission_action == "resolve":
+        try:
+            valid_token = isinstance(args.token, str) and UUID(args.token).version == 4 and UUID(args.token).hex == args.token
+        except (ValueError, AttributeError):
+            valid_token = False
+        if not args.confirmed_idle or not valid_token:
+            sys.stderr.write("Error: resolve requires a valid token and --confirmed-idle\n")
+            return 2
+
+    admission = (remote_model_admission if args.remote else default_model_admission)()
+    if args.model_admission_action == "status":
+        slots = admission.snapshot()
+        if not slots:
+            print("no admission state")
+            return 0
+        for token, state, expires_at in slots:
+            expiry = datetime.fromtimestamp(expires_at, UTC).isoformat()
+            print(f"token={token} state={state} expires_at={expiry}")
+        return 0
+
+    try:
+        resolved = admission.resolve_uncertain(args.token, confirmed_idle=True)
+    except ValueError:
+        sys.stderr.write("Error: resolve requires a valid token and --confirmed-idle\n")
+        return 2
+    return 0 if resolved else 1
+
+
+def run_ondemand_cli(args: argparse.Namespace) -> int:
+    from review_bot.runtime.ondemand_entrypoint import run_ondemand
+
+    return run_ondemand(args.job_id, vm_id=args.vm_id, config_path=args.config)
+
+
 def main(args: list[str] | None = None) -> int:
     parser = create_parser()
     parsed = parser.parse_args(args)
     if not parsed.subcommand:
         parser.print_help()
+        return 0
+
+    if parsed.subcommand == "agent-proxy-image":
+        from review_bot.adapters.pi_agent_docker import proxy_image_tag
+
+        print(proxy_image_tag())
         return 0
 
     if parsed.subcommand == "version":
@@ -822,7 +894,17 @@ def main(args: list[str] | None = None) -> int:
     if parsed.subcommand == "worker":
         return _cmd_worker(parsed)
 
+    if parsed.subcommand == "ondemand-run":
+        return run_ondemand_cli(parsed)
+
+    if parsed.subcommand == "model-admission":
+        return run_model_admission(parsed)
+
     return 1
+
+
+def ondemand_main() -> int:
+    return main(["ondemand-run", *sys.argv[1:]])
 
 
 if __name__ == "__main__":

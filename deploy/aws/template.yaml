@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  intent-review-bot reference: GitHub webhook -> Lambda intake -> DynamoDB job -> one-shot EC2 review VM.
+  Reference only; not deployed by this repository. The worker AMI/launch template is operator-owned.
+
+Parameters:
+  WebhookSecretArn:
+    Type: String
+    Description: Secrets Manager ARN holding the GitHub App webhook secret.
+  WorkerLaunchTemplateId:
+    Type: String
+    Description: Launch template (trusted AMI, private subnet, SG, instance profile) for review VMs.
+  WorkerInstanceRoleArn:
+    Type: String
+    Description: IAM role used by the worker instance profile (passed only to EC2).
+  CodeBucket:
+    Type: String
+  CodeKey:
+    Type: String
+  AllowedInstallations:
+    Type: String
+    Default: ""
+  AllowedRepositories:
+    Type: String
+    Default: ""
+  MaxVmSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 60
+    MaxValue: 21600
+
+Resources:
+  JobTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: pr_key, AttributeType: S}
+        - {AttributeName: active, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+      GlobalSecondaryIndexes:
+        - IndexName: pr_index
+          KeySchema: [{AttributeName: pr_key, KeyType: HASH}]
+          Projection: {ProjectionType: KEYS_ONLY}
+        - IndexName: active_index
+          KeySchema: [{AttributeName: active, KeyType: HASH}]
+          Projection: {ProjectionType: KEYS_ONLY}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  IntakeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: review-bot-intake
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+                Resource: [!GetAtt JobTable.Arn, !Sub "${JobTable.Arn}/index/*"]
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref WebhookSecretArn
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource: "*"
+                Condition:
+                  ArnLike:
+                    ec2:LaunchTemplate: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${WorkerLaunchTemplateId}"
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:*/*"
+                Condition:
+                  StringEquals: {ec2:CreateAction: RunInstances}
+              - Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource: "*"
+                Condition:
+                  StringEquals: {aws:ResourceTag/review-bot:managed: "true"}
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Ref WorkerInstanceRoleArn
+                Condition:
+                  StringEquals: {iam:PassedToService: ec2.amazonaws.com}
+
+  IntakeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: review_bot.runtime.aws_lambda.intake
+      Role: !GetAtt IntakeRole.Arn
+      Timeout: 20
+      MemorySize: 256
+      ReservedConcurrentExecutions: 10
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKey}
+      Environment:
+        Variables:
+          REVIEW_BOT_JOB_TABLE: !Ref JobTable
+          REVIEW_BOT_LAUNCH_TEMPLATE_ID: !Ref WorkerLaunchTemplateId
+          REVIEW_BOT_WEBHOOK_SECRET_ARN: !Ref WebhookSecretArn
+          REVIEW_BOT_ALLOWED_INSTALLATIONS: !Ref AllowedInstallations
+          REVIEW_BOT_ALLOWED_REPOSITORIES: !Ref AllowedRepositories
+          REVIEW_BOT_MAX_VM_SECONDS: !Ref MaxVmSeconds
+
+  IntakeUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE  # GitHub cannot sign SigV4; the handler enforces X-Hub-Signature-256.
+      TargetFunctionArn: !GetAtt IntakeFunction.Arn
+
+  IntakeUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !Ref IntakeFunction
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  RecoveryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: review_bot.runtime.aws_lambda.recovery
+      Role: !GetAtt IntakeRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKey}
+      Environment:
+        Variables:
+          REVIEW_BOT_JOB_TABLE: !Ref JobTable
+          REVIEW_BOT_LAUNCH_TEMPLATE_ID: !Ref WorkerLaunchTemplateId
+          REVIEW_BOT_MAX_VM_SECONDS: !Ref MaxVmSeconds
+
+  RecoverySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(5 minutes)
+      Targets:
+        - {Arn: !GetAtt RecoveryFunction.Arn, Id: recovery}
+
+  RecoveryPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RecoveryFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RecoverySchedule.Arn
+
+  WorkerTablePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Attach to WorkerInstanceRole. Job state/trace only; no other AWS access.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [dynamodb:GetItem, dynamodb:PutItem]
+            Resource: !GetAtt JobTable.Arn
+          - Effect: Allow
+            Action: ec2:TerminateInstances
+            Resource: "*"
+            # AWS documents ec2:SourceInstanceARN, but not aws:ARN for comparing the caller to the target instance.
+            Condition:
+              StringEquals: {aws:ResourceTag/review-bot:managed: "true"}
+
+Outputs:
+  WebhookUrl:
+    Value: !GetAtt IntakeUrl.FunctionUrl
+  JobTableName:
+    Value: !Ref JobTable
+  WorkerTablePolicyArn:
+    Value: !Ref WorkerTablePolicy

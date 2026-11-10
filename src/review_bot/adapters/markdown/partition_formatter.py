@@ -42,21 +42,30 @@ def _format_private_partition_markdown(result: PartitionReviewResult, task, **_o
         lines.append(_escape(result.summary))
     if result.partition.get("fact_verification"):
         verification = result.partition["fact_verification"]
-        lines.extend(["", "#### 사실 검토" if ko else "#### Factual review",
-            "- 코드 판단은 모델이 원문과 대조한 결과이며, 정확성을 증명하지는 않습니다." if ko else
-            "- Code claims were checked by a model against originals; this is not a proof of accuracy."])
-        for entry in verification["items"]:
-            corrected = len(entry["attempts"]) > 1
-            citation_only = (corrected and any("citation_repair" in attempt for attempt in entry["attempts"])
-                and not any("rewrite" in attempt for attempt in entry["attempts"]))
-            correction = ((" · 인용 보강 후 재검토" if ko else " · citations supplemented and rechecked")
-                if citation_only else (" · 재작성 후 재검토" if ko else " · rewritten and rechecked") if corrected else "")
-            lines.append(f"- {_escape(entry['item_id'])}: {_escape(entry['status'])}" +
-                correction)
-        if verification["status"] != "model_supported":
-            lines.append("- 미검증 항목이 남아 있으므로 완료된 리뷰가 아닙니다." if ko else
-                "- Unverified items remain; this is not a completed review.")
+        lines.extend(["", "#### 사실 검토" if ko else "#### Factual review"])
+        if verification == "not_configured":
+            lines.append("사실 검토 모델이 설정되지 않았습니다." if ko else
+                "No factual-review model is configured.")
+        elif isinstance(verification, dict):
+            lines.append("- 코드 판단은 모델이 원문과 대조한 결과이며, 정확성을 증명하지는 않습니다." if ko else
+                "- Code claims were checked by a model against originals; this is not a proof of accuracy.")
+            if verification.get("version") == "agent-verify-v2":
+                lines.append("- 성립 조건은 가정을 설명하는 필드라 사실 검토 대상에서 제외했습니다." if ko else
+                    "- Failure conditions describe hypothetical scenarios and are excluded from factual review.")
+            for entry in verification["items"]:
+                corrected = len(entry["attempts"]) > 1
+                citation_only = (corrected and any("citation_repair" in attempt for attempt in entry["attempts"])
+                    and not any("rewrite" in attempt for attempt in entry["attempts"]))
+                correction = ((" · 인용 보강 후 재검토" if ko else " · citations supplemented and rechecked")
+                    if citation_only else (" · 재작성 후 재검토" if ko else " · rewritten and rechecked") if corrected else "")
+                lines.append(f"- {_escape(entry['item_id'])}: {_escape(entry['status'])}" +
+                    correction)
+            if verification["status"] != "model_supported":
+                lines.append("- 미검증 항목이 남아 있으므로 완료된 리뷰가 아닙니다." if ko else
+                    "- Unverified items remain; this is not a completed review.")
     for item in (*result.perspectives, *result.findings):
+        if result.review_type == "B" and item.get("assessments") == []:
+            continue
         label = item.get("perspective_id", "발견사항" if ko else "Finding")
         lines.extend(["", f"#### {_escape(label)}"])
         if item.get("assessments"):
@@ -82,7 +91,7 @@ def _format_private_partition_markdown(result: PartitionReviewResult, task, **_o
 
 def format_partition_review_markdown(result: PartitionReviewResult, task, *,
     publication_mode: str = "artifact_only", marker: str | None = None, max_length: int = 60000,
-    presentation=None, comment_template: str | None = None, **options,
+    presentation=None, comment_template: str | None = None, trace_context=None, **options,
 ) -> str:
     """Render a validated artifact or a developer comment; never publish it."""
     if publication_mode == "artifact_only":
@@ -91,7 +100,7 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
         raise ValueError("invalid_partition_formatter_options")
     from review_bot.adapters.markdown.developer_presentation import (
         BUILTIN_COMMENT_TEMPLATES, actionable_intent_findings, findings_section, finish, intent_lead, label, perspective_section, review_summary, walkthrough,
-        selected_signals, static_analysis, status_sections,
+        selected_signals, static_analysis, status_sections, execution_trace,
     )
     from review_bot.domain.markers import DEFAULT_B_MARKER
     from review_bot.adapters.markdown.formatter import DEFAULT_A_MARKER
@@ -104,23 +113,30 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
         final = result.partition.get("final", {})
         unreviewed = list(final.get("missing_context", ())) + list(result.validation_errors)
         return finish(marker, title, status_sections(result, ko=result.language == "ko", unreviewed=unreviewed),
-            scope="", max_length=max_length)
+            scope="", max_length=max_length, trace=execution_trace(result, context=trace_context, ko=result.language == "ko"))
     summary = review_summary(result.summary, task, is_mock=result.model.get("is_mock"))
     sections = {"summary": summary}
     if architecture:
         target_reviews = result.partition.get("final", {}).get("target_reviews", {})
-        signals = selected_signals(task, result.findings)
+        signal_reviews = target_reviews if result.partition.get("engine") == "pi-agent" else None
+        signals = selected_signals(task, result.findings, signal_reviews)
         walk = walkthrough(task, result.findings, result.questions, signals=signals)
         if walk:
             sections["summary"] = summary + "\n\n" + walk
         target_reviews = result.partition.get("final", {}).get("target_reviews", {})
-        signals = selected_signals(task, result.findings)
+        signal_reviews = target_reviews if result.partition.get("engine") == "pi-agent" else None
+        signals = selected_signals(task, result.findings, signal_reviews)
         sections["static_analysis"] = static_analysis(task, signals, presentation=presentation)
         sections["llm_review"] = findings_section(result.findings, result.questions, task,
             signals=signals, target_reviews=target_reviews, presentation=presentation)
     else:
-        findings = actionable_intent_findings(result.findings, result.perspectives)
-        lead = intent_lead(result.perspectives)
+        perspectives = [
+            item for item in result.perspectives
+            if not (isinstance(item, dict) and isinstance(item.get("assessments"), list)
+                and not item["assessments"])
+        ]
+        findings = actionable_intent_findings(result.findings, perspectives)
+        lead = intent_lead(perspectives)
         if lead:
             summary = lead + "\n\n" + summary
         sections["summary"] = summary
@@ -128,6 +144,7 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
         if walk:
             sections["summary"] = summary + "\n\n" + walk
         sections["llm_review"] = findings_section(findings, result.questions, task, presentation=presentation)
-        sections["perspectives"] = perspective_section(result.perspectives, task, presentation)
+        sections["perspectives"] = perspective_section(perspectives, task, presentation)
     footer = label(presentation, "footer_notice", "")
-    return finish(marker, title, sections, scope="", template=comment_template if comment_template is not None else BUILTIN_COMMENT_TEMPLATES["architecture" if architecture else "intent"], max_length=max_length, footer=footer)
+    return finish(marker, title, sections, scope="", template=comment_template if comment_template is not None else BUILTIN_COMMENT_TEMPLATES["architecture" if architecture else "intent"], max_length=max_length, footer=footer,
+        trace=execution_trace(result, context=trace_context, ko=result.language == "ko"))

@@ -50,3 +50,27 @@ def test_perspective_config_rejects_external_publication(intent_flow, publish):
     raw["publish"].update(publish)
     with pytest.raises(ValueError, match="artifact_only"):
         load_review_config_from_str(yaml.safe_dump(raw))
+
+
+def test_direct_intent_path_keeps_configured_context_out_of_reviewed_paths(intent_flow):
+    """Non-shared-plan jobs build their own task input; configured context must stay context."""
+    f = intent_flow
+    raw = f.config.model_dump()
+    raw["intent"]["pipeline"] = "perspectives-v1"
+    raw["execution"]["mode"] = "offline"
+    f.config, _ = load_review_config_from_str(yaml.safe_dump(raw))
+    f.worker.config = f.config
+    f.worker.model_client = PartitionModelClient()
+    seen = []
+    original = f.worker._review_perspectives
+
+    def observe(task, *args, **kwargs):
+        seen.append(task)
+        return original(task, *args, **kwargs)
+
+    f.worker._review_perspectives = observe
+    assert send_event(f).status_code == 202
+    f.worker.run_once()
+    assert len(seen) == 1
+    assert seen[0].reviewed_paths == ("app.py",)
+    assert seen[0].context_paths == ("tests/test_app.py",)

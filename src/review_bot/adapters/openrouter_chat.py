@@ -18,14 +18,13 @@ import json
 import math
 import threading
 import time
+from copy import deepcopy
 from typing import Any
 
 import httpx
 
 from review_bot.adapters.byte_budget import (
-    ADMISSION_OUTPUT_FLOOR_TOKENS,
-    CHOICE_WIRE_FLOOR_TOKENS,
-    _CHOICE_REQUEST_CEILING_TOKENS,
+    effective_output_reservation,
 )
 from review_bot.adapters.llama_cpp_local import _check_output_fields, _json_object
 from review_bot.adapters.model_http import mark_model_request_sent, model_request_slot
@@ -80,17 +79,23 @@ def review_wire_payload(request: ModelRequest, *, reasoning_max_tokens: int | No
     maximum = request.max_output_tokens if request.max_output_tokens is not None else APP_OUTPUT_TOKENS
     if type(maximum) is not int or not 0 < maximum <= APP_OUTPUT_TOKENS:
         raise PermanentModelError("Invalid OpenRouter review output reservation")
-    # Minimax reasoning is mandatory and billed as completion tokens. Tiny
-    # legacy reservations (e.g. 16-token closed choices) cannot fit reasoning
-    # plus content, so the wire reservation is floored. The floor participates
-    # in the same byte-bound pre-gate and post-send usage check.
-    floored = max(maximum, ADMISSION_OUTPUT_FLOOR_TOKENS)
-    if maximum <= _CHOICE_REQUEST_CEILING_TOKENS:
-        floored = max(floored, CHOICE_WIRE_FLOOR_TOKENS)
+    floored = effective_output_reservation(maximum, "openrouter")
     schema = compact_schema(request.response_schema)
     contract = ("\n\nReturn exactly one JSON object matching this entire response schema. "
         "Do not add prose or fields.\n"
         + encode(schema).decode("utf-8"))
+    wire_schema = deepcopy(schema)
+
+    def strip_unique_items(node: Any) -> None:
+        if isinstance(node, dict):
+            node.pop("uniqueItems", None)
+            for child in node.values():
+                strip_unique_items(child)
+        elif isinstance(node, list):
+            for child in node:
+                strip_unique_items(child)
+
+    strip_unique_items(wire_schema)
     reasoning: dict[str, Any] = {"effort": "low"}
     if reasoning_max_tokens is not None:
         if type(reasoning_max_tokens) is not int or reasoning_max_tokens < 1:
@@ -102,12 +107,64 @@ def review_wire_payload(request: ModelRequest, *, reasoning_max_tokens: int | No
             {"role": "system", "content": request.system_prompt + contract},
             {"role": "user", "content": request.user_content}],
         "response_format": {"type": "json_schema", "json_schema": {
-            "name": "review_bot", "strict": True, "schema": schema}},
+            "name": "review_bot", "strict": True, "schema": wire_schema}},
         "stream": False, "temperature": 0, "max_tokens": floored,
         "reasoning": reasoning}
     # Canonicalize through the shared encoder so the fingerprinted bytes
     # equal the transmitted bytes.
     return json.loads(encode(payload).decode("utf-8")), floored
+
+
+def _check_unique_items(value: Any, schema: Any, root: Any = None, active_refs: frozenset[str] = frozenset()) -> None:
+    if not isinstance(schema, dict):
+        return
+    if root is None:
+        root = schema
+    reference = schema.get("$ref")
+    if isinstance(reference, str) and reference.startswith("#/") and reference not in active_refs:
+        target = root
+        try:
+            for component in reference[2:].split("/"):
+                component = component.replace("~1", "/").replace("~0", "~")
+                target = target[component]
+        except (KeyError, TypeError):
+            target = None
+        if isinstance(target, dict):
+            _check_unique_items(value, target, root, active_refs | {reference})
+    if schema.get("uniqueItems") is True and isinstance(value, list):
+        encoded = [encode(item) for item in value]
+        if len(encoded) != len(set(encoded)):
+            raise PermanentModelError("OpenRouter review output repeats unique items")
+
+    if isinstance(value, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for key, child in value.items():
+                child_schema = properties.get(key)
+                if isinstance(child_schema, dict):
+                    _check_unique_items(child, child_schema, root, active_refs)
+        additional = schema.get("additionalProperties")
+        if isinstance(additional, dict) and isinstance(properties, dict):
+            for key, child in value.items():
+                if key not in properties:
+                    _check_unique_items(child, additional, root, active_refs)
+    elif isinstance(value, list):
+        items = schema.get("items")
+        if isinstance(items, dict):
+            for child in value:
+                _check_unique_items(child, items, root, active_refs)
+        elif isinstance(items, list):
+            for child, child_schema in zip(value, items):
+                _check_unique_items(child, child_schema, root, active_refs)
+        prefix_items = schema.get("prefixItems")
+        if isinstance(prefix_items, list):
+            for child, child_schema in zip(value, prefix_items):
+                _check_unique_items(child, child_schema, root, active_refs)
+    for key in ("allOf", "anyOf", "oneOf"):
+        branches = schema.get(key)
+        if isinstance(branches, list):
+            for branch in branches:
+                _check_unique_items(value, branch, root, active_refs)
 
 
 class OpenRouterReviewClient:
@@ -250,9 +307,10 @@ class OpenRouterReviewClient:
         except PermanentModelError:
             raise PermanentModelError("OpenRouter review output must be a JSON object") from None
         try:
-            _check_output_fields(value, payload["response_format"]["json_schema"]["schema"])
+            _check_output_fields(value, compact_schema(request.response_schema))
         except PermanentModelError:
             raise PermanentModelError("Unexpected OpenRouter review model output fields") from None
+        _check_unique_items(value, request.response_schema)
         usage = check_response_usage(data.get("usage"), app_input_tokens=self.profile.max_input_tokens,
             app_output_tokens=self.profile.max_output_tokens, model_context_tokens=model_context,
             max_output_tokens=maximum, role="OpenRouter review")

@@ -106,7 +106,7 @@ class ModelAdmissionTicket:
 
 
 class SQLiteModelAdmission:
-    """A shared hard cap of two; uncertain generating sends never expire automatically."""
+    """A shared hard cap of two; remote callers may reclaim expired sends."""
 
     def __init__(
         self,
@@ -114,6 +114,7 @@ class SQLiteModelAdmission:
         max_concurrency: int = 2,
         *,
         poll_interval: float = 0.05,
+        reclaim_expired_remote: bool = False,
     ) -> None:
         if (
             not isinstance(db_path, Path)
@@ -128,9 +129,12 @@ class SQLiteModelAdmission:
         interval = _finite_number(poll_interval)
         if interval <= 0:
             raise ValueError("Model admission poll interval must be positive")
+        if type(reclaim_expired_remote) is not bool:
+            raise ValueError("Model admission remote reclamation flag must be boolean")
         self.db_path = db_path
         self.max_concurrency = max_concurrency
         self.poll_interval = interval
+        self.reclaim_expired_remote = reclaim_expired_remote
 
     @contextmanager
     def request(
@@ -156,6 +160,11 @@ class SQLiteModelAdmission:
                 "DELETE FROM model_admission WHERE state IN ('reserved', 'metadata') AND expires_at <= ?",
                 (now,),
             )
+            if self.reclaim_expired_remote:
+                connection.execute(
+                    "DELETE FROM model_admission WHERE state IN ('sent', 'uncertain') AND expires_at <= ?",
+                    (now,),
+                )
             limits = [row[0] for row in connection.execute("SELECT caller_limit FROM model_admission")]
             if any(type(limit) is not int or limit not in (1, 2) for limit in limits):
                 raise ModelAdmissionError("Model admission state is unavailable")
@@ -202,6 +211,36 @@ class SQLiteModelAdmission:
             ).rowcount == 1
 
         return bool(self._run(resolve, deadline=time.monotonic() + _CLEANUP_TIMEOUT_SECONDS, missing_ok=True))
+
+    def snapshot(self) -> list[tuple[str, str, float]]:
+        try:
+            with self._private_directory(create=False) as directory:
+                descriptor = self._open_database(directory, create=False, read_only=True)
+                try:
+                    self._check_identity(directory, descriptor)
+                    self._check_files(directory)
+                    connection = sqlite3.connect(
+                        self.db_path.as_uri() + "?mode=ro", uri=True, timeout=0.0, isolation_level=None
+                    )
+                    try:
+                        self._check_identity(directory, descriptor)
+                        self._check_files(directory)
+                        rows = connection.execute(
+                            "SELECT token, state, expires_at FROM model_admission ORDER BY token"
+                        ).fetchall()
+                        self._check_identity(directory, descriptor)
+                        self._check_files(directory)
+                    finally:
+                        connection.close()
+                    return [(token, state, expires_at) for token, state, expires_at in rows]
+                finally:
+                    os.close(descriptor)
+        except FileNotFoundError:
+            return []
+        except sqlite3.Error:
+            raise ModelAdmissionError("Model admission state is unavailable") from None
+        except OSError:
+            raise ModelAdmissionError("Model admission private state is unavailable") from None
 
     def _mark_sent(
         self,
@@ -354,8 +393,8 @@ class SQLiteModelAdmission:
                     continue
             _private_file_metadata(metadata)
 
-    def _open_database(self, directory: int, *, create: bool) -> int:
-        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+    def _open_database(self, directory: int, *, create: bool, read_only: bool = False) -> int:
+        flags = (os.O_RDONLY if read_only else os.O_RDWR) | os.O_NOFOLLOW | os.O_NONBLOCK
         try:
             metadata = os.stat(self.db_path.name, dir_fd=directory, follow_symlinks=False)
         except FileNotFoundError:

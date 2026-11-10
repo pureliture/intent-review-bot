@@ -332,7 +332,8 @@ def assert_private_result(flow, run, *, publication="artifact_only"):
     assert result["base_sha"] == task["base"]["sha"] == flow.base
     assert result["head_sha"] == task["head"]["sha"] == flow.head
     assert task["snapshot"]["pr_number"] == run["pr_number"]
-    assert task["reviewed_paths"] == ["app.py", "tests/test_app.py"] and "outside.py" not in json.dumps(task)
+    assert task["reviewed_paths"] == ["app.py"] and task["context_paths"] == ["tests/test_app.py"]
+    assert "outside.py" not in json.dumps(task)
     assert next(item["content"] for item in task["head"]["files"] if item["path"] == "app.py") == HEAD_SOURCE
     assert result["schema_version"] == 13 and len(result["perspectives"]) == 8
     review_stages = [stage for stage in result["stages"] if stage["attempts"]]

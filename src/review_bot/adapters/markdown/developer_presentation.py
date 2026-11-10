@@ -7,8 +7,9 @@ edited or replaced by metric-derived defect claims.
 from __future__ import annotations
 
 import html
+import json
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 
@@ -68,20 +69,213 @@ def compose(sections: Mapping[str, str], template: str | None = None) -> str:
 
 
 def finish(marker: str, title: str, sections: Mapping[str, str], *, scope: str,
-    template: str | None = None, max_length: int = 60000, footer: str = "") -> str:
+    template: str | None = None, max_length: int = 60000, footer: str = "", trace: str = "") -> str:
     if type(max_length) is not int or not 1000 <= max_length <= 60000:
         raise ValueError("invalid_comment_length")
     intro = f"{marker}\n### {title}\n\n"
     rendered = intro + compose(sections, template) + ("\n\n" + scope if scope else "")
     if footer:
         rendered += "\n\n" + footer
+    if trace:
+        rendered += "\n\n" + trace
     if len(rendered) + 1 > max_length:
         # Never publish a shortened subset of conclusions as a complete review.
         rendered = (intro + "> 리뷰 본문 표시 보류: 댓글 길이 한도를 초과했습니다.\n\n본문 전체를 싣지 못했습니다."
-            + ("\n\n" + scope if scope else ""))
+            + ("\n\n" + scope if scope else "") + ("\n\n" + trace if trace else ""))
     if len(rendered) + 1 > max_length:
         raise ValueError("comment_notice_too_large")
     return rendered + "\n"
+
+
+def _usage_text(value, ko: bool) -> str:
+    return str(value) if type(value) is int else ("미반환" if ko else "not returned")
+
+
+def _code(value) -> str:
+    text = str(value).replace("`", "'").replace("\r", " ").replace("\n", " ")
+    return f"`{text}`"
+
+
+def _context_pressure(usages, ko: bool) -> str:
+    usage_rows = [usage for usage in usages if isinstance(usage, Mapping)]
+    if not any("max_prompt_tokens" in usage or "compactions" in usage for usage in usage_rows):
+        return ""
+    prompt_tokens = [usage["max_prompt_tokens"] for usage in usage_rows
+        if type(usage.get("max_prompt_tokens")) is int]
+    compactions = sum(usage["compactions"] for usage in usage_rows
+        if type(usage.get("compactions")) is int)
+    return (f" · max request input {_usage_text(max(prompt_tokens) if prompt_tokens else None, ko)}"
+        f" · compactions {_usage_text(compactions, ko)}")
+
+
+def _verification_usages(partition: Mapping) -> list[Mapping]:
+    ledger = partition.get("fact_verification")
+    runs = ledger.get("runs", []) if isinstance(ledger, Mapping) else []
+    return [run["usage"] for run in runs if isinstance(run, Mapping) and run.get("role") == "verify"
+        and isinstance(run.get("usage"), Mapping)] if isinstance(runs, list) else []
+
+
+def _sum_usage(usages, key: str) -> int | None:
+    values = [usage[key] for usage in usages if type(usage.get(key)) is int]
+    return sum(values) if values else None
+
+
+def execution_trace(result, *, context: Mapping | None = None, ko: bool = True) -> str:
+    """Folded execution record built only from metadata: no prompts, responses or source text."""
+    context = context or {}
+    model = result.model if isinstance(result.model, Mapping) else {}
+    profile = model.get("profile") if isinstance(model.get("profile"), Mapping) else {}
+    unknown = "미반환" if ko else "not returned"
+    lines = []
+    for key, name in (("repository", "저장소" if ko else "Repository"), ("pr_number", "PR"),
+            ("run_id", "실행 ID" if ko else "Run ID")):
+        if context.get(key) not in (None, ""):
+            lines.append(f"- {name}: {_code(context[key])}")
+    lines += [
+        f"- base / head: {_code(result.base_sha)} / {_code(result.head_sha)}",
+        f"- {'모드 · 상태' if ko else 'Mode · status'}: {escape(result.review_type)} · {_code(result.status)}"
+            + (f" ({_code(result.reason)})" if result.reason and result.reason != result.status else ""),
+    ]
+    partition = result.partition if isinstance(result.partition, Mapping) else {}
+    agent = partition.get("agent") if partition.get("engine") == "pi-agent" else None
+    if isinstance(agent, Mapping):
+        agent_usage = agent.get("usage", {})
+        agent_usage = agent_usage if isinstance(agent_usage, Mapping) else {}
+        verification_usages = _verification_usages(partition)
+        context_pressure = _context_pressure([agent_usage], ko)
+        session = agent.get("session", {})
+        limits = agent.get("limits", {})
+        lines.append(f"- Engine: {_code('pi-agent')}")
+        lines.append(f"- pi version / skill: {_code(agent.get('pi_version', unknown))} / "
+            f"{_code(agent.get('skill_sha256', unknown))}")
+        lines.append(f"- Agent model: {_code(agent.get('model', unknown))}")
+        if isinstance(limits, Mapping):
+            limits_line = (f"- Agent limits: timeout {_usage_text(limits.get('timeout_seconds'), ko)}s · "
+                f"max proxy calls {_usage_text(limits.get('max_proxy_calls'), ko)}")
+            if limits.get("max_output_tokens") is not None:
+                limits_line += f" · max output tokens {_usage_text(limits['max_output_tokens'], ko)}"
+            lines.append(limits_line)
+        lines.append(f"- Agent usage: input {_usage_text(agent_usage.get('input_tokens', agent_usage.get('input')), ko)} · "
+            f"output {_usage_text(agent_usage.get('output_tokens', agent_usage.get('output')), ko)} · "
+            f"total {_usage_text(agent_usage.get('total_tokens', agent_usage.get('total')), ko)} tokens"
+            + context_pressure)
+        if isinstance(agent_usage.get("cost"), Mapping):
+            lines.append(f"- Agent cost: {_code(json.dumps(agent_usage['cost'], sort_keys=True))}")
+        if verification_usages:
+            verification_pressure = _context_pressure(verification_usages, ko)
+            lines.append(f"- Agent verification usage: input {_usage_text(_sum_usage(verification_usages, 'input_tokens'), ko)} · "
+                f"output {_usage_text(_sum_usage(verification_usages, 'output_tokens'), ko)} · "
+                f"total {_usage_text(_sum_usage(verification_usages, 'total_tokens'), ko)} tokens"
+                + verification_pressure)
+        repair_label = "attempted" if agent.get("repair_attempted") else "not needed"
+        lines.append(f"- Agent repair: {repair_label} · rejected before/after "
+            f"{agent.get('before_rejected_count', 0)}/{agent.get('after_rejected_count', 0)}")
+        rejected = agent.get("rejected", [])
+        if isinstance(rejected, list):
+            codes = Counter(item.get("reason") for item in rejected
+                if isinstance(item, Mapping) and isinstance(item.get("reason"), str))
+            code_text = ", ".join(f"{_code(code)} × {count}" for code, count in sorted(codes.items()))
+            lines.append(f"- Rejected items: {len(rejected)}" + (f" · {code_text}" if code_text else ""))
+        rejected_before = agent.get("rejected_before", [])
+        if isinstance(rejected_before, list) and rejected_before:
+            before_codes = Counter(item.get("reason") for item in rejected_before
+                if isinstance(item, Mapping) and isinstance(item.get("reason"), str))
+            code_text = ", ".join(f"{_code(code)} × {count}" for code, count in sorted(before_codes.items()))
+            lines.append(f"- Initial rejection codes: {code_text}")
+        if isinstance(session, Mapping) and isinstance(session.get("sha256"), str):
+            lines.append(f"- Session SHA-256: {_code(session['sha256'])}")
+    for role, value in context.get("models", {}).items() if isinstance(context.get("models"), Mapping) else ():
+        lines.append(f"- {escape(role)}: {_code(value)}")
+    lines.append(f"- {'리뷰 모델' if ko else 'Review model'}: {_code(model.get('provider', unknown))} / "
+        f"{_code(model.get('model', unknown))}" + (" · mock" if model.get("is_mock") else ""))
+    if profile and not isinstance(agent, Mapping):
+        lines.append(f"- {'모델 한도' if ko else 'Model limits'}: input {_usage_text(profile.get('max_input_tokens'), ko)} · "
+            f"output {_usage_text(profile.get('max_output_tokens'), ko)} tokens · timeout {_usage_text(profile.get('timeout_seconds'), ko)}s")
+    lines.append(f"- prompt: {_code(result.prompt_version)} · {_code(result.prompt_hash[:12])}")
+    header = ("| 단계 | 사전검사 | 호출 | 완료 | 실패·중단 | 재시도 | 소요(ms) | 입력 토큰 | 출력 토큰 | 사용량 미반환 |" if ko else
+        "| Stage | Admission checks | Calls | Completed | Failed/interrupted | Retries | Duration (ms) | Input tokens | Output tokens | Usage not returned |")
+    table = [header, "|" + "---|" * 10]
+    if isinstance(agent, Mapping):
+        agent_usage = agent.get("usage", {})
+        agent_usage = agent_usage if isinstance(agent_usage, Mapping) else {}
+        calls = agent_usage.get("model_calls", 0)
+        calls = calls if type(calls) is int else 0
+        call_rows = agent_usage.get("calls", [])
+        failed = sum(1 for item in call_rows if isinstance(item, Mapping) and item.get("status") != 200)
+        unknown = agent_usage.get("unknown_usage_attempts", 0)
+        unknown = unknown if type(unknown) is int else 0
+        table.append(f"| agent_review | 0 | {calls} | {calls - failed} | {failed} | "
+            f"{int(bool(agent.get('repair_attempted')))} | {agent.get('duration_ms', 0)} | "
+            f"{agent_usage.get('input_tokens', 0)} | {agent_usage.get('output_tokens', 0)} | {unknown} |")
+        fact_groups: dict[str, dict[str, int]] = {}
+        for record in result.stages:
+            name = record.stage.split(":", 1)[0]
+            row_ = fact_groups.setdefault(name, {"admissions": 0, "calls": 0, "completed": 0, "failed": 0,
+                "retries": 0, "duration_ms": 0, "input": 0, "output": 0, "unknown": 0})
+            if record.stage.endswith(":admission") or not record.attempts:
+                row_["admissions"] += 1
+                continue
+            row_["retries"] += max(0, len(record.attempts) - 1)
+            for attempt in record.attempts:
+                row_["calls"] += 1
+                row_["completed" if attempt.status == "completed" else "failed"] += 1
+                row_["duration_ms"] += attempt.duration_ms if type(attempt.duration_ms) is int else 0
+                if attempt.usage is None or attempt.delivery == "unknown":
+                    row_["unknown"] += 1
+                else:
+                    row_["input"] += attempt.usage.get("input_tokens", 0)
+                    row_["output"] += attempt.usage.get("output_tokens", 0)
+        for name, value in fact_groups.items():
+            table.append(f"| {escape(name)} | {value['admissions']} | {value['calls']} | {value['completed']} | "
+                f"{value['failed']} | {value['retries']} | {value['duration_ms']} | {value['input']} | "
+                f"{value['output']} | {value['unknown']} |")
+    else:
+        groups: dict[str, dict[str, int]] = {}
+        for record in result.stages:
+            name = record.stage.split(":", 1)[0]
+            row_ = groups.setdefault(name, {"admissions": 0, "calls": 0, "completed": 0, "failed": 0, "retries": 0,
+                "duration_ms": 0, "input": 0, "output": 0, "unknown": 0})
+            if record.stage.endswith(":admission") or not record.attempts:
+                row_["admissions"] += 1
+                continue
+            row_["retries"] += max(0, len(record.attempts) - 1)
+            for attempt in record.attempts:
+                row_["calls"] += 1
+                row_["completed" if attempt.status == "completed" else "failed"] += 1
+                row_["duration_ms"] += attempt.duration_ms if type(attempt.duration_ms) is int else 0
+                if attempt.usage is None or attempt.delivery == "unknown":
+                    row_["unknown"] += 1
+                else:
+                    row_["input"] += attempt.usage.get("input_tokens", 0)
+                    row_["output"] += attempt.usage.get("output_tokens", 0)
+        for name, v in groups.items():
+            table.append(f"| {escape(name)} | {v['admissions']} | {v['calls']} | {v['completed']} | {v['failed']} | {v['retries']} | "
+                f"{v['duration_ms']} | {v['input']} | {v['output']} | {v['unknown']} |")
+    usage = dict(result.usage) if isinstance(result.usage, Mapping) else {}
+    if isinstance(agent, Mapping):
+        for record in result.stages:
+            for attempt in record.attempts:
+                usage["model_calls"] = usage.get("model_calls", 0) + 1
+                if attempt.usage is None or attempt.delivery == "unknown":
+                    usage["unknown_usage_attempts"] = usage.get("unknown_usage_attempts", 0) + 1
+                    usage["usage_complete"] = False
+                else:
+                    usage["known_input_tokens"] = usage.get("known_input_tokens", 0) + attempt.usage.get("input_tokens", 0)
+                    usage["known_output_tokens"] = usage.get("known_output_tokens", 0) + attempt.usage.get("output_tokens", 0)
+        if usage.get("unknown_usage_attempts"):
+            usage["usage_complete"] = False
+    complete = usage.get("usage_complete") is True and not usage.get("unknown_usage_attempts")
+    total = (f"- {'합계' if ko else 'Total'}: {'호출' if ko else 'calls'} {_usage_text(usage.get('model_calls'), ko)} · "
+        f"{'알려진 입력/출력 토큰' if ko else 'known input/output tokens'} {_usage_text(usage.get('known_input_tokens'), ko)} / "
+        f"{_usage_text(usage.get('known_output_tokens'), ko)} · "
+        + (("사용량 모두 반환됨" if ko else "usage complete") if complete else
+           (f"사용량 미반환 호출 {usage.get('unknown_usage_attempts', unknown)}건 (0으로 집계하지 않음)" if ko else
+            f"{usage.get('unknown_usage_attempts', unknown)} calls without usage (not counted as zero)")))
+    publication = context.get("publication")
+    if isinstance(publication, str) and publication:
+        total += f"\n- {'게시' if ko else 'Publication'}: {escape(publication)}"
+    body = "\n".join(lines) + "\n\n" + "\n".join(table) + "\n\n" + total
+    return details("리뷰 실행 내역" if ko else "Review execution trace", body)
 
 
 _STATUS_REASONS = {

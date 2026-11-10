@@ -7,11 +7,13 @@ import pytest
 import yaml
 
 from review_bot.config import (
+    AgentEngineConfig,
     ConfigAliasError,
     ConfigDuplicateKeyError,
     ConfigSecurityError,
     ConfigSyntaxError,
     ConfigValidationError,
+    ExecutionConfig,
     compute_config_hash,
     load_review_config,
     load_review_config_from_str,
@@ -32,6 +34,52 @@ def test_load_example_config(valid_config_yaml: str) -> None:
     assert config.architecture.run_target_build_scripts is False
     assert config.artifacts.publish_private_data_to_public_ci is False
     assert config_hash == EXPECTED_EXAMPLE_HASH
+
+
+def test_agent_engine_config_is_opt_in_and_strict(valid_config_yaml: str) -> None:
+    config, _ = load_review_config_from_str(valid_config_yaml)
+    assert config.review_engine == "partition"
+    assert config.agent_engine.model_id == "stealth/crouton-alpha"
+    assert config.agent_engine.provider == "openrouter"
+    assert config.agent_engine.context_window_tokens is None
+    assert config.agent_engine.max_output_tokens is None
+    assert config.agent_engine.timeout_seconds is None
+    assert config.agent_engine.parallel_modes is True
+
+    enabled = valid_config_yaml.replace("schema_version: 2", "schema_version: 2\nreview_engine: agent", 1)
+    config, _ = load_review_config_from_str(enabled)
+    assert config.review_engine == "agent"
+
+    opencode = enabled.replace("review_engine: agent",
+        "review_engine: agent\nagent_engine:\n  provider: opencode-go\n"
+        "  context_window_tokens: 1048576\n  max_output_tokens: 8192")
+    config, _ = load_review_config_from_str(opencode)
+    assert config.agent_engine.provider == "opencode-go"
+    assert config.agent_engine.context_window_tokens == 1048576
+    assert config.agent_engine.max_output_tokens == 8192
+
+    invalid_engine = enabled.replace("review_engine: agent", "review_engine: autonomous")
+    with pytest.raises(ConfigValidationError):
+        load_review_config_from_str(invalid_engine)
+
+    invalid_provider = enabled.replace("review_engine: agent",
+        "review_engine: agent\nagent_engine:\n  provider: other")
+    with pytest.raises(ConfigValidationError):
+        load_review_config_from_str(invalid_provider)
+
+    invalid_context_window = enabled.replace("review_engine: agent",
+        "review_engine: agent\nagent_engine:\n  context_window_tokens: 1023")
+    with pytest.raises(ConfigValidationError):
+        load_review_config_from_str(invalid_context_window)
+
+    invalid_limits = enabled.replace("review_engine: agent", "review_engine: agent\nagent_engine:\n  max_proxy_calls: 0")
+    with pytest.raises(ConfigValidationError):
+        load_review_config_from_str(invalid_limits)
+
+
+def test_agent_and_task_timeout_defaults() -> None:
+    assert AgentEngineConfig().timeout_seconds is None
+    assert ExecutionConfig(available_modes=["architecture"]).task_timeout_seconds == 3000
 
 
 def test_load_example_config_from_file() -> None:
@@ -196,6 +244,16 @@ def test_config_hash_invariance(valid_config_yaml: str) -> None:
     _cfg2, hash2 = load_review_config_from_str(reversed_yaml)
 
     assert hash1 == hash2 == EXPECTED_EXAMPLE_HASH
+
+
+def test_agent_parallel_modes_does_not_change_config_hash(valid_config_yaml: str) -> None:
+    agent_yaml = valid_config_yaml.replace("schema_version: 2", "schema_version: 2\nreview_engine: agent", 1)
+    config, _ = load_review_config_from_str(agent_yaml)
+    serial_config = config.model_copy(update={
+        "agent_engine": config.agent_engine.model_copy(update={"parallel_modes": False}),
+    })
+
+    assert config.config_hash == serial_config.config_hash
 
 
 def test_active_environment_validation(valid_config_yaml: str) -> None:

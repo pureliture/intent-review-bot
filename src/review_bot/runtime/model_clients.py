@@ -12,7 +12,7 @@ from review_bot.adapters.llama_cpp_macbook import (
     MacBookLlamaCppModelClient,
     macbook_model_admission,
 )
-from review_bot.adapters.model_http import default_model_admission
+from review_bot.adapters.model_http import default_model_admission, remote_model_admission
 from review_bot.adapters.ollama_local import OLLAMA_PROFILE, OllamaDecisionClient, OllamaModelClient
 from review_bot.adapters.openrouter_chat import (
     OPENROUTER_REVIEW_PROFILE,
@@ -100,6 +100,14 @@ def _configured_chat(role: str, settings: ModelConfig, *, selection: bool = Fals
     return client
 
 
+def _model_admission(profile: str, settings: ModelConfig):
+    if profile in OPENROUTER_PROFILES:
+        return remote_model_admission(settings.max_concurrency)
+    if profile in MACBOOK_PROFILES:
+        return macbook_model_admission(settings.max_concurrency)
+    return default_model_admission(settings.max_concurrency)
+
+
 def build_review_client(profile: str | None, settings: ModelConfig | None = None) -> ModelClient | None:
     if profile is None:
         return None
@@ -133,10 +141,7 @@ def build_review_client(profile: str | None, settings: ModelConfig | None = None
         client = MacBookGraniteLlamaCppModelClient(api_url=_endpoint("MACBOOK_GRANITE_BASE_URL", profile), **options)
     else:
         client = OllamaModelClient(**options)
-    client.request_admission = (
-        macbook_model_admission(settings.max_concurrency) if profile in MACBOOK_PROFILES
-        else default_model_admission(settings.max_concurrency)
-    )
+    client.request_admission = _model_admission(profile, settings)
     return client
 
 
@@ -170,10 +175,7 @@ def build_selector_client(profile: str | None, settings: ModelConfig | None = No
         )
     else:
         client = OllamaDecisionClient(timeout_seconds=settings.call_timeout_seconds)
-    client.request_admission = (
-        macbook_model_admission(settings.max_concurrency) if profile in MACBOOK_PROFILES
-        else default_model_admission(settings.max_concurrency)
-    )
+    client.request_admission = _model_admission(profile, settings)
     return client
 
 
@@ -197,7 +199,7 @@ def build_planning_client(profile: str | None, settings: ModelConfig | None = No
         return None
     settings = settings or ModelConfig()
     if profile in OPENROUTER_PROFILES:
-        return OpenRouterReviewClient(api_key=_openrouter_key(profile), origin=_openrouter_origin(),
+        client = OpenRouterReviewClient(api_key=_openrouter_key(profile), origin=_openrouter_origin(),
             model=_openrouter_model("OPENROUTER_REVIEW_MODEL", OPENROUTER_REVIEW_MODEL_DEFAULT, profile),
             timeout_seconds=settings.review_call_timeout_seconds or settings.call_timeout_seconds,
             max_output_bytes=settings.max_output_bytes,
@@ -206,6 +208,8 @@ def build_planning_client(profile: str | None, settings: ModelConfig | None = No
             framing_reserve_tokens=settings.framing_reserve_tokens,
             max_transport_bytes=settings.max_transport_bytes,
             reasoning_max_tokens=settings.reasoning_max_tokens)
+        client.request_admission = _model_admission(profile, settings)
+        return client
     options = dict(api_url=_endpoint(variable, profile), timeout_seconds=settings.call_timeout_seconds,
         max_output_bytes=settings.max_output_bytes, max_attempts=settings.max_attempts)
     if profile == LLAMACPP_PROFILE:
@@ -215,10 +219,7 @@ def build_planning_client(profile: str | None, settings: ModelConfig | None = No
         client = MacBookTev4bPlanClient(**options)
     else:
         client = MacBookLlamaCppPlanClient(**options) if profile in MACBOOK_PROFILES else LlamaCppPlanClient(**options)
-    client.request_admission = (
-        macbook_model_admission(settings.max_concurrency) if profile in MACBOOK_PROFILES
-        else default_model_admission(settings.max_concurrency)
-    )
+    client.request_admission = _model_admission(profile, settings)
     return client
 
 
@@ -242,7 +243,7 @@ def build_intent_selection_client(profile: str | None, settings: ModelConfig | N
             app_output_tokens=settings.review_output_tokens,
             framing_reserve_tokens=settings.framing_reserve_tokens,
             max_transport_bytes=settings.max_transport_bytes)
-        client.request_admission = default_model_admission(settings.max_concurrency)
+        client.request_admission = _model_admission(profile, settings)
         return client
     if profile not in (LLAMACPP_PROFILE, *MACBOOK_PROFILES):
         raise ValueError("Intent perspective selection requires an explicit llama.cpp profile")

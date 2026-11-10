@@ -405,6 +405,28 @@ def publish_review_comment(
             reason=failure_reason("post_check_failed", exc),
         )
 
+    # 5. Read back the owned comment: success requires the stored body to equal what was written.
+    try:
+        if strict_target:
+            stored = github_client.find_marker_comment(pr_number, marker, before_request=publication_guard,
+                timeout_seconds=read_timeout_seconds, max_response_bytes=8388608)
+        else:
+            stored = _call_client_method(github_client.find_marker_comment, pr_number, marker,
+                fallback_args=(repository_id, pr_number, marker))
+    except GitHubAuthorizationError:
+        if strict_target:
+            raise PublicationAuthorizationError(PublicationReceipt(published_id, "unknown", fingerprint,
+                marker=marker, published_at=datetime.now(UTC).isoformat(), reason="publication_authorization_lost")) from None
+        raise
+    except Exception as exc:
+        return PublicationReceipt(published_id, "unknown", fingerprint, marker=marker,
+            published_at=datetime.now(UTC).isoformat(), reason=failure_reason("readback_failed", exc))
+    stored_id = stored.get("id") if isinstance(stored, dict) else getattr(stored, "id", None)
+    stored_body = stored.get("body") if isinstance(stored, dict) else getattr(stored, "body", None)
+    if stored_id != published_id or not isinstance(stored_body, str) or _comparable(stored_body) != _comparable(clean_body):
+        return PublicationReceipt(published_id, "unknown", fingerprint, marker=marker,
+            published_at=datetime.now(UTC).isoformat(), reason="readback_mismatch")
+
     return PublicationReceipt(
         comment_id=published_id,
         status="succeeded",
@@ -413,3 +435,8 @@ def publish_review_comment(
         published_at=datetime.now(UTC).isoformat(),
         reason="published",
     )
+
+
+def _comparable(body: str) -> str:
+    """GitHub may normalize line endings and trailing whitespace of stored comment bodies."""
+    return "\n".join(line.rstrip() for line in body.replace("\r\n", "\n").split("\n")).strip()

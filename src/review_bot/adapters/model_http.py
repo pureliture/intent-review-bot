@@ -15,7 +15,7 @@ from review_bot.application.architecture_review import PermanentModelError
 _REQUEST_CONTEXT: ContextVar[tuple[Callable[[], bool], float] | None] = ContextVar("model_request_context", default=None)
 
 
-def default_model_admission(max_concurrency: int = 2) -> SQLiteModelAdmission:
+def _model_state_root() -> Path:
     configured = os.environ.get("REVIEW_BOT_MODEL_STATE_DIR")
     if configured is not None:
         if not configured.strip():
@@ -25,7 +25,16 @@ def default_model_admission(max_concurrency: int = 2) -> SQLiteModelAdmission:
         root = Path.home() / ".local" / "state" / "github-review-bot" / "model-admission"
     if not root.is_absolute() or ".." in root.parts or root == Path("/"):
         raise ValueError("REVIEW_BOT_MODEL_STATE_DIR must be an absolute private directory")
-    return SQLiteModelAdmission(root / "requests.sqlite", max_concurrency=max_concurrency)
+    return root
+
+
+def default_model_admission(max_concurrency: int = 2) -> SQLiteModelAdmission:
+    return SQLiteModelAdmission(_model_state_root() / "requests.sqlite", max_concurrency=max_concurrency)
+
+
+def remote_model_admission(max_concurrency: int = 2) -> SQLiteModelAdmission:
+    return SQLiteModelAdmission(_model_state_root() / "remote-requests.sqlite",
+        max_concurrency=max_concurrency, reclaim_expired_remote=True)
 
 
 def set_model_request_context(cancelled: Callable[[], bool], deadline: float) -> Token:

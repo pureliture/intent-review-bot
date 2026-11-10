@@ -1,6 +1,7 @@
 """Abstract Protocols and port types for github-review-bot Hexagonal Architecture."""
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,55 @@ from review_bot.domain.status import (
     RunStatusKind,
 )
 
+
+@dataclass(frozen=True)
+class AgentRunRequest:
+    mode: str
+    workspace_dir: Path
+    skill_id: str
+    model: str
+    timeout_seconds: int
+
+
+@dataclass(frozen=True)
+class AgentRunResponse:
+    final_text: str
+    session_jsonl: bytes
+    usage: dict[str, Any]
+    pi_version: str
+    exit_status: int
+    session_id: str | None = None
+    output_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class AgentRunFinalization:
+    session_jsonl: bytes
+    usage: dict[str, Any]
+    agent_reported_usage: dict[str, Any]
+    proxy_ledger_path: str
+    duration_ms: int
+
+
+class AgentRunError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        if not isinstance(code, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+            raise ValueError("invalid_agent_run_error_code")
+        self.code = code
+        super().__init__(code)
+
+
+@runtime_checkable
+class AgentRunner(Protocol):
+    def run(self, request: AgentRunRequest) -> AgentRunResponse:
+        ...
+
+    def repair(self, request: AgentRunRequest, session_id: str, message: str, *,
+        timeout_seconds: int | None = None) -> AgentRunResponse:
+        ...
+
+    def finish(self, session_id: str) -> AgentRunFinalization:
+        ...
 
 @dataclass(frozen=True)
 class MergeBaseResult:

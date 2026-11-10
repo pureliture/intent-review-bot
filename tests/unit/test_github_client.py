@@ -288,6 +288,7 @@ def test_publication_updates_marker_comment_on_second_page(
             })
         if request.method == "PATCH" and request.url.path == "/repos/org/repo/issues/comments/120":
             updated_bodies.append(json.loads(request.content)["body"])
+            comments[119]["body"] = updated_bodies[-1]
             return httpx.Response(200, json={"id": 120})
         raise AssertionError(f"Unexpected GitHub API request: {request.method} {request.url}")
 
@@ -303,7 +304,7 @@ def test_publication_updates_marker_comment_on_second_page(
     assert receipt.comment_id == 120
     assert updated_bodies == [f"{MARKER}\n\nUpdated architecture review"]
     assert not any(request.method == "POST" for request in requests)
-    assert len(requests) == 5
+    assert len(requests) == 7, "pre-check, 2 discovery pages, write, post-check, 2 readback pages"
 
 
 @pytest.mark.parametrize("author", [
@@ -366,6 +367,9 @@ def test_app_bound_marker_comment_ownership_allows_only_own_bot_upsert(operation
             })
         if request.method == "GET" and request.url.path == "/repos/org/repo/issues/42/comments":
             return httpx.Response(200, json=comments)
+        written = {"id": 88, "body": json.loads(request.content)["body"],
+            "user": {"type": "Bot", "login": BOT_LOGIN}}
+        comments[:] = [c for c in comments if c["id"] != 88] + [written]
         return httpx.Response(201 if request.method == "POST" else 200, json={"id": 88})
 
     client = GitHubApiClient(

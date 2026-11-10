@@ -292,7 +292,8 @@ def test_capacity_authority_keeps_native_wire_separate_from_supported_operating_
     snapshot = deepcopy((record, packet, profile, request))
     payload, maximum = review_wire_payload(request)
     assert payload["model"] == request.model == profile.model
-    assert maximum == request.max_output_tokens == output_tokens
+    from review_bot.adapters.byte_budget import effective_output_reservation
+    assert maximum == effective_output_reservation(request.max_output_tokens, "openrouter") == max(output_tokens, 2048)
     assert payload["max_tokens"] == maximum
     assert profile.max_input_tokens + profile.max_output_tokens == context_tokens
     assert packet["admission_bound"] == record.measured_input_tokens
@@ -336,7 +337,8 @@ def _check_admission_authority(record, packet, profile, request):
         payload, maximum = review_wire_payload(request)
     except Exception as error:
         raise ValueError("invalid_admission_wire") from error
-    if maximum != request.max_output_tokens or payload["model"] != request.model:
+    from review_bot.adapters.byte_budget import effective_output_reservation
+    if maximum != effective_output_reservation(request.max_output_tokens, "openrouter") or payload["model"] != request.model:
         raise ValueError("invalid_admission_wire")
     if set(packet) != {"admission_bound", "witness_hash", "request_hash"}:
         raise ValueError("invalid_admission_witness")
@@ -683,6 +685,20 @@ def test_literal_metric_values_do_not_assert_a_meaning_category(prose):
     assert "summary" in schema["properties"]["items"]["required"]  # value check is still required
 
 
+def test_fact_check_schema_without_delivered_references_allows_only_empty_citations():
+    row = {"id": "summary", "kind": "summary", "item": "The change improves behavior."}
+    refs = facts.CitationContext({}, [], [], facts.VERSION)
+    schema = facts.check_schema([row], refs, source_ids=())
+    citations = schema["properties"]["items"]["properties"]["summary"]["properties"]["text"]["properties"]["citations"]
+    assert citations == {
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 0,
+        "maxItems": 0,
+    }
+    assert '"enum": []' not in json.dumps(schema)
+
+
 def test_literal_grammar_never_skips_a_meaning_claim_next_to_values():
     row = {"id": "summary", "kind": "summary", "item": "TCC 0.07이다. Therefore coupling is low."}
     assert [s["state"]["target_metric"] for s in facts.metric_specs(row)] == ["TCC"]
@@ -1004,6 +1020,29 @@ def test_requested_fact_original_is_complete_even_in_focused_citation_delivery()
     extra["source_requests"][0]["evidence_id"] = "outside"
     with pytest.raises(PartitionError, match="outside_frozen_corpus"):
         facts.delivery([row], final, [code, test, purpose], {}, kind="cited_ranges", extra=extra)
+
+
+def test_summary_citations_of_a_zero_finding_agent_final_are_delivered_for_the_summary_row():
+    from review_bot.application.source_partition import SourceOriginal, make_span
+    code = SourceOriginal("S-code", "one\ntwo\nthree\nfour\n", "source", "src/A.py", "head", "a" * 40)
+    purpose = SourceOriginal("S-purpose", "Frozen full purpose", "pr_text", "", "", "")
+    span = make_span(code, 4, 8, "test")
+    citation = {"evidence_id": span.evidence_id, "start_byte": span.start_byte, "end_byte": span.end_byte,
+        "sha": span.sha, "path": span.path, "version": span.version, "begin_line": span.begin_line,
+        "end_line": span.end_line, "quote": span.text}
+    final = {"summary": "No defect in the changed lines.", "summary_citations": [citation],
+        "findings": [], "perspectives": [], "questions": [], "supplied_quotes": []}
+    row = {"id": "summary", "kind": "summary", "item": final["summary"]}
+
+    payload, refs, _ = facts.delivery([row], final, [code, purpose], {}, kind="cited_originals")
+
+    supplied = {s["evidence_id"]: "".join(b["text"] for b in s["blocks"]) for s in payload["originals"]}
+    assert supplied[code.evidence_id] == code.text
+    catalog = {(source["evidence_id"], entry["start_byte"], entry["end_byte"])
+        for source in payload["citation_catalog"] for entry in source["ranges"]}
+    assert (span.evidence_id, span.start_byte, span.end_byte) in catalog
+    assert any(reference.evidence_id == span.evidence_id and reference.start_byte == span.start_byte
+        and reference.end_byte == span.end_byte for reference in refs.values())
 
 
 @pytest.mark.parametrize("corrupt", ["outside", "already_delivered", "duplicate", "empty_reason"])
