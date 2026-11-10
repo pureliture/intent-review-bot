@@ -158,6 +158,10 @@ def create_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
     subparsers = parser.add_subparsers(dest="subcommand", help="Available subcommands")
+    subparsers.add_parser(
+        "agent-proxy-image",
+        help="Print the content-addressed agent proxy image tag",
+    )
 
     # 1. review
     review_parser = subparsers.add_parser(
@@ -854,6 +858,12 @@ def main(args: list[str] | None = None) -> int:
     parsed = parser.parse_args(args)
     if not parsed.subcommand:
         parser.print_help()
+        return 0
+
+    if parsed.subcommand == "agent-proxy-image":
+        from review_bot.adapters.pi_agent_docker import proxy_image_tag
+
+        print(proxy_image_tag())
         return 0
 
     if parsed.subcommand == "version":
