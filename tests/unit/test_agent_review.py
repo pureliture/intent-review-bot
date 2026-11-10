@@ -59,7 +59,7 @@ class FakeAgentRunner:
         self.finished = []
         self.proxy_usage = {"input_tokens": 9, "output_tokens": 4, "total_tokens": 13,
             "model_calls": 2, "usage_complete": True, "unknown_usage_attempts": 0,
-            "cost": {"total": 0.025}, "calls": [
+            "max_prompt_tokens": 5, "compactions": 1, "cost": {"total": 0.025}, "calls": [
                 {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6, "cost": {"total": 0.01}, "status": 200},
                 {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7, "cost": {"total": 0.015}, "status": 200},
             ]}
@@ -124,6 +124,7 @@ class FakeAgentRunner:
             if isinstance(body, str):
                 body = body.encode("utf-8")
             self.output_path.write_bytes(body or b"")
+        usage = {**usage, "max_prompt_tokens": 5, "compactions": 1}
         return AgentRunResponse("DONE", self.session, usage, "0.73.1", 0,
             session_id, self.output_path)
 
@@ -305,6 +306,9 @@ def test_agent_fact_verification_rewrites_contradicted_assessment(tmp_path):
     assert '"summary_citations"' in runner.repair_message
     assert '"statement"' in runner.repair_message
     assert "node /skills/check_output.mjs --revision" in runner.repair_message
+    revision_usage = next(run["usage"] for run in result.partition["fact_verification"]["runs"]
+        if run["role"] == "revise")
+    assert revision_usage["max_prompt_tokens"] == 5 and revision_usage["compactions"] == 1
 
 
 def test_agent_verifier_uses_isolated_workspace_without_changing_generation_contract(tmp_path):
@@ -968,11 +972,35 @@ def test_agent_reported_usage_is_separate_from_proxy_usage_and_rendered(tmp_path
 
     assert agent["usage"]["input_tokens"] == 9
     assert agent["usage"]["cost"]["total"] == 0.025
+    assert agent["usage"]["max_prompt_tokens"] == 5 and agent["usage"]["compactions"] == 1
     assert agent["agent_reported_usage"]["input_tokens"] == 10
     assert agent["proxy_ledger_path"].endswith("usage.jsonl")
+    assert result.usage["max_prompt_tokens"] == 5 and result.usage["compactions"] == 1
+    verify_usage = next(run["usage"] for run in result.partition["fact_verification"]["runs"]
+        if run["role"] == "verify")
+    assert verify_usage["max_prompt_tokens"] == 5 and verify_usage["compactions"] == 1
     markdown = format_partition_review_markdown(result, task, publication_mode="comment")
     assert "Rejected items: 0" in markdown
     assert "| agent_review | 0 | 2 | 2 | 0 |" in markdown
+    assert "Agent usage: input 9 · output 4 · total 13 tokens · max request input 5 · compactions 1" in markdown
+    assert "Agent verification usage:" in markdown
+    assert "max request input 5 · compactions 1" in markdown
+
+
+def test_agent_result_validator_accepts_legacy_usage_without_context_metrics(tmp_path):
+    task = _pmd_partition_task()
+    result = _run(task, "architecture", tmp_path, _architecture_body(task))
+    legacy = deepcopy(result)
+    for usage in (legacy.partition["agent"]["usage"], legacy.usage):
+        usage.pop("max_prompt_tokens")
+        usage.pop("compactions")
+    for run in legacy.partition["fact_verification"]["runs"]:
+        usage = run.get("usage")
+        if isinstance(usage, dict):
+            usage.pop("max_prompt_tokens", None)
+            usage.pop("compactions", None)
+
+    validate_partition_result(legacy, task)
 
 
 def test_distinct_findings_can_share_a_citation(tmp_path):

@@ -192,7 +192,19 @@ class DockerPiAgentRunner:
         return result
 
     @staticmethod
-    def _proxy_usage(ledger_path: Path) -> dict[str, Any]:
+    def _session_compactions(session: bytes) -> int:
+        compactions = 0
+        for line in session.splitlines():
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(record, dict) and record.get("type") == "compaction":
+                compactions += 1
+        return compactions
+
+    @staticmethod
+    def _proxy_usage(ledger_path: Path, session: bytes = b"") -> dict[str, Any]:
         calls = []
         if ledger_path.is_file():
             for line in ledger_path.read_text(encoding="utf-8").splitlines():
@@ -216,12 +228,17 @@ class DockerPiAgentRunner:
             for key, value in row.get("cost", {}).items() if isinstance(row.get("cost"), dict) else ():
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     cost[key] = cost.get(key, 0.0) + float(value)
+        max_prompt_tokens = max(
+            (row["prompt_tokens"] for row in calls if type(row.get("prompt_tokens")) is int),
+            default=None,
+        )
         result: dict[str, Any] = {
             "input_tokens": input_tokens, "output_tokens": output_tokens,
             "total_tokens": total_tokens, "model_calls": len(calls),
             "known_input_tokens": input_tokens, "known_output_tokens": output_tokens,
             "usage_complete": unknown == 0, "unknown_usage_attempts": unknown,
-            "calls": calls,
+            "calls": calls, "max_prompt_tokens": max_prompt_tokens,
+            "compactions": DockerPiAgentRunner._session_compactions(session),
         }
         if cost:
             result["cost"] = cost
@@ -348,8 +365,16 @@ class DockerPiAgentRunner:
             raise AgentRunError("agent_session_unavailable")
         with suppress(Exception):
             self._docker(["rm", "-f", run.agent_name], timeout=15)
+        usage = self._agent_reported_usage(run.session_jsonl)
+        try:
+            proxy_usage = self._proxy_usage(run.ledger_path, run.session_jsonl)
+        except OSError:
+            proxy_usage = {"max_prompt_tokens": None,
+                "compactions": self._session_compactions(run.session_jsonl)}
+        usage.update(max_prompt_tokens=proxy_usage["max_prompt_tokens"],
+            compactions=proxy_usage["compactions"])
         return AgentRunResponse(completed.stdout, run.session_jsonl,
-            self._agent_reported_usage(run.session_jsonl), PI_VERSION, completed.returncode, resolved_session,
+            usage, PI_VERSION, completed.returncode, resolved_session,
             run.output_dir / "result.json")
 
     def run(self, request: AgentRunRequest) -> AgentRunResponse:
@@ -397,7 +422,7 @@ class DockerPiAgentRunner:
         try:
             self._cleanup_names(run.agent_name, run.proxy_name, run.network)
             try:
-                usage = self._proxy_usage(run.ledger_path)
+                usage = self._proxy_usage(run.ledger_path, session)
             except OSError:
                 raise AgentRunError("usage_ledger_unavailable") from None
             return AgentRunFinalization(session, usage, self._agent_reported_usage(session),

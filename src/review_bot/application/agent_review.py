@@ -544,11 +544,28 @@ def _agent_usage(usage: dict) -> dict:
     output_tokens = int(usage.get("output_tokens", usage.get("output", 0)) or 0)
     total = int(usage.get("total_tokens", usage.get("total", input_tokens + output_tokens)) or 0)
     model_calls = int(usage.get("model_calls", 0) or 0)
-    return {"usage_complete": usage.get("usage_complete", True),
+    result = {"usage_complete": usage.get("usage_complete", True),
         "unknown_usage_attempts": usage.get("unknown_usage_attempts", 0), "model_calls": model_calls,
         "known_input_tokens": input_tokens, "known_output_tokens": output_tokens,
         "input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total,
         **({"cost": usage["cost"]} if "cost" in usage else {})}
+    for key in ("max_prompt_tokens", "compactions"):
+        if key in usage:
+            result[key] = usage[key]
+    return result
+
+
+def _valid_context_usage(usage: dict) -> bool:
+    metrics = {"max_prompt_tokens", "compactions"}
+    present = metrics & usage.keys()
+    if not present:
+        return True
+    if present != metrics:
+        return False
+    max_prompt_tokens = usage["max_prompt_tokens"]
+    return ((max_prompt_tokens is None or
+        (type(max_prompt_tokens) is int and max_prompt_tokens >= 0))
+        and type(usage["compactions"]) is int and usage["compactions"] >= 0)
 
 
 def _result(task, mode, language, originals, meta, final, rejected, skill_id, skill_sha, model,
@@ -1416,6 +1433,9 @@ def _validate_agent_verification_replay(result: PartitionReviewResult, originals
             raise PartitionError("stored_agent_verification_status")
     if not isinstance(ledger["runs"], list):
         raise PartitionError("stored_agent_verification_ledger")
+    if any(isinstance(run, dict) and isinstance(run.get("usage"), dict)
+            and not _valid_context_usage(run["usage"]) for run in ledger["runs"]):
+        raise PartitionError("stored_agent_verification_ledger")
 
 
 def validate_agent_partition_result(result: PartitionReviewResult, task) -> None:
@@ -1505,6 +1525,8 @@ def validate_agent_partition_result(result: PartitionReviewResult, task) -> None
             or not isinstance(agent["usage"], dict) or not isinstance(agent["agent_reported_usage"], dict)
             or not isinstance(agent["session"], dict) or set(agent["session"]) != {
             "sha256", "bytes", "store_path"}):
+        raise PartitionError("invalid_agent_session_metadata")
+    if not _valid_context_usage(agent["usage"]):
         raise PartitionError("invalid_agent_session_metadata")
     if (not _SHA256.fullmatch(agent["session"]["sha256"])
             or type(agent["session"]["bytes"]) is not int or agent["session"]["bytes"] < 0

@@ -96,6 +96,30 @@ def _code(value) -> str:
     return f"`{text}`"
 
 
+def _context_pressure(usages, ko: bool) -> str:
+    usage_rows = [usage for usage in usages if isinstance(usage, Mapping)]
+    if not any("max_prompt_tokens" in usage or "compactions" in usage for usage in usage_rows):
+        return ""
+    prompt_tokens = [usage["max_prompt_tokens"] for usage in usage_rows
+        if type(usage.get("max_prompt_tokens")) is int]
+    compactions = sum(usage["compactions"] for usage in usage_rows
+        if type(usage.get("compactions")) is int)
+    return (f" · max request input {_usage_text(max(prompt_tokens) if prompt_tokens else None, ko)}"
+        f" · compactions {_usage_text(compactions, ko)}")
+
+
+def _verification_usages(partition: Mapping) -> list[Mapping]:
+    ledger = partition.get("fact_verification")
+    runs = ledger.get("runs", []) if isinstance(ledger, Mapping) else []
+    return [run["usage"] for run in runs if isinstance(run, Mapping) and run.get("role") == "verify"
+        and isinstance(run.get("usage"), Mapping)] if isinstance(runs, list) else []
+
+
+def _sum_usage(usages, key: str) -> int | None:
+    values = [usage[key] for usage in usages if type(usage.get(key)) is int]
+    return sum(values) if values else None
+
+
 def execution_trace(result, *, context: Mapping | None = None, ko: bool = True) -> str:
     """Folded execution record built only from metadata: no prompts, responses or source text."""
     context = context or {}
@@ -116,6 +140,9 @@ def execution_trace(result, *, context: Mapping | None = None, ko: bool = True) 
     agent = partition.get("agent") if partition.get("engine") == "pi-agent" else None
     if isinstance(agent, Mapping):
         agent_usage = agent.get("usage", {})
+        agent_usage = agent_usage if isinstance(agent_usage, Mapping) else {}
+        verification_usages = _verification_usages(partition)
+        context_pressure = _context_pressure([agent_usage], ko)
         session = agent.get("session", {})
         limits = agent.get("limits", {})
         lines.append(f"- Engine: {_code('pi-agent')}")
@@ -126,12 +153,18 @@ def execution_trace(result, *, context: Mapping | None = None, ko: bool = True) 
             lines.append(f"- Agent limits: timeout {_usage_text(limits.get('timeout_seconds'), ko)}s · "
                 f"max proxy calls {_usage_text(limits.get('max_proxy_calls'), ko)} · "
                 f"max output tokens {_usage_text(limits.get('max_output_tokens'), ko)}")
-        if isinstance(agent_usage, Mapping):
-            lines.append(f"- Agent usage: input {_usage_text(agent_usage.get('input_tokens', agent_usage.get('input')), ko)} · "
-                f"output {_usage_text(agent_usage.get('output_tokens', agent_usage.get('output')), ko)} · "
-                f"total {_usage_text(agent_usage.get('total_tokens', agent_usage.get('total')), ko)} tokens")
-            if isinstance(agent_usage.get("cost"), Mapping):
-                lines.append(f"- Agent cost: {_code(json.dumps(agent_usage['cost'], sort_keys=True))}")
+        lines.append(f"- Agent usage: input {_usage_text(agent_usage.get('input_tokens', agent_usage.get('input')), ko)} · "
+            f"output {_usage_text(agent_usage.get('output_tokens', agent_usage.get('output')), ko)} · "
+            f"total {_usage_text(agent_usage.get('total_tokens', agent_usage.get('total')), ko)} tokens"
+            + context_pressure)
+        if isinstance(agent_usage.get("cost"), Mapping):
+            lines.append(f"- Agent cost: {_code(json.dumps(agent_usage['cost'], sort_keys=True))}")
+        if verification_usages:
+            verification_pressure = _context_pressure(verification_usages, ko)
+            lines.append(f"- Agent verification usage: input {_usage_text(_sum_usage(verification_usages, 'input_tokens'), ko)} · "
+                f"output {_usage_text(_sum_usage(verification_usages, 'output_tokens'), ko)} · "
+                f"total {_usage_text(_sum_usage(verification_usages, 'total_tokens'), ko)} tokens"
+                + verification_pressure)
         repair_label = "attempted" if agent.get("repair_attempted") else "not needed"
         lines.append(f"- Agent repair: {repair_label} · rejected before/after "
             f"{agent.get('before_rejected_count', 0)}/{agent.get('after_rejected_count', 0)}")
