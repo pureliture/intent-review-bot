@@ -238,11 +238,10 @@ class WorkerLoop:
         if _agent_engine_enabled(self.config):
             from review_bot.application.agent_review import run_agent_review
             self._require_active(run, deadline)
-            timeout = min(self.config.agent_engine.timeout_seconds,
-                max(1, math.ceil(deadline - time.monotonic())))
             result = run_agent_review(task_input, mode, self.agent_runner, language=language,
-                instructions=self._repository_settings.bundle.instructions_for(mode), timeout_seconds=timeout,
-                max_revisions=self.config.agent_engine.max_revisions)
+                instructions=self._repository_settings.bundle.instructions_for(mode),
+                timeout_seconds=self.config.agent_engine.timeout_seconds,
+                max_revisions=self.config.agent_engine.max_revisions, deadline=deadline)
             self._require_active(run, deadline)
             from review_bot.application.partition_review import validate_partition_result
             validate_partition_result(result, task_input)
@@ -472,7 +471,7 @@ class WorkerLoop:
         previous_github_client = self.github_client
         previous_repo_reader = self.repo_reader
         artifacts = None
-        deadline = time.monotonic() + getattr(getattr(self.config, "execution", None), "task_timeout_seconds", 900)
+        deadline = time.monotonic() + getattr(getattr(self.config, "execution", None), "task_timeout_seconds", 3000)
         receipts: dict[str, ExecutionReceipt] = {}
         heartbeat_stop, heartbeat_thread = self._start_heartbeat(run_id)
         request_scope_lock = threading.Lock()

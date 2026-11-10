@@ -419,10 +419,13 @@ class DockerPiAgentRunner:
                     run.output_temporary.cleanup()
             raise AgentRunError("docker_runner_failed") from None
 
-    def repair(self, request: AgentRunRequest, session_id: str, message: str) -> AgentRunResponse:
+    def repair(self, request: AgentRunRequest, session_id: str, message: str, *,
+        timeout_seconds: int | None = None) -> AgentRunResponse:
         run = self._active_runs.get(session_id)
         if run is None or run.request != request:
             raise AgentRunError("agent_session_unknown")
+        if timeout_seconds is not None:
+            run.deadline = time.monotonic() + timeout_seconds
         return self._invoke(run, message, session_id)
 
     def finish(self, session_id: str) -> AgentRunFinalization:

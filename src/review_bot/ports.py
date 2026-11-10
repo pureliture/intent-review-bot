@@ -72,7 +72,8 @@ class AgentRunner(Protocol):
     def run(self, request: AgentRunRequest) -> AgentRunResponse:
         ...
 
-    def repair(self, request: AgentRunRequest, session_id: str, message: str) -> AgentRunResponse:
+    def repair(self, request: AgentRunRequest, session_id: str, message: str, *,
+        timeout_seconds: int | None = None) -> AgentRunResponse:
         ...
 
     def finish(self, session_id: str) -> AgentRunFinalization:

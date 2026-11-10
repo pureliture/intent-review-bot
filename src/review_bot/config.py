@@ -125,7 +125,7 @@ class ExecutionConfig(BaseModel):
     selector_policy: Literal["all_available"] = "all_available"
     selector_uses_model: bool = False
     worker_concurrency: int = Field(ge=1, le=2, default=1)
-    task_timeout_seconds: int = Field(ge=1, default=900)
+    task_timeout_seconds: int = Field(ge=1, default=3000)
     max_model_calls: int = Field(ge=1, le=512, default=256)
     max_total_tokens: int = Field(ge=1, default=8388608)
     pr_actions: list[str] = Field(
@@ -317,7 +317,7 @@ class AgentEngineConfig(BaseModel):
     provider: Literal["openrouter", "opencode-go"] = "openrouter"
     model_id: str = Field(default="stealth/crouton-alpha", min_length=1, max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/-]*$")
-    timeout_seconds: int = Field(ge=1, le=3600, default=900)
+    timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
     max_proxy_calls: int = Field(ge=1, le=512, default=40)
     max_output_tokens: int | None = Field(default=None, ge=1, le=32768)
     context_window_tokens: int | None = Field(default=None, ge=1024, le=10_000_000)

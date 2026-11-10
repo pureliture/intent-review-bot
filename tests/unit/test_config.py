@@ -7,11 +7,13 @@ import pytest
 import yaml
 
 from review_bot.config import (
+    AgentEngineConfig,
     ConfigAliasError,
     ConfigDuplicateKeyError,
     ConfigSecurityError,
     ConfigSyntaxError,
     ConfigValidationError,
+    ExecutionConfig,
     compute_config_hash,
     load_review_config,
     load_review_config_from_str,
@@ -41,7 +43,7 @@ def test_agent_engine_config_is_opt_in_and_strict(valid_config_yaml: str) -> Non
     assert config.agent_engine.provider == "openrouter"
     assert config.agent_engine.context_window_tokens is None
     assert config.agent_engine.max_output_tokens is None
-    assert config.agent_engine.timeout_seconds > 0
+    assert config.agent_engine.timeout_seconds is None
 
     enabled = valid_config_yaml.replace("schema_version: 2", "schema_version: 2\nreview_engine: agent", 1)
     config, _ = load_review_config_from_str(enabled)
@@ -72,6 +74,11 @@ def test_agent_engine_config_is_opt_in_and_strict(valid_config_yaml: str) -> Non
     invalid_limits = enabled.replace("review_engine: agent", "review_engine: agent\nagent_engine:\n  max_proxy_calls: 0")
     with pytest.raises(ConfigValidationError):
         load_review_config_from_str(invalid_limits)
+
+
+def test_agent_and_task_timeout_defaults() -> None:
+    assert AgentEngineConfig().timeout_seconds is None
+    assert ExecutionConfig(available_modes=["architecture"]).task_timeout_seconds == 3000
 
 
 def test_load_example_config_from_file() -> None:

@@ -10,6 +10,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -54,6 +55,37 @@ def webhook_client(tmp_path: Path, valid_config_yaml: str) -> tuple[TestClient, 
     app = create_webhook_app(config, store, secret=SECRET)
     client = TestClient(app)
     return client, store
+
+
+def test_worker_passes_run_deadline_and_optional_agent_cap(monkeypatch) -> None:
+    from review_bot.application import agent_review, partition_review
+
+    worker = WorkerLoop.__new__(WorkerLoop)
+    worker.config = SimpleNamespace(review_engine="agent", agent_engine=SimpleNamespace(
+        timeout_seconds=None, max_revisions=1))
+    worker.agent_runner = object()
+    worker._repository_settings = SimpleNamespace(bundle=SimpleNamespace(
+        instructions_for=lambda _mode: "instructions"))
+    deadlines = []
+    worker._require_active = lambda _run, deadline: deadlines.append(deadline)
+    captured = {}
+    expected_result = object()
+
+    def fake_run_agent_review(*args, **kwargs):
+        captured.update(kwargs)
+        return expected_result
+
+    monkeypatch.setattr(agent_review, "run_agent_review", fake_run_agent_review)
+    monkeypatch.setattr(partition_review, "validate_partition_result", lambda _result, _task: None)
+
+    deadline = 123.5
+    result = worker._review_partitioned(object(), "architecture", object(), deadline, "en")
+
+    assert result is expected_result
+    assert captured["deadline"] == deadline
+    assert captured["timeout_seconds"] is None
+    assert captured["max_revisions"] == 1
+    assert deadlines == [deadline, deadline]
 
 
 class TestWebhookEndpoints:

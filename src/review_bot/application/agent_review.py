@@ -4,6 +4,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -39,6 +40,7 @@ from review_bot.ports import (
 )
 
 _MAX_OUTPUT_BYTES = 1_048_576
+_DEFAULT_AGENT_TIMEOUT = 3000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _AGENT_VERIFY_VERSION = "agent-verify-v2"
@@ -48,6 +50,16 @@ _SEARCH_SCOPE_RULE = (
     "All inputs are under /workspace and the checker is /skills/check_output.mjs. "
     "Do not search / or other system directories; limit find and grep to /workspace."
 )
+
+
+def _stage_timeout(deadline: float | None, cap: int | None) -> int:
+    remaining = None
+    if deadline is not None:
+        remaining = math.ceil(deadline - time.monotonic())
+        if remaining <= 0:
+            raise AgentRunError("timeout")
+    limits = [value for value in (cap, remaining) if value is not None]
+    return min(limits) if limits else _DEFAULT_AGENT_TIMEOUT
 
 
 def agent_skill_path(mode: str) -> Path:
@@ -954,10 +966,12 @@ def _decode_json_file(path: Path | None) -> dict:
 
 
 def _run_verifier(runner, workspace: Path, claims: list[dict], meta: dict, instructions: str,
-    originals: list[SourceOriginal], model: str, timeout: int, language: str) -> tuple[dict, list, dict]:
+    originals: list[SourceOriginal], model: str, deadline: float | None, timeout_cap: int | None,
+    language: str) -> tuple[dict, list, dict]:
     verifier_workspace, temporary = _verifier_workspace(workspace)
     try:
         _write_verifier_workspace(verifier_workspace, claims, meta, instructions)
+        timeout = _stage_timeout(deadline, timeout_cap)
         request = AgentRunRequest("verify", verifier_workspace, _SKILLS["verify"], model, timeout)
         response = runner.run(request)
         if not isinstance(response, AgentRunResponse) or response.exit_status != 0 or not response.session_id:
@@ -971,7 +985,8 @@ def _run_verifier(runner, workspace: Path, claims: list[dict], meta: dict, instr
             except (AgentOutputError, ValueError, TypeError, json.JSONDecodeError):
                 repaired = runner.repair(request, session_id,
                     "Verifier output was invalid. Rewrite /out/result.json with exact row and field coverage, "
-                    "run node /skills/check_output.mjs until it prints OK, and reply DONE.")
+                    "run node /skills/check_output.mjs until it prints OK, and reply DONE.",
+                    timeout_seconds=_stage_timeout(deadline, timeout_cap))
                 if (not isinstance(repaired, AgentRunResponse) or repaired.exit_status != 0
                         or repaired.session_id not in (None, session_id)):
                     raise AgentRunError("verifier_repair_failed")
@@ -991,7 +1006,7 @@ def _run_verifier(runner, workspace: Path, claims: list[dict], meta: dict, instr
 
 
 def _apply_agent_fact_verification(result, mode, runner, request, session_id, workspace,
-    originals, meta, instructions, model, timeout, max_revisions):
+    originals, meta, instructions, model, generation_timeout, deadline, timeout_cap, max_revisions):
     final = deepcopy(result.partition["final"])
     pre_verification_final = deepcopy(final)
     row_ids = _stable_row_ids(final)
@@ -1011,7 +1026,7 @@ def _apply_agent_fact_verification(result, mode, runner, request, session_id, wo
     else:
         try:
             verdicts, issues, run_record = _run_verifier(runner, workspace, claims, meta, instructions,
-                originals, model, timeout, result.language)
+                originals, model, deadline, timeout_cap, result.language)
             ledger["runs"].append(run_record)
         except AgentRunError as error:
             verdicts, issues = _all_unverified(claims, "verifier_run_failed"), []
@@ -1061,7 +1076,8 @@ def _apply_agent_fact_verification(result, mode, runner, request, session_id, wo
             "/workspace/revision_rows.json. Run node /skills/check_output.mjs --revision until it "
             "prints OK, then reply DONE.")
         try:
-            revised_response = runner.repair(request, session_id, message)
+            revised_response = runner.repair(request, session_id, message,
+                timeout_seconds=_stage_timeout(deadline, timeout_cap))
         except AgentRunError as error:
             for entry in issue_entries:
                 entry["host_issues"].append({"reason": f"revision_run_failed:{error.code}"})
@@ -1120,7 +1136,7 @@ def _apply_agent_fact_verification(result, mode, runner, request, session_id, wo
             reverification_failure = None
             try:
                 verdicts, issues, run_record = _run_verifier(runner, workspace, revised_claims, meta,
-                    instructions, originals, model, timeout, result.language)
+                    instructions, originals, model, deadline, timeout_cap, result.language)
                 ledger["runs"].append(run_record)
             except AgentRunError as error:
                 verdicts, issues = _all_unverified(revised_claims, "verifier_run_failed"), []
@@ -1146,10 +1162,10 @@ def _apply_agent_fact_verification(result, mode, runner, request, session_id, wo
     identity = deepcopy(partition["identity"])
     identity.update(models={
         "agent": {"provider": "pi-agent", "model": agent["model"],
-            "timeout_seconds": agent["limits"]["timeout_seconds"],
+            "timeout_seconds": generation_timeout,
             "max_proxy_calls": agent["limits"]["max_proxy_calls"],
             "max_output_tokens": agent["limits"]["max_output_tokens"]},
-        "verifier": {"provider": "pi-agent", "model": model, "timeout_seconds": timeout,
+        "verifier": {"provider": "pi-agent", "model": model, "timeout_seconds": generation_timeout,
             "max_proxy_calls": agent["limits"]["max_proxy_calls"],
             "max_output_tokens": agent["limits"]["max_output_tokens"]},
     }, limits={**agent["limits"], "max_revisions": max_revisions})
@@ -1166,7 +1182,8 @@ def _apply_agent_fact_verification(result, mode, runner, request, session_id, wo
 
 
 def run_agent_review(task, mode: str, runner: AgentRunner, *, language: str, instructions: str,
-    timeout_seconds: int | None = None, max_revisions: int | None = None) -> PartitionReviewResult:
+    timeout_seconds: int | None = None, max_revisions: int | None = None,
+    deadline: float | None = None) -> PartitionReviewResult:
     if mode not in ("architecture", "intent") or language not in ("ko", "en"):
         raise ValueError("invalid_agent_review_options")
     originals, meta = prepare_originals(task, mode)
@@ -1174,10 +1191,10 @@ def run_agent_review(task, mode: str, runner: AgentRunner, *, language: str, ins
     skill_bytes = agent_skill_path(mode).read_bytes()
     skill_sha = hashlib.sha256(skill_bytes).hexdigest()
     model = getattr(runner, "model_id", "stealth/crouton-alpha")
-    timeout = timeout_seconds or getattr(runner, "timeout_seconds", 900)
-    limits = _configured_limits(runner, timeout)
     workspace, delivered, delivered_spans, temporary = _workspace(task, mode, originals, meta, skill_id, instructions)
     prompt_hash = hash_json({"skill_sha256": skill_sha, "instructions": instructions, "mode": mode})
+    timeout = _DEFAULT_AGENT_TIMEOUT
+    limits = _configured_limits(runner, timeout)
     request = AgentRunRequest(mode, workspace, skill_id, model, timeout)
     response = None
     session_id = None
@@ -1190,6 +1207,9 @@ def run_agent_review(task, mode: str, runner: AgentRunner, *, language: str, ins
     valid_final = False
     first_diagnostics: list[str] = []
     try:
+        timeout = _stage_timeout(deadline, timeout_seconds)
+        limits = _configured_limits(runner, timeout)
+        request = AgentRunRequest(mode, workspace, skill_id, model, timeout)
         response = runner.run(request)
         if not isinstance(response, AgentRunResponse) or response.exit_status != 0 or not response.session_id:
             raise AgentRunError("agent_session_unavailable")
@@ -1213,7 +1233,8 @@ def run_agent_review(task, mode: str, runner: AgentRunner, *, language: str, ins
                     "reason": "agent_perspective_missing"}
                     for index, identifier in enumerate(PERSPECTIVE_IDS) if identifier not in accepted_ids]
         if repair_attempted:
-            response = runner.repair(request, session_id, _repair_message(rejected_before, first_diagnostics))
+            response = runner.repair(request, session_id, _repair_message(rejected_before, first_diagnostics),
+                timeout_seconds=_stage_timeout(deadline, timeout_seconds))
             if not isinstance(response, AgentRunResponse) or response.exit_status != 0:
                 raise AgentRunError("agent_repair_failed")
             try:
@@ -1246,7 +1267,7 @@ def run_agent_review(task, mode: str, runner: AgentRunner, *, language: str, ins
                 repair_attempted=repair_attempted, rejected_before=rejected_before, duration_ms=0,
                 proxy_ledger_path="")
             initial = _apply_agent_fact_verification(initial, mode, runner, request, session_id, workspace,
-                originals, meta, instructions, model, timeout, max_revisions)
+                originals, meta, instructions, model, timeout, deadline, timeout_seconds, max_revisions)
             finalization = runner.finish(session_id)
             session = _store_session(finalization.session_jsonl,
                 getattr(runner, "session_store_dir", Path.home() / ".local/share/review-bot/agent-sessions"))
@@ -1266,7 +1287,7 @@ def run_agent_review(task, mode: str, runner: AgentRunner, *, language: str, ins
                 repair_attempted=repair_attempted, rejected_before=rejected_before, duration_ms=0,
                 proxy_ledger_path="")
             result = _apply_agent_fact_verification(initial, mode, runner, request, None, workspace,
-                originals, meta, instructions, model, timeout, max_revisions)
+                originals, meta, instructions, model, timeout, deadline, timeout_seconds, max_revisions)
             result = replace(result, partition={**result.partition, "agent": {
                 **result.partition["agent"],
                 "session": _store_session(response.session_jsonl, getattr(runner, "session_store_dir",

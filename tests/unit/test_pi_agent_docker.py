@@ -152,6 +152,7 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
     workspace.mkdir()
     monkeypatch.setenv("OPENCODE_API_KEY", "test-only-secret")
     calls = []
+    agent_timeouts = []
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
@@ -163,6 +164,7 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
                 '"total_tokens":30,"cost":{"total":0.0025}}\n', encoding="utf-8")
             return subprocess.CompletedProcess(argv, 0, "proxy-id", "")
         if "review-bot-pi-agent:0.73.1" in argv:
+            agent_timeouts.append(kwargs["timeout"])
             skills_mount = next(item for item in argv if item.endswith(":/skills:ro"))
             skills_dir = Path(skills_mount.split(":/skills:ro")[0])
             assert (skills_dir / "review-architecture" / "SKILL.md").is_file()
@@ -182,7 +184,8 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
     request = AgentRunRequest("architecture", workspace, "review-architecture",
         "stealth/crouton-alpha", 20)
     first = runner.run(request)
-    repaired = runner.repair(request, first.session_id, "item_index=0 reason=agent_output_invalid")
+    repaired = runner.repair(request, first.session_id, "item_index=0 reason=agent_output_invalid",
+        timeout_seconds=7)
     result = runner.finish(first.session_id)
     verifier_finalization = None
     verifier_request = AgentRunRequest("verify", workspace, "verify-claims",
@@ -195,6 +198,7 @@ def test_docker_repair_reuses_proxy_session_and_reads_usage_ledger_after_teardow
     assert first.session_id == repaired.session_id == "session-123"
     assert verifier.session_id == "session-verify"
     assert len(agents) == 3 and len(proxies) == 2
+    assert agent_timeouts[1] == 7
     assert agents[1][agents[1].index("--session") + 1] == "session-123"
     assert agents[0][agents[0].index("--network") + 1] == agents[1][agents[1].index("--network") + 1]
     assert "OPENROUTER_API_KEY" not in agents[0] and "test-only-secret" not in json.dumps(agents)
