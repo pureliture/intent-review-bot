@@ -98,8 +98,12 @@ uses that opt-out because the reused LocalStack instance has Logs disabled.
      deploy/packer/review-bot.pkr.hcl
    ```
 
-   The image installs the project wheel, JDK 21, the locked PMD 7.3.0 tool bundle, a dedicated rootless Docker daemon
-   for PMD/CPD, and the agent/proxy images. Agent/proxy containers use the separate Docker daemon with the runner's
+   The Packer provisioner downloads any missing PMD artifacts from their locked HTTPS Maven Central URLs and verifies
+   both downloaded and pre-existing files against `tooling/tools.lock.json` before building the PMD image. The image
+   installs the project wheel, JDK 21, the locked PMD 7.3.0 tool bundle, a dedicated rootless Docker daemon for
+   PMD/CPD, and the agent/proxy images. The proxy image tag is generated from the proxy Dockerfile and its copied
+   source files, so source changes require a correspondingly tagged image. Agent/proxy containers use the separate
+   Docker daemon with the runner's
    read-only root, internal network, capability, PID, memory, and no-new-privileges restrictions; neither container
    receives a Docker socket. It enables a systemd oneshot bootstrap. The worker reads its job ID and secret ARNs
    from IMDSv2 user data and instance tags, writes secret files with mode `0600` under `/run/review-bot`, and runs
