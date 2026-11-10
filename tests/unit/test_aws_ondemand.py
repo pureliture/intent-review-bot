@@ -219,6 +219,7 @@ def test_ec2_managed_instance_listing_filters_deployment_tags():
     client = Client()
     launcher = Ec2VmLauncher(client, "lt-id", instance_tags={
         "team": "review-bot", "review-bot:job-table": "review-bot-prod",
+        "review-bot:managed": "false", "review-bot:job-id": "0" * 64,
     })
 
     assert launcher.list_managed_instances() == []
@@ -226,6 +227,8 @@ def test_ec2_managed_instance_listing_filters_deployment_tags():
         {"Name": "tag:review-bot:job-table", "Values": ["review-bot-prod"]},
         {"Name": "tag:team", "Values": ["review-bot"]},
     ]
+    assert {"Name": "tag:review-bot:managed", "Values": ["true"]} in client.filters
+    assert not any(f["Values"] in (["false"], ["0" * 64]) for f in client.filters)
 
 
 def test_ec2_launcher_adds_bootstrap_tags_without_overriding_job_tags(aws):

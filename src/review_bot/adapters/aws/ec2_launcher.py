@@ -57,9 +57,10 @@ class Ec2VmLauncher:
             {"Name": f"tag:{self.tag_prefix}:job-id", "Values": ["*"]},
             {"Name": "instance-state-name", "Values": ["pending", "running"]},
         ]
+        reserved = {f"{self.tag_prefix}:managed", f"{self.tag_prefix}:job-id"}
         filters.extend(
             {"Name": f"tag:{key}", "Values": [self.instance_tags[key]]}
-            for key in sorted(self.instance_tags)
+            for key in sorted(self.instance_tags) if key not in reserved
         )
         token = None
         while True:
