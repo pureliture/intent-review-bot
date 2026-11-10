@@ -235,27 +235,28 @@ class WorkerLoop:
 
     def _review_partitioned(self, task_input, mode, run, deadline, language, *, available_modes=()):
         from review_bot.application.partition_review import run_partition_review
-        from review_bot.application.model_execution import ModelExecutionBudget
-        from review_bot.domain.partition_review import PartitionReviewLimits
-
         if _agent_engine_enabled(self.config):
             from review_bot.application.agent_review import run_agent_review
             self._require_active(run, deadline)
             timeout = min(self.config.agent_engine.timeout_seconds,
                 max(1, math.ceil(deadline - time.monotonic())))
             result = run_agent_review(task_input, mode, self.agent_runner, language=language,
-                instructions=self._repository_settings.bundle.instructions_for(mode), timeout_seconds=timeout)
+                instructions=self._repository_settings.bundle.instructions_for(mode), timeout_seconds=timeout,
+                max_revisions=self.config.agent_engine.max_revisions)
             self._require_active(run, deadline)
             from review_bot.application.partition_review import validate_partition_result
             validate_partition_result(result, task_input)
             return result
 
-        self._prepare_partition_planner()
+        from review_bot.application.model_execution import ModelExecutionBudget
+        from review_bot.domain.partition_review import PartitionReviewLimits
+
         trial = self.config.partition_evaluation
         limits = PartitionReviewLimits(max_total_tokens=trial.max_total_tokens or self.config.execution.max_total_tokens,
             max_calls=trial.max_calls or self.config.execution.max_model_calls, input_target_tokens=trial.input_target_tokens,
             observation_output_tokens=trial.observation_output_tokens,
             task_timeout_seconds=max(1, math.ceil(deadline - time.monotonic())))
+        self._prepare_partition_planner()
         key = (run.run_id, run.generation, run.attempts)
         if self._partition_budget_key != key:
             self._partition_budget_key = key

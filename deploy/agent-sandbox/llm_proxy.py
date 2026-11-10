@@ -10,17 +10,29 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-UPSTREAM = "https://openrouter.ai/api/v1/chat/completions"
+UPSTREAMS = {
+    "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+    "opencode-go": "https://opencode.ai/inference/go/openai/v1/chat/completions",
+}
 _MAX_USAGE_SCAN_BYTES = 16_777_216
 
 
 class ProxyState:
     def __init__(self, model: str, call_budget: int, max_output_tokens: int,
-        ledger_path: str | None = None) -> None:
+        ledger_path: str | None = None, provider: str = "openrouter",
+        upstream_session_id: str | None = None) -> None:
+        if provider not in UPSTREAMS:
+            raise ValueError("unsupported_provider")
+        if provider == "opencode-go" and (not isinstance(upstream_session_id, str)
+                or not upstream_session_id.startswith("ses_")):
+            raise ValueError("upstream_session_id_required")
         self.model = model
         self.remaining = call_budget
         self.max_output_tokens = max_output_tokens
         self.ledger_path = ledger_path
+        self.provider = provider
+        self.upstream_url = UPSTREAMS[provider]
+        self.upstream_session_id = upstream_session_id
         self.calls = 0
         self.lock = threading.Lock()
 
@@ -55,8 +67,23 @@ def authorize_request(path: str, payload: dict, state: ProxyState) -> tuple[int,
     if "max_tokens" not in payload and "max_completion_tokens" not in payload:
         payload["max_tokens"] = state.max_output_tokens
     usage_options = payload.get("usage")
-    payload["usage"] = {**usage_options, "include": True} if isinstance(usage_options, dict) else {"include": True}
+    if state.provider == "openrouter":
+        payload["usage"] = ({**usage_options, "include": True}
+            if isinstance(usage_options, dict) else {"include": True})
+    elif isinstance(usage_options, dict):
+        usage_options.pop("include", None)
+        if not usage_options:
+            payload.pop("usage", None)
     return 200, payload
+
+
+def build_upstream_request(state: ProxyState, payload: dict, api_key: str) -> Request:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if state.provider == "opencode-go":
+        headers["User-Agent"] = "review-bot-agent/0.1.0"
+        headers["x-opencode-session"] = state.upstream_session_id
+    return Request(state.upstream_url, data=json.dumps(payload).encode("utf-8"),
+        headers=headers, method="POST")
 
 
 def usage_record(payload: object) -> dict | None:
@@ -78,6 +105,20 @@ def usage_record(payload: object) -> dict | None:
             if isinstance(value, (int, float)) and not isinstance(value, bool)}
     elif isinstance(cost, (int, float)) and not isinstance(cost, bool):
         result["cost"] = {"total": cost}
+    opencode = usage.get("opencode")
+    if isinstance(opencode, dict):
+        opencode_cost = result.get("cost", {})
+        if not isinstance(opencode_cost, dict):
+            opencode_cost = {}
+        for source, destination in (("list_cost", "list_cost"), ("allowance", "allowance")):
+            value = opencode.get(source)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                opencode_cost[destination] = value
+        if opencode_cost:
+            result["cost"] = opencode_cost
+        billing_source = opencode.get("billing_source")
+        if isinstance(billing_source, str):
+            result["billing_source"] = billing_source
     return result or None
 
 
@@ -150,12 +191,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     print("proxy_budget_exhausted", flush=True)
                 self._reply(status, {"error": "request_denied"})
                 return
-            key = os.environ.get("OPENROUTER_API_KEY", "")
+            key = os.environ.get("UPSTREAM_API_KEY", "")
             if not key:
                 self._reply(503, {"error": "upstream_unavailable"})
                 return
-            request = Request(UPSTREAM, data=json.dumps(authorized).encode("utf-8"),
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
+            request = build_upstream_request(self.state, authorized, key)
             call = self.state.next_call()
             started = time.monotonic()
             usage = None
@@ -210,7 +250,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     state = ProxyState(os.environ["MODEL_ID"], int(os.environ["MAX_PROXY_CALLS"]),
-        int(os.environ["MAX_OUTPUT_TOKENS"]), os.environ.get("USAGE_LEDGER_PATH"))
+        int(os.environ["MAX_OUTPUT_TOKENS"]), os.environ.get("USAGE_LEDGER_PATH"),
+        os.environ.get("PROVIDER", "openrouter"), os.environ.get("UPSTREAM_SESSION_ID"))
     handler = type("ConfiguredProxyHandler", (ProxyHandler,), {"state": state})
     ThreadingHTTPServer(("0.0.0.0", 8080), handler).serve_forever()
 

@@ -100,7 +100,12 @@ def collect_intent_code_snapshot(
         raise IntentInputError("context_path_limit_exceeded")
     exclusions = [SourceExclusion(path, "trusted_exclusion") for path in paths if intent_path_exclusion(path)]
     allowed = tuple(path for path in paths if not intent_path_exclusion(path))
-    blobs = reader.read_tree_blobs(sha, paths=allowed) if allowed else {}
+    try:
+        blobs = reader.read_tree_blobs(sha, paths=allowed) if allowed else {}
+    except Exception as error:
+        inventory = hashlib.sha256(b"").hexdigest()
+        return CodeSnapshot(sha, (), tuple(sorted(exclusions, key=lambda item: item.path)),
+            inventory, False, (f"git_blob_read_failed:{type(error).__name__}",))
     if not isinstance(blobs, dict) or any(path not in allowed or not isinstance(content, bytes) for path, content in blobs.items()):
         raise IntentInputError("invalid_scoped_blobs")
     files = []

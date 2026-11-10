@@ -172,6 +172,28 @@ def execution_trace(result, *, context: Mapping | None = None, ko: bool = True) 
         table.append(f"| agent_review | 0 | {calls} | {calls - failed} | {failed} | "
             f"{int(bool(agent.get('repair_attempted')))} | {agent.get('duration_ms', 0)} | "
             f"{agent_usage.get('input_tokens', 0)} | {agent_usage.get('output_tokens', 0)} | {unknown} |")
+        fact_groups: dict[str, dict[str, int]] = {}
+        for record in result.stages:
+            name = record.stage.split(":", 1)[0]
+            row_ = fact_groups.setdefault(name, {"admissions": 0, "calls": 0, "completed": 0, "failed": 0,
+                "retries": 0, "duration_ms": 0, "input": 0, "output": 0, "unknown": 0})
+            if record.stage.endswith(":admission") or not record.attempts:
+                row_["admissions"] += 1
+                continue
+            row_["retries"] += max(0, len(record.attempts) - 1)
+            for attempt in record.attempts:
+                row_["calls"] += 1
+                row_["completed" if attempt.status == "completed" else "failed"] += 1
+                row_["duration_ms"] += attempt.duration_ms if type(attempt.duration_ms) is int else 0
+                if attempt.usage is None or attempt.delivery == "unknown":
+                    row_["unknown"] += 1
+                else:
+                    row_["input"] += attempt.usage.get("input_tokens", 0)
+                    row_["output"] += attempt.usage.get("output_tokens", 0)
+        for name, value in fact_groups.items():
+            table.append(f"| {escape(name)} | {value['admissions']} | {value['calls']} | {value['completed']} | "
+                f"{value['failed']} | {value['retries']} | {value['duration_ms']} | {value['input']} | "
+                f"{value['output']} | {value['unknown']} |")
     else:
         groups: dict[str, dict[str, int]] = {}
         for record in result.stages:
@@ -194,7 +216,19 @@ def execution_trace(result, *, context: Mapping | None = None, ko: bool = True) 
         for name, v in groups.items():
             table.append(f"| {escape(name)} | {v['admissions']} | {v['calls']} | {v['completed']} | {v['failed']} | {v['retries']} | "
                 f"{v['duration_ms']} | {v['input']} | {v['output']} | {v['unknown']} |")
-    usage = result.usage if isinstance(result.usage, Mapping) else {}
+    usage = dict(result.usage) if isinstance(result.usage, Mapping) else {}
+    if isinstance(agent, Mapping):
+        for record in result.stages:
+            for attempt in record.attempts:
+                usage["model_calls"] = usage.get("model_calls", 0) + 1
+                if attempt.usage is None or attempt.delivery == "unknown":
+                    usage["unknown_usage_attempts"] = usage.get("unknown_usage_attempts", 0) + 1
+                    usage["usage_complete"] = False
+                else:
+                    usage["known_input_tokens"] = usage.get("known_input_tokens", 0) + attempt.usage.get("input_tokens", 0)
+                    usage["known_output_tokens"] = usage.get("known_output_tokens", 0) + attempt.usage.get("output_tokens", 0)
+        if usage.get("unknown_usage_attempts"):
+            usage["usage_complete"] = False
     complete = usage.get("usage_complete") is True and not usage.get("unknown_usage_attempts")
     total = (f"- {'합계' if ko else 'Total'}: {'호출' if ko else 'calls'} {_usage_text(usage.get('model_calls'), ko)} · "
         f"{'알려진 입력/출력 토큰' if ko else 'known input/output tokens'} {_usage_text(usage.get('known_input_tokens'), ko)} / "

@@ -312,6 +312,21 @@ class TestWorkerLoopRuntime:
         assert worker.claim_and_execute_once() is False
         store.close()
 
+    def test_agent_worker_skips_openrouter_review_client_construction(
+        self, tmp_path: Path, valid_config_yaml: str, monkeypatch,
+    ) -> None:
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        config, _ = load_review_config_from_str(valid_config_yaml)
+        config.review_engine = "agent"
+        config.model.profile = "openrouter-review"
+        store = SQLiteJobStore(tmp_path / "agent_worker.db")
+
+        worker = WorkerLoop(config, store)
+        assert worker.model_client is None
+        worker.prepare_models()
+        assert worker.model_client is None
+        store.close()
+
     def test_worker_generation_fencing_aborts_stale_run(self, tmp_path: Path, valid_config_yaml: str) -> None:
         db_file = tmp_path / "fencing_worker.db"
         store = SQLiteJobStore(db_file)
