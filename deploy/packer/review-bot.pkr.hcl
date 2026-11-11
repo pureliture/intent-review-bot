@@ -146,7 +146,7 @@ build {
       "chmod a+r /etc/apt/keyrings/docker.asc",
       ". /etc/os-release && echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable\" > /etc/apt/sources.list.d/docker.list",
       "apt-get update",
-      "apt-get install -y --no-install-recommends ca-certificates curl dbus-user-session docker-ce docker-ce-cli docker-ce-rootless-extras containerd.io fuse-overlayfs openjdk-21-jdk-headless python3 python3-pip python3-venv slirp4netns uidmap",
+      "apt-get install -y --no-install-recommends ca-certificates curl dbus-user-session docker-ce docker-ce-cli docker-buildx-plugin docker-ce-rootless-extras containerd.io fuse-overlayfs openjdk-21-jdk-headless python3 python3-pip python3-venv slirp4netns uidmap",
       "systemctl disable --now docker.socket docker.service",
       "systemctl stop docker.socket docker.service",
       "if systemctl is-active --quiet docker.socket || systemctl is-active --quiet docker.service; then echo 'rootful Docker still active' >&2; exit 1; fi",
@@ -170,7 +170,9 @@ build {
       "ln -s /opt/review-bot/venv/bin/review-bot-ondemand /opt/review-bot/bin/review-bot-ondemand",
       "install -m 0644 /tmp/review-bot-bootstrap.service /etc/systemd/system/review-bot-bootstrap.service",
       "chmod -R a+rX /tmp/review-bot-source",
-      "cd /tmp/review-bot-source",
+      # LXD copies the source directory itself; SSH copies its contents. Accept
+      # either layout, and require exactly one checkout before building images.
+      "source_root=/tmp/review-bot-source; if [ ! -f \"$source_root/pyproject.toml\" ]; then set -- \"$source_root\"/*/pyproject.toml; [ \"$#\" -eq 1 ] && [ -f \"$1\" ] || { echo 'Expected one review-bot source checkout' >&2; exit 1; }; source_root=\"$(dirname \"$1\")\"; fi; cd \"$source_root\"",
       "rm -rf dist",
       "mkdir -p dist",
       "cp /tmp/review-bot-wheel/*.whl dist/",
