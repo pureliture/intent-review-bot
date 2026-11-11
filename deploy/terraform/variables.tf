@@ -59,6 +59,50 @@ variable "max_vm_seconds" {
   }
 }
 
+variable "agent_profile" {
+  description = "Review profile for on-demand workers: deep by default, with an opt-in bounded fast review."
+  type        = string
+  default     = "deep"
+  validation {
+    condition     = contains(["fast", "deep"], var.agent_profile)
+    error_message = "agent_profile must be fast or deep."
+  }
+}
+
+variable "agent_provider" {
+  description = "Agent model provider configured for on-demand workers."
+  type        = string
+  default     = "openrouter"
+  validation {
+    condition     = contains(["openrouter", "opencode-go"], var.agent_provider)
+    error_message = "agent_provider must be openrouter or opencode-go."
+  }
+}
+
+variable "agent_model_id" {
+  description = "Agent model ID configured for on-demand workers."
+  type        = string
+  default     = "stealth/crouton-alpha"
+  validation {
+    condition     = length(var.agent_model_id) <= 128 && can(regex("^[A-Za-z0-9][A-Za-z0-9_.:/-]*$", var.agent_model_id))
+    error_message = "agent_model_id must be a valid model ID of at most 128 characters."
+  }
+}
+
+variable "agent_context_window_tokens" {
+  description = "Optional agent context-window size for on-demand workers."
+  type        = number
+  default     = null
+  validation {
+    condition = var.agent_context_window_tokens == null ? true : (
+      var.agent_context_window_tokens >= 1024 &&
+      var.agent_context_window_tokens <= 10000000 &&
+      floor(var.agent_context_window_tokens) == var.agent_context_window_tokens
+    )
+    error_message = "agent_context_window_tokens must be an integer from 1024 through 10000000."
+  }
+}
+
 variable "session_expiration_days" {
   description = "Lifecycle expiry for session/artifact bucket objects."
   type        = number

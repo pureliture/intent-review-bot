@@ -647,7 +647,10 @@ def test_service_calls_canonical_environment_validator(
     validate = Mock(wraps=service.validate_active_environment)
     monkeypatch.setattr(service, "validate_active_environment", validate)
     assert main(["worker", "--config", str(service_config.path), "--once"]) == 0
-    validate.assert_called_once_with(dependencies.worker_factory.call_args.args[0])
+    validate.assert_called_once_with(
+        dependencies.worker_factory.call_args.args[0],
+        require_webhook_secret=True,
+    )
 
 
 @pytest.mark.parametrize("name", ["state", "repositories", "analysis", "artifacts"])
@@ -836,8 +839,9 @@ def test_signed_cli_intake_to_real_worker_with_mock_github(
         job_store.close.assert_called_once_with()
 
 
+@pytest.mark.parametrize("deadline_exceeded", [False, True])
 def test_ondemand_service_enqueues_and_processes_one_worker_run(
-    service_config, worker_pipeline_ports, monkeypatch: pytest.MonkeyPatch,
+    service_config, worker_pipeline_ports, monkeypatch: pytest.MonkeyPatch, deadline_exceeded,
 ) -> None:
     from review_bot.adapters.github.client import MockGitHubClient
     from review_bot.application.ondemand import ReviewJob
@@ -869,7 +873,16 @@ def test_ondemand_service_enqueues_and_processes_one_worker_run(
     monkeypatch.setattr(service, "_ClaimedAppAdapters", Adapters)
     monkeypatch.setattr(service, "_architecture_analyzer",
         lambda _config, _root: worker_pipeline_ports["analyzer"])
-    monkeypatch.setattr(service, "WorkerLoop", shared_fixture_worker)
+    def make_worker(*args, **kwargs):
+        worker = shared_fixture_worker(*args, **kwargs)
+        if deadline_exceeded:
+            from tests.unit.test_webhook_and_worker import _configure_deadline_agent_worker
+            _configure_deadline_agent_worker(worker, service_config.state, monkeypatch)
+            # The on-demand service reads this exact artifact tree after execution.
+            worker.artifact_root = kwargs["artifact_root"]
+        return worker
+
+    monkeypatch.setattr(service, "WorkerLoop", make_worker)
     job = ReviewJob("a" * 64, 44, 99, 7, "a" * 40, "b" * 40, "running",
         time.time(), time.time(), vm_id="i-1234abcd")
 
@@ -877,13 +890,21 @@ def test_ondemand_service_enqueues_and_processes_one_worker_run(
         str(service_config.path), job, lambda: True, vm_lifetime_seconds=3600,
     )
 
-    assert mode_results == {"architecture": "completed", "intent": "not_selected"}
-    assert trace["worker_completed"] is True and trace["selected_modes"] == ["architecture"]
+    assert mode_results == {"architecture": "completed", "intent": "failed" if deadline_exceeded else "not_selected"}
+    assert trace["worker_completed"] is (not deadline_exceeded)
+    assert trace["selected_modes"] == (["architecture", "intent"] if deadline_exceeded else ["architecture"])
+    assert trace["status"] == ("failed" if deadline_exceeded else "succeeded")
+    assert trace["metrics"]["wall_ms"] >= 0
+    assert {span["mode"] for span in trace["metrics"]["mode_spans"]} == set(trace["selected_modes"])
+    if deadline_exceeded:
+        assert trace["error_code"] == "task_deadline_exceeded"
+        assert trace["modes"]["intent"]["error_code"] == "task_deadline_exceeded"
+        assert trace["modes"]["architecture"]["publication"]["status"] == "succeeded"
     state = service_config.state / "ondemand" / job.job_id
     connection = sqlite3.connect(state / "jobs.sqlite")
     try:
         assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
-        assert connection.execute("SELECT status FROM runs").fetchone()[0] == "succeeded"
+        assert connection.execute("SELECT status FROM runs").fetchone()[0] == trace["status"]
     finally:
         connection.close()
 
@@ -908,7 +929,9 @@ def test_ondemand_vm_lifetime_guard_and_optional_lifetime(
     from review_bot.runtime.service import ServiceConfigurationError
 
     service_config.raw["execution"]["task_timeout_seconds"] = 3000
+    service_config.raw["service"]["webhook_secret_env"] = "REVIEW_BOT_WEBHOOK_SECRET"
     write_config(service_config)
+    monkeypatch.delenv("REVIEW_BOT_WEBHOOK_SECRET", raising=False)
     job = ReviewJob("a" * 64, 44, 99, 7, "a" * 40, "b" * 40, "running",
         time.time(), time.time(), vm_id="i-1234abcd")
 

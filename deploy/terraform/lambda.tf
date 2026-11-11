@@ -21,13 +21,13 @@ resource "aws_lambda_function" "intake" {
       REVIEW_BOT_JOB_TABLE          = aws_dynamodb_table.jobs.name
       REVIEW_BOT_LAUNCH_TEMPLATE_ID = aws_launch_template.worker.id
       REVIEW_BOT_WEBHOOK_SECRET_ARN = aws_secretsmanager_secret.webhook.arn
-      REVIEW_BOT_INSTANCE_TAGS = jsonencode({
+      REVIEW_BOT_INSTANCE_TAGS = jsonencode(merge({
         "review-bot:job-table"             = aws_dynamodb_table.jobs.name
         "review-bot:github-app-secret-arn" = aws_secretsmanager_secret.github_app.arn
         "review-bot:openrouter-secret-arn" = aws_secretsmanager_secret.openrouter.arn
         "review-bot:session-bucket"        = aws_s3_bucket.sessions.bucket
         "review-bot:region"                = data.aws_region.current.name
-      })
+      }, local.agent_instance_tags))
       REVIEW_BOT_ALLOWED_INSTALLATIONS = join(",", var.allowed_installations)
       REVIEW_BOT_ALLOWED_REPOSITORIES  = join(",", var.allowed_repositories)
       REVIEW_BOT_MAX_VM_SECONDS        = tostring(var.max_vm_seconds)
@@ -59,13 +59,13 @@ resource "aws_lambda_function" "recovery" {
     variables = {
       REVIEW_BOT_JOB_TABLE          = aws_dynamodb_table.jobs.name
       REVIEW_BOT_LAUNCH_TEMPLATE_ID = aws_launch_template.worker.id
-      REVIEW_BOT_INSTANCE_TAGS = jsonencode({
+      REVIEW_BOT_INSTANCE_TAGS = jsonencode(merge({
         "review-bot:job-table"             = aws_dynamodb_table.jobs.name
         "review-bot:github-app-secret-arn" = aws_secretsmanager_secret.github_app.arn
         "review-bot:openrouter-secret-arn" = aws_secretsmanager_secret.openrouter.arn
         "review-bot:session-bucket"        = aws_s3_bucket.sessions.bucket
         "review-bot:region"                = data.aws_region.current.name
-      })
+      }, local.agent_instance_tags))
       REVIEW_BOT_MAX_VM_SECONDS = tostring(var.max_vm_seconds)
     }
   }

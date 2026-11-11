@@ -43,6 +43,12 @@ def test_agent_engine_config_is_opt_in_and_strict(valid_config_yaml: str) -> Non
     assert config.agent_engine.provider == "openrouter"
     assert config.agent_engine.context_window_tokens is None
     assert config.agent_engine.max_output_tokens is None
+    assert config.agent_engine.profile == "deep"
+    assert config.agent_engine.thinking_level == "medium"
+    assert config.agent_engine.max_proxy_calls == 40
+    assert config.agent_engine.max_total_output_tokens is None
+    assert config.agent_engine.max_mode_seconds is None
+    assert config.agent_engine.max_revisions == 1
     assert config.agent_engine.timeout_seconds is None
     assert config.agent_engine.parallel_modes is True
 
@@ -80,6 +86,41 @@ def test_agent_engine_config_is_opt_in_and_strict(valid_config_yaml: str) -> Non
 def test_agent_and_task_timeout_defaults() -> None:
     assert AgentEngineConfig().timeout_seconds is None
     assert ExecutionConfig(available_modes=["architecture"]).task_timeout_seconds == 3000
+
+
+def test_deep_profile_preserves_the_previous_review_policy():
+    deep = AgentEngineConfig(profile="deep")
+    assert AgentEngineConfig().model_dump() == deep.model_dump()
+    assert deep.max_proxy_calls == 40
+    assert deep.max_revisions == 1
+    assert deep.max_output_tokens is deep.max_total_output_tokens is deep.max_mode_seconds is None
+    assert deep.thinking_level == "medium"
+    tuned = AgentEngineConfig(profile="deep", max_proxy_calls=15, max_revisions=2,
+        max_mode_seconds=600, max_total_output_tokens=20000, thinking_level="low")
+    assert tuned.max_proxy_calls == 15 and tuned.max_revisions == 2
+    assert tuned.max_mode_seconds == 600 and tuned.thinking_level == "low"
+
+
+def test_fast_profile_is_explicit_and_preserves_bounded_defaults():
+    fast = AgentEngineConfig(profile="fast")
+    assert fast.thinking_level == "off"
+    assert fast.max_mode_seconds == 240
+    assert fast.max_proxy_calls == 16
+    assert fast.max_output_tokens == 4096
+    assert fast.max_total_output_tokens == 12000
+    assert fast.max_revisions == 0
+    tuned = AgentEngineConfig(profile="fast", max_proxy_calls=8, max_output_tokens=2048,
+        max_total_output_tokens=8000, max_mode_seconds=120, thinking_level="low")
+    assert tuned.max_proxy_calls == 8 and tuned.max_output_tokens == 2048
+    assert tuned.max_total_output_tokens == 8000 and tuned.max_mode_seconds == 120
+    assert tuned.thinking_level == "low"
+
+
+@pytest.mark.parametrize("settings", [{"profile": "instant"}, {"thinking_level": "unlimited"},
+    {"max_mode_seconds": 0}, {"max_total_output_tokens": 0}])
+def test_invalid_review_profile_settings_are_rejected(settings):
+    with pytest.raises(ValueError):
+        AgentEngineConfig(**settings)
 
 
 def test_load_example_config_from_file() -> None:
@@ -278,6 +319,24 @@ def test_active_environment_validation(valid_config_yaml: str) -> None:
     with pytest.raises(ConfigValidationError) as exc:
         validate_active_environment(cfg_app, env={})
     assert "Missing required environment variables" in str(exc.value)
+
+    env_without_webhook_secret = {
+        "REVIEW_BOT_APP_ID": "1001",
+        "REVIEW_BOT_APP_PRIVATE_KEY_FILE": "/path/to/key.pem",
+    }
+    with pytest.raises(ConfigValidationError, match="REVIEW_BOT_WEBHOOK_SECRET"):
+        validate_active_environment(cfg_app, env=env_without_webhook_secret)
+    validate_active_environment(
+        cfg_app,
+        env=env_without_webhook_secret,
+        require_webhook_secret=False,
+    )
+    with pytest.raises(ConfigValidationError, match="REVIEW_BOT_APP_ID"):
+        validate_active_environment(
+            cfg_app,
+            env={"REVIEW_BOT_APP_PRIVATE_KEY_FILE": "/path/to/key.pem"},
+            require_webhook_secret=False,
+        )
 
     # with all env vars populated passes
     env_vars = {

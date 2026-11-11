@@ -29,7 +29,7 @@ from review_bot.application.partition_review import (
     validate_partition_result,
 )
 from review_bot.application.source_partition import PartitionError, SourceOriginal, make_span
-from review_bot.config import load_review_config_from_str
+from review_bot.config import AgentEngineConfig, load_review_config_from_str
 from review_bot.ports import AgentRunError, AgentRunFinalization, AgentRunResponse
 from tests.fixtures.intent_perspectives import make_task as make_intent_task
 from tests.unit.test_partition_review import _pmd_partition_task
@@ -95,6 +95,8 @@ class FakeAgentRunner:
         self.contract = (request.workspace_dir / "CONTRACT.md").read_text(encoding="utf-8")
         self.contract_json = json.loads((request.workspace_dir / "contract.json").read_text(encoding="utf-8"))
         if request.mode != "verify":
+            if (request.workspace_dir / "review_scope.json").exists():
+                self.fast_scope = json.loads((request.workspace_dir / "review_scope.json").read_text())
             self.generation_workspace = set(self.workspace)
             self.generation_contract = self.contract
             self.generation_contract_json = deepcopy(self.contract_json)
@@ -105,6 +107,7 @@ class FakeAgentRunner:
             }
         else:
             self.verifier_workspace_dir = request.workspace_dir
+            self.verifier_template = json.loads((request.workspace_dir / "verifier_output_template.json").read_text())
             self.generation_contract_hashes_during_verify = {
                 name: hashlib.sha256((self.generation_workspace_dir / name).read_bytes()).hexdigest()
                 for name in ("contract.json", "CONTRACT.md")
@@ -219,6 +222,99 @@ def _intent_body(task):
     ]}
 
 
+@pytest.mark.parametrize("mode", ["architecture", "intent"])
+def test_default_deep_review_verifies_all_items_without_the_fast_cap(tmp_path, mode):
+    task = _pmd_partition_task() if mode == "architecture" else make_intent_task()
+    body = _architecture_body(task) if mode == "architecture" else _intent_body(task)
+    if mode == "architecture":
+        body["findings"] = [{**deepcopy(body["findings"][0]), "statement": f"Defect {index}."}
+            for index in range(6)]
+    runner = FakeAgentRunner(tmp_path, body)
+    runner.config = AgentEngineConfig()
+    result = run_agent_review(task, mode, runner, language="en", instructions="")
+    expected_items = 6 if mode == "architecture" else len(PERSPECTIVE_IDS)
+    assert result.status == "completed"
+    assert len(runner.verify_claim_ids[0]) == 1 + expected_items
+    assert runner.run_modes == [mode, "verify"]
+    assert result.partition["review_policy"]["profile"] == "deep"
+    assert result.partition["review_policy"]["max_items"] is None
+    assert result.partition["identity"]["limits"]["max_revisions"] == 1
+    assert "Review profile: deep" in runner.generation_contract
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("mode", ["architecture", "intent"])
+def test_fast_review_bounds_generated_items_before_independent_verification(tmp_path, mode):
+    task = _pmd_partition_task() if mode == "architecture" else make_intent_task()
+    body = _architecture_body(task) if mode == "architecture" else _intent_body(task)
+    if mode == "architecture":
+        body["findings"] = [{**deepcopy(body["findings"][0]), "statement": f"Defect {index}."}
+            for index in range(6)]
+    else:
+        body["questions"] = ["Another question?", "One more?"]
+    runner = FakeAgentRunner(tmp_path, body)
+    runner.config = AgentEngineConfig(profile="fast")
+    result = run_agent_review(task, mode, runner, language="en", instructions="")
+    assert result.status == "completed"
+    assert len(runner.verify_claim_ids[0]) == 4  # summary plus three selected items
+    assert runner.run_modes == [mode, "verify"]
+    assert runner.repair_calls == 0
+    assert "bounded first pass" in runner.generation_contract
+    assert runner.fast_scope["bounded_context"] is True
+    assert runner.fast_scope["full_sources_available"] is True
+    assert runner.fast_scope["changed_path_count"] > 0
+    assert len(runner.fast_scope["changes"]) <= 8
+    assert result.partition["review_policy"]["profile"] == "fast"
+    assert result.partition["identity"]["limits"]["max_revisions"] == 0
+    assert "Fast review" in format_partition_review_markdown(result, task, publication_mode="comment")
+    validate_partition_result(result, task)
+
+
+def test_fast_review_does_not_revise_or_reverify_contradicted_claims(tmp_path):
+    task = _pmd_partition_task()
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+    runner.config = AgentEngineConfig(profile="fast", max_revisions=3)
+    runner.verify_outputs = [lambda _request, claims: {"items": {claim["id"]: {
+        field: {"state": "contradicted", "reason": "The source contradicts this claim.",
+            "citations": claim["cited"]} for field in claim["fields"]} for claim in claims}}]
+    result = run_agent_review(task, "architecture", runner, language="en", instructions="", max_revisions=3)
+    assert result.status == "partial_review"
+    assert result.reason == "factual_verification_incomplete"
+    assert runner.run_modes == ["architecture", "verify"]
+    assert runner.repair_calls == 0
+    assert all(len(entry["attempts"]) == 1 and entry["revision"] is None
+        for entry in result.partition["fact_verification"]["items"])
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("outer_deadline, expected", [(None, [240, 40]), (220, [220, 20])])
+def test_fast_mode_deadline_is_shared_by_generation_and_verification(tmp_path, monkeypatch,
+    outer_deadline, expected):
+    task = _pmd_partition_task()
+    clock = ControlledClock()
+    monkeypatch.setattr(agent_review.time, "monotonic", clock.monotonic)
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+    runner.config = AgentEngineConfig(profile="fast")
+    runner.run_callback = lambda request: setattr(clock, "now", 200) if request.mode != "verify" else None
+    result = run_agent_review(task, "architecture", runner, language="en", instructions="", deadline=outer_deadline)
+    assert [request.timeout_seconds for request in runner.run_requests] == expected
+    assert result.status == "completed"
+
+
+def test_fast_mode_does_not_start_verification_after_its_own_deadline(tmp_path, monkeypatch):
+    task = _pmd_partition_task()
+    clock = ControlledClock()
+    monkeypatch.setattr(agent_review.time, "monotonic", clock.monotonic)
+    runner = FakeAgentRunner(tmp_path, _architecture_body(task))
+    runner.config = AgentEngineConfig(profile="fast")
+    runner.run_callback = lambda request: setattr(clock, "now", 241)
+    result = run_agent_review(task, "architecture", runner, language="en", instructions="", deadline=3000)
+    assert runner.run_modes == ["architecture"]
+    assert runner.repair_calls == 0
+    assert result.status == "partial_review"
+    validate_partition_result(result, task)
+
+
 def _run(task, mode, tmp_path, body, *, session=None, runner=None):
     runner = runner or FakeAgentRunner(tmp_path, body, session=session)
     return run_agent_review(task, mode, runner, language="en", instructions="Use the code evidence.")
@@ -244,6 +340,18 @@ def test_search_scope_rule_is_in_every_contract(mode, skill):
 @pytest.mark.parametrize("mode", ["architecture", "intent", "verify"])
 def test_search_scope_rule_is_in_initial_prompts(mode):
     assert _SEARCH_SCOPE_RULE in _initial_agent_prompt(mode)
+
+
+def test_fast_initial_prompt_loads_contract_and_skill_without_discovery_roundtrips(tmp_path):
+    for name in ("CONTRACT.md", "contract.json", "PR.md", "claims.json"):
+        (tmp_path / name).write_text("{}")
+    prompt = _initial_agent_prompt("verify", fast=True, workspace_dir=tmp_path)
+    assert "already loaded" in prompt
+    assert "Factual claim verification" in prompt
+    assert '"claims.json"' in prompt
+    assert "untrusted review data" in prompt
+    assert "do not rediscover" in prompt
+    assert _SEARCH_SCOPE_RULE in prompt
 
 
 @pytest.mark.parametrize("mode", ["architecture", "intent"])
@@ -323,6 +431,7 @@ def test_revision_gets_fresh_remaining_deadline_after_generation_timeout_elapsed
     clock = ControlledClock()
     monkeypatch.setattr(agent_review.time, "monotonic", clock.monotonic)
     runner = FakeAgentRunner(tmp_path, body)
+    runner.config = AgentEngineConfig()
     runner.verify_outputs = [lambda _request, claims: {"items": {claim["id"]: {
         field: {"state": "contradicted" if claim["id"] == "findings:0" else "supported",
             "reason": "Recheck this finding." if claim["id"] == "findings:0"
@@ -608,6 +717,8 @@ def test_agent_verifier_uses_isolated_workspace_without_changing_generation_cont
     assert runner.generation_contract_hashes_during_verify == runner.generation_contract_hashes_before_verify
     assert _SEARCH_SCOPE_RULE in runner.contract
     assert runner.contract_json["mode"] == "verify"
+    assert runner.verifier_template["items"]["summary"]["text"] == {
+        "state": None, "reason": None, "citations": []}
     assert not runner.verifier_workspace_dir.exists()
     assert {"head/src/A.java", "base/src/A.java", "PR.md"} <= runner.workspace
 

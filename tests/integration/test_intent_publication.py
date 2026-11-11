@@ -811,6 +811,7 @@ def test_failed_plan_status_notice_respects_post_write_abort_and_lease_owner(int
     assert flow.store._get_connection().execute("SELECT COUNT(*) FROM publication_receipts").fetchone()[0] == 0
     if abort == "stop":
         assert status == "cancelled"
+        assert json.loads((root / "manifest.json").read_text())["status"] == "cancelled"
     else:
         assert status == "running" and observed["replacement"].run_id == root.name
         assert flow.store._get_connection().execute("SELECT worker_id FROM runs WHERE run_id = ?", (root.name,)).fetchone()[0] == "replacement"

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import io
+import http.client
+import threading
 from copy import deepcopy
 from pathlib import Path
 
@@ -41,6 +44,78 @@ def test_proxy_adds_a_ceiling_when_request_omits_max_tokens():
         {"model": "stealth/crouton-alpha"}, state)
     assert allowed == 200 and payload["max_tokens"] == 1024
     assert payload["usage"] == {"include": True}
+
+
+def test_total_output_budget_reserves_inflight_calls_and_refunds_known_usage():
+    proxy = _proxy_module()
+    state = proxy.ProxyState("model", 10, 4096, max_total_output_tokens=5000)
+    status, payload = proxy.authorize_request("/v1/chat/completions", {"model": "model"}, state)
+    assert status == 200 and payload["max_tokens"] == 4096
+    # A concurrent attempt cannot spend the tokens reserved by the first request.
+    status, payload = proxy.authorize_request("/v1/chat/completions", {"model": "model"}, state)
+    assert status == 200 and payload["max_tokens"] == 904
+    assert proxy.authorize_request("/v1/chat/completions", {"model": "model"}, state)[0] == 429
+    state.complete_output(4096, {"completion_tokens": 1000})
+    status, payload = proxy.authorize_request("/v1/chat/completions", {"model": "model"}, state)
+    assert status == 200 and payload["max_tokens"] == 3096
+
+
+@pytest.mark.parametrize("usage", [None, {}, {"completion_tokens": -1}, {"completion_tokens": True}])
+def test_missing_or_invalid_usage_keeps_total_output_reservation_charged(usage):
+    proxy = _proxy_module()
+    state = proxy.ProxyState("model", 10, 4096, max_total_output_tokens=2000)
+    _, payload = proxy.authorize_request("/v1/chat/completions", {"model": "model"}, state)
+    assert payload["max_tokens"] == 2000
+    state.complete_output(2000, usage)
+    assert proxy.authorize_request("/v1/chat/completions", {"model": "model"}, state)[0] == 429
+
+
+def test_total_output_budget_remains_enforced_without_per_call_cap():
+    proxy = _proxy_module()
+    state = proxy.ProxyState("model", 10, max_total_output_tokens=2500)
+    status, payload = proxy.authorize_request("/v1/chat/completions", {"model": "model"}, state)
+    assert status == 200 and payload["max_tokens"] == 2500
+    state.complete_output(2500, {"completion_tokens": 2500})
+    assert proxy.authorize_request("/v1/chat/completions", {"model": "model"}, state)[0] == 429
+
+
+def test_proxy_http_handler_accounts_for_output_across_multiple_model_calls(monkeypatch):
+    proxy = _proxy_module()
+    monkeypatch.setenv("UPSTREAM_API_KEY", "test-only-secret")
+    forwarded_limits = []
+
+    class Response(io.BytesIO):
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+    def upstream(request, timeout):
+        forwarded_limits.append(json.loads(request.data)["max_tokens"])
+        return Response(json.dumps({"choices": [{"finish_reason": "stop"}], "usage": {
+            "prompt_tokens": 10, "completion_tokens": 1000, "total_tokens": 1010}}).encode())
+
+    monkeypatch.setattr(proxy, "urlopen", upstream)
+    state = proxy.ProxyState("model", 10, 4096, max_total_output_tokens=5000)
+    handler = type("TestProxyHandler", (proxy.ProxyHandler,), {"state": state})
+    server = proxy.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        statuses = []
+        for _ in range(6):
+            connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+            connection.request("POST", "/v1/chat/completions", json.dumps({"model": "model"}),
+                {"Content-Type": "application/json"})
+            response = connection.getresponse()
+            statuses.append(response.status)
+            response.read()
+            connection.close()
+        assert statuses == [200, 200, 200, 200, 200, 429]
+        assert forwarded_limits == [4096, 4000, 3000, 2000, 1000]
+        assert state.remaining_output_tokens == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_proxy_without_configured_cap_uses_pi_ceiling_without_injecting_tokens():
@@ -179,4 +254,17 @@ def test_proxy_extracts_opencode_go_usage():
         "prompt_tokens": 23, "completion_tokens": 7, "total_tokens": 30,
         "cost": {"total": 0, "list_cost": 0, "allowance": 0},
         "billing_source": "go",
+        "reasoning_tokens": 4,
     }
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_proxy_preserves_reasoning_tokens_and_length_stop_without_response_text(stream):
+    proxy = _proxy_module()
+    payload = {"choices": [{"finish_reason": "length", "message": {"content": "private response"}}],
+        "usage": {"completion_tokens": 100, "completion_tokens_details": {"reasoning_tokens": 80}}}
+    capture = proxy.ResponseUsageCapture("text/event-stream" if stream else "application/json")
+    raw = json.dumps(payload).encode()
+    capture.feed(b"data: " + raw + b"\n\n" if stream else raw)
+    assert capture.result() == {"completion_tokens": 100, "reasoning_tokens": 80, "finish_reason": "length"}
+    assert "private response" not in json.dumps(capture.result())

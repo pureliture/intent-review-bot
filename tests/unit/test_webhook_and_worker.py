@@ -1020,6 +1020,74 @@ def test_agent_worker_parallel_mode_failure_matches_sequential_and_joins_threads
         assert not any(thread.name.startswith("agent-mode") for thread in threading.enumerate())
 
 
+def _configure_deadline_agent_worker(worker, tmp_path, monkeypatch, *, abort="deadline"):
+    published = threading.Event()
+    now = [100.0]
+    monkeypatch.setattr("review_bot.runtime.worker.time.monotonic", lambda: now[0])
+    _configure_agent_mode_worker(worker, tmp_path, monkeypatch,
+        _BarrierAgentRunner(parallel=True), architecture_published=published)
+    architecture = worker._execute_architecture
+
+    def complete_architecture(*args, **kwargs):
+        receipt = architecture(*args, **kwargs)
+        published.set()
+        return receipt
+
+    def abort_intent(run, _snapshot, _selection, _material, _artifacts, deadline, **_kwargs):
+        worker._review_partitioned(_AgentModeTask("2" * 64), "intent", run, deadline,
+            worker.config.output.language)
+        # Let A return its real publication receipt before B observes cancellation.
+        assert published.wait(timeout=5)
+        if abort == "stop":
+            worker._stop_event.set()
+        else:
+            now[0] = deadline + 1
+        if abort == "fence":
+            worker.job_store.enqueue_request(PrRequestRecord(run.installation_id, run.repository_id, run.pr_number, 1))
+        elif abort == "external":
+            worker.external_write_guard = lambda: False
+        worker._require_active(run, deadline)
+        pytest.fail("B must stop without publishing")
+
+    # B does not need a model for this deterministic deadline/fencing regression.
+    worker.agent_runner.barrier = None
+    monkeypatch.setattr(worker, "_execute_architecture", complete_architecture)
+    monkeypatch.setattr(worker, "_execute_intent", abort_intent)
+
+
+@pytest.mark.parametrize("abort", ["deadline", "stop", "fence", "external"])
+def test_parallel_completed_publication_survives_abort_only_while_owned(
+    claimed_worker, tmp_path, monkeypatch, abort,
+):
+    store, worker, run = claimed_worker
+    _configure_deadline_agent_worker(worker, tmp_path, monkeypatch, abort=abort)
+
+    assert worker.process_run(run) is False
+
+    assert len(worker.github_client.posted_comments) == 1
+    root = worker.artifact_root / "runs" / str(run.repository_id) / str(run.pr_number) / run.run_id
+    manifest = json.loads((root / "manifest.json").read_text())
+    publications = store._get_connection().execute(
+        "SELECT comment_id, status FROM publication_receipts WHERE run_id = ?", (run.run_id,),
+    ).fetchall()
+    if abort in ("fence", "external"):
+        assert publications == []
+        assert not (root / "A" / "receipt.json").exists()
+        assert manifest["status"] == "running"
+    else:
+        receipt = json.loads((root / "A" / "receipt.json").read_text())
+        assert receipt["execution_status"] == "completed"
+        assert publications == [(receipt["publication"]["comment_id"], "succeeded")]
+        assert manifest["modes"]["architecture"]["publication"]["status"] == "succeeded"
+        assert manifest["status"] == ("failed" if abort == "deadline" else "cancelled")
+        assert manifest["error_code"] == ("task_deadline_exceeded" if abort == "deadline" else "worker_stopped")
+        status, error, reason = store._get_connection().execute(
+            "SELECT status, error, reason FROM runs WHERE run_id = ?", (run.run_id,),
+        ).fetchone()
+        assert status == manifest["status"]
+        assert (error if abort == "deadline" else reason) == manifest["error_code"]
+
+
 @pytest.fixture
 def worker_tree_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     roots: list[Path] = []

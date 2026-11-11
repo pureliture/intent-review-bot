@@ -2,7 +2,7 @@
 
 Read `/workspace/CONTRACT.md` and `/workspace/contract.json` first.
 
-Compare the stated purpose and requirements in `/workspace/PR.md` with the implementation under `/workspace/head/` (and `/workspace/base/` for what changed). For each required perspective ID, decide whether the change achieves what the PR asks for, citing the code that shows it. Check in particular:
+Compare the stated purpose and requirements in `/workspace/PR.md` with the implementation under `/workspace/head/` (and `/workspace/base/` for what changed). Follow the review profile in `CONTRACT.md`: fast checks the highest-impact requirements with at most three assessments and questions combined; deep checks all stated requirements. Include every required perspective ID, using empty assessments for perspectives outside the bounded fast review. Cite code for each assessment. Check in particular:
 - every numbered or stated requirement: achieved, not achieved, or partially achieved,
 - boundary values and limits stated in the requirements,
 - whether tests cover what the requirements demand.

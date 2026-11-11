@@ -41,7 +41,11 @@ def enqueue_service_review(job_store: SQLiteJobStore, request: PrRequestRecord, 
         job_store.accept_delivery(delivery, request)
 
 
-def load_service_config(path: str | None) -> ReviewBotConfig:
+def load_service_config(
+    path: str | None,
+    *,
+    require_webhook_secret: bool = True,
+) -> ReviewBotConfig:
     if not path:
         raise ServiceConfigurationError("Service commands require --config")
     try:
@@ -73,7 +77,7 @@ def load_service_config(path: str | None) -> ReviewBotConfig:
             raise ServiceConfigurationError("REVIEW_BOT_API_TOKEN must be set for the fixed-input API")
     else:
         try:
-            validate_active_environment(config)
+            validate_active_environment(config, require_webhook_secret=require_webhook_secret)
         except Exception:
             raise ServiceConfigurationError("Required GitHub App environment references must be set") from None
     if not os.environ.get(config.service.state_root_env, "").strip():
@@ -307,7 +311,7 @@ def execute_ondemand_review(config_path: str | None, job, is_current, *,
     base = Path(previous or "/var/lib/review-bot")
     os.environ[state_env] = os.fspath(base / "ondemand" / job.job_id)
     try:
-        config = load_service_config(config_path)
+        config = load_service_config(config_path, require_webhook_secret=False)
         if (vm_lifetime_seconds is not None
                 and config.execution.task_timeout_seconds + _VM_LIFETIME_MARGIN_SECONDS > vm_lifetime_seconds):
             raise ServiceConfigurationError("task_timeout_exceeds_vm_lifetime")
@@ -357,7 +361,7 @@ def execute_ondemand_review(config_path: str | None, job, is_current, *,
                     receipt = {}
                 record = manifest.get("modes", {}).get(mode, {})
                 publication = receipt.get("publication") or record.get("publication")
-                execution_status = receipt.get("execution_status")
+                execution_status = receipt.get("execution_status") or record.get("execution_status")
                 result_status = record.get("status")
                 if execution_status == "failed":
                     modes[mode] = "publication_failed" if (
@@ -371,7 +375,8 @@ def execute_ondemand_review(config_path: str | None, job, is_current, *,
                     modes[mode] = "failed"
                 trace_modes[mode] = {
                     "execution_status": execution_status,
-                    "error_code": receipt.get("error_code"),
+                    "error_code": receipt.get("error_code") or record.get("error_code") or (
+                        manifest.get("error_code") if modes[mode] == "failed" else None),
                     "usage": receipt.get("usage"),
                     "model_delivery": receipt.get("model_delivery"),
                     "publication": publication,
@@ -380,9 +385,14 @@ def execute_ondemand_review(config_path: str | None, job, is_current, *,
                 "run_id": run.run_id,
                 "worker_completed": completed,
                 "status": manifest.get("status"),
+                "error_code": manifest.get("error_code"),
                 "selected_modes": sorted(selected),
                 "modes": trace_modes,
             }
+            try:
+                trace["metrics"] = json.loads((artifact_path / "execution-metrics.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                trace["metrics"] = None
             return modes, trace
     finally:
         if previous is None:

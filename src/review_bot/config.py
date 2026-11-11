@@ -312,6 +312,10 @@ class PartitionEvaluationConfig(BaseModel):
 
 class AgentEngineConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
+    profile: Literal["fast", "deep"] = "deep"
+    thinking_level: Literal["off", "minimal", "low", "medium", "high"] = "medium"
+    max_mode_seconds: int | None = Field(default=None, ge=1, le=3600)
+    max_total_output_tokens: int | None = Field(default=None, ge=1)
     image_tag: str = Field(default="review-bot-pi-agent:0.73.1", min_length=1, max_length=255,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
     provider: Literal["openrouter", "opencode-go"] = "openrouter"
@@ -325,6 +329,15 @@ class AgentEngineConfig(BaseModel):
     max_revisions: int = Field(ge=0, le=3, default=1)
     session_store_dir: str = Field(min_length=1, max_length=1024,
         default="~/.local/share/review-bot/agent-sessions")
+
+    @model_validator(mode="before")
+    @classmethod
+    def profile_defaults(cls, value):
+        if isinstance(value, dict) and value.get("profile") == "fast":
+            return {"thinking_level": "off", "max_mode_seconds": 240,
+                "max_proxy_calls": 16, "max_output_tokens": 4096,
+                "max_total_output_tokens": 12000, "max_revisions": 0, **value}
+        return value
 
     @field_validator("session_store_dir")
     @classmethod
@@ -562,15 +575,19 @@ def load_target_repository_config(path_or_str: str | Path | TextIO) -> TargetRep
 def validate_active_environment(
     config: ReviewBotConfig,
     env: Mapping[str, str] = os.environ,
+    *,
+    require_webhook_secret: bool = True,
 ) -> None:
     """Validates required environment secrets when running in active GitHub App mode."""
     if config.execution.mode == "github_app":
         missing_vars: list[str] = []
-        for var_name in (
+        required_vars = [
             config.service.app_id_env,
             config.service.app_private_key_file_env,
-            config.service.webhook_secret_env,
-        ):
+        ]
+        if require_webhook_secret:
+            required_vars.append(config.service.webhook_secret_env)
+        for var_name in required_vars:
             if var_name not in env or not env[var_name].strip():
                 missing_vars.append(var_name)
         if missing_vars:

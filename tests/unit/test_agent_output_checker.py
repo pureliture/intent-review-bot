@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node is no
 
 
 def _run_checker(tmp_path, mode, result, source=b"void run() {}", *, claims=None, pr_text=None,
-    revision_rows=None):
+    revision_rows=None, profile=None):
     workspace = tmp_path / "workspace"
     output = tmp_path / "out"
     (workspace / "head" / "src").mkdir(parents=True, exist_ok=True)
@@ -32,7 +32,7 @@ def _run_checker(tmp_path, mode, result, source=b"void run() {}", *, claims=None
         }]}), encoding="utf-8")
     if revision_rows is not None:
         (workspace / "revision_rows.json").write_text(json.dumps(revision_rows), encoding="utf-8")
-    contract = _contract_json(mode, {"targets": ["target-1"]})
+    contract = _contract_json(mode, {"targets": ["target-1"], "review_policy": {"profile": profile}})
     (workspace / "contract.json").write_text(json.dumps(contract), encoding="utf-8")
     if isinstance(result, bytes):
         (output / ("revision.json" if revision_rows is not None else "result.json")).write_bytes(result)
@@ -65,6 +65,26 @@ def _finding(*, verdict="concern", basis="observed_structure", target_ids=None, 
 
 def _summary_citations(quote="void run()"):
     return [{"path": "src/A.java", "version": "head", "quote": quote}]
+
+
+def test_fast_checker_rejects_more_than_three_architecture_findings(tmp_path):
+    result = _run_checker(tmp_path, "architecture", {"summary": "Review.",
+        "summary_citations": _summary_citations(), "findings": [
+            {**_finding(), "statement": f"Finding {index}."} for index in range(4)]}, profile="fast")
+    assert result.returncode == 1
+    assert "agent_output_too_many_items" in result.stdout
+
+
+def test_fast_checker_caps_intent_assessments_and_questions_together(tmp_path):
+    contract = _contract_json("intent", {"targets": []})
+    result = _run_checker(tmp_path, "intent", {"summary": "Review.",
+        "summary_citations": _summary_citations(), "questions": ["Question one?", "Question two?"],
+        "perspectives": [{"perspective_id": contract["allowed_perspective_ids"][0], "assessments": [
+            {"verdict": "concern", "statement": f"Assessment {index}.", "reasoning": "Reason.",
+                "failure_condition": "", "citations": _summary_citations()} for index in range(2)]}]},
+        profile="fast")
+    assert result.returncode == 1
+    assert "agent_output_too_many_items" in result.stdout
 
 
 def test_checker_reports_json_parse_message_offset_and_context(tmp_path):

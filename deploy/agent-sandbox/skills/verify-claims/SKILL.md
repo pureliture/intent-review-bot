@@ -12,6 +12,19 @@ Return exactly one verdict for every listed field:
 - `unverifiable`: the frozen sources do not establish the field's factual assertions.
 - `non_factual`: the field is empty or makes no factual assertion.
 
+Write exactly this object shape, replacing the placeholders with IDs and field keys from `claims.json`:
+
+```json
+{"items":{"<claim.id>":{"<key in claim.fields>":{"state":"supported","reason":"Concise reason.","citations":[{"path":"repo/path","version":"head","quote":"exact source text"}]}}}}
+```
+
+Start from `/workspace/verifier_output_template.json`, which has all row and field
+keys with null verdicts. After checking the evidence, use Node to parse the template,
+assign each `items[id][field]` verdict object, and serialize with `JSON.stringify` to
+`/out/result.json`. Fill every null state and reason; choose `unverifiable` when the
+source does not establish the assertion. This keeps JSON syntax separate from the
+factual decision. Node is available in the sandbox.
+
 Every non-empty field marked `supported` must include at least one exact `head` or `base` code citation; PR-only citations do not qualify. Citations may also use `version` `pr`; for `pr`, use `path` `PR.md`. A `head` or `base` citation must quote exact text from that source file. A `pr` citation must quote exact text from `/workspace/PR.md`. Every quote must occur exactly once in its source. Do not invent or paraphrase quotes. Use at most 32 citations per field. Give a concise, factual reason for every verdict.
 
 Do not edit repository files. Write the result to `/out/result.json`, run `node /skills/check_output.mjs`, correct any errors, and repeat until it prints `OK`. Reply `DONE` only.

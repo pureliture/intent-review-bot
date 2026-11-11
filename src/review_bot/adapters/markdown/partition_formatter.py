@@ -6,6 +6,19 @@ from review_bot.application.partition_review import validate_partition_result
 from review_bot.domain.partition_review import PartitionReviewResult
 
 
+def _profile_notice(result: PartitionReviewResult) -> str:
+    profile = result.partition.get("review_policy", {}).get("profile")
+    if profile == "fast":
+        return ("빠른 리뷰: 변경 코드의 핵심 항목을 최대 3개 검토하며 사실 확인은 1회로 제한합니다. "
+            "검증 상태는 아래 결과를 참고하세요. 전체 변경을 망라한 심층 리뷰가 아닙니다."
+            if result.language == "ko" else
+            "Fast review: up to 3 priority items from changed code, with at most one factual-check pass. "
+            "See the verification status below. This is not an exhaustive deep review.")
+    if profile == "deep":
+        return "심층 리뷰" if result.language == "ko" else "Deep review"
+    return ""
+
+
 def _format_private_partition_markdown(result: PartitionReviewResult, task, **_options) -> str:
     if _options.get("publication_mode", "artifact_only") != "artifact_only":
         raise ValueError("partition_evaluation_is_private_only")
@@ -21,6 +34,8 @@ def _format_private_partition_markdown(result: PartitionReviewResult, task, **_o
         "- Fixed originals only. No target code, build, test execution or external publication.",
         f"- 원문 {result.scope['originals']}개 · 구간 {result.scope['units']}개" if ko else
         f"- {result.scope['originals']} originals · {result.scope['units']} spans", ""]
+    if notice := _profile_notice(result):
+        lines.extend([notice, ""])
     if result.model.get("is_mock"):
         lines.append("- 모의 모델을 사용한 실행 경로 검증입니다. 실제 리뷰 품질 측정 결과가 아닙니다." if ko else
             "- Mock-model contract verification, not a measurement of actual review quality.")
@@ -109,11 +124,12 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
     architecture = result.review_type == "A"
     title = label(presentation, "architecture_title" if architecture else "intent_title", "아키텍처 리뷰" if architecture else "개발 의도 리뷰")
     marker = marker or (DEFAULT_A_MARKER if architecture else DEFAULT_B_MARKER)
+    profile_notice = _profile_notice(result)
     if result.status != "completed" or result.validation_errors:
         final = result.partition.get("final", {})
         unreviewed = list(final.get("missing_context", ())) + list(result.validation_errors)
         return finish(marker, title, status_sections(result, ko=result.language == "ko", unreviewed=unreviewed),
-            scope="", max_length=max_length, trace=execution_trace(result, context=trace_context, ko=result.language == "ko"))
+            scope=profile_notice, max_length=max_length, trace=execution_trace(result, context=trace_context, ko=result.language == "ko"))
     summary = review_summary(result.summary, task, is_mock=result.model.get("is_mock"))
     sections = {"summary": summary}
     if architecture:
@@ -146,5 +162,5 @@ def format_partition_review_markdown(result: PartitionReviewResult, task, *,
         sections["llm_review"] = findings_section(findings, result.questions, task, presentation=presentation)
         sections["perspectives"] = perspective_section(perspectives, task, presentation)
     footer = label(presentation, "footer_notice", "")
-    return finish(marker, title, sections, scope="", template=comment_template if comment_template is not None else BUILTIN_COMMENT_TEMPLATES["architecture" if architecture else "intent"], max_length=max_length, footer=footer,
+    return finish(marker, title, sections, scope=profile_notice, template=comment_template if comment_template is not None else BUILTIN_COMMENT_TEMPLATES["architecture" if architecture else "intent"], max_length=max_length, footer=footer,
         trace=execution_trace(result, context=trace_context, ko=result.language == "ko"))

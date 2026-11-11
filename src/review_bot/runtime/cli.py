@@ -58,6 +58,16 @@ def _load_tools_lock() -> dict[str, Any]:
     return {"pmd_version": "7.3.0", "java_version": "21"}
 
 
+def _minimum_vm_lifetime_seconds(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if seconds < 60:
+        raise argparse.ArgumentTypeError("must be at least 60 seconds")
+    return seconds
+
+
 def _parse_pmd_violation(d: dict[str, Any]) -> PmdViolation:
     return PmdViolation(
         path=d.get("path", ""),
@@ -356,10 +366,20 @@ def create_parser() -> argparse.ArgumentParser:
         "ondemand-run", help="Claim and execute one on-demand review job",
     )
     ondemand_parser.add_argument("--job-id", required=True)
-    ondemand_parser.add_argument("--vm-id", default=None, help="Override the IMDSv2 instance identity")
+    ondemand_parser.add_argument("--vm-id", default=None, help="Override the VM identity")
     ondemand_parser.add_argument("--config",
         default=os.environ.get("REVIEW_BOT_CONFIG", "/etc/review-bot/operator.yaml"),
         help="Path to operator review-config.yaml")
+    ondemand_parser.add_argument(
+        "--vm-lifetime-seconds",
+        type=_minimum_vm_lifetime_seconds,
+        default=None,
+        help="VM lifetime in seconds (minimum 60)",
+    )
+    subparsers.add_parser(
+        "ondemand-recover",
+        help="Recover queued or orphaned on-demand review jobs",
+    )
 
     admission_parser = subparsers.add_parser(
         "model-admission", help="Inspect or resolve model HTTP admission slots",
@@ -850,7 +870,27 @@ def run_model_admission(args: argparse.Namespace) -> int:
 def run_ondemand_cli(args: argparse.Namespace) -> int:
     from review_bot.runtime.ondemand_entrypoint import run_ondemand
 
-    return run_ondemand(args.job_id, vm_id=args.vm_id, config_path=args.config)
+    return run_ondemand(
+        args.job_id,
+        vm_id=args.vm_id,
+        config_path=args.config,
+        vm_lifetime_seconds=args.vm_lifetime_seconds,
+    )
+
+
+def run_ondemand_recover_cli() -> int:
+    try:
+        from review_bot.runtime.aws_lambda import (
+            _coordinator_from_environment,
+            build_recovery_handler,
+        )
+
+        result = build_recovery_handler(_coordinator_from_environment())()
+    except Exception:
+        sys.stderr.write("Error: on-demand recovery failed\n")
+        return 1
+    print(json.dumps(result))
+    return 0
 
 
 def main(args: list[str] | None = None) -> int:
@@ -896,6 +936,9 @@ def main(args: list[str] | None = None) -> int:
 
     if parsed.subcommand == "ondemand-run":
         return run_ondemand_cli(parsed)
+
+    if parsed.subcommand == "ondemand-recover":
+        return run_ondemand_recover_cli()
 
     if parsed.subcommand == "model-admission":
         return run_model_admission(parsed)

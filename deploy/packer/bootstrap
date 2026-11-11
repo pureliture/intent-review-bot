@@ -10,17 +10,85 @@ shutdown_on_exit() {
 }
 trap shutdown_on_exit EXIT
 
-imds_token="$(curl --connect-timeout 2 --max-time 3 --fail --silent --show-error \
-  -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
-  http://169.254.169.254/latest/api/token)"
-imds_get() {
-  curl --connect-timeout 2 --max-time 3 --fail --silent --show-error \
-    -H "X-aws-ec2-metadata-token: ${imds_token}" \
-    "http://169.254.169.254/latest/${1}"
+if [[ -S /dev/lxd/sock ]]; then
+  vm_provider=lxd
+else
+  vm_provider=ec2
+  imds_token="$(curl --connect-timeout 2 --max-time 3 --fail --silent --show-error \
+    -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+    http://169.254.169.254/latest/api/token)"
+fi
+
+metadata_response() {
+  local name=$1
+  if [[ "${vm_provider}" == lxd ]]; then
+    curl --connect-timeout 2 --max-time 3 --silent --show-error \
+      --unix-socket /dev/lxd/sock -w $'\n%{http_code}' \
+      "http://lxd/1.0/config/user.review-bot.${name}"
+  else
+    curl --connect-timeout 2 --max-time 3 --silent --show-error \
+      -H "X-aws-ec2-metadata-token: ${imds_token}" \
+      -w $'\n%{http_code}' \
+      "http://169.254.169.254/latest/meta-data/tags/instance/review-bot:${name}"
+  fi
 }
 
-user_data="$(imds_get user-data)"
-job_id="$(printf '%s\n' "${user_data}" | python3 -c '
+meta() {
+  local response status body value
+  response="$(metadata_response "$1")"
+  status="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  if [[ "${status}" != 200 ]]; then
+    printf 'Required metadata key is unavailable: %s\n' "$1" >&2
+    return 1
+  fi
+  value="${body}"
+  if [[ -z "${value}" ]]; then
+    printf 'Required metadata key is empty: %s\n' "$1" >&2
+    return 1
+  fi
+  printf '%s' "${value}"
+}
+
+meta_optional() {
+  local response status body
+  response="$(metadata_response "$1")"
+  status="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  if [[ "${status}" == 404 ]]; then
+    return 0
+  fi
+  if [[ "${status}" != 200 ]]; then
+    printf 'Optional metadata lookup failed: %s\n' "$1" >&2
+    return 1
+  fi
+  printf '%s' "${body}"
+}
+
+if [[ "${vm_provider}" == lxd ]]; then
+  job_id="$(meta job-id)"
+  vm_id="$(meta vm-id)"
+  lifetime="$(meta max-lifetime-seconds)"
+  region="$(meta region)"
+  endpoint="$(meta_optional aws-endpoint-url)"
+  [[ "${job_id}" =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'Invalid on-demand job id\n' >&2
+    exit 1
+  }
+  [[ "${vm_id}" =~ ^rb-[0-9a-f]{20}$ ]] || {
+    printf 'Invalid LXD VM id\n' >&2
+    exit 1
+  }
+  if [[ ! "${lifetime}" =~ ^[0-9]{1,5}$ ]] ||
+    (( 10#${lifetime} < 60 || 10#${lifetime} > 21600 )); then
+    printf 'Invalid VM lifetime\n' >&2
+    exit 1
+  fi
+else
+  user_data="$(curl --connect-timeout 2 --max-time 3 --fail --silent --show-error \
+    -H "X-aws-ec2-metadata-token: ${imds_token}" \
+    http://169.254.169.254/latest/user-data)"
+  job_id="$(printf '%s\n' "${user_data}" | python3 -c '
 import re
 import sys
 text = sys.stdin.read()
@@ -29,10 +97,28 @@ if match is None:
     raise SystemExit("on-demand job id missing from EC2 user data")
 print(match.group(1))
 ')"
-github_secret_arn="$(imds_get meta-data/tags/instance/review-bot:github-app-secret-arn)"
-openrouter_secret_arn="$(imds_get meta-data/tags/instance/review-bot:openrouter-secret-arn)"
-job_table="$(imds_get meta-data/tags/instance/review-bot:job-table)"
-region="$(imds_get meta-data/placement/region)"
+  region="$(curl --connect-timeout 2 --max-time 3 --fail --silent --show-error \
+    -H "X-aws-ec2-metadata-token: ${imds_token}" \
+    http://169.254.169.254/latest/meta-data/placement/region)"
+  unset AWS_ENDPOINT_URL
+fi
+
+github_secret_arn="$(meta github-app-secret-arn)"
+openrouter_secret_arn="$(meta openrouter-secret-arn)"
+job_table="$(meta job-table)"
+agent_provider="$(meta_optional agent-provider)"
+agent_profile="$(meta_optional agent-profile)"
+agent_model_id="$(meta_optional agent-model-id)"
+agent_context_window_tokens="$(meta_optional agent-context-window-tokens)"
+export AWS_REGION="${region}"
+export AWS_DEFAULT_REGION="${region}"
+export REVIEW_BOT_AGENT_PROVIDER="${agent_provider}"
+export REVIEW_BOT_AGENT_PROFILE="${agent_profile}"
+export REVIEW_BOT_AGENT_MODEL_ID="${agent_model_id}"
+export REVIEW_BOT_AGENT_CONTEXT_WINDOW_TOKENS="${agent_context_window_tokens}"
+if [[ -n "${endpoint:-}" ]]; then
+  export AWS_ENDPOINT_URL="${endpoint}"
+fi
 
 install -d -o root -g root -m 0700 /run/review-bot
 install -d -o root -g reviewbot -m 0750 /etc/review-bot
@@ -40,21 +126,25 @@ install -d -o reviewbot -g reviewbot -m 0700 /var/lib/review-bot
 /opt/review-bot/venv/bin/python /opt/review-bot/bootstrap_runtime.py \
   "${github_secret_arn}" "${openrouter_secret_arn}" "${region}"
 
-export AWS_REGION="${region}"
-export AWS_DEFAULT_REGION="${region}"
 export REVIEW_BOT_JOB_TABLE="${job_table}"
 export REVIEW_BOT_CONFIG=/etc/review-bot/operator.yaml
 export REVIEW_BOT_STATE_DIR=/var/lib/review-bot
 REVIEW_BOT_APP_ID="$(< /run/review-bot/github-app-id)"
 export REVIEW_BOT_APP_ID
 export REVIEW_BOT_APP_PRIVATE_KEY_FILE=/run/review-bot/github-app-private-key.pem
-export OPENROUTER_API_KEY_FILE=/run/review-bot/openrouter-api-key
+export OPENROUTER_API_KEY_FILE=/run/review-bot/model-api-key
+export OPENCODE_API_KEY_FILE=/run/review-bot/model-api-key
 export DOCKER_HOST=unix:///run/user/1001/docker.sock
 export REVIEW_BOT_AGENT_DOCKER_HOST=unix:///var/run/docker.sock
 export XDG_RUNTIME_DIR=/run/user/1001
 export HOME=/home/reviewbot
 export USER=reviewbot
 export LOGNAME=reviewbot
+
+if [[ "${vm_provider}" == lxd ]]; then
+  export REVIEW_BOT_VM_PROVIDER=lxd-guest
+  export REVIEW_BOT_VM_ID="${vm_id}"
+fi
 
 for attempt in $(seq 1 30); do
   if docker info >/dev/null 2>&1; then
@@ -66,5 +156,11 @@ for attempt in $(seq 1 30); do
   sleep 1
 done
 
-runuser --preserve-environment --user reviewbot -- \
-  /opt/review-bot/bin/review-bot-ondemand --job-id "${job_id}"
+if [[ "${vm_provider}" == lxd ]]; then
+  runuser --preserve-environment --user reviewbot -- \
+    /opt/review-bot/bin/review-bot-ondemand \
+    --job-id "${job_id}" --vm-id "${vm_id}" --vm-lifetime-seconds "${lifetime}"
+else
+  runuser --preserve-environment --user reviewbot -- \
+    /opt/review-bot/bin/review-bot-ondemand --job-id "${job_id}"
+fi

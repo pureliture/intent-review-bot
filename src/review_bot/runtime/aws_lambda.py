@@ -9,7 +9,7 @@ import hashlib
 import json
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from review_bot.adapters.github.webhook import verify_github_signature
 from review_bot.application.ondemand import IntakeEvent, OnDemandCoordinator
@@ -72,22 +72,67 @@ def build_recovery_handler(coordinator: OnDemandCoordinator) -> Callable:
     return handler
 
 
+def _launcher_from_environment(
+    environ: Mapping[str, str],
+    *,
+    ec2_client_factory: Callable[..., object],
+):
+    provider = environ.get("REVIEW_BOT_VM_PROVIDER", "ec2")
+    if provider == "ec2":
+        from review_bot.adapters.aws.ec2_launcher import Ec2VmLauncher
+
+        region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION")
+        instance_tags = json.loads(environ.get("REVIEW_BOT_INSTANCE_TAGS", "{}"))
+        if not isinstance(instance_tags, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in instance_tags.items()
+        ):
+            raise ValueError("REVIEW_BOT_INSTANCE_TAGS must be a string mapping")
+        return Ec2VmLauncher(
+            ec2_client_factory(region_name=region),
+            environ.get("REVIEW_BOT_LAUNCH_TEMPLATE_ID", ""),
+            instance_tags=instance_tags,
+        )
+    if provider == "lxd":
+        from review_bot.adapters.lxd.launcher import LxdVmLauncher
+
+        image = environ.get("REVIEW_BOT_LXD_IMAGE")
+        if not image:
+            raise ValueError("REVIEW_BOT_LXD_IMAGE is required")
+        profiles = tuple(
+            profile.strip()
+            for profile in environ.get("REVIEW_BOT_LXD_PROFILES", "default").split(",")
+        )
+        instance_config = json.loads(environ.get("REVIEW_BOT_INSTANCE_TAGS", "{}"))
+        if not isinstance(instance_config, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in instance_config.items()
+        ):
+            raise ValueError("REVIEW_BOT_INSTANCE_TAGS must be a string mapping")
+        return LxdVmLauncher(
+            image=image,
+            profiles=profiles,
+            project=environ.get("REVIEW_BOT_LXD_PROJECT") or None,
+            instance_config=instance_config,
+        )
+    if provider == "lxd-guest":
+        from review_bot.adapters.lxd.launcher import LxdGuestLauncher
+
+        return LxdGuestLauncher(environ.get("REVIEW_BOT_VM_ID", ""))
+    raise ValueError("unsupported_vm_provider")
+
+
 def _coordinator_from_environment() -> OnDemandCoordinator:  # pragma: no cover - requires AWS
     import boto3
 
     from review_bot.adapters.aws.dynamodb_job_store import DynamoDbJobStore
-    from review_bot.adapters.aws.ec2_launcher import Ec2VmLauncher
 
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
     store = DynamoDbJobStore(boto3.client("dynamodb", region_name=region), os.environ["REVIEW_BOT_JOB_TABLE"])
-    instance_tags = json.loads(os.environ.get("REVIEW_BOT_INSTANCE_TAGS", "{}"))
-    if not isinstance(instance_tags, dict) or any(
-        not isinstance(key, str) or not isinstance(value, str)
-        for key, value in instance_tags.items()
-    ):
-        raise ValueError("REVIEW_BOT_INSTANCE_TAGS must be a string mapping")
-    launcher = Ec2VmLauncher(boto3.client("ec2", region_name=region),
-        os.environ.get("REVIEW_BOT_LAUNCH_TEMPLATE_ID", ""), instance_tags=instance_tags)
+    launcher = _launcher_from_environment(
+        os.environ,
+        ec2_client_factory=lambda **kwargs: boto3.client("ec2", **kwargs),
+    )
     return OnDemandCoordinator(store, launcher, clock=time.time,
         max_vm_lifetime_seconds=int(os.environ.get("REVIEW_BOT_MAX_VM_SECONDS", "3600")))
 

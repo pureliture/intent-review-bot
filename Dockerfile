@@ -4,6 +4,8 @@ COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
+COPY tooling/tools.lock.json ./tooling/tools.lock.json
+COPY deploy/agent-sandbox ./deploy/agent-sandbox
 RUN uv sync --frozen --no-dev --no-editable --python /usr/local/bin/python
 
 FROM python:3.12-slim

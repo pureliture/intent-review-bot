@@ -1,5 +1,7 @@
 # On-demand review: Lambda intake → one-shot Linux VM
 
+For the local open-source LXD VM backend, see [on-demand review with LXD](ondemand-local-lxd.md).
+
 Terraform in `deploy/terraform/` is the recommended deployment path. The CloudFormation template at
 `deploy/aws/template.yaml` is retained as an equivalent reference. LocalStack is used for free service emulation;
 no real AWS account, EC2 worker, or GitHub delivery has been used to verify this deployment.

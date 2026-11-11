@@ -54,14 +54,14 @@ resource "aws_launch_template" "worker" {
 
   tag_specifications {
     resource_type = "instance"
-    tags = {
+    tags = merge({
       "review-bot:managed"               = "true"
       "review-bot:job-table"             = aws_dynamodb_table.jobs.name
       "review-bot:github-app-secret-arn" = aws_secretsmanager_secret.github_app.arn
       "review-bot:openrouter-secret-arn" = aws_secretsmanager_secret.openrouter.arn
       "review-bot:session-bucket"        = aws_s3_bucket.sessions.bucket
       "review-bot:region"                = data.aws_region.current.name
-    }
+    }, local.agent_instance_tags)
   }
   tag_specifications {
     resource_type = "volume"
