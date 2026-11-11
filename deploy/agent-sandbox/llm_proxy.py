@@ -103,6 +103,11 @@ def usage_record(payload: object) -> dict | None:
         value = usage.get(source)
         if type(value) is int and value >= 0:
             result[destination] = value
+    details = usage.get("completion_tokens_details")
+    if isinstance(details, dict):
+        reasoning = details.get("reasoning_tokens")
+        if type(reasoning) is int and reasoning >= 0:
+            result["reasoning_tokens"] = reasoning
     cost = usage.get("cost")
     if isinstance(cost, dict):
         result["cost"] = {str(key): value for key, value in cost.items()
@@ -132,6 +137,15 @@ class ResponseUsageCapture:
         self.pending = bytearray()
         self.raw = bytearray()
         self.usage: dict | None = None
+        self.finish_reason: str | None = None
+
+    def _capture(self, value: object) -> None:
+        self.usage = usage_record(value) or self.usage
+        if isinstance(value, dict):
+            for choice in value.get("choices", []):
+                if isinstance(choice, dict) and choice.get("finish_reason") in (
+                    "stop", "length", "tool_calls", "content_filter", "function_call"):
+                    self.finish_reason = choice["finish_reason"]
 
     def feed(self, chunk: bytes) -> None:
         if self.event_stream:
@@ -154,17 +168,18 @@ class ResponseUsageCapture:
             value = json.loads(data)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
-        self.usage = usage_record(value) or self.usage
+        self._capture(value)
 
     def result(self) -> dict | None:
         if self.event_stream:
             if self.pending:
                 self._event_line(bytes(self.pending))
-            return self.usage
+            return {**(self.usage or {}), **({"finish_reason": self.finish_reason} if self.finish_reason else {})} or None
         if len(self.raw) >= _MAX_USAGE_SCAN_BYTES:
             return self.usage
         try:
-            return usage_record(json.loads(self.raw))
+            self._capture(json.loads(self.raw))
+            return {**(self.usage or {}), **({"finish_reason": self.finish_reason} if self.finish_reason else {})} or None
         except (json.JSONDecodeError, UnicodeDecodeError):
             return self.usage
 
@@ -202,6 +217,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             request = build_upstream_request(self.state, authorized, key)
             call = self.state.next_call()
             started = time.monotonic()
+            started_at = round(time.time() * 1000)
+            # Survive proxy/VM teardown while an upstream call is still pending.
+            self.state.record({"call": call, "status": "in_flight", "started_at_unix_ms": started_at})
             usage = None
             status_code = 502
             try:
@@ -217,6 +235,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 status_code = getattr(response, "status", None) or getattr(response, "code", 502)
                 content_type = response.headers.get("Content-Type", "application/json")
                 capture = ResponseUsageCapture(content_type)
+                first_byte_ms = None
                 self.send_response(status_code)
                 self.send_header("Content-Type", content_type)
                 length_header = response.headers.get("Content-Length")
@@ -228,6 +247,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     chunk = response.read1(65536) if hasattr(response, "read1") else response.read(65536)
                     if not chunk:
                         break
+                    if first_byte_ms is None:
+                        first_byte_ms = round((time.monotonic() - started) * 1000)
                     capture.feed(chunk)
                     self.wfile.write(chunk)
                     self.wfile.flush()
@@ -236,7 +257,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             finally:
                 response.close()
                 self.state.record({"call": call, "status": status_code, "duration_ms": int(
-                    (time.monotonic() - started) * 1000), **(usage or {})})
+                    (time.monotonic() - started) * 1000), "first_byte_ms": first_byte_ms,
+                    **(capture.result() or {})})
         except (ValueError, TypeError, URLError, TimeoutError):
             self._reply(502, {"error": "upstream_unavailable"})
 

@@ -28,6 +28,7 @@ from review_bot.adapters.model_http import reset_model_request_context, set_mode
 from review_bot.application.classification import classify_pr
 from review_bot.application.context import build_task_input
 from review_bot.application.delta import build_delta
+from review_bot.application.execution_metrics import ExecutionMetrics, current_execution_metrics, current_review_mode
 from review_bot.application.intent_context import IntentInputError, build_intent_task_input
 from review_bot.application.publication import PublicationAuthorizationError, publication_fingerprint, publish_review_comment
 from review_bot.application.architecture_review import run_review_a_pipeline
@@ -285,6 +286,9 @@ class WorkerLoop:
         self, run, mode, review_snap, pr_snap, classification, mode_sel, material, artifacts,
         title, body, draft, deadline, mode_lock=None,
     ) -> ExecutionReceipt:
+        metrics = current_execution_metrics.get()
+        mode_started = metrics.elapsed_ms() if metrics is not None else 0
+        mode_token = current_review_mode.set(mode)
         mode_context = self._mode_lock_context
         if mode_lock is not None:
             mode_context.lock = mode_lock
@@ -317,6 +321,9 @@ class WorkerLoop:
                     publication=self._publish_failure_notice(run, mode, review_snap, error_code, deadline, draft=draft))
             return receipt
         finally:
+            if metrics is not None:
+                metrics.mode_finished(mode, mode_started)
+            current_review_mode.reset(mode_token)
             if mode_lock is not None:
                 if mode_context.lock_held:
                     mode_lock.release()
@@ -527,6 +534,8 @@ class WorkerLoop:
         previous_github_client = self.github_client
         previous_repo_reader = self.repo_reader
         artifacts = None
+        metrics = ExecutionMetrics()
+        metrics_context = current_execution_metrics.set(metrics)
         deadline = time.monotonic() + getattr(getattr(self.config, "execution", None), "task_timeout_seconds", 3000)
         receipts: dict[str, ExecutionReceipt] = {}
         heartbeat_stop, heartbeat_thread = self._start_heartbeat(run_id)
@@ -776,13 +785,15 @@ class WorkerLoop:
                         except BaseException as exc:
                             mode_errors[mode] = exc
             for mode in mode_sel.selected_modes:
-                self._require_active(run, deadline)
+                persist_guard = (lambda: self._require_owned(run)) if parallel_receipts is not None else (
+                    lambda: self._require_active(run, deadline))
+                persist_guard()
                 if parallel_receipts is not None and mode in mode_errors:
                     continue
                 receipt = (parallel_receipts[mode] if parallel_receipts is not None else self._execute_mode(
                     run, mode, review_snap, pr_snap, classification, mode_sel, material, artifacts,
                     title, body, draft, deadline))
-                self._require_active(run, deadline)
+                persist_guard()
                 if receipt.publication is not None:
                     eligible = (receipt.execution_status in ("completed", "not_run") and receipt.publication.status == "succeeded"
                         and type(receipt.publication.comment_id) is int and receipt.publication.comment_id > 0)
@@ -792,7 +803,7 @@ class WorkerLoop:
                     try:
                         artifacts.save_receipt(receipt)
                     except (OSError, ValueError, TypeError) as exc:
-                        self._require_active(run, deadline)
+                        persist_guard()
                         receipt = replace(receipt, execution_status="failed", error_code=f"{mode}_artifact_error:{type(exc).__name__}")
                         if receipt.publication is not None:
                             receipt = replace(receipt, publication=replace(receipt.publication, input_fingerprint=None))
@@ -802,10 +813,12 @@ class WorkerLoop:
                     publication.status in ("not_attempted", "unknown")
                     or type(publication.comment_id) is int and publication.comment_id > 0
                 ):
-                    self._record_publication(run, publication, deadline)
+                    self._record_publication(run, publication, deadline,
+                        allow_past_deadline=parallel_receipts is not None)
                 receipts[mode] = receipt
                 if publication is not None and publication.reason == "publication_authorization_lost":
                     raise _CommonFailure("publication_authorization_lost")
+            self._require_active(run, deadline)
             for mode in mode_sel.selected_modes:
                 if mode in mode_errors:
                     raise mode_errors[mode]
@@ -825,11 +838,13 @@ class WorkerLoop:
                         "usage_complete": not unknown, "planning": self._partition_plan.usage if self._partition_plan else None,
                         "modes": {mode: receipt.usage for mode, receipt in receipts.items()}})
                 artifacts.finish(terminal_status.value, publication)
+                self._save_metrics(artifacts, metrics)
             stage = RunStage.PUBLISH if not failed or any(receipt.publication for receipt in failed) else None
             applied = self._update_run(run, terminal_status, stage, error=error, reason=reason)
             return applied and not failed
 
         except _RunAborted:
+            self._finish_aborted_run(run, deadline, artifacts, metrics)
             return False
 
         except Exception as exc:
@@ -844,11 +859,13 @@ class WorkerLoop:
                         if notice is not None and notice.reason == "publication_authorization_lost":
                             break
                 except _RunAborted:
+                    self._finish_aborted_run(run, deadline, artifacts, metrics)
                     return False
-            if artifacts is not None and self._active(run, deadline):
+            if artifacts is not None and self._owned(run):
                 try:
                     artifacts.manifest["error_code"] = error_code
                     artifacts.finish("failed")
+                    self._save_metrics(artifacts, metrics)
                 except (OSError, ValueError, TypeError):
                     pass
             if self._update_run(run, RunStatus.FAILED, error=error_code):
@@ -856,6 +873,7 @@ class WorkerLoop:
             return False
 
         finally:
+            current_execution_metrics.reset(metrics_context)
             with request_scope_lock:
                 request_scope_closed.set()
             reset_model_request_context(request_context)
@@ -867,7 +885,7 @@ class WorkerLoop:
             if self.repo_reader_factory is not None:
                 self.repo_reader = previous_repo_reader
 
-    def _active(self, run: RunRecord, deadline: float) -> bool:
+    def _owned(self, run: RunRecord) -> bool:
         if not self._check_fencing_and_lease(run.run_id, run.generation):
             return False
         if self.external_write_guard is not None:
@@ -876,13 +894,33 @@ class WorkerLoop:
                     return False
             except Exception:
                 return False
-        if self._stop_event.is_set():
-            self._update_run(run, RunStatus.CANCELLED, reason="worker_stopped")
-            return False
-        if time.monotonic() >= deadline:
-            self._update_run(run, RunStatus.FAILED, error="task_deadline_exceeded", reason="task_deadline_exceeded")
-            return False
         return True
+
+    def _require_owned(self, run: RunRecord) -> None:
+        if not self._owned(run):
+            raise _RunAborted
+
+    def _finish_aborted_run(self, run: RunRecord, deadline: float,
+        artifacts: RunArtifacts | None, metrics: ExecutionMetrics) -> None:
+        # Keep the lease until completed side effects have been recorded. A deadline
+        # stops new work, but must not discard a parallel mode's publication receipt.
+        if not self._owned(run):
+            return
+        stopped = self._stop_event.is_set()
+        error_code = "worker_stopped" if stopped else (
+            "task_deadline_exceeded" if time.monotonic() >= deadline else "run_aborted")
+        if artifacts is not None:
+            try:
+                artifacts.manifest["error_code"] = error_code
+                artifacts.finish("cancelled" if stopped else "failed")
+                self._save_metrics(artifacts, metrics)
+            except (OSError, ValueError, TypeError):
+                pass
+        self._update_run(run, RunStatus.CANCELLED if stopped else RunStatus.FAILED,
+            error=None if stopped else error_code, reason=error_code)
+
+    def _active(self, run: RunRecord, deadline: float) -> bool:
+        return self._owned(run) and not self._stop_event.is_set() and time.monotonic() < deadline
 
     def _require_active(self, run: RunRecord, deadline: float) -> None:
         if not self._active(run, deadline):
@@ -892,9 +930,24 @@ class WorkerLoop:
         self._require_active(run, deadline)
         if not self._update_run(run, RunStatus.RUNNING, stage):
             raise _RunAborted
+        metrics = current_execution_metrics.get()
+        if metrics is not None:
+            metrics.event(stage.value)
 
-    def _record_publication(self, run: RunRecord, receipt: PublicationReceipt, deadline: float) -> None:
-        self._require_active(run, deadline)
+    @staticmethod
+    def _save_metrics(artifacts: RunArtifacts | None, metrics: ExecutionMetrics) -> None:
+        if artifacts is not None:
+            try:
+                artifacts.write_json("execution-metrics.json", metrics.snapshot())
+            except (OSError, ValueError, TypeError):
+                logger.info("Could not persist execution metrics", exc_info=True)
+
+    def _record_publication(self, run: RunRecord, receipt: PublicationReceipt, deadline: float, *,
+        allow_past_deadline: bool = False) -> None:
+        if allow_past_deadline:
+            self._require_owned(run)
+        else:
+            self._require_active(run, deadline)
         if not self.job_store.record_publication(receipt, run.repository_id, run.pr_number,
             run_id=run.run_id, worker_id=self.worker_id, generation=run.generation):
             self._check_fencing_and_lease(run.run_id, run.generation)

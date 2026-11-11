@@ -1,6 +1,8 @@
 """Strict pi-agent review output acceptance and frozen-source citation binding."""
 from __future__ import annotations
 
+from review_bot.application.execution_metrics import agent_stage
+
 import gzip
 import hashlib
 import json
@@ -981,13 +983,14 @@ def _decode_json_file(path: Path | None) -> dict:
 
 def _run_verifier(runner, workspace: Path, claims: list[dict], meta: dict, instructions: str,
     originals: list[SourceOriginal], model: str, deadline: float | None, timeout_cap: int | None,
-    language: str) -> tuple[dict, list, dict]:
+    language: str, *, review_mode: str = "unknown", phase: str = "verify") -> tuple[dict, list, dict]:
     verifier_workspace, temporary = _verifier_workspace(workspace)
     try:
         _write_verifier_workspace(verifier_workspace, claims, meta, instructions)
         timeout = _stage_timeout(deadline, timeout_cap)
         request = AgentRunRequest("verify", verifier_workspace, _SKILLS["verify"], model, timeout)
-        response = runner.run(request)
+        with agent_stage(review_mode, phase):
+            response = runner.run(request)
         if not isinstance(response, AgentRunResponse) or response.exit_status != 0 or not response.session_id:
             raise AgentRunError("verifier_run_failed")
         session_id = response.session_id
@@ -997,10 +1000,11 @@ def _run_verifier(runner, workspace: Path, claims: list[dict], meta: dict, instr
                 body = _decode_output(response.output_path, "verify")
                 verdicts, issues = _validate_verifier_output(body, claims, originals, verify_spans)
             except (AgentOutputError, ValueError, TypeError, json.JSONDecodeError):
-                repaired = runner.repair(request, session_id,
-                    "Verifier output was invalid. Rewrite /out/result.json with exact row and field coverage, "
-                    "run node /skills/check_output.mjs until it prints OK, and reply DONE.",
-                    timeout_seconds=_stage_timeout(deadline, timeout_cap))
+                with agent_stage(review_mode, phase + "_output_repair"):
+                    repaired = runner.repair(request, session_id,
+                        "Verifier output was invalid. Rewrite /out/result.json with exact row and field coverage, "
+                        "run node /skills/check_output.mjs until it prints OK, and reply DONE.",
+                        timeout_seconds=_stage_timeout(deadline, timeout_cap))
                 if (not isinstance(repaired, AgentRunResponse) or repaired.exit_status != 0
                         or repaired.session_id not in (None, session_id)):
                     raise AgentRunError("verifier_repair_failed")
@@ -1040,7 +1044,7 @@ def _apply_agent_fact_verification(result, mode, runner, request, session_id, wo
     else:
         try:
             verdicts, issues, run_record = _run_verifier(runner, workspace, claims, meta, instructions,
-                originals, model, deadline, timeout_cap, result.language)
+                originals, model, deadline, timeout_cap, result.language, review_mode=mode)
             ledger["runs"].append(run_record)
         except AgentRunError as error:
             verdicts, issues = _all_unverified(claims, "verifier_run_failed"), []
@@ -1090,8 +1094,9 @@ def _apply_agent_fact_verification(result, mode, runner, request, session_id, wo
             "/workspace/revision_rows.json. Run node /skills/check_output.mjs --revision until it "
             "prints OK, then reply DONE.")
         try:
-            revised_response = runner.repair(request, session_id, message,
-                timeout_seconds=_stage_timeout(deadline, timeout_cap))
+            with agent_stage(mode, "revise"):
+                revised_response = runner.repair(request, session_id, message,
+                    timeout_seconds=_stage_timeout(deadline, timeout_cap))
         except AgentRunError as error:
             for entry in issue_entries:
                 entry["host_issues"].append({"reason": f"revision_run_failed:{error.code}"})
@@ -1150,7 +1155,8 @@ def _apply_agent_fact_verification(result, mode, runner, request, session_id, wo
             reverification_failure = None
             try:
                 verdicts, issues, run_record = _run_verifier(runner, workspace, revised_claims, meta,
-                    instructions, originals, model, deadline, timeout_cap, result.language)
+                    instructions, originals, model, deadline, timeout_cap, result.language,
+                    review_mode=mode, phase="reverify")
                 ledger["runs"].append(run_record)
             except AgentRunError as error:
                 verdicts, issues = _all_unverified(revised_claims, "verifier_run_failed"), []
@@ -1229,7 +1235,8 @@ def run_agent_review(task, mode: str, runner: AgentRunner, *, language: str, ins
             timeout = _stage_timeout(deadline, timeout_seconds)
             limits = _configured_limits(runner, timeout)
             request = AgentRunRequest(mode, workspace, skill_id, model, timeout)
-            response = runner.run(request)
+            with agent_stage(mode, "generate"):
+                response = runner.run(request)
             if not isinstance(response, AgentRunResponse) or response.exit_status != 0 or not response.session_id:
                 raise AgentRunError("agent_session_unavailable")
             session_id = response.session_id
@@ -1252,8 +1259,9 @@ def run_agent_review(task, mode: str, runner: AgentRunner, *, language: str, ins
                         "reason": "agent_perspective_missing"}
                         for index, identifier in enumerate(PERSPECTIVE_IDS) if identifier not in accepted_ids]
             if repair_attempted:
-                response = runner.repair(request, session_id, _repair_message(rejected_before, first_diagnostics),
-                    timeout_seconds=_stage_timeout(deadline, timeout_seconds))
+                with agent_stage(mode, "output_repair"):
+                    response = runner.repair(request, session_id, _repair_message(rejected_before, first_diagnostics),
+                        timeout_seconds=_stage_timeout(deadline, timeout_seconds))
                 if not isinstance(response, AgentRunResponse) or response.exit_status != 0:
                     raise AgentRunError("agent_repair_failed")
                 try:

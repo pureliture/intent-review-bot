@@ -81,6 +81,14 @@ The worker bootstrap reads these `user.review-bot.*` keys from LXD devlxd metada
 
 To reconcile lost jobs from the local host, run `review-bot ondemand-recover` with the same DynamoDB endpoint and table configuration as the coordinator.
 
+## Execution diagnostics
+
+Each review run writes `execution-metrics.json` beside its manifest and includes it in the on-demand job's `trace.metrics`. It contains worker stage events, per-mode wall spans, and agent session setup/invocation timings. Invocation stages distinguish generation, output repair, verification, revision, and reverification. A model call belongs to an invocation when its number is greater than `call_start` and at most `call_end` within that session.
+
+The numeric proxy ledger includes attempted calls, HTTP status, duration, response-header latency (`first_byte_ms`), input/output tokens, optional reasoning tokens, and finish reason. An `in_flight` row is merged with its completion row by call number; an interrupted attempt with no usage remains counted with unknown usage. Summed model duration includes overlapping modes and is not run wall time. Prompts, responses, API keys, and raw agent transcripts are excluded from these metrics.
+
+When the review deadline expires, completed parallel mode receipts and publication receipts are persisted before the run is marked failed with `task_deadline_exceeded`. A published mode can therefore remain completed inside a failed overall run. This persistence still requires the current lease and fencing ownership. Normal completion/deadline cleanup preserves the metrics in the job trace even after the ephemeral VM is deleted; an abrupt VM loss before finalization can still leave incomplete diagnostics.
+
 ## Security
 
 LXD guest root can read `user.*` instance config through `/dev/lxd/sock`. Never put secret values, API keys, private keys, or other credentials in LXD config or `REVIEW_BOT_INSTANCE_TAGS`. Put secret values in Secrets Manager and pass only their ARNs as metadata; use a trusted Secrets Manager-compatible endpoint reachable from the bridge. The endpoint and LocalStack should remain restricted to trusted host/guest traffic.

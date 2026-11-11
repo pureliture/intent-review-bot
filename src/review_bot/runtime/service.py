@@ -361,7 +361,7 @@ def execute_ondemand_review(config_path: str | None, job, is_current, *,
                     receipt = {}
                 record = manifest.get("modes", {}).get(mode, {})
                 publication = receipt.get("publication") or record.get("publication")
-                execution_status = receipt.get("execution_status")
+                execution_status = receipt.get("execution_status") or record.get("execution_status")
                 result_status = record.get("status")
                 if execution_status == "failed":
                     modes[mode] = "publication_failed" if (
@@ -375,7 +375,8 @@ def execute_ondemand_review(config_path: str | None, job, is_current, *,
                     modes[mode] = "failed"
                 trace_modes[mode] = {
                     "execution_status": execution_status,
-                    "error_code": receipt.get("error_code"),
+                    "error_code": receipt.get("error_code") or record.get("error_code") or (
+                        manifest.get("error_code") if modes[mode] == "failed" else None),
                     "usage": receipt.get("usage"),
                     "model_delivery": receipt.get("model_delivery"),
                     "publication": publication,
@@ -384,9 +385,14 @@ def execute_ondemand_review(config_path: str | None, job, is_current, *,
                 "run_id": run.run_id,
                 "worker_completed": completed,
                 "status": manifest.get("status"),
+                "error_code": manifest.get("error_code"),
                 "selected_modes": sorted(selected),
                 "modes": trace_modes,
             }
+            try:
+                trace["metrics"] = json.loads((artifact_path / "execution-metrics.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                trace["metrics"] = None
             return modes, trace
     finally:
         if previous is None:

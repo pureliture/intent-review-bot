@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from glob import glob
 from importlib.resources import files
 from pathlib import Path
@@ -25,6 +25,7 @@ from review_bot.application.agent_review import (
     agent_skill_path,
     agent_skills_dir,
 )
+from review_bot.application.execution_metrics import current_agent_stage, current_execution_metrics
 from review_bot.config import AgentEngineConfig
 from review_bot.ports import (
     AgentRunError,
@@ -147,6 +148,8 @@ class _ActiveRun:
     started: float
     deadline: float
     session_jsonl: bytes = b""
+    invocations: list[dict] = field(default_factory=list)
+    setup_duration_ms: int = 0
 
 
 class DockerPiAgentRunner:
@@ -310,6 +313,7 @@ class DockerPiAgentRunner:
     @staticmethod
     def _proxy_usage(ledger_path: Path, session: bytes = b"") -> dict[str, Any]:
         calls = []
+        by_call = {}
         if ledger_path.is_file():
             for line in ledger_path.read_text(encoding="utf-8").splitlines():
                 try:
@@ -317,7 +321,14 @@ class DockerPiAgentRunner:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(row, dict):
-                    calls.append(row)
+                    number = row.get("call")
+                    if type(number) is int:
+                        if number not in by_call:
+                            by_call[number] = {}
+                            calls.append(by_call[number])
+                        by_call[number].update(row)
+                    else:
+                        calls.append(row)
         input_tokens = output_tokens = total_tokens = unknown = 0
         cost: dict[str, float] = {}
         for row in calls:
@@ -349,6 +360,7 @@ class DockerPiAgentRunner:
         return result
 
     def _start(self, request: AgentRunRequest) -> tuple[str, _ActiveRun]:
+        setup_started = time.monotonic()
         allowed_skills = {
             "architecture": "review-architecture",
             "intent": "review-intent",
@@ -445,6 +457,7 @@ class DockerPiAgentRunner:
                 config_temporary, session_temporary, skills_temporary, output_temporary,
                 now, now + max(1, request.timeout_seconds),
             )
+            run.setup_duration_ms = round((now - setup_started) * 1000)
             return suffix, run
         except Exception:
             try:
@@ -457,6 +470,27 @@ class DockerPiAgentRunner:
             raise
 
     def _invoke(self, run: _ActiveRun, prompt: str, session_id: str | None) -> AgentRunResponse:
+        started = time.monotonic()
+        status = "succeeded"
+        call_start = self._last_call(run)
+        try:
+            return self._invoke_agent(run, prompt, session_id)
+        except AgentRunError as error:
+            status = error.code
+            raise
+        finally:
+            run.invocations.append({"resumed": session_id is not None, "status": status,
+                **(current_agent_stage.get() or {"review_mode": run.request.mode, "stage": "unknown"}),
+                "call_start": call_start, "call_end": self._last_call(run),
+                "start_ms": round((started - run.started) * 1000),
+                "duration_ms": round((time.monotonic() - started) * 1000)})
+
+    def _last_call(self, run: _ActiveRun) -> int:
+        with suppress(OSError):
+            return max((row.get("call", 0) for row in self._proxy_usage(run.ledger_path)["calls"]), default=0)
+        return 0
+
+    def _invoke_agent(self, run: _ActiveRun, prompt: str, session_id: str | None) -> AgentRunResponse:
         remaining = run.deadline - time.monotonic()
         if remaining <= 0:
             raise AgentRunError("timeout")
@@ -507,6 +541,7 @@ class DockerPiAgentRunner:
                 try:
                     self._cleanup_names(run.agent_name, run.proxy_name, run.network, run.egress_network)
                 finally:
+                    self._capture_metrics(run, "failed")
                     run.config_temporary.cleanup()
                     run.session_temporary.cleanup()
                     run.skills_temporary.cleanup()
@@ -517,6 +552,7 @@ class DockerPiAgentRunner:
                 try:
                     self._cleanup_names(run.agent_name, run.proxy_name, run.network, run.egress_network)
                 finally:
+                    self._capture_metrics(run, "failed")
                     run.config_temporary.cleanup()
                     run.session_temporary.cleanup()
                     run.skills_temporary.cleanup()
@@ -549,10 +585,26 @@ class DockerPiAgentRunner:
             return AgentRunFinalization(session, usage, self._agent_reported_usage(session),
                 str(run.ledger_path), duration_ms)
         finally:
+            self._capture_metrics(run, "finished")
             run.config_temporary.cleanup()
             run.session_temporary.cleanup()
             run.skills_temporary.cleanup()
             run.output_temporary.cleanup()
+
+    def _capture_metrics(self, run: _ActiveRun, status: str) -> None:
+        metrics = current_execution_metrics.get()
+        if metrics is None:
+            return
+        # Diagnostics must not change review/cleanup outcomes. Read after proxy
+        # teardown so failed/timed-out sessions are included as well as successes.
+        with suppress(OSError, ValueError, TypeError):
+            usage = self._proxy_usage(run.ledger_path, run.session_jsonl)
+            metrics.agent_session({"mode": run.request.mode, "skill_id": run.request.skill_id,
+                "model": run.request.model, "status": status,
+                "setup_duration_ms": getattr(run, "setup_duration_ms", 0),
+                "start_ms": max(0, metrics.elapsed_ms() - round((time.monotonic() - run.started) * 1000)),
+                "duration_ms": round((time.monotonic() - run.started) * 1000),
+                "invocations": getattr(run, "invocations", []), "usage": usage})
 
     def _cleanup_names(self, agent_name: str, proxy_name: str, network: str, egress_network: str) -> None:
         failures = []

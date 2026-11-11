@@ -179,4 +179,17 @@ def test_proxy_extracts_opencode_go_usage():
         "prompt_tokens": 23, "completion_tokens": 7, "total_tokens": 30,
         "cost": {"total": 0, "list_cost": 0, "allowance": 0},
         "billing_source": "go",
+        "reasoning_tokens": 4,
     }
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_proxy_preserves_reasoning_tokens_and_length_stop_without_response_text(stream):
+    proxy = _proxy_module()
+    payload = {"choices": [{"finish_reason": "length", "message": {"content": "private response"}}],
+        "usage": {"completion_tokens": 100, "completion_tokens_details": {"reasoning_tokens": 80}}}
+    capture = proxy.ResponseUsageCapture("text/event-stream" if stream else "application/json")
+    raw = json.dumps(payload).encode()
+    capture.feed(b"data: " + raw + b"\n\n" if stream else raw)
+    assert capture.result() == {"completion_tokens": 100, "reasoning_tokens": 80, "finish_reason": "length"}
+    assert "private response" not in json.dumps(capture.result())

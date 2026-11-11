@@ -229,6 +229,10 @@ def test_initial_agent_prompt_scopes_searches(tmp_path, monkeypatch, mode, skill
 
 
 def test_docker_runner_maps_timeout_to_agent_error_and_cleans_up(tmp_path, monkeypatch):
+    from review_bot.application.execution_metrics import ExecutionMetrics, agent_stage
+
+    metrics = ExecutionMetrics()
+    monkeypatch.setattr(pi_agent_docker, "current_execution_metrics", SimpleNamespace(get=lambda: metrics))
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
@@ -236,20 +240,45 @@ def test_docker_runner_maps_timeout_to_agent_error_and_cleans_up(tmp_path, monke
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
+        for argument in argv:
+            if ":/ledger:rw" in argument:
+                (Path(argument.split(":/ledger:rw")[0]) / "usage.jsonl").write_text(
+                    '{"call":1,"status":"in_flight","started_at_unix_ms":1000}\n')
         if "review-bot-pi-agent:0.73.1" in argv:
             raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     runner = DockerPiAgentRunner(AgentEngineConfig())
-    with pytest.raises(AgentRunError, match="timeout"):
+    with agent_stage("intent", "generate"), pytest.raises(AgentRunError, match="timeout"):
         runner.run(AgentRunRequest("intent", workspace, "review-intent", "stealth/crouton-alpha", 1))
+    snapshot = metrics.snapshot()
+    assert snapshot["model_calls"] == 1 and snapshot["unknown_usage_calls"] == 1
+    invocation = snapshot["agent_sessions"][0]["invocations"][0]
+    assert invocation["stage"] == "generate" and invocation["review_mode"] == "intent"
+    assert invocation["status"] == "timeout" and invocation["call_end"] == 1
+    assert "test-only-secret" not in json.dumps(snapshot)
     assert any(argv[1:3] == ["network", "rm"] for argv in calls)
     created_egress_networks = {argv[-1] for argv in calls
         if argv[1:3] == ["network", "create"] and argv[-1].startswith("review-agent-egress-")}
     removed_egress_networks = {argv[-1] for argv in calls
         if argv[1:3] == ["network", "rm"] and argv[-1].startswith("review-agent-egress-")}
     assert created_egress_networks == removed_egress_networks
+
+
+def test_proxy_usage_counts_attempts_once_and_keeps_unfinished_calls_unknown(tmp_path):
+    ledger = tmp_path / "usage.jsonl"
+    ledger.write_text(
+        '{"call":1,"status":"in_flight","started_at_unix_ms":1000}\n'
+        '{"call":1,"status":200,"duration_ms":1500,"prompt_tokens":30,"completion_tokens":45}\n'
+        '{"call":2,"status":"in_flight","started_at_unix_ms":2500}\n'
+        '{"call":')  # An interrupted append must not erase the completed attempt.
+    usage = DockerPiAgentRunner._proxy_usage(ledger)
+    assert usage["model_calls"] == 2 and usage["unknown_usage_attempts"] == 1
+    assert usage["input_tokens"] == 30 and usage["output_tokens"] == 45
+    assert usage["usage_complete"] is False
+    assert usage["calls"][0]["started_at_unix_ms"] == 1000
+    assert usage["calls"][0]["duration_ms"] == 1500
 
 
 def test_docker_runner_fails_closed_when_egress_network_creation_fails(tmp_path, monkeypatch):
