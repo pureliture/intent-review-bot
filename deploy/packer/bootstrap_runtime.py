@@ -62,7 +62,10 @@ def render_operator_config(
     provider: str = _DEFAULT_PROVIDER,
     model_id: str = _DEFAULT_MODEL_ID,
     context_window_tokens: int | None = None,
+    profile: str = "fast",
 ) -> str:
+    if profile not in {"fast", "deep"}:
+        raise ValueError("invalid_agent_profile")
     context_window = (
         f"  context_window_tokens: {context_window_tokens}\n"
         if context_window_tokens is not None
@@ -115,11 +118,11 @@ model:
   max_attempts: 1
 review_engine: agent
 agent_engine:
+  profile: {profile}
   image_tag: review-bot-pi-agent:0.73.1
   provider: {provider}
   model_id: {model_id}
-{context_window}  max_proxy_calls: 40
-  session_store_dir: /var/lib/review-bot/agent-sessions
+{context_window}  session_store_dir: /var/lib/review-bot/agent-sessions
 architecture:
   review_type: A
   analysis_profile: java21-jdk-only-v1
@@ -200,6 +203,7 @@ def main() -> None:
         provider=provider,
         model_id=model_id,
         context_window_tokens=context_window_tokens,
+        profile=os.environ.get("REVIEW_BOT_AGENT_PROFILE") or "fast",
     )
     config_path = Path("/etc/review-bot/operator.yaml")
     config_path.write_text(config, encoding="utf-8")

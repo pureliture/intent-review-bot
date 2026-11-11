@@ -59,6 +59,16 @@ variable "max_vm_seconds" {
   }
 }
 
+variable "agent_profile" {
+  description = "Default bounded fast review or opt-in deep review for on-demand workers."
+  type        = string
+  default     = "fast"
+  validation {
+    condition     = contains(["fast", "deep"], var.agent_profile)
+    error_message = "agent_profile must be fast or deep."
+  }
+}
+
 variable "agent_provider" {
   description = "Agent model provider configured for on-demand workers."
   type        = string

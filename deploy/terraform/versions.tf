@@ -27,6 +27,7 @@ locals {
   agent_instance_tags = merge(
     {
       "review-bot:agent-provider" = var.agent_provider
+      "review-bot:agent-profile"  = var.agent_profile
       "review-bot:agent-model-id" = var.agent_model_id
     },
     var.agent_context_window_tokens == null ? {} : {

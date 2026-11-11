@@ -211,7 +211,7 @@ class DockerPiAgentRunner:
             "--session-dir", "/sessions",
             "--tools", "read,grep,find,ls,bash",
             "--no-extensions", "--no-context-files", "--no-prompt-templates", "--no-themes",
-            "--thinking", "medium",
+            "--thinking", self.config.thinking_level,
         ]
         if session_id is not None:
             argv.extend(["--session", session_id])
@@ -235,6 +235,8 @@ class DockerPiAgentRunner:
         ]
         if self.config.max_output_tokens is not None:
             argv.extend(["--env", f"MAX_OUTPUT_TOKENS={self.config.max_output_tokens}"])
+        if self.config.max_total_output_tokens is not None:
+            argv.extend(["--env", f"MAX_TOTAL_OUTPUT_TOKENS={self.config.max_total_output_tokens}"])
         argv.extend(["--env", "USAGE_LEDGER_PATH=/ledger/usage.jsonl", image_tag])
         return argv
 
@@ -414,6 +416,16 @@ class DockerPiAgentRunner:
             model_config = {
                 "id": request.model, "name": request.model, "reasoning": True,
             }
+            # The localhost relay masks the real provider URL from pi's auto-detection.
+            # Restore the native reasoning format instead of sending an ignored effort.
+            if self.config.provider == "openrouter":
+                model_config["compat"] = {"thinkingFormat": "openrouter"}
+            elif request.model in {"mimo-v2.6-flash", "mimo-v2.6-pro"}:
+                # Go translates the standard effort field; native thinking.type alone
+                # is ignored by that gateway. A wire probe confirmed none disables it.
+                model_config["compat"] = {"thinkingFormat": "openai",
+                    "requiresReasoningContentOnAssistantMessages": True}
+                model_config["thinkingLevelMap"] = {"off": "none"}
             if self.config.max_output_tokens is not None:
                 model_config["maxTokens"] = self.config.max_output_tokens
             if self.config.context_window_tokens is not None:
@@ -455,7 +467,7 @@ class DockerPiAgentRunner:
                 network, egress_network, proxy_name, agent_name, config_dir, session_dir, ledger_path, ledger_dir,
                 request, request.workspace_dir.resolve(), skills_dir.resolve(), output_dir,
                 config_temporary, session_temporary, skills_temporary, output_temporary,
-                now, now + max(1, request.timeout_seconds),
+                now, setup_started + max(1, request.timeout_seconds),
             )
             run.setup_duration_ms = round((now - setup_started) * 1000)
             return suffix, run
@@ -532,7 +544,8 @@ class DockerPiAgentRunner:
     def run(self, request: AgentRunRequest) -> AgentRunResponse:
         try:
             _, run = self._start(request)
-            response = self._invoke(run, _initial_agent_prompt(request.mode), None)
+            response = self._invoke(run, _initial_agent_prompt(request.mode,
+                fast=self.config.profile == "fast", workspace_dir=request.workspace_dir), None)
             with self._active_runs_lock:
                 self._active_runs[response.session_id] = run
             return response

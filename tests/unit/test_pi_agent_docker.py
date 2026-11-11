@@ -32,6 +32,30 @@ def test_proxy_image_tag_is_stable():
     assert proxy_image_tag() == tag
 
 
+@pytest.mark.parametrize("profile, expected", [("fast", "off"), ("deep", "medium")])
+def test_go_mimo_reasoning_configuration_survives_the_local_proxy(tmp_path, monkeypatch, profile, expected):
+    monkeypatch.setenv("OPENCODE_API_KEY", "test-only-secret")
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        if "review-bot-pi-agent:0.73.1" in argv:
+            mount = next(arg for arg in argv if arg.endswith(":/agent/models.json:ro"))
+            models = json.loads(Path(mount.split(":/agent/models.json:ro")[0]).read_text())
+            captured.update(models["providers"]["llmproxy"]["models"][0])
+            assert argv[argv.index("--thinking") + 1] == expected
+            return subprocess.CompletedProcess(argv, 1, "", "agent failed")
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = DockerPiAgentRunner(AgentEngineConfig(profile=profile, provider="opencode-go",
+        model_id="mimo-v2.6-flash", session_store_dir=str(tmp_path / "sessions")))
+    with pytest.raises(AgentRunError, match="agent_crashed"):
+        runner.run(AgentRunRequest("architecture", tmp_path, "review-architecture", "mimo-v2.6-flash", 10))
+    assert captured["compat"] == {"thinkingFormat": "openai",
+        "requiresReasoningContentOnAssistantMessages": True}
+    assert captured["thinkingLevelMap"] == {"off": "none"}
+
+
 def test_proxy_image_tag_changes_when_llm_proxy_changes(tmp_path, monkeypatch):
     inputs = []
     for name, source in pi_agent_docker._proxy_build_inputs():
@@ -142,7 +166,7 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
             model = models["providers"]["llmproxy"]["models"][0]
             assert model["id"] == "stealth/crouton-alpha"
             assert "contextWindow" not in model
-            assert "maxTokens" not in model
+            assert model["maxTokens"] == 4096
             assert any(item.endswith(":/agent/models.json:ro") for item in argv)
             assert any(item.startswith("/agent:rw,") for index, item in enumerate(argv)
                 if index > 0 and argv[index - 1] == "--tmpfs")
@@ -192,7 +216,10 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
     assert proxy_network.startswith("review-agent-egress-")
     assert proxy_network != "bridge"
     assert "UPSTREAM_API_KEY" in proxy
-    assert not any(arg.startswith("MAX_OUTPUT_TOKENS=") for arg in proxy)
+    assert "MAX_OUTPUT_TOKENS=4096" in proxy
+    assert "MAX_TOTAL_OUTPUT_TOKENS=12000" in proxy
+    assert "MAX_PROXY_CALLS=16" in proxy
+    assert agent[agent.index("--thinking") + 1] == "off"
     assert not any(arg.startswith("UPSTREAM_API_KEY=") for arg in proxy)
     assert "PROVIDER=openrouter" in proxy
     assert not any("OPENROUTER_API_KEY" in argument for argument in proxy)
@@ -224,7 +251,7 @@ def test_initial_agent_prompt_scopes_searches(tmp_path, monkeypatch, mode, skill
     with pytest.raises(AgentRunError, match="agent_crashed"):
         runner.run(AgentRunRequest(mode, workspace, skill_id, "model-id", 10))
 
-    assert prompts == [_initial_agent_prompt(mode)]
+    assert prompts == [_initial_agent_prompt(mode, fast=True)]
     assert _SEARCH_SCOPE_RULE in prompts[0]
 
 

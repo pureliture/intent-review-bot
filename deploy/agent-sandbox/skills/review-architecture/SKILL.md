@@ -2,12 +2,12 @@
 
 Read `/workspace/CONTRACT.md` and `/workspace/contract.json` first.
 
-Review the architecture of the changed code by comparing files under `/workspace/head/` with `/workspace/base/`, independent of what `PR.md` says the change is for. Check every changed file for:
+Review the architecture of the changed code by comparing files under `/workspace/head/` with `/workspace/base/`, independent of what `PR.md` says the change is for. Follow the review profile in `CONTRACT.md`: fast prioritizes the highest-impact changed code and reports at most three findings; deep checks every changed file. Check for:
 - duplicated logic across files or methods (whether or not CPD reported it),
 - global or shared mutable state,
 - dependency direction and layering (for example domain code depending on infrastructure),
 - complexity and nesting, including conditions that can never be true or branches that can never run,
-- each static-analysis target in `signals.json`: say whether it is a real problem in the changed code.
+- static-analysis targets in `signals.json`: prioritize relevant signals in fast; check every target in deep.
 
 Report one finding per distinct defect. Do not split one defect into several findings or repeat it under different wording. Use basis `analysis_signal` with the target ID for a finding about a `signals.json` target, and basis `observed_structure` with empty `target_ids` for a defect that no target covers. Do not report intent or requirement mismatches; another reviewer handles those.
 

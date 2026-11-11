@@ -76,7 +76,7 @@ export REVIEW_BOT_JOB_TABLE=review-jobs
 The worker bootstrap reads these `user.review-bot.*` keys from LXD devlxd metadata:
 
 - Required: `job-id`, `vm-id`, `max-lifetime-seconds`, `region`, `github-app-secret-arn`, `openrouter-secret-arn`, and `job-table`.
-- Optional: `aws-endpoint-url`, `agent-provider`, `agent-model-id`, and `agent-context-window-tokens`.
+- Optional: `aws-endpoint-url`, `agent-provider`, `agent-model-id`, `agent-context-window-tokens`, and `agent-profile` (`fast` by default; `deep` for broader review).
 - The host launcher supplies `managed`, `job-id`, `vm-id`, and `max-lifetime-seconds`; configure the remaining values through `REVIEW_BOT_INSTANCE_TAGS`.
 
 To reconcile lost jobs from the local host, run `review-bot ondemand-recover` with the same DynamoDB endpoint and table configuration as the coordinator.

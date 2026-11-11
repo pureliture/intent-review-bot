@@ -28,12 +28,27 @@ def test_render_operator_config_uses_current_timeouts_and_provider_settings():
     config, _ = load_review_config_from_str(rendered)
     assert config.execution.task_timeout_seconds == 3000
     assert config.agent_engine.timeout_seconds is None
-    assert config.agent_engine.max_output_tokens is None
+    assert config.agent_engine.max_output_tokens == 4096
+    assert config.agent_engine.profile == "fast"
+    assert config.agent_engine.max_proxy_calls == 16
+    assert config.agent_engine.max_revisions == 0
     assert config.agent_engine.provider == "opencode-go"
     assert config.agent_engine.model_id == "openai/gpt-4.1-mini"
     assert config.agent_engine.context_window_tokens == 8192
     assert "timeout_seconds: 900" not in rendered
     assert "max_output_tokens: 4096" not in rendered
+
+
+def test_render_operator_config_supports_opt_in_deep_profile():
+    module = load_bootstrap_runtime()
+    config, _ = load_review_config_from_str(module.render_operator_config("sha256:" + "a" * 64,
+        profile="deep"))
+    assert config.agent_engine.profile == "deep"
+    assert config.agent_engine.max_proxy_calls == 40
+    assert config.agent_engine.max_output_tokens is None
+    assert config.agent_engine.max_revisions == 1
+    with pytest.raises(ValueError, match="invalid_agent_profile"):
+        module.render_operator_config("sha256:" + "a" * 64, profile="other")
 
 
 def test_render_operator_config_defaults_agent_provider_and_omits_context_window():

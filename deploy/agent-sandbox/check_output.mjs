@@ -268,6 +268,12 @@ function checkIntent(result, contract) {
       checkAssessment(assessment, [...at, "assessments", assessmentIndex], contract, seenItems);
     });
   });
+  if (Number.isInteger(contract.max_items.total_review_items)
+      && (result.questions?.length ?? 0) + result.perspectives.reduce(
+        (count, perspective) => count + (perspective?.assessments?.length ?? 0), 0)
+      > contract.max_items.total_review_items) {
+    error(["perspectives"], "agent_output_too_many_items");
+  }
 }
 
 function checkVerify(result, contract) {

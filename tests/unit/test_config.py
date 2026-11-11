@@ -42,7 +42,13 @@ def test_agent_engine_config_is_opt_in_and_strict(valid_config_yaml: str) -> Non
     assert config.agent_engine.model_id == "stealth/crouton-alpha"
     assert config.agent_engine.provider == "openrouter"
     assert config.agent_engine.context_window_tokens is None
-    assert config.agent_engine.max_output_tokens is None
+    assert config.agent_engine.max_output_tokens == 4096
+    assert config.agent_engine.profile == "fast"
+    assert config.agent_engine.thinking_level == "off"
+    assert config.agent_engine.max_proxy_calls == 16
+    assert config.agent_engine.max_total_output_tokens == 12000
+    assert config.agent_engine.max_mode_seconds == 240
+    assert config.agent_engine.max_revisions == 0
     assert config.agent_engine.timeout_seconds is None
     assert config.agent_engine.parallel_modes is True
 
@@ -80,6 +86,25 @@ def test_agent_engine_config_is_opt_in_and_strict(valid_config_yaml: str) -> Non
 def test_agent_and_task_timeout_defaults() -> None:
     assert AgentEngineConfig().timeout_seconds is None
     assert ExecutionConfig(available_modes=["architecture"]).task_timeout_seconds == 3000
+
+
+def test_deep_profile_preserves_the_previous_review_policy():
+    deep = AgentEngineConfig(profile="deep")
+    assert deep.max_proxy_calls == 40
+    assert deep.max_revisions == 1
+    assert deep.max_output_tokens is deep.max_total_output_tokens is deep.max_mode_seconds is None
+    assert deep.thinking_level == "medium"
+    tuned = AgentEngineConfig(profile="deep", max_proxy_calls=15, max_revisions=2,
+        max_mode_seconds=600, max_total_output_tokens=20000, thinking_level="low")
+    assert tuned.max_proxy_calls == 15 and tuned.max_revisions == 2
+    assert tuned.max_mode_seconds == 600 and tuned.thinking_level == "low"
+
+
+@pytest.mark.parametrize("settings", [{"profile": "instant"}, {"thinking_level": "unlimited"},
+    {"max_mode_seconds": 0}, {"max_total_output_tokens": 0}])
+def test_invalid_review_profile_settings_are_rejected(settings):
+    with pytest.raises(ValueError):
+        AgentEngineConfig(**settings)
 
 
 def test_load_example_config_from_file() -> None:
