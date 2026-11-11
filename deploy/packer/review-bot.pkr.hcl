@@ -169,6 +169,7 @@ build {
       "install -m 0644 /tmp/review-bot-bootstrap-runtime.py /opt/review-bot/bootstrap_runtime.py",
       "ln -s /opt/review-bot/venv/bin/review-bot-ondemand /opt/review-bot/bin/review-bot-ondemand",
       "install -m 0644 /tmp/review-bot-bootstrap.service /etc/systemd/system/review-bot-bootstrap.service",
+      "chmod -R a+rX /tmp/review-bot-source",
       "cd /tmp/review-bot-source",
       "rm -rf dist",
       "mkdir -p dist",
