@@ -149,7 +149,7 @@ build {
       "apt-get install -y --no-install-recommends ca-certificates curl dbus-user-session docker-ce docker-ce-cli docker-ce-rootless-extras containerd.io fuse-overlayfs openjdk-21-jdk-headless python3 python3-pip python3-venv slirp4netns uidmap",
       "systemctl disable --now docker.socket docker.service",
       "systemctl stop docker.socket docker.service",
-      "! systemctl is-active --quiet docker.socket && ! systemctl is-active --quiet docker.service",
+      "if systemctl is-active --quiet docker.socket || systemctl is-active --quiet docker.service; then echo 'rootful Docker still active' >&2; exit 1; fi",
       "useradd --uid 1001 --create-home --shell /bin/bash --groups docker reviewbot",
       "grep -q '^reviewbot:' /etc/subuid || echo 'reviewbot:100000:65536' >> /etc/subuid",
       "grep -q '^reviewbot:' /etc/subgid || echo 'reviewbot:100000:65536' >> /etc/subgid",
