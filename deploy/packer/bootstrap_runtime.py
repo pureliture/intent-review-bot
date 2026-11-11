@@ -14,6 +14,7 @@ import boto3
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]*$")
 _DEFAULT_PROVIDER = "openrouter"
 _DEFAULT_MODEL_ID = "stealth/crouton-alpha"
+_DEFAULT_PROFILE = "deep"
 
 
 def write_private(path: Path, value: str) -> None:
@@ -62,7 +63,7 @@ def render_operator_config(
     provider: str = _DEFAULT_PROVIDER,
     model_id: str = _DEFAULT_MODEL_ID,
     context_window_tokens: int | None = None,
-    profile: str = "fast",
+    profile: str = _DEFAULT_PROFILE,
 ) -> str:
     if profile not in {"fast", "deep"}:
         raise ValueError("invalid_agent_profile")
@@ -203,7 +204,7 @@ def main() -> None:
         provider=provider,
         model_id=model_id,
         context_window_tokens=context_window_tokens,
-        profile=os.environ.get("REVIEW_BOT_AGENT_PROFILE") or "fast",
+        profile=os.environ.get("REVIEW_BOT_AGENT_PROFILE") or _DEFAULT_PROFILE,
     )
     config_path = Path("/etc/review-bot/operator.yaml")
     config_path.write_text(config, encoding="utf-8")

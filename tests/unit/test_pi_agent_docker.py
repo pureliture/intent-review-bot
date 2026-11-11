@@ -145,7 +145,8 @@ def test_docker_runner_tracks_concurrent_sessions_safely(tmp_path, monkeypatch):
     assert runner._active_runs == {}
 
 
-def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monkeypatch):
+@pytest.mark.parametrize("profile", [None, "fast"])
+def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monkeypatch, profile):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
@@ -166,7 +167,10 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
             model = models["providers"]["llmproxy"]["models"][0]
             assert model["id"] == "stealth/crouton-alpha"
             assert "contextWindow" not in model
-            assert model["maxTokens"] == 4096
+            if profile == "fast":
+                assert model["maxTokens"] == 4096
+            else:
+                assert "maxTokens" not in model
             assert any(item.endswith(":/agent/models.json:ro") for item in argv)
             assert any(item.startswith("/agent:rw,") for index, item in enumerate(argv)
                 if index > 0 and argv[index - 1] == "--tmpfs")
@@ -179,7 +183,8 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
         return subprocess.CompletedProcess(argv, 0, "ok", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    runner = DockerPiAgentRunner(AgentEngineConfig(session_store_dir=str(tmp_path / "sessions")))
+    settings = {"profile": profile} if profile is not None else {}
+    runner = DockerPiAgentRunner(AgentEngineConfig(session_store_dir=str(tmp_path / "sessions"), **settings))
     with pytest.raises(AgentRunError, match="agent_crashed"):
         runner.run(AgentRunRequest("architecture", workspace, "review-architecture",
             "stealth/crouton-alpha", 10))
@@ -216,10 +221,15 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
     assert proxy_network.startswith("review-agent-egress-")
     assert proxy_network != "bridge"
     assert "UPSTREAM_API_KEY" in proxy
-    assert "MAX_OUTPUT_TOKENS=4096" in proxy
-    assert "MAX_TOTAL_OUTPUT_TOKENS=12000" in proxy
-    assert "MAX_PROXY_CALLS=16" in proxy
-    assert agent[agent.index("--thinking") + 1] == "off"
+    if profile == "fast":
+        assert "MAX_OUTPUT_TOKENS=4096" in proxy
+        assert "MAX_TOTAL_OUTPUT_TOKENS=12000" in proxy
+        assert "MAX_PROXY_CALLS=16" in proxy
+        assert agent[agent.index("--thinking") + 1] == "off"
+    else:
+        assert not any(arg.startswith(("MAX_OUTPUT_TOKENS=", "MAX_TOTAL_OUTPUT_TOKENS=")) for arg in proxy)
+        assert "MAX_PROXY_CALLS=40" in proxy
+        assert agent[agent.index("--thinking") + 1] == "medium"
     assert not any(arg.startswith("UPSTREAM_API_KEY=") for arg in proxy)
     assert "PROVIDER=openrouter" in proxy
     assert not any("OPENROUTER_API_KEY" in argument for argument in proxy)
@@ -234,7 +244,8 @@ def test_docker_runner_hardens_agent_and_tears_down_after_failure(tmp_path, monk
     ("architecture", "review-architecture"),
     ("verify", "verify-claims"),
 ])
-def test_initial_agent_prompt_scopes_searches(tmp_path, monkeypatch, mode, skill_id):
+@pytest.mark.parametrize("profile", [None, "fast"])
+def test_initial_agent_prompt_scopes_searches(tmp_path, monkeypatch, mode, skill_id, profile):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-only-secret")
@@ -247,11 +258,11 @@ def test_initial_agent_prompt_scopes_searches(tmp_path, monkeypatch, mode, skill
         return subprocess.CompletedProcess(argv, 0, "ok", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    runner = DockerPiAgentRunner(AgentEngineConfig())
+    runner = DockerPiAgentRunner(AgentEngineConfig(**({"profile": profile} if profile is not None else {})))
     with pytest.raises(AgentRunError, match="agent_crashed"):
         runner.run(AgentRunRequest(mode, workspace, skill_id, "model-id", 10))
 
-    assert prompts == [_initial_agent_prompt(mode, fast=True)]
+    assert prompts == [_initial_agent_prompt(mode, fast=profile == "fast")]
     assert _SEARCH_SCOPE_RULE in prompts[0]
 
 

@@ -28,10 +28,13 @@ def test_render_operator_config_uses_current_timeouts_and_provider_settings():
     config, _ = load_review_config_from_str(rendered)
     assert config.execution.task_timeout_seconds == 3000
     assert config.agent_engine.timeout_seconds is None
-    assert config.agent_engine.max_output_tokens == 4096
-    assert config.agent_engine.profile == "fast"
-    assert config.agent_engine.max_proxy_calls == 16
-    assert config.agent_engine.max_revisions == 0
+    assert config.agent_engine.max_output_tokens is None
+    assert config.agent_engine.profile == "deep"
+    assert config.agent_engine.max_proxy_calls == 40
+    assert config.agent_engine.max_revisions == 1
+    assert config.agent_engine.thinking_level == "medium"
+    assert config.agent_engine.max_mode_seconds is None
+    assert config.agent_engine.max_total_output_tokens is None
     assert config.agent_engine.provider == "opencode-go"
     assert config.agent_engine.model_id == "openai/gpt-4.1-mini"
     assert config.agent_engine.context_window_tokens == 8192
@@ -39,14 +42,16 @@ def test_render_operator_config_uses_current_timeouts_and_provider_settings():
     assert "max_output_tokens: 4096" not in rendered
 
 
-def test_render_operator_config_supports_opt_in_deep_profile():
+@pytest.mark.parametrize("profile, calls, output_tokens, revisions", [
+    ("deep", 40, None, 1), ("fast", 16, 4096, 0)])
+def test_render_operator_config_supports_explicit_review_profiles(profile, calls, output_tokens, revisions):
     module = load_bootstrap_runtime()
     config, _ = load_review_config_from_str(module.render_operator_config("sha256:" + "a" * 64,
-        profile="deep"))
-    assert config.agent_engine.profile == "deep"
-    assert config.agent_engine.max_proxy_calls == 40
-    assert config.agent_engine.max_output_tokens is None
-    assert config.agent_engine.max_revisions == 1
+        profile=profile))
+    assert config.agent_engine.profile == profile
+    assert config.agent_engine.max_proxy_calls == calls
+    assert config.agent_engine.max_output_tokens == output_tokens
+    assert config.agent_engine.max_revisions == revisions
     with pytest.raises(ValueError, match="invalid_agent_profile"):
         module.render_operator_config("sha256:" + "a" * 64, profile="other")
 

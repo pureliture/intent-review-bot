@@ -13,7 +13,12 @@ per-run internal network.
 
 ## Review profiles
 
-The agent engine now defaults to `agent_engine.profile: fast`. A fast review
+The agent engine defaults to `agent_engine.profile: deep` to prioritize review
+coverage and quality. Deep reviews retain generation, independent verification,
+revision and reverification, with medium thinking and no three-item fast cap.
+Omitting the profile selects deep, including in generated worker configuration.
+
+An explicitly selected `agent_engine.profile: fast` review
 prioritizes changed code and direct dependencies, selects at most three findings
 or three intent assessments/questions per mode, and independently verifies the
 summary and selected items once. Unverified claims remain a partial review;
@@ -39,12 +44,12 @@ receive one format-repair invocation within the same session budget. A/B still
 run concurrently by default and share the outer task deadline. Setup/static
 analysis/publication time is additional; 240 seconds is not an end-to-end SLA.
 
-Select the broader review explicitly in the trusted operator configuration:
+Select the bounded first pass explicitly in the trusted operator configuration:
 
 ```yaml
 review_engine: agent
 agent_engine:
-  profile: deep
+  profile: fast
 ```
 
 `deep` retains the previous generation, independent verification, revision and
@@ -52,9 +57,10 @@ reverification policy. Profile defaults can be tuned by trusted operators throug
 `thinking_level`, `max_mode_seconds`, `max_proxy_calls`, `max_output_tokens`,
 `max_total_output_tokens`, and `max_revisions`. Fast always disables semantic
 revisions and caps result items at three, even if a revision override is supplied.
-To keep a previously configured deployment bounded, remove old explicit budget
-overrides or set the values in the table; explicit operator values override
-profile defaults. The legacy partition engine is unaffected.
+Explicit operator values override profile defaults. Deployments with an explicit
+`profile: fast` remain fast; select deep or remove that setting to use the default.
+Remove any old fast budget overrides when switching to deep if its defaults are
+desired. The legacy partition engine is unaffected.
 
 The published comment identifies the profile and bounded scope. Artifacts record
 the policy in result identity, and generation cache keys include profile/budget
@@ -70,10 +76,10 @@ initial prompt. This avoids model calls spent rediscovering the input files.
 OpenCode Go MiMo uses `reasoning_effort: none` for fast; that gateway ignored
 native `thinking.type: disabled` in a comparison probe. The adapter preserves
 reasoning history in multi-turn deep reviews.
-Deep review is an opt-in worker configuration; it is not automatically queued
-after a fast review and has no separate PR command in this change.
+Fast review is an opt-in worker configuration; a deep review is not automatically
+queued after it. There is no separate PR command for switching profiles in this change.
 
-For on-demand EC2 workers, set Terraform `agent_profile` (`fast` by default).
+For on-demand EC2 workers, set Terraform `agent_profile` (`deep` by default).
 For LXD workers, set `user.review-bot.agent-profile` in `REVIEW_BOT_INSTANCE_TAGS`.
 Bootstrap maps this metadata to `REVIEW_BOT_AGENT_PROFILE` and renders the selected
 operator profile. Rebuild the worker image to include these changes; rebuild the

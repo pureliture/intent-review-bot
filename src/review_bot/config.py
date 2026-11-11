@@ -312,10 +312,10 @@ class PartitionEvaluationConfig(BaseModel):
 
 class AgentEngineConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
-    profile: Literal["fast", "deep"] = "fast"
-    thinking_level: Literal["off", "minimal", "low", "medium", "high"] = "off"
-    max_mode_seconds: int | None = Field(default=240, ge=1, le=3600)
-    max_total_output_tokens: int | None = Field(default=12000, ge=1)
+    profile: Literal["fast", "deep"] = "deep"
+    thinking_level: Literal["off", "minimal", "low", "medium", "high"] = "medium"
+    max_mode_seconds: int | None = Field(default=None, ge=1, le=3600)
+    max_total_output_tokens: int | None = Field(default=None, ge=1)
     image_tag: str = Field(default="review-bot-pi-agent:0.73.1", min_length=1, max_length=255,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
     provider: Literal["openrouter", "opencode-go"] = "openrouter"
@@ -323,20 +323,20 @@ class AgentEngineConfig(BaseModel):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:/-]*$")
     parallel_modes: bool = True
     timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
-    max_proxy_calls: int = Field(ge=1, le=512, default=16)
-    max_output_tokens: int | None = Field(default=4096, ge=1, le=32768)
+    max_proxy_calls: int = Field(ge=1, le=512, default=40)
+    max_output_tokens: int | None = Field(default=None, ge=1, le=32768)
     context_window_tokens: int | None = Field(default=None, ge=1024, le=10_000_000)
-    max_revisions: int = Field(ge=0, le=3, default=0)
+    max_revisions: int = Field(ge=0, le=3, default=1)
     session_store_dir: str = Field(min_length=1, max_length=1024,
         default="~/.local/share/review-bot/agent-sessions")
 
     @model_validator(mode="before")
     @classmethod
     def profile_defaults(cls, value):
-        if isinstance(value, dict) and value.get("profile") == "deep":
-            return {"thinking_level": "medium", "max_mode_seconds": None,
-                "max_proxy_calls": 40, "max_output_tokens": None,
-                "max_total_output_tokens": None, "max_revisions": 1, **value}
+        if isinstance(value, dict) and value.get("profile") == "fast":
+            return {"thinking_level": "off", "max_mode_seconds": 240,
+                "max_proxy_calls": 16, "max_output_tokens": 4096,
+                "max_total_output_tokens": 12000, "max_revisions": 0, **value}
         return value
 
     @field_validator("session_store_dir")

@@ -60,9 +60,9 @@ variable "max_vm_seconds" {
 }
 
 variable "agent_profile" {
-  description = "Default bounded fast review or opt-in deep review for on-demand workers."
+  description = "Review profile for on-demand workers: deep by default, with an opt-in bounded fast review."
   type        = string
-  default     = "fast"
+  default     = "deep"
   validation {
     condition     = contains(["fast", "deep"], var.agent_profile)
     error_message = "agent_profile must be fast or deep."

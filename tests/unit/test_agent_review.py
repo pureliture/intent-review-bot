@@ -223,6 +223,27 @@ def _intent_body(task):
 
 
 @pytest.mark.parametrize("mode", ["architecture", "intent"])
+def test_default_deep_review_verifies_all_items_without_the_fast_cap(tmp_path, mode):
+    task = _pmd_partition_task() if mode == "architecture" else make_intent_task()
+    body = _architecture_body(task) if mode == "architecture" else _intent_body(task)
+    if mode == "architecture":
+        body["findings"] = [{**deepcopy(body["findings"][0]), "statement": f"Defect {index}."}
+            for index in range(6)]
+    runner = FakeAgentRunner(tmp_path, body)
+    runner.config = AgentEngineConfig()
+    result = run_agent_review(task, mode, runner, language="en", instructions="")
+    expected_items = 6 if mode == "architecture" else len(PERSPECTIVE_IDS)
+    assert result.status == "completed"
+    assert len(runner.verify_claim_ids[0]) == 1 + expected_items
+    assert runner.run_modes == [mode, "verify"]
+    assert result.partition["review_policy"]["profile"] == "deep"
+    assert result.partition["review_policy"]["max_items"] is None
+    assert result.partition["identity"]["limits"]["max_revisions"] == 1
+    assert "Review profile: deep" in runner.generation_contract
+    validate_partition_result(result, task)
+
+
+@pytest.mark.parametrize("mode", ["architecture", "intent"])
 def test_fast_review_bounds_generated_items_before_independent_verification(tmp_path, mode):
     task = _pmd_partition_task() if mode == "architecture" else make_intent_task()
     body = _architecture_body(task) if mode == "architecture" else _intent_body(task)
@@ -232,7 +253,7 @@ def test_fast_review_bounds_generated_items_before_independent_verification(tmp_
     else:
         body["questions"] = ["Another question?", "One more?"]
     runner = FakeAgentRunner(tmp_path, body)
-    runner.config = AgentEngineConfig()
+    runner.config = AgentEngineConfig(profile="fast")
     result = run_agent_review(task, mode, runner, language="en", instructions="")
     assert result.status == "completed"
     assert len(runner.verify_claim_ids[0]) == 4  # summary plus three selected items
@@ -252,7 +273,7 @@ def test_fast_review_bounds_generated_items_before_independent_verification(tmp_
 def test_fast_review_does_not_revise_or_reverify_contradicted_claims(tmp_path):
     task = _pmd_partition_task()
     runner = FakeAgentRunner(tmp_path, _architecture_body(task))
-    runner.config = AgentEngineConfig(max_revisions=3)
+    runner.config = AgentEngineConfig(profile="fast", max_revisions=3)
     runner.verify_outputs = [lambda _request, claims: {"items": {claim["id"]: {
         field: {"state": "contradicted", "reason": "The source contradicts this claim.",
             "citations": claim["cited"]} for field in claim["fields"]} for claim in claims}}]
@@ -273,7 +294,7 @@ def test_fast_mode_deadline_is_shared_by_generation_and_verification(tmp_path, m
     clock = ControlledClock()
     monkeypatch.setattr(agent_review.time, "monotonic", clock.monotonic)
     runner = FakeAgentRunner(tmp_path, _architecture_body(task))
-    runner.config = AgentEngineConfig()
+    runner.config = AgentEngineConfig(profile="fast")
     runner.run_callback = lambda request: setattr(clock, "now", 200) if request.mode != "verify" else None
     result = run_agent_review(task, "architecture", runner, language="en", instructions="", deadline=outer_deadline)
     assert [request.timeout_seconds for request in runner.run_requests] == expected
@@ -285,7 +306,7 @@ def test_fast_mode_does_not_start_verification_after_its_own_deadline(tmp_path, 
     clock = ControlledClock()
     monkeypatch.setattr(agent_review.time, "monotonic", clock.monotonic)
     runner = FakeAgentRunner(tmp_path, _architecture_body(task))
-    runner.config = AgentEngineConfig()
+    runner.config = AgentEngineConfig(profile="fast")
     runner.run_callback = lambda request: setattr(clock, "now", 241)
     result = run_agent_review(task, "architecture", runner, language="en", instructions="", deadline=3000)
     assert runner.run_modes == ["architecture"]
@@ -410,6 +431,7 @@ def test_revision_gets_fresh_remaining_deadline_after_generation_timeout_elapsed
     clock = ControlledClock()
     monkeypatch.setattr(agent_review.time, "monotonic", clock.monotonic)
     runner = FakeAgentRunner(tmp_path, body)
+    runner.config = AgentEngineConfig()
     runner.verify_outputs = [lambda _request, claims: {"items": {claim["id"]: {
         field: {"state": "contradicted" if claim["id"] == "findings:0" else "supported",
             "reason": "Recheck this finding." if claim["id"] == "findings:0"
