@@ -33,17 +33,6 @@ metadata_response() {
   fi
 }
 
-decode_lxd_value() {
-  printf '%s' "$1" | python3 -c '
-import json
-import sys
-value = json.load(sys.stdin)
-if not isinstance(value, str):
-    raise SystemExit("invalid LXD metadata value")
-print(value)
-'
-}
-
 meta() {
   local response status body value
   response="$(metadata_response "$1")"
@@ -53,11 +42,7 @@ meta() {
     printf 'Required metadata key is unavailable: %s\n' "$1" >&2
     return 1
   fi
-  if [[ "${vm_provider}" == lxd ]]; then
-    value="$(decode_lxd_value "${body}")"
-  else
-    value="${body}"
-  fi
+  value="${body}"
   if [[ -z "${value}" ]]; then
     printf 'Required metadata key is empty: %s\n' "$1" >&2
     return 1
@@ -77,11 +62,7 @@ meta_optional() {
     printf 'Optional metadata lookup failed: %s\n' "$1" >&2
     return 1
   fi
-  if [[ "${vm_provider}" == lxd ]]; then
-    decode_lxd_value "${body}"
-  else
-    printf '%s' "${body}"
-  fi
+  printf '%s' "${body}"
 }
 
 if [[ "${vm_provider}" == lxd ]]; then
