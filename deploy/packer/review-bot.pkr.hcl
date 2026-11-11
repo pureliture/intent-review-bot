@@ -150,6 +150,7 @@ build {
       "systemctl disable --now docker.socket docker.service",
       "systemctl stop docker.socket docker.service",
       "if systemctl is-active --quiet docker.socket || systemctl is-active --quiet docker.service; then echo 'rootful Docker still active' >&2; exit 1; fi",
+      "rm -f /var/run/docker.sock",
       "useradd --uid 1001 --create-home --shell /bin/bash --groups docker reviewbot",
       "grep -q '^reviewbot:' /etc/subuid || echo 'reviewbot:100000:65536' >> /etc/subuid",
       "grep -q '^reviewbot:' /etc/subgid || echo 'reviewbot:100000:65536' >> /etc/subgid",
