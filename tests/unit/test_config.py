@@ -279,6 +279,24 @@ def test_active_environment_validation(valid_config_yaml: str) -> None:
         validate_active_environment(cfg_app, env={})
     assert "Missing required environment variables" in str(exc.value)
 
+    env_without_webhook_secret = {
+        "REVIEW_BOT_APP_ID": "1001",
+        "REVIEW_BOT_APP_PRIVATE_KEY_FILE": "/path/to/key.pem",
+    }
+    with pytest.raises(ConfigValidationError, match="REVIEW_BOT_WEBHOOK_SECRET"):
+        validate_active_environment(cfg_app, env=env_without_webhook_secret)
+    validate_active_environment(
+        cfg_app,
+        env=env_without_webhook_secret,
+        require_webhook_secret=False,
+    )
+    with pytest.raises(ConfigValidationError, match="REVIEW_BOT_APP_ID"):
+        validate_active_environment(
+            cfg_app,
+            env={"REVIEW_BOT_APP_PRIVATE_KEY_FILE": "/path/to/key.pem"},
+            require_webhook_secret=False,
+        )
+
     # with all env vars populated passes
     env_vars = {
         "REVIEW_BOT_APP_ID": "1001",

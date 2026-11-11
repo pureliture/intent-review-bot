@@ -647,7 +647,10 @@ def test_service_calls_canonical_environment_validator(
     validate = Mock(wraps=service.validate_active_environment)
     monkeypatch.setattr(service, "validate_active_environment", validate)
     assert main(["worker", "--config", str(service_config.path), "--once"]) == 0
-    validate.assert_called_once_with(dependencies.worker_factory.call_args.args[0])
+    validate.assert_called_once_with(
+        dependencies.worker_factory.call_args.args[0],
+        require_webhook_secret=True,
+    )
 
 
 @pytest.mark.parametrize("name", ["state", "repositories", "analysis", "artifacts"])
@@ -908,7 +911,9 @@ def test_ondemand_vm_lifetime_guard_and_optional_lifetime(
     from review_bot.runtime.service import ServiceConfigurationError
 
     service_config.raw["execution"]["task_timeout_seconds"] = 3000
+    service_config.raw["service"]["webhook_secret_env"] = "REVIEW_BOT_WEBHOOK_SECRET"
     write_config(service_config)
+    monkeypatch.delenv("REVIEW_BOT_WEBHOOK_SECRET", raising=False)
     job = ReviewJob("a" * 64, 44, 99, 7, "a" * 40, "b" * 40, "running",
         time.time(), time.time(), vm_id="i-1234abcd")
 

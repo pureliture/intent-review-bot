@@ -41,7 +41,11 @@ def enqueue_service_review(job_store: SQLiteJobStore, request: PrRequestRecord, 
         job_store.accept_delivery(delivery, request)
 
 
-def load_service_config(path: str | None) -> ReviewBotConfig:
+def load_service_config(
+    path: str | None,
+    *,
+    require_webhook_secret: bool = True,
+) -> ReviewBotConfig:
     if not path:
         raise ServiceConfigurationError("Service commands require --config")
     try:
@@ -73,7 +77,7 @@ def load_service_config(path: str | None) -> ReviewBotConfig:
             raise ServiceConfigurationError("REVIEW_BOT_API_TOKEN must be set for the fixed-input API")
     else:
         try:
-            validate_active_environment(config)
+            validate_active_environment(config, require_webhook_secret=require_webhook_secret)
         except Exception:
             raise ServiceConfigurationError("Required GitHub App environment references must be set") from None
     if not os.environ.get(config.service.state_root_env, "").strip():
@@ -307,7 +311,7 @@ def execute_ondemand_review(config_path: str | None, job, is_current, *,
     base = Path(previous or "/var/lib/review-bot")
     os.environ[state_env] = os.fspath(base / "ondemand" / job.job_id)
     try:
-        config = load_service_config(config_path)
+        config = load_service_config(config_path, require_webhook_secret=False)
         if (vm_lifetime_seconds is not None
                 and config.execution.task_timeout_seconds + _VM_LIFETIME_MARGIN_SECONDS > vm_lifetime_seconds):
             raise ServiceConfigurationError("task_timeout_exceeds_vm_lifetime")

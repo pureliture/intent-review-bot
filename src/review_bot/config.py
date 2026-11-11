@@ -562,15 +562,19 @@ def load_target_repository_config(path_or_str: str | Path | TextIO) -> TargetRep
 def validate_active_environment(
     config: ReviewBotConfig,
     env: Mapping[str, str] = os.environ,
+    *,
+    require_webhook_secret: bool = True,
 ) -> None:
     """Validates required environment secrets when running in active GitHub App mode."""
     if config.execution.mode == "github_app":
         missing_vars: list[str] = []
-        for var_name in (
+        required_vars = [
             config.service.app_id_env,
             config.service.app_private_key_file_env,
-            config.service.webhook_secret_env,
-        ):
+        ]
+        if require_webhook_secret:
+            required_vars.append(config.service.webhook_secret_env)
+        for var_name in required_vars:
             if var_name not in env or not env[var_name].strip():
                 missing_vars.append(var_name)
         if missing_vars:
